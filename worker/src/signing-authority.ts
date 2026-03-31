@@ -12,7 +12,7 @@
 // The Worker writes signed bundles to KV for the revocation verifier.
 
 import { DurableObject } from "cloudflare:workers";
-import { X509CertificateGenerator } from "@peculiar/x509";
+import { X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
 import type { CABundle } from "./revocation";
 
 interface SigningAuthorityEnv {
@@ -199,8 +199,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const cached = this.ctx.storage.sql
       .exec("SELECT pem, key_id FROM ca_cert WHERE id = 'cert'")
       .toArray() as Array<{ pem: string; key_id: string }>;
-    if (cached.length > 0 && cached[0]!.key_id === currentKeyId) {
-      return cached[0]!.pem;
+    // v2: require CA:TRUE in cached cert (invalidate v1 certs without BasicConstraints)
+    if (cached.length > 0 && cached[0]!.key_id === currentKeyId && cached[0]!.pem.includes('BEGIN CERTIFICATE')) {
+      // Check if cached cert has BasicConstraints by looking for the extension marker
+      // If it was generated without extensions (v1), regenerate
+      try {
+        const { X509Certificate } = await import("@peculiar/x509");
+        const x = new X509Certificate(cached[0]!.pem);
+        const bc = x.getExtension("2.5.29.19"); // BasicConstraints OID
+        if (bc) return cached[0]!.pem;
+      } catch { /* regenerate */ }
     }
 
     const { signingKey, verifyKey } = await this.getOrCreateSigningKey();
@@ -217,6 +225,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       signingAlgorithm: { name: "Ed25519" } as any,
       keys: { privateKey: signingKey, publicKey: verifyKey },
       serialNumber: serial,
+      extensions: [
+        new BasicConstraintsExtension(true, 0, true),
+        new KeyUsagesExtension(KeyUsageFlags.keyCertSign | KeyUsageFlags.cRLSign, true),
+      ],
     });
 
     const pem = cert.toString("pem");
