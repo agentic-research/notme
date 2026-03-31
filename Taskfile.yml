@@ -29,10 +29,23 @@ tasks:
     cmds:
       - npx wrangler dev
 
-  worker:check:
-    desc: Type-check + test
+  worker:install:
+    desc: Clean install from lockfile (no scripts)
     dir: worker
     cmds:
+      - npm ci --ignore-scripts
+
+  worker:audit:
+    desc: Check for known vulnerabilities
+    dir: worker
+    cmds:
+      - npm audit --omit=dev
+
+  worker:check:
+    desc: Audit + type-check + test
+    dir: worker
+    cmds:
+      - npm audit --omit=dev
       - npx tsc --noEmit
       - npx vitest run
 
@@ -58,8 +71,9 @@ tasks:
         curl -sf https://notme.bot/apas | grep -q "APAS" && echo "✓ apas" || echo "✗ apas"
 
   ship:
-    desc: "Golden path: check → deploy → verify"
+    desc: "Golden path: install → check → deploy → verify"
     cmds:
+      - task: worker:install
       - task: worker:check
       - task: worker:deploy
       - task: worker:verify
