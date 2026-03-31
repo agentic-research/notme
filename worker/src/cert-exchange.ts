@@ -156,20 +156,7 @@ export async function handleCertExchange(
     );
   }
 
-  // ── Mint bridge cert ──
-
-  let signingKey: CryptoKey;
-  let authorityState: { epoch: number; keyId: string };
-  try {
-    const keys = await authority.getOrCreateSigningKey();
-    signingKey = keys.signingKey;
-    authorityState = await authority.getAuthorityState();
-  } catch (e: any) {
-    return Response.json(
-      { error: "authority unavailable: " + e.message },
-      { status: 503 },
-    );
-  }
+  // ── Mint bridge cert (signing stays inside the DO — CryptoKey can't cross RPC) ──
 
   // Generate ephemeral P-256 keypair
   const kp = (await crypto.subtle.generateKey(
@@ -192,13 +179,11 @@ export async function handleCertExchange(
   const privB64 = btoa(String.fromCharCode(...new Uint8Array(privDer)));
   const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${privB64.match(/.{1,64}/g)!.join("\n")}\n-----END PRIVATE KEY-----`;
 
-  const { mintGHABridgeCert } = await import("./cert-authority");
-  let result;
+  let mintResult;
   try {
-    result = await mintGHABridgeCert(
+    mintResult = await authority.mintBridgeCert(
       principalId, // CN = principal UUID
       publicKeyPem,
-      signingKey,
       CERT_TTL_MS,
     );
   } catch (e: any) {
@@ -209,14 +194,11 @@ export async function handleCertExchange(
   }
 
   const response: CertExchangeResponse = {
-    certificate: result.certificate,
+    certificate: mintResult.certificate,
     private_key: privateKeyPem,
-    expires_at: result.expires_at,
-    subject: result.subject,
-    authority: {
-      epoch: authorityState.epoch,
-      key_id: authorityState.keyId,
-    },
+    expires_at: mintResult.expires_at,
+    subject: mintResult.subject,
+    authority: mintResult.authority,
     principal_id: principalId,
     scopes: effectiveScopes,
     auth_method: authMethod,

@@ -96,40 +96,14 @@ jobs:
           # URL-encode the audience (safe for query string)
           AUDIENCE_ENC=$(printf '%s' "$BRIDGE_AUDIENCE" | jq -sRr @uri)
 
-          echo "OIDC URL set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
-          echo "OIDC token set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
-          echo "Audience encoded: ${AUDIENCE_ENC}"
-
-          OIDC_RESPONSE=$(curl -sS \
-            -w "\nHTTP_CODE:%{http_code}" \
+          TOKEN=$(curl -sSf \
             -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE_ENC}")
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE_ENC}" \
+            | jq -r '.value')
 
-          OIDC_HTTP=$(echo "$OIDC_RESPONSE" | tail -1 | sed 's/HTTP_CODE://')
-          OIDC_BODY=$(echo "$OIDC_RESPONSE" | sed '$d')
-          echo "OIDC response code: $OIDC_HTTP"
-
-          if [ "$OIDC_HTTP" != "200" ]; then
-            echo "::error::OIDC token request failed (HTTP $OIDC_HTTP): $OIDC_BODY"
-            exit 1
-          fi
-
-          TOKEN=$(echo "$OIDC_BODY" | jq -r '.value')
-
-          BRIDGE_RESPONSE=$(curl -sS \
-            -w "\nHTTP_CODE:%{http_code}" \
-            -X POST "https://auth.notme.bot/cert/gha" \
+          RESULT=$(curl -sSfX POST "https://auth.notme.bot/cert/gha" \
             -H "Authorization: Bearer ${TOKEN}" \
             -H "Content-Type: application/json")
-
-          BRIDGE_HTTP=$(echo "$BRIDGE_RESPONSE" | tail -1 | sed 's/HTTP_CODE://')
-          RESULT=$(echo "$BRIDGE_RESPONSE" | sed '$d')
-          echo "Bridge response code: $BRIDGE_HTTP"
-
-          if [ "$BRIDGE_HTTP" != "200" ]; then
-            echo "::error::Bridge cert request failed (HTTP $BRIDGE_HTTP): $RESULT"
-            exit 1
-          fi
 
           if echo "$RESULT" | jq -e '.error' > /dev/null 2>&1; then
             echo "::error::signet exchange failed: $(echo "$RESULT" | jq -r '.error')"

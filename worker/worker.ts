@@ -47,16 +47,10 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
 
   const cfg = getConfig(env);
 
-  // Get signing key + authority state from SigningAuthority DO
+  // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC)
   const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
   const authority = env.SIGNING_AUTHORITY.get(authorityId);
-  let signingKey: CryptoKey;
-  let authorityState: { epoch: number; keyId: string };
   try {
-    const keys = await authority.getOrCreateSigningKey();
-    signingKey = keys.signingKey;
-    authorityState = await authority.getAuthorityState();
-
     // Ensure CA bundle is published to KV (lazy init — first request bootstraps)
     const existingBundle = await env.CA_BUNDLE_CACHE?.get("bundle:current");
     if (!existingBundle) {
@@ -138,13 +132,11 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
   const privB64 = btoa(String.fromCharCode(...new Uint8Array(privDer)));
   const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${privB64.match(/.{1,64}/g)!.join("\n")}\n-----END PRIVATE KEY-----`;
 
-  const { mintGHABridgeCert } = await import("./src/cert-authority");
   let result;
   try {
-    result = await mintGHABridgeCert(
+    result = await authority.mintBridgeCert(
       claims.sub,
       publicKeyPem,
-      signingKey,
       cfg.ghaCertTtlMs,
     );
   } catch (e: any) {
@@ -156,11 +148,7 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
     private_key: privateKeyPem,
     expires_at: result.expires_at,
     subject: result.subject,
-    // Authority state — verifiers use these to check revocation
-    authority: {
-      epoch: authorityState.epoch,
-      key_id: authorityState.keyId,
-    },
+    authority: result.authority,
     claims: {
       repository: claims.repository,
       ref: claims.ref,

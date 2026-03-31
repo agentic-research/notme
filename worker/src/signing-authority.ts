@@ -257,6 +257,27 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return crypto.subtle.sign("Ed25519" as any, signingKey, data);
   }
 
+  // Mint a bridge cert inside the DO — CryptoKey never crosses the RPC boundary.
+  async mintBridgeCert(
+    subject: string,
+    publicKeyPem: string,
+    ttlMs?: number,
+  ): Promise<{
+    certificate: string;
+    expires_at: number;
+    subject: string;
+    authority: { epoch: number; key_id: string };
+  }> {
+    const { signingKey } = await this.getOrCreateSigningKey();
+    const state = await this.getAuthorityState();
+    const { mintGHABridgeCert } = await import("./cert-authority");
+    const result = await mintGHABridgeCert(subject, publicKeyPem, signingKey, ttlMs);
+    return {
+      ...result,
+      authority: { epoch: state.epoch, key_id: state.keyId },
+    };
+  }
+
   // Current epoch and keyId for embedding in issued certs.
   async getAuthorityState(): Promise<{
     epoch: number;
