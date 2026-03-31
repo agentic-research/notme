@@ -12,6 +12,7 @@
 // The Worker writes signed bundles to KV for the revocation verifier.
 
 import { DurableObject } from "cloudflare:workers";
+import { X509CertificateGenerator } from "@peculiar/x509";
 import type { CABundle } from "./revocation";
 
 interface SigningAuthorityEnv {
@@ -181,6 +182,51 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const b64 = btoa(String.fromCharCode(...new Uint8Array(spki)));
     const lines = b64.match(/.{1,64}/g)!;
     return `-----BEGIN PUBLIC KEY-----\n${lines.join("\n")}\n-----END PUBLIC KEY-----\n`;
+  }
+
+  // Self-signed X.509 CA certificate for CF mTLS trust store.
+  // Cached in DO SQLite; invalidated on key rotation (key_id mismatch).
+  async getCACertificatePem(): Promise<string> {
+    this.ensureSchema();
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS ca_cert (
+        id     TEXT PRIMARY KEY DEFAULT 'cert',
+        pem    TEXT NOT NULL,
+        key_id TEXT NOT NULL
+      )
+    `);
+    const currentKeyId = this.getKeyId();
+    const cached = this.ctx.storage.sql
+      .exec("SELECT pem, key_id FROM ca_cert WHERE id = 'cert'")
+      .toArray() as Array<{ pem: string; key_id: string }>;
+    if (cached.length > 0 && cached[0]!.key_id === currentKeyId) {
+      return cached[0]!.pem;
+    }
+
+    const { signingKey, verifyKey } = await this.getOrCreateSigningKey();
+    const now = new Date();
+    const notAfter = new Date(now.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000);
+    const serial = crypto
+      .getRandomValues(new Uint8Array(16))
+      .reduce((s, b) => s + b.toString(16).padStart(2, "0"), "");
+
+    const cert = await X509CertificateGenerator.createSelfSigned({
+      name: "CN=signet-authority,O=notme",
+      notBefore: now,
+      notAfter,
+      signingAlgorithm: { name: "Ed25519" } as any,
+      keys: { privateKey: signingKey, publicKey: verifyKey },
+      serialNumber: serial,
+    });
+
+    const pem = cert.toString("pem");
+    this.ctx.storage.sql.exec("DELETE FROM ca_cert WHERE id = 'cert'");
+    this.ctx.storage.sql.exec(
+      "INSERT INTO ca_cert (id, pem, key_id) VALUES ('cert', ?, ?)",
+      pem,
+      currentKeyId,
+    );
+    return pem;
   }
 
   // Return the raw 32-byte Ed25519 public key as base64 (for CABundle.keys).

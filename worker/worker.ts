@@ -1024,14 +1024,15 @@ export default {
         return cachePut(request, resp);
       }
 
-      // CA public key — served from SigningAuthority DO (zero-copy, edge-fast).
+      // CA certificate — self-signed X.509 from SigningAuthority DO.
+      // CF mTLS trust store requires X.509 PEM, not raw public keys.
       if (pathname === "/.well-known/ca-bundle.pem") {
         const cached = await cacheMatch(request);
         if (cached) return cached;
         try {
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const pem: string = await authority.getPublicKeyPem();
+          const pem: string = await authority.getCACertificatePem();
           const resp = new Response(pem, {
             headers: {
               "Content-Type": "application/x-pem-file",
