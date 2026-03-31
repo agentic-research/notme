@@ -102,8 +102,9 @@ signet doesn't care how you authenticated. it cares that you did. any auth layer
 
 ```
 schema/     cap'n proto type definitions (single source of truth across Go, TS, Rust)
+gen/        auto-generated TS (Zod) + Go bindings from schema
 worker/     cloudflare worker — the identity authority at auth.notme.bot
-wasm/       ley-line-sign (ed25519 signing at edge)
+action/     reusable GHA action — OIDC token → bridge cert (zero secrets)
 .github/    reusable GHA workflows (OIDC-authed, SHA-pinned)
 ```
 
@@ -117,22 +118,31 @@ this matters because signature verification depends on canonical encoding. if tw
 
 cloudflare worker deployed at [`auth.notme.bot`](https://auth.notme.bot). the `SigningAuthority` durable object generates the Ed25519 CA key on first request and stores it in SQLite. the key never leaves cloudflare infrastructure — no secrets to manage, no PEM files, no `wrangler secret put`.
 
-**endpoints**
+**endpoints** (auth.notme.bot)
 
 | method | path | what it does |
 |--------|------|-------------|
-| `POST` | `/cert/gha` | GHA OIDC token → 5-min bridge cert (edge-handled) |
+| `POST` | `/cert` | any proof (passkey session, OIDC, bootstrap) → scoped bridge cert |
+| `POST` | `/cert/gha` | GHA OIDC token → 5-min bridge cert (legacy compat) |
+| `POST` | `/auth/passkey/register/*` | WebAuthn passkey registration |
+| `POST` | `/auth/passkey/login/*` | WebAuthn passkey login |
+| `GET` | `/me` | current session info |
+| `POST` | `/invites` | create scoped invite token (requires authorityManage) |
+| `GET/POST` | `/join` | redeem invite |
 | `GET` | `/.well-known/signet-authority.json` | authority discovery |
-| `GET` | `/.well-known/ca-bundle.pem` | CA public key (trust anchor) |
+| `GET` | `/.well-known/ca-bundle.pem` | X.509 CA certificate (trust anchor) |
 | `GET` | `/api/docs` | full API reference |
 
 ## run your own
 
 ```bash
-cd worker && wrangler deploy
+cd worker
+cp wrangler.toml.example wrangler.toml
+# edit wrangler.toml — fill in your CF KV namespace ID and VPC service ID
+wrangler deploy
 ```
 
-CA key is generated on first request. one command, zero secrets.
+CA key is generated on first request. first passkey registration requires a bootstrap code (visible in `wrangler tail`).
 
 ## related
 

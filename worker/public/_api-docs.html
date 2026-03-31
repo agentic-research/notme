@@ -488,19 +488,20 @@
         </div>
         <div class="ep-body">
           <div class="ep-desc">
-            CA trust anchor — the authority's Ed25519 public key in PEM format.
-            Configure MCP servers and verifiers with this to validate bridge
-            certificates. Served from the SigningAuthority Durable Object
-            (edge-fast, zero VPC roundtrip).
+            CA trust anchor — self-signed X.509 CA certificate (Ed25519).
+            Upload to CF mTLS trust store or use with any X.509 verifier to
+            validate bridge certificates. Served from the SigningAuthority
+            Durable Object (edge-fast, zero VPC roundtrip).
           </div>
           <div class="ep-label">response</div>
           <div class="ep-response">
-            -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEA... -----END PUBLIC
-            KEY-----
+            -----BEGIN CERTIFICATE----- MIIBFjCByaADAgEC... -----END
+            CERTIFICATE-----
           </div>
           <div class="ep-note">
-            Cache-Control: 1 hour. Key is generated in CF and never leaves —
-            there is no PEM file to exfiltrate.
+            Cache-Control: 1 hour. CA:TRUE, KeyUsage: keyCertSign|cRLSign.
+            Key is generated in CF and never leaves — there is no PEM file
+            to exfiltrate.
           </div>
         </div>
       </div>

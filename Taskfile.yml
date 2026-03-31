@@ -50,7 +50,7 @@ tasks:
         curl -sf https://auth.notme.bot/ | grep -q "identity authority" && echo "✓ landing" || echo "✗ landing"
         curl -sf https://auth.notme.bot/login | grep -q "passkey" && echo "✓ login" || echo "✗ login"
         curl -sf https://auth.notme.bot/.well-known/signet-authority.json | grep -q "issuer" && echo "✓ discovery" || echo "✗ discovery"
-        curl -sf https://auth.notme.bot/.well-known/ca-bundle.pem | grep -q "PUBLIC KEY" && echo "✓ ca-bundle" || echo "✗ ca-bundle"
+        curl -sf https://auth.notme.bot/.well-known/ca-bundle.pem | grep -q "CERTIFICATE" && echo "✓ ca-bundle" || echo "✗ ca-bundle"
         curl -sf https://auth.notme.bot/api/docs | grep -q "auth.notme.bot" && echo "✓ api-docs" || echo "✗ api-docs"
         curl -sf https://auth.notme.bot/auth/passkey/status | grep -q "rpId" && echo "✓ passkey-status" || echo "✗ passkey-status"
         echo "=== notme.bot ==="
