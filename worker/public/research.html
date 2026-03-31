@@ -1,0 +1,862 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>research — your agents are you, cryptographically</title>
+    <meta
+      name="description"
+      content="9 of 10 AI coding tools use your credentials. 24 CVEs across major AI IDEs. No open-source agent identity standard exists. Full analysis."
+    />
+    <meta
+      property="og:title"
+      content="Your Agents Are You, Cryptographically"
+    />
+    <meta property="og:url" content="https://notme.bot/research" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="canonical" href="https://notme.bot/research" />
+    <link rel="stylesheet" href="styles.css" />
+    <style>
+      body {
+        background: #141210;
+        color: #c8b8a0;
+        font-family: "DM Mono", monospace;
+        font-size: 0.8125rem;
+        line-height: 1.9;
+      }
+      .page {
+        max-width: 640px;
+        margin: 0 auto;
+        padding: 24px 28px;
+      }
+      h1,
+      h2,
+      h3 {
+        font-family: "Syne", sans-serif;
+      }
+      main h1 {
+        color: #ffe060;
+        font-size: 1.375rem;
+        font-weight: 700;
+        margin: 0 0 16px;
+        letter-spacing: -0.02em;
+        font-family: "Syne", sans-serif;
+        padding-bottom: 0.15em;
+        border-bottom: 3px solid #ffe060;
+      }
+      h2 {
+        color: #f8f0e0;
+        font-size: 1.0625rem;
+        font-weight: 700;
+        margin: 40px 0 14px;
+        padding-top: 20px;
+        border-top: 1px solid #3a3428;
+        padding-bottom: 0.15em;
+        border-bottom: 2px solid #f8f0e0;
+      }
+      h3 {
+        color: #c8b8a0;
+        font-size: 0.875rem;
+        font-weight: 600;
+        margin: 24px 0 10px;
+        padding-bottom: 0.15em;
+        border-bottom: 1px solid #c8b8a0;
+      }
+      p {
+        margin: 0 0 16px;
+      }
+      strong {
+        color: #e8dcc8;
+        font-weight: 500;
+      }
+      code {
+        color: #00d4e8;
+        background: rgba(0, 212, 232, 0.08);
+        padding: 1px 5px;
+        font-size: 0.8125rem;
+      }
+      a {
+        color: #00d4e8;
+        text-decoration: none;
+        border-bottom: 1px dotted rgba(0, 212, 232, 0.3);
+      }
+      a:hover {
+        color: #f0d040;
+        border-color: rgba(240, 208, 64, 0.4);
+      }
+
+      .research-hero {
+        padding: 60px 0 20px;
+      }
+      .meta {
+        color: #706050;
+        font-size: 0.75rem;
+        margin-bottom: 24px;
+      }
+      .meta span::before {
+        content: "\25C7 ";
+        opacity: 0.4;
+      }
+      .meta span:first-child::before {
+        display: none;
+      }
+      .research-sub {
+        color: #c8b8a0;
+        font-size: 0.875rem;
+        line-height: 1.9;
+        max-width: 580px;
+        margin-bottom: 28px;
+      }
+      .research-sub strong {
+        color: #f0d040;
+      }
+      .research-actions {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      /* Stats */
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin: 32px 0;
+      }
+      .stat {
+        padding: 20px 16px;
+        border-left: 3px solid var(--c, #f0d040);
+        background: #1c1810;
+      }
+      .stat-num {
+        font-family: "Syne", sans-serif;
+        font-size: 1.375rem;
+        font-weight: 800;
+        color: var(--c, #f0d040);
+        display: block;
+        line-height: 1;
+        margin-bottom: 4px;
+      }
+      .stat-label {
+        font-size: 0.6875rem;
+        color: #988870;
+      }
+
+      /* Pull quotes */
+      .quote {
+        border-left: 3px solid #f0d040;
+        padding: 16px 0 16px 24px;
+        margin: 28px 0;
+      }
+      .quote p {
+        color: #e8dcc8;
+        font-size: 0.875rem;
+        font-weight: 400;
+        margin: 0;
+      }
+      .quote .hl {
+        color: #f0d040;
+        text-shadow: 0 0 16px rgba(240, 208, 64, 0.2);
+      }
+      .quote .attr {
+        display: block;
+        margin-top: 8px;
+        font-size: 0.75rem;
+        color: #706050;
+      }
+
+      /* Tables */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 24px 0;
+        font-size: 0.8125rem;
+      }
+      th {
+        text-align: left;
+        padding: 8px 12px;
+        font-size: 0.6875rem;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: #706050;
+        border-bottom: 2px solid #3a3428;
+        font-weight: 400;
+      }
+      td {
+        padding: 8px 12px;
+        border-bottom: 1px solid #2c2820;
+      }
+      tr:hover td {
+        background: rgba(240, 208, 64, 0.02);
+      }
+      .tag-bad {
+        color: #e04030;
+        font-size: 0.625rem;
+        font-weight: 600;
+      }
+      .tag-good {
+        color: #48c868;
+        font-size: 0.625rem;
+        font-weight: 600;
+      }
+
+      /* Tier blocks */
+      .tier {
+        background: #1c1810;
+        border-left: 3px solid var(--c, #3a3428);
+        padding: 16px 20px;
+        margin: 12px 0;
+      }
+      .tier h4 {
+        font-family: "Syne", sans-serif;
+        font-size: 0.875rem;
+        font-weight: 700;
+        color: #e8dcc8;
+        margin: 0 0 6px;
+      }
+      .tier p {
+        font-size: 0.875rem;
+        margin: 0;
+      }
+
+      /* Mid-CTAs */
+      .mid-cta {
+        border: 1px solid #3a3428;
+        padding: 24px;
+        margin: 32px 0;
+        text-align: center;
+      }
+      .mid-cta p {
+        font-size: 0.875rem;
+        color: #988870;
+        margin-bottom: 12px;
+      }
+
+      /* Section divider */
+      .sep {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 48px 0 0;
+      }
+      .sep .line {
+        flex: 1;
+        height: 1px;
+        background: #3a3428;
+      }
+      .sep .num {
+        font-family: "Syne", sans-serif;
+        font-size: 0.625rem;
+        color: #706050;
+        font-weight: 700;
+        letter-spacing: 0.2em;
+      }
+
+      /* CTA block */
+      .cta-block {
+        text-align: center;
+        padding: 64px 0 80px;
+        border-top: 2px solid #3a3428;
+        margin-top: 48px;
+      }
+      .cta-block h3 {
+        margin-bottom: 12px;
+      }
+      .cta-block p {
+        color: #988870;
+        max-width: 420px;
+        margin: 0 auto 24px;
+      }
+
+      /* Nav overrides for dark bg */
+      nav {
+        border-color: #3a3428;
+      }
+      footer {
+        padding: 28px 0;
+        border-top: 1px solid #3a3428;
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.75rem;
+        color: #504838;
+        margin-top: 48px;
+      }
+      footer a {
+        color: #706050;
+        border: none;
+      }
+      footer a:hover {
+        color: #00d4e8;
+      }
+
+      /* Progress bar */
+      .read-progress {
+        position: fixed;
+        top: 0;
+        left: 0;
+        height: 2px;
+        background: linear-gradient(90deg, #f0d040, #00d4e8);
+        z-index: 9999;
+        width: 0%;
+        transition: width 80ms ease;
+      }
+
+      @media (max-width: 640px) {
+        .page {
+          padding: 16px;
+        }
+        .stats {
+          grid-template-columns: 1fr 1fr;
+        }
+        h1 {
+          font-size: 1.5rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="read-progress" id="readProgress"></div>
+    <div class="grain"></div>
+    <div class="scanline"></div>
+    <div class="static-overlay"></div>
+
+    <div class="page">
+      <nav></nav>
+
+      <main>
+        <div class="research-hero">
+          <div class="meta">
+            <span>march 2026</span>
+            <span>market analysis</span>
+            <span>12 min read</span>
+          </div>
+          <h1>your agents are you, cryptographically.</h1>
+          <p class="hero-sub">
+            every commit, every API call, every push your AI agent makes carries
+            <strong>your identity</strong> with zero separation. the trivy
+            breach proved mutable references and long-lived tokens are
+            catastrophic. no open-source standard exists. this is the gap.
+          </p>
+          <div class="hero-actions">
+            <a
+              href="https://github.com/agentic-research"
+              class="btn btn-primary"
+              >view the source</a
+            >
+            <a href="/architecture" class="btn btn-ghost">how it works</a>
+            <a href="#positioning" class="btn btn-ghost">the solution &darr;</a>
+          </div>
+        </div>
+
+        <!-- ── 01 TRIVY ── -->
+        <div class="sep">
+          <span class="num">01</span>
+          <div class="line"></div>
+        </div>
+
+        <h2 id="trivy">the trivy breach proves the thesis in production</h2>
+
+        <p>
+          On March 19, 2026, TeamPCP compromised Aqua Security's Trivy &mdash;
+          one of the most widely deployed open-source vulnerability scanners
+          &mdash; in what Palo Alto Networks called &ldquo;the most
+          sophisticated supply chain attack on a security tool to date.&rdquo;
+          The attack exploited exactly two foundational weaknesses:
+          <strong>mutable git tag references</strong> and
+          <strong>long-lived service account tokens</strong>.
+        </p>
+
+        <div class="stats">
+          <div class="stat" style="--c: #e04030">
+            <span class="stat-num">76</span
+            ><span class="stat-label"
+              >tags force-pushed to malicious commits</span
+            >
+          </div>
+          <div class="stat" style="--c: #f0d040">
+            <span class="stat-num">1,000+</span
+            ><span class="stat-label">SaaS environments impacted</span>
+          </div>
+          <div class="stat" style="--c: #00d4e8">
+            <span class="stat-num">47+</span
+            ><span class="stat-label">npm packages compromised</span>
+          </div>
+        </div>
+
+        <p>
+          The attackers force-pushed 76 of 77 version tags in
+          <code>trivy-action</code> to point at malicious commits. Every CI/CD
+          pipeline referencing these actions by tag silently executed
+          attacker-controlled code, with no visible change to workflow files or
+          release pages.
+        </p>
+
+        <p>
+          A single compromised service account &mdash;
+          <code>Argon-DevOps-Mgt</code>, a bot bridging two GitHub organizations
+          with a long-lived PAT &mdash; gave the attacker write access to both
+          open-source and proprietary repositories.
+        </p>
+
+        <div class="quote">
+          <p>
+            immutable, content-addressed references would have prevented the
+            entire tag-poisoning phase. ephemeral, proof-of-possession tokens
+            make stolen credentials <span class="hl">useless</span>. when the
+            auditor is compromised, only independent cryptographic provenance
+            survives.
+          </p>
+        </div>
+
+        <p>
+          The compromised Trivy binary ran both the legitimate scan and a
+          credential stealer simultaneously &mdash; workflows appeared normal
+          while secrets were exfiltrated. The attack cascaded to Checkmarx KICS,
+          LiteLLM (36% of cloud environments), and 47+ npm packages.
+        </p>
+
+        <!-- ── 02 AGENTS ARE YOU ── -->
+        <div class="sep">
+          <span class="num">02</span>
+          <div class="line"></div>
+        </div>
+
+        <h2 id="agents-are-you">
+          your agents are you, and the evidence is overwhelming
+        </h2>
+
+        <p>
+          Research across ten leading AI coding tools reveals that
+          <strong>nine out of ten use the developer's own credentials</strong>
+          with no cryptographic separation.
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>tool</th>
+              <th>identity model</th>
+              <th>separation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Claude Code</td>
+              <td>developer's local git config + keychain</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>Cursor</td>
+              <td>inherits existing git credentials</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>Cline</td>
+              <td>executes git via developer's config</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>Roo Code</td>
+              <td>executes git via developer's config</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>Devin</td>
+              <td>cloud sandbox, delegated GitHub access</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>Amazon Q</td>
+              <td>developer's personal tokens</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>Windsurf</td>
+              <td>developer's personal tokens</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>OpenHands</td>
+              <td>developer's personal tokens</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>Codex CLI</td>
+              <td>developer's local git config</td>
+              <td><span class="tag-bad">your identity</span></td>
+            </tr>
+            <tr>
+              <td>GitHub Copilot Agent</td>
+              <td>agent-attributed commits</td>
+              <td><span class="tag-good">agent identity</span></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="quote">
+          <p>
+            the pattern: prompt injection &rarr; agent acts with developer's
+            full credentials &rarr; exfiltration.
+            <span class="hl">24 CVEs across all major AI IDEs</span> in the
+            IDEsaster vulnerability class.
+          </p>
+        </div>
+
+        <div class="stats">
+          <div class="stat" style="--c: #e04030">
+            <span class="stat-num">28%</span
+            ><span class="stat-label"
+              >of orgs can trace agent actions to a human</span
+            >
+          </div>
+          <div class="stat" style="--c: #f0d040">
+            <span class="stat-num">21.9%</span
+            ><span class="stat-label">of agents have their own identity</span>
+          </div>
+          <div class="stat" style="--c: #00d4e8">
+            <span class="stat-num">24</span
+            ><span class="stat-label">CVEs across major AI IDEs</span>
+          </div>
+        </div>
+
+        <p>
+          The &ldquo;Clinejection&rdquo; attack exploited prompt injection in a
+          GitHub Issue to steal npm credentials. &ldquo;RoguePilot&rdquo;
+          exfiltrated GITHUB_TOKEN via Copilot in Codespaces. Check Point
+          demonstrated API key exfiltration from Claude Code before users
+          confirmed trust dialogs.
+        </p>
+
+        <p>
+          IETF published <code>draft-klrc-aiagent-auth-00</code> in March 2026
+          &mdash; its Security Considerations section still reads
+          <strong>&ldquo;TODO Security.&rdquo;</strong>
+        </p>
+
+        <div class="mid-cta">
+          <p>
+            signet is self-sovereign identity built for humans and machines:
+            proof-of-possession certs instead of bearer tokens, for commit
+            signing, GitHub Actions, HTTP auth, and more.
+          </p>
+          <a
+            href="https://github.com/agentic-research/signet"
+            class="btn btn-ghost"
+            >signet on github &rarr;</a
+          >
+        </div>
+
+        <!-- ── 03 NO LAYER EXISTS ── -->
+        <div class="sep">
+          <span class="num">03</span>
+          <div class="line"></div>
+        </div>
+
+        <h2 id="market">no open-source identity layer exists</h2>
+
+        <p>
+          Non-human identity is the fastest-growing segment in IAM. AI agent
+          security is the most explosive new category. But
+          <strong>no open-source standard exists</strong> for agent identity
+          primitives.
+        </p>
+
+        <div class="tier" style="--c: #f0d040">
+          <h4>NHI governance platforms</h4>
+          <p>
+            Oasis, Astrix, Clutch. Discover and manage existing identities
+            &mdash; posture tools, not issuance infrastructure.
+          </p>
+        </div>
+        <div class="tier" style="--c: #00d4e8">
+          <h4>workload identity</h4>
+          <p>
+            SPIFFE/SPIRE, Aembit. Designed for the cooperative model &mdash;
+            doesn't work for cross-domain agent interactions.
+          </p>
+        </div>
+        <div class="tier" style="--c: #e04030">
+          <h4>platform IAM giants</h4>
+          <p>
+            Microsoft Entra Agent ID, Okta for AI Agents. Agents as another row
+            in the directory. Governance, not cryptographic identity.
+          </p>
+        </div>
+        <div class="tier" style="--c: #988870">
+          <h4>secrets management</h4>
+          <p>
+            HashiCorp Vault, CyberArk Conjur. Manages credentials but doesn't
+            provide identity.
+          </p>
+        </div>
+        <div class="tier" style="--c: #48c868">
+          <h4>open-source agent identity</h4>
+          <p>Nearly nonexistent. <strong>This is the gap.</strong></p>
+        </div>
+
+        <div class="quote">
+          <p>
+            no open-source layer provides
+            <span class="hl">agent identity primitives</span> &mdash;
+            self-sovereign proof-of-possession certs, ephemeral machine
+            credentials, and <a href="/apas">cryptographic provenance</a>.
+            signet provides the cert layer for humans and machines; notme.bot
+            applies it to AI agents. chain hashing is shipped; DSSE envelope
+            signing is in progress.
+          </p>
+        </div>
+
+        <!-- ── 04 SUPPLY CHAIN ── -->
+        <div class="sep">
+          <span class="num">04</span>
+          <div class="line"></div>
+        </div>
+
+        <h2 id="supply-chain">supply chain frameworks have a blind spot</h2>
+
+        <p>
+          SLSA, in-toto, keyless signing &mdash; designed for human-driven build
+          pipelines. They track
+          <strong>how artifacts were built, not how code was written</strong>.
+        </p>
+
+        <div class="quote">
+          <p>
+            &ldquo;five years ago, we reached consensus that building on
+            developer laptops is a supply chain risk. we codified that into SLSA
+            and moved builds into hermetic pipelines. then we deployed AI agents
+            and
+            <span class="hl">put them right back on developer laptops.</span
+            >&rdquo;<span class="attr"
+              >&mdash; Jed Salazar, Edera, March 2026</span
+            >
+          </p>
+        </div>
+
+        <p>
+          SLSA's trust boundary begins at the build system. When an agent writes
+          code on a developer's machine, it enters the supply chain before SLSA
+          applies. Keyless signing supports non-human identities through OIDC,
+          but <strong>no standard OIDC schema exists for AI agents</strong>.
+        </p>
+
+        <h3>APAS fills the gap</h3>
+
+        <table>
+          <thead>
+            <tr>
+              <th>APAS level</th>
+              <th>parallels</th>
+              <th>what it adds</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>L1</strong> audit trail</td>
+              <td>SLSA Build L1</td>
+              <td>provenance as in-toto predicate</td>
+            </tr>
+            <tr>
+              <td><strong>L2</strong> signed attestations</td>
+              <td>SLSA Build L2</td>
+              <td>signed with agent OIDC claims</td>
+            </tr>
+            <tr>
+              <td><strong>L3</strong> isolated execution</td>
+              <td>SLSA Build L3</td>
+              <td>hardened, ephemeral environments</td>
+            </tr>
+            <tr>
+              <td><strong>L4</strong> verified inputs</td>
+              <td>beyond SLSA</td>
+              <td>prompts, context, model versions verified</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p>
+          No regulatory framework addresses AI agents as code authors. NIST
+          launched its AI Agent Standards Initiative but has no concrete
+          standards. The EU Cyber Resilience Act will require security
+          attestations.
+          <strong
+            >APAS positions itself as the standard regulators reference.</strong
+          >
+        </p>
+
+        <div class="mid-cta">
+          <p>
+            APAS has an open reference specification and implementation path.
+          </p>
+          <a href="/apas" class="btn btn-ghost">view APAS &rarr;</a>
+        </div>
+
+        <!-- ── 05 ATTACK SURFACE ── -->
+        <div class="sep">
+          <span class="num">05</span>
+          <div class="line"></div>
+        </div>
+
+        <h2 id="attack-surface">
+          the attack surface has reached critical mass
+        </h2>
+
+        <p>
+          This is the <strong>dominant cybersecurity narrative of 2026</strong>.
+          48% of cybersecurity professionals identify agentic AI as the single
+          most dangerous attack vector. Bessemer declared securing AI agents
+          &ldquo;the defining cybersecurity challenge of 2026.&rdquo;
+        </p>
+
+        <p>
+          The Nx npm attack weaponized local AI agents via prompt injection.
+          OWASP published its Top 10 for Agentic Applications. Microsoft coined
+          &ldquo;agent sprawl.&rdquo; NIST launched its AI Agent Standards
+          Initiative. The EU AI Act core framework becomes operational
+          <strong>August 2, 2026</strong>.
+        </p>
+
+        <!-- ── 06 POSITIONING ── -->
+        <div class="sep">
+          <span class="num">06</span>
+          <div class="line"></div>
+        </div>
+
+        <h2 id="positioning">the open-source identity layer</h2>
+
+        <p>
+          Not a governance dashboard. Not a workload IAM platform. Not a
+          directory extension.
+          <strong
+            >The cryptographic primitives that all of these need
+            underneath.</strong
+          >
+        </p>
+
+        <h3>the problem</h3>
+        <p>
+          Your agents are you, cryptographically. The Trivy breach proved
+          mutable references and long-lived tokens are catastrophic. Every AI
+          coding tool except Copilot commits as the human. When an agent is
+          compromised, the attacker inherits your full identity.
+        </p>
+
+        <h3>the insight</h3>
+        <p>
+          Agents aren't users &mdash; they're machines. They need machine
+          identity, not hacked human identity. What's needed: self-sovereign
+          proof-of-possession certs that eliminate bearer-token reuse (<a
+            href="https://github.com/agentic-research/signet"
+            >Signet</a
+          >) and cryptographic provenance chains for AI work (<a href="/apas"
+            >APAS</a
+          >
+          via notme.bot). Signet ships the cert layer today; APAS DSSE signing
+          is in progress.
+        </p>
+
+        <h3>the demo</h3>
+
+        <table>
+          <thead>
+            <tr>
+              <th></th>
+              <th><span class="tag-bad">today</span></th>
+              <th><span class="tag-good">with notme</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>identity</td>
+              <td>your GitHub PAT</td>
+              <td>agent's own Ed25519 cert (ML-DSA-44 ready)</td>
+            </tr>
+            <tr>
+              <td>scope</td>
+              <td>all your repos</td>
+              <td>orchestrator-enforced, per-task</td>
+            </tr>
+            <tr>
+              <td>revocation</td>
+              <td>rotate your token</td>
+              <td>near-real-time edge revoke</td>
+            </tr>
+            <tr>
+              <td>audit</td>
+              <td>no trail</td>
+              <td>signed commits + chain hash (DSSE signing coming)</td>
+            </tr>
+            <tr>
+              <td>on compromise</td>
+              <td>attacker is you</td>
+              <td
+                style="
+                  color: #f0d040;
+                  font-weight: 700;
+                  font-family: &quot;Syne&quot;, sans-serif;
+                  text-shadow: 0 0 16px rgba(240, 208, 64, 0.3);
+                "
+              >
+                not me
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="quote">
+          <p>
+            platform giants are validating the category. IETF drafts are
+            forming. an open-source standard that gains adoption now
+            <span class="hl">defines how agent identity works everywhere.</span>
+          </p>
+        </div>
+
+        <p>
+          The differentiation is structural &mdash; open-source,
+          cryptographic-primitives-first, standards-defining.
+          <strong>Signet</strong> as the identity primitive,
+          <strong>APAS</strong> as the attestation standard, and rigorous
+          auditability as a built-in property. Infrastructure standards that
+          achieve adoption become the market.
+        </p>
+
+        <!-- ── CTA ── -->
+        <section class="cta-block">
+          <h3>the identity layer agents need</h3>
+          <p>open-source. cryptographic. standards-defining.</p>
+          <div
+            style="
+              display: flex;
+              gap: 12px;
+              justify-content: center;
+              flex-wrap: wrap;
+            "
+          >
+            <a
+              href="https://github.com/agentic-research"
+              class="btn btn-primary"
+              >star the repos</a
+            >
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <span>agentic research &middot; 2026</span>
+        <div style="display: flex; gap: 16px">
+          <a href="https://github.com/agentic-research">github</a>
+        </div>
+      </footer>
+    </div>
+
+    <script>
+      window.addEventListener("scroll", function () {
+        var h = document.documentElement;
+        var pct = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+        document.getElementById("readProgress").style.width = pct + "%";
+      });
+    </script>
+
+    <script src="nav.js" defer></script>
+  </body>
+</html>

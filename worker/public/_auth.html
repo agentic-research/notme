@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>auth — notme.bot identity authority</title>
+    <meta
+      name="description"
+      content="Self-sovereign identity for agents. Your key stays on your machine. signet attests your identity and issues bridge certificates."
+    />
+    <link
+      rel="icon"
+      href="https://notme.bot/favicon.svg"
+      type="image/svg+xml"
+    />
+    <link rel="canonical" href="https://auth.notme.bot" />
+    <link rel="stylesheet" href="https://notme.bot/styles.css" />
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300;1,400&display=swap");
+
+      :root {
+        --paper: #1c1810;
+        --paper-warm: #242018;
+        --paper-dark: #141210;
+        --ink: #e8dcc8;
+        --ink-2: #c8b8a0;
+        --ink-3: #988870;
+        --ink-4: #706050;
+        --cyan: #00d4e8;
+        --yellow: #f0d040;
+        --red: #e04030;
+        --green: #48c868;
+        --border: #3a3428;
+        --stamp: #f0d040;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html {
+        font-size: 17px;
+        background: var(--paper);
+      }
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: "DM Mono", monospace;
+        line-height: 1.8;
+        overflow-x: hidden;
+      }
+
+      /* Static overlay — matches homepage flicker */
+      .static-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 9994;
+        pointer-events: none;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='s'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='2.5' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23s)' opacity='0.15'/%3E%3C/svg%3E");
+        background-size: 256px 256px;
+        animation: static-flash 4s ease infinite;
+      }
+      @keyframes static-flash {
+        0% { opacity: 0; }
+        5% { opacity: 0.08; }
+        10% { opacity: 0; }
+        50% { opacity: 0; }
+        55% { opacity: 0.05; }
+        60% { opacity: 0; }
+        100% { opacity: 0; }
+      }
+
+      .grain {
+        position: fixed;
+        inset: 0;
+        z-index: 9998;
+        pointer-events: none;
+        opacity: 0.4;
+        mix-blend-mode: overlay;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)' opacity='0.03'/%3E%3C/svg%3E");
+      }
+      .scanline {
+        position: fixed;
+        left: 0;
+        right: 0;
+        height: 4px;
+        z-index: 9995;
+        pointer-events: none;
+        background: linear-gradient(
+          180deg,
+          transparent,
+          rgba(0, 212, 232, 0.04),
+          transparent
+        );
+        animation: scanline-pass 8s linear infinite;
+      }
+      @keyframes scanline-pass {
+        0% {
+          top: -4px;
+        }
+        100% {
+          top: 100%;
+        }
+      }
+
+      .page {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 0 28px 100px;
+      }
+
+      nav {
+        padding: 28px 0;
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        border-bottom: 2px solid var(--ink);
+      }
+      .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+        color: var(--ink);
+      }
+      .logo-text {
+        font-family: "Syne", sans-serif;
+        font-size: 1.25rem;
+        font-weight: 800;
+        color: var(--stamp);
+      }
+      .nav-links {
+        display: flex;
+        gap: 20px;
+        margin-left: auto;
+      }
+      .nav-links a {
+        color: var(--ink-3);
+        text-decoration: none;
+        font-size: 0.8125rem;
+      }
+      .nav-links a:hover {
+        color: var(--cyan);
+      }
+      .nav-links a.active {
+        color: var(--ink);
+      }
+
+      .hero {
+        padding: 80px 0 40px;
+      }
+      .hero-stamp {
+        display: inline-block;
+        font-family: "Syne", sans-serif;
+        font-size: 0.625rem;
+        font-weight: 700;
+        letter-spacing: 0.25em;
+        text-transform: uppercase;
+        color: var(--stamp);
+        border: 2px solid var(--stamp);
+        padding: 4px 12px;
+        margin-bottom: 24px;
+        transform: rotate(-1.5deg);
+      }
+      h1 {
+        font-family: "Syne", sans-serif;
+        font-size: clamp(2.5rem, 6vw, 4rem);
+        font-weight: 800;
+        letter-spacing: -0.04em;
+        line-height: 1.2;
+        margin-bottom: 24px;
+        padding-bottom: 0.15em;
+        border-bottom: 2px solid var(--ink);
+      }
+      .lead {
+        font-size: 1.1rem;
+        color: var(--ink-2);
+        max-width: 700px;
+        margin-bottom: 40px;
+      }
+
+      h2 {
+        font-family: "Syne", sans-serif;
+        font-size: 1.5rem;
+        font-weight: 800;
+        color: var(--yellow);
+        margin: 60px 0 24px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        padding-bottom: 0.15em;
+        border-bottom: 1px solid var(--yellow);
+      }
+      h3 {
+        font-size: 1rem;
+        color: var(--ink);
+        margin-bottom: 12px;
+        font-weight: 600;
+        border-left: 3px solid var(--cyan);
+        padding-left: 12px;
+      }
+      p {
+        margin-bottom: 20px;
+        color: var(--ink-2);
+        font-size: 0.95rem;
+      }
+
+      .dossier-card {
+        border: 1px solid var(--border);
+        padding: 28px;
+        background: rgba(36, 32, 24, 0.4);
+        position: relative;
+        margin-bottom: 40px;
+      }
+      .dossier-card::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 40px;
+        height: 1px;
+        background: var(--yellow);
+      }
+
+      .cmd-block {
+        background: var(--paper-dark);
+        border-left: 3px solid var(--cyan);
+        padding: 20px 24px;
+        margin: 24px 0;
+        position: relative;
+      }
+      .cmd-label {
+        font-size: 0.625rem;
+        color: var(--ink-4);
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+        margin-bottom: 10px;
+      }
+      .cmd {
+        color: var(--cyan);
+        font-size: 1rem;
+      }
+      .cmd-note {
+        color: var(--ink-3);
+        font-size: 0.8rem;
+        margin-top: 10px;
+        line-height: 1.6;
+      }
+      .cmd-note a {
+        color: var(--yellow);
+        text-decoration: none;
+      }
+      .copy-btn {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        background: none;
+        border: 1px solid var(--border);
+        color: var(--ink-4);
+        font-family: "DM Mono", monospace;
+        font-size: 0.625rem;
+        letter-spacing: 0.06em;
+        padding: 3px 10px;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+      .copy-btn:hover {
+        color: var(--yellow);
+        border-color: var(--yellow);
+      }
+      .copy-btn.copied {
+        color: var(--green);
+        border-color: var(--green);
+      }
+
+      .endpoint-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 24px 0;
+        font-size: 0.875rem;
+      }
+      .endpoint-table th {
+        text-align: left;
+        padding: 8px 12px;
+        font-size: 0.625rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--ink-4);
+        border-bottom: 1px solid var(--border);
+      }
+      .endpoint-table td {
+        padding: 10px 12px;
+        border-bottom: 1px solid rgba(58, 52, 40, 0.5);
+        vertical-align: top;
+      }
+      .method {
+        font-weight: 600;
+      }
+      .method.post {
+        color: var(--cyan);
+      }
+      .method.get {
+        color: var(--yellow);
+      }
+      .ep-path {
+        color: var(--ink);
+      }
+      .ep-desc {
+        color: var(--ink-3);
+      }
+      .ep-note {
+        color: var(--ink-4);
+        font-size: 0.75rem;
+      }
+
+      .key-chain {
+        border: 1px solid var(--border);
+        padding: 24px;
+        background: rgba(36, 32, 24, 0.4);
+        margin: 24px 0;
+        font-size: 0.875rem;
+      }
+      .key-level {
+        display: flex;
+        gap: 12px;
+        align-items: flex-start;
+        padding: 8px 0;
+      }
+      .key-level + .key-level {
+        border-top: 1px solid rgba(58, 52, 40, 0.5);
+      }
+      .key-marker {
+        color: var(--yellow);
+        flex-shrink: 0;
+        width: 20px;
+      }
+      .key-name {
+        color: var(--ink);
+        font-weight: 600;
+      }
+      .key-detail {
+        color: var(--ink-3);
+        font-size: 0.8rem;
+      }
+
+      .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        font-size: 0.625rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        border: 1px solid;
+      }
+      .badge-live {
+        color: var(--green);
+        border-color: rgba(72, 200, 104, 0.3);
+      }
+      .badge-ed25519 {
+        color: var(--yellow);
+        border-color: rgba(240, 208, 64, 0.3);
+      }
+      .badges {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 32px;
+      }
+
+      .status-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--ink-4);
+        margin-right: 6px;
+        vertical-align: middle;
+      }
+      .status-dot.up {
+        background: var(--green);
+        box-shadow: 0 0 6px rgba(72, 200, 104, 0.5);
+      }
+
+      @media (max-width: 600px) {
+        .page {
+          padding: 0 18px 60px;
+        }
+        .endpoint-table td,
+        .endpoint-table th {
+          padding: 6px 8px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grain"></div>
+    <div class="scanline"></div>
+    <div class="static-overlay"></div>
+    <div class="page">
+      <nav></nav>
+
+      <div class="hero">
+        <div class="hero-stamp">auth.notme.bot</div>
+        <h1>identity authority</h1>
+        <div class="badges">
+          <span class="badge badge-live"
+            ><span class="status-dot" id="healthDot"></span>live</span
+          >
+          <span class="badge badge-ed25519">ed25519</span>
+        </div>
+        <p class="lead">
+          this is the certificate authority for the
+          <a href="https://notme.bot" style="color:var(--cyan)">notme</a>
+          identity stack. it issues short-lived Ed25519 bridge certificates
+          using the <a href="https://github.com/agentic-research/signet" style="color:var(--cyan)">signet</a>
+          protocol. your key stays on your machine — this service only
+          attests your identity.
+        </p>
+        <div style="margin-top:24px">
+          <a href="/login" style="display:inline-block;padding:12px 28px;font-family:'DM Mono',monospace;font-size:0.8125rem;font-weight:500;background:var(--yellow);color:var(--paper);text-decoration:none;transition:all 0.15s">sign in with passkey</a>
+          <a href="/api/docs" style="display:inline-block;padding:12px 28px;font-family:'DM Mono',monospace;font-size:0.8125rem;color:var(--ink-2);border:1px solid var(--border);text-decoration:none;margin-left:8px">api docs</a>
+        </div>
+      </div>
+
+      <h2>run your own</h2>
+      <p>
+        signet is open source. this authority is a Cloudflare Worker with a
+        Durable Object that generates and stores the CA key — no secrets to
+        manage. fork, deploy, own your identity chain.
+      </p>
+      <p>
+        source:
+        <a
+          href="https://github.com/agentic-research/signet"
+          style="color: var(--cyan)"
+          >github.com/agentic-research/signet</a
+        >
+      </p>
+
+      <h2>authenticate</h2>
+      <div class="dossier-card">
+        <h3>GitHub Actions / CI</h3>
+        <p>
+          request a GHA OIDC token (audience: <code>notme.bot</code>) and
+          exchange it for a 5-minute bridge cert. no stored secrets — the OIDC
+          JWT is the credential.
+        </p>
+        <div class="cmd-block">
+          <div class="cmd-label">exchange token in CI</div>
+          <div class="cmd">
+            TOKEN=$(curl -sS
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&amp;audience=notme.bot" \<br />
+            &nbsp;&nbsp;-H "Authorization: Bearer
+            ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value')<br />
+            curl -sS https://auth.notme.bot/cert/gha \<br />
+            &nbsp;&nbsp;-H "Authorization: Bearer ${TOKEN}"
+          </div>
+          <button class="copy-btn" onclick="copyCmd(this)">&#9112; copy</button>
+        </div>
+        <p style="margin: 0">
+          returns
+          <code>{ certificate, private_key, expires_at, subject }</code>. cert
+          is valid for 5 minutes — enough for one job.
+        </p>
+      </div>
+
+      <h2>endpoints</h2>
+      <p>authority base: <code>https://auth.notme.bot</code></p>
+      <table class="endpoint-table">
+        <thead>
+          <tr>
+            <th>method</th>
+            <th>path</th>
+            <th>description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="method post">POST</span></td>
+            <td class="ep-path">/exchange-token</td>
+            <td class="ep-desc">
+              OIDC token → bridge cert<br /><span class="ep-note"
+                >human auth flow via signet CLI</span
+              >
+            </td>
+          </tr>
+          <tr>
+            <td><span class="method post">POST</span></td>
+            <td class="ep-path">/cert/gha</td>
+            <td class="ep-desc">
+              GHA OIDC → bridge cert<br /><span class="ep-note"
+                >audience: notme.bot · 5-min TTL · edge-handled</span
+              >
+            </td>
+          </tr>
+          <tr>
+            <td><span class="method post">POST</span></td>
+            <td class="ep-path">/api/cert/register</td>
+            <td class="ep-desc">
+              GitHub PAT → bridge cert<br /><span class="ep-note"
+                >agent / headless registration</span
+              >
+            </td>
+          </tr>
+          <tr>
+            <td><span class="method get">GET</span></td>
+            <td class="ep-path">/.well-known/ca-bundle.pem</td>
+            <td class="ep-desc">
+              CA trust anchor<br /><span class="ep-note"
+                >configure MCP servers to verify client certs</span
+              >
+            </td>
+          </tr>
+          <tr>
+            <td><span class="method get">GET</span></td>
+            <td class="ep-path">/.well-known/signet-authority.json</td>
+            <td class="ep-desc">
+              authority discovery<br /><span class="ep-note"
+                >endpoints, algorithms, documentation</span
+              >
+            </td>
+          </tr>
+          <tr>
+            <td><span class="method get">GET</span></td>
+            <td class="ep-path">/login</td>
+            <td class="ep-desc">OAuth flow (browser)</td>
+          </tr>
+          <tr>
+            <td><span class="method get">GET</span></td>
+            <td class="ep-path">/healthz</td>
+            <td class="ep-desc">health check</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>key hierarchy</h2>
+      <p>
+        the signing chain from your long-lived identity to an agent's ephemeral
+        session key.
+      </p>
+      <div class="key-chain">
+        <div class="key-level">
+          <span class="key-marker">01</span>
+          <div>
+            <div class="key-name">user master key — Ed25519, long-lived</div>
+            <div class="key-detail">
+              generated locally by signet CLI · never leaves your machine
+            </div>
+          </div>
+        </div>
+        <div class="key-level">
+          <span class="key-marker">02</span>
+          <div>
+            <div class="key-name">
+              bridge certificate — X.509 + Ed25519, 24h
+            </div>
+            <div class="key-detail">
+              issued by this authority · binds your public key to your verified
+              identity
+            </div>
+          </div>
+        </div>
+        <div class="key-level">
+          <span class="key-marker">03</span>
+          <div>
+            <div class="key-name">
+              agent session key — ephemeral Ed25519, per-dispatch
+            </div>
+            <div class="key-detail">
+              generated fresh per orchestrator dispatch · bound to work item +
+              pipeline context
+            </div>
+          </div>
+        </div>
+        <div class="key-level">
+          <span class="key-marker">04</span>
+          <div>
+            <div class="key-name">signed commits — git/jj, per-action</div>
+            <div class="key-detail">
+              every agent commit signed · APAS provenance chain anchored to
+              artifact
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      function copyCmd(btn) {
+        var block = btn.closest(".cmd-block");
+        var cmd = block.querySelector(".cmd");
+        var text = cmd.innerText.replace(/\s+/g, " ").trim();
+        navigator.clipboard.writeText(text).then(function () {
+          btn.textContent = "\u2713 copied";
+          btn.classList.add("copied");
+          setTimeout(function () {
+            btn.textContent = "\u2398 copy";
+            btn.classList.remove("copied");
+          }, 1500);
+        });
+      }
+
+      // Health check dot
+      fetch("https://auth.notme.bot/healthz", {
+        method: "HEAD",
+        mode: "no-cors",
+      })
+        .then(function () {
+          document.getElementById("healthDot").classList.add("up");
+        })
+        .catch(function () {});
+    </script>
+    <script src="https://notme.bot/nav.js" defer></script>
+  </body>
+</html>

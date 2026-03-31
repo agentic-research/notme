@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sign in — auth.notme.bot</title>
+  <link rel="icon" href="https://notme.bot/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@700;800&display=swap">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1c1810;
+      color: #e8dcc8;
+      font-family: 'DM Mono', monospace;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 40px 20px;
+    }
+
+    .term-window {
+      max-width: 520px;
+      width: 100%;
+      background: rgba(28, 24, 16, 0.9);
+      backdrop-filter: blur(12px);
+      padding: 32px;
+      border: 1px solid #3a3428;
+    }
+
+    .term-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #3a3428;
+    }
+    .term-dots { display: flex; gap: 6px; }
+    .term-dots span { width: 6px; height: 6px; border-radius: 50%; }
+    .term-dots span:nth-child(1) { background: #e04030; opacity: 0.6; }
+    .term-dots span:nth-child(2) { background: #f0d040; opacity: 0.6; }
+    .term-dots span:nth-child(3) { background: #48c868; opacity: 0.6; }
+    .term-title {
+      font-size: 0.5625rem;
+      color: #706050;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      margin-left: auto;
+    }
+
+    .term-output { min-height: 100px; margin-bottom: 16px; }
+    .term-line {
+      font-size: 0.8125rem;
+      line-height: 1.8;
+      white-space: pre-wrap;
+    }
+    .term-line.dim { color: #706050; }
+    .term-line.info { color: #988870; }
+    .term-line.ok { color: #48c868; }
+    .term-line.err { color: #e04030; }
+    .term-line .cmd { color: #e8dcc8; }
+    .term-line .hl { color: #f0d040; }
+    .term-line .cyn { color: #00d4e8; }
+
+    .term-providers {
+      display: flex;
+      gap: 2px;
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid rgba(58, 52, 40, 0.4);
+    }
+    .term-provider {
+      flex: 1;
+      padding: 14px 8px;
+      background: rgba(36, 32, 24, 0.6);
+      border: 1px solid #3a3428;
+      color: #988870;
+      font-family: 'DM Mono', monospace;
+      font-size: 0.625rem;
+      letter-spacing: 0.08em;
+      text-align: center;
+      cursor: pointer;
+      transition: all 200ms ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+    .term-provider:hover {
+      border-color: #f0d040;
+      color: #e8dcc8;
+      background: rgba(240, 208, 64, 0.04);
+    }
+    .term-provider .glyph { font-size: 1rem; line-height: 1; }
+
+    .term-footer {
+      margin-top: 24px;
+      text-align: center;
+      font-size: 0.5625rem;
+      color: #706050;
+    }
+    .term-footer a {
+      color: #988870;
+      text-decoration: none;
+      border-bottom: 1px dotted #988870;
+    }
+    .term-footer a:hover { color: #00d4e8; border-color: #00d4e8; }
+
+    .bootstrap-input {
+      width: 100%;
+      padding: 10px;
+      font-family: 'DM Mono', monospace;
+      font-size: 0.8rem;
+      background: transparent;
+      border: 1px solid #3a3428;
+      color: #e8dcc8;
+      margin: 8px 0;
+      outline: none;
+    }
+    .bootstrap-input:focus { border-color: #f0d040; }
+    .hidden { display: none; }
+
+    @media (max-width: 520px) {
+      .term-window { padding: 20px 16px; }
+      .term-providers { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="term-window">
+  <div class="term-header">
+    <div class="term-dots"><span></span><span></span><span></span></div>
+    <span class="term-title">auth.notme.bot</span>
+  </div>
+
+  <div class="term-output" id="output">
+    <div class="term-line dim">notme — identity authority</div>
+    <div class="term-line dim">&nbsp;</div>
+    <div class="term-line info">prove your identity. get a scoped bridge cert.</div>
+    <div class="term-line dim">passkey, oidc token, or invite.</div>
+    <div class="term-line dim">&nbsp;</div>
+  </div>
+
+  <div id="statusLine" class="term-line dim">&nbsp;</div>
+
+  <div class="term-providers">
+    <button class="term-provider" id="btnPasskey" onclick="loginPasskey()">
+      <span class="glyph">&#9635;</span>
+      passkey
+    </button>
+    <button class="term-provider" id="btnToken" onclick="showTokenInput()">
+      <span class="glyph">&#9674;</span>
+      bring a token
+    </button>
+    <button class="term-provider hidden" id="btnRegister" onclick="registerPasskey()">
+      <span class="glyph">+</span>
+      register
+    </button>
+  </div>
+
+  <div id="tokenDiv" class="hidden" style="margin-top:12px">
+    <input class="bootstrap-input" id="tokenInput" type="text"
+      placeholder="paste OIDC JWT or invite token" />
+    <button class="term-provider" style="width:100%;margin-top:4px" onclick="submitToken()">
+      verify
+    </button>
+  </div>
+
+  <div id="bootstrapDiv" class="hidden" style="margin-top:12px">
+    <input class="bootstrap-input" id="bootstrapInput" type="text"
+      placeholder="bootstrap code from wrangler tail" />
+    <button class="term-provider" style="width:100%;margin-top:4px" onclick="bootstrapRegister()">
+      bootstrap + register
+    </button>
+  </div>
+
+  <div class="term-footer">
+    <a href="/">&#8592; back to authority</a>
+  </div>
+</div>
+
+<script>
+var output = document.getElementById('output');
+var statusLine = document.getElementById('statusLine');
+
+function addLine(text, cls) {
+  var line = document.createElement('div');
+  line.className = 'term-line ' + (cls || 'dim');
+  line.textContent = text;
+  output.appendChild(line);
+}
+
+function setStatus(text, cls) {
+  statusLine.textContent = text;
+  statusLine.className = 'term-line ' + (cls || 'dim');
+}
+
+// Check for invite token in URL
+var inviteToken = new URLSearchParams(window.location.search).get('t');
+if (inviteToken) {
+  addLine('invite token detected.', 'info');
+  addLine('register a passkey or paste an oidc token to join.', 'dim');
+  document.getElementById('btnRegister').classList.remove('hidden');
+}
+
+// ── Passkey login ──
+async function loginPasskey() {
+  setStatus('requesting challenge...', 'info');
+  try {
+    var optRes = await fetch('/auth/passkey/login/options', { method: 'POST' });
+    if (!optRes.ok) throw new Error((await optRes.json()).error || 'failed');
+    var options = await optRes.json();
+
+    options.challenge = b64urlToBuf(options.challenge);
+    if (options.allowCredentials) {
+      options.allowCredentials = options.allowCredentials.map(function(c) {
+        c.id = b64urlToBuf(c.id); return c;
+      });
+    }
+
+    setStatus('touch your authenticator...', 'info');
+    var cred = await navigator.credentials.get({ publicKey: options });
+
+    setStatus('verifying...', 'info');
+    var res = await fetch('/auth/passkey/login/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        response: {
+          id: cred.id,
+          rawId: bufToB64url(cred.rawId),
+          response: {
+            authenticatorData: bufToB64url(cred.response.authenticatorData),
+            clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+            signature: bufToB64url(cred.response.signature),
+            userHandle: cred.response.userHandle ? bufToB64url(cred.response.userHandle) : undefined,
+          },
+          type: cred.type,
+          clientExtensionResults: cred.getClientExtensionResults(),
+          authenticatorAttachment: cred.authenticatorAttachment,
+        }
+      })
+    });
+
+    var text = await res.text();
+    if (!res.ok) {
+      try { throw new Error(JSON.parse(text).error); }
+      catch(e) { throw new Error(text.slice(0, 200)); }
+    }
+
+    setStatus('authenticated — redirecting...', 'ok');
+    setTimeout(function() { window.location.href = '/me'; }, 800);
+  } catch(e) {
+    if (e.name === 'NotAllowedError') { setStatus('cancelled', 'dim'); return; }
+    setStatus(e.message, 'err');
+    document.getElementById('btnRegister').classList.remove('hidden');
+    document.getElementById('bootstrapDiv').classList.remove('hidden');
+  }
+}
+
+// ── Register passkey ──
+async function registerPasskey() {
+  var bootstrapCode = document.getElementById('bootstrapInput').value.trim();
+  setStatus('requesting registration...', 'info');
+  try {
+    var body = inviteToken ? {} : (bootstrapCode ? { bootstrapCode: bootstrapCode } : {});
+    var optRes = await fetch('/auth/passkey/register/options', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+
+    if (!optRes.ok) {
+      var err = (await optRes.json()).error || 'failed';
+      if (err.indexOf('bootstrap') !== -1) {
+        document.getElementById('bootstrapDiv').classList.remove('hidden');
+        setStatus('enter bootstrap code from wrangler tail', 'info');
+        return;
+      }
+      throw new Error(err);
+    }
+
+    var data = await optRes.json();
+    var options = data.options;
+    options.challenge = b64urlToBuf(options.challenge);
+    options.user.id = (() => { var e = new TextEncoder().encode(data.userId || 'user'); var b = new Uint8Array(e.length); b.set(e); return b; })();
+    if (options.excludeCredentials) {
+      options.excludeCredentials = options.excludeCredentials.map(function(c) { c.id = b64urlToBuf(c.id); return c; });
+    }
+
+    setStatus('touch your authenticator...', 'info');
+    var cred = await navigator.credentials.create({ publicKey: options });
+
+    setStatus('verifying...', 'info');
+
+    // If invite token, redeem via /join
+    if (inviteToken) {
+      var joinRes = await fetch('/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: inviteToken })
+      });
+      if (!joinRes.ok) throw new Error((await joinRes.json()).error || 'join failed');
+    }
+
+    var verifyRes = await fetch('/auth/passkey/register/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: data.userId,
+        scopes: data.scopes,
+        response: {
+          id: cred.id,
+          rawId: bufToB64url(cred.rawId),
+          response: {
+            attestationObject: bufToB64url(cred.response.attestationObject),
+            clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+          },
+          type: cred.type,
+          clientExtensionResults: cred.getClientExtensionResults(),
+          authenticatorAttachment: cred.authenticatorAttachment,
+        }
+      })
+    });
+
+    if (!verifyRes.ok) throw new Error((await verifyRes.json()).error || 'registration failed');
+    setStatus('registered — redirecting...', 'ok');
+    setTimeout(function() { window.location.href = '/me'; }, 800);
+  } catch(e) {
+    if (e.name === 'NotAllowedError') { setStatus('cancelled', 'dim'); return; }
+    setStatus(e.message, 'err');
+  }
+}
+
+function bootstrapRegister() { registerPasskey(); }
+
+// ── Token input (OIDC or invite) ──
+function showTokenInput() {
+  document.getElementById('tokenDiv').classList.toggle('hidden');
+  document.getElementById('tokenInput').focus();
+}
+
+async function submitToken() {
+  var token = document.getElementById('tokenInput').value.trim();
+  if (!token) { setStatus('paste a token', 'err'); return; }
+
+  setStatus('verifying token...', 'info');
+
+  // Try as invite token first (short, UUID-like)
+  if (token.length < 40 && !token.includes('.')) {
+    try {
+      var joinRes = await fetch('/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: token })
+      });
+      if (joinRes.ok) {
+        setStatus('joined — redirecting...', 'ok');
+        setTimeout(function() { window.location.href = '/me'; }, 800);
+        return;
+      }
+    } catch(e) {}
+  }
+
+  // Try as OIDC JWT
+  try {
+    var res = await fetch('/auth/oidc/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token })
+    });
+    var text = await res.text();
+    if (!res.ok) {
+      try { throw new Error(JSON.parse(text).error); }
+      catch(e) { throw new Error(text.slice(0, 200)); }
+    }
+    setStatus('authenticated — redirecting...', 'ok');
+    setTimeout(function() { window.location.href = '/me'; }, 800);
+  } catch(e) {
+    setStatus(e.message, 'err');
+  }
+}
+
+// ── Base64url helpers ──
+function b64urlToBuf(s) {
+  var b = s.replace(/-/g,'+').replace(/_/g,'/');
+  var p = (4 - b.length % 4) % 4;
+  var r = atob(b + '='.repeat(p));
+  var a = new Uint8Array(r.length);
+  for (var i = 0; i < r.length; i++) a[i] = r.charCodeAt(i);
+  return a.buffer;
+}
+function bufToB64url(b) {
+  var a = new Uint8Array(b);
+  var s = '';
+  for (var i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+</script>
+</body>
+</html>

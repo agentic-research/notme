@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>how it works — notme.bot</title>
+    <meta
+      name="description"
+      content="Practical deployment of agent-sovereign identity: local key generation, bridge certificates, mTLS enforcement, and cryptographic attribution."
+    />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="canonical" href="https://notme.bot/architecture" />
+    <link rel="stylesheet" href="styles.css" />
+    <style>
+      /* ── Redacted Dossier Style ── */
+      @import url("https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300;1,400&display=swap");
+
+      :root {
+        --paper: #1c1810;
+        --paper-warm: #242018;
+        --paper-dark: #141210;
+        --ink: #e8dcc8;
+        --ink-2: #c8b8a0;
+        --ink-3: #988870;
+        --ink-4: #706050;
+        --cyan: #00d4e8;
+        --yellow: #f0d040;
+        --red: #e04030;
+        --border: #3a3428;
+        --stamp: #f0d040;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html {
+        font-size: 17px;
+        background: var(--paper);
+      }
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: "DM Mono", monospace;
+        line-height: 1.8;
+        overflow-x: hidden;
+      }
+
+      /* ── Overlays ── */
+      .grain {
+        position: fixed;
+        inset: 0;
+        z-index: 9998;
+        pointer-events: none;
+        opacity: 0.4;
+        mix-blend-mode: overlay;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)' opacity='0.03'/%3E%3C/svg%3E");
+      }
+      .scanline {
+        position: fixed;
+        left: 0;
+        right: 0;
+        height: 4px;
+        z-index: 9995;
+        pointer-events: none;
+        background: linear-gradient(
+          180deg,
+          transparent,
+          rgba(0, 212, 232, 0.04),
+          transparent
+        );
+        animation: scanline-pass 8s linear infinite;
+      }
+      @keyframes scanline-pass {
+        0% {
+          top: -4px;
+        }
+        100% {
+          top: 100%;
+        }
+      }
+
+      .page {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 0 28px 100px;
+      }
+
+      nav {
+        padding: 28px 0;
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        border-bottom: 2px solid var(--ink);
+      }
+      .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+        color: var(--ink);
+      }
+      .logo-text {
+        font-family: "Syne", sans-serif;
+        font-size: 1.25rem;
+        font-weight: 800;
+        color: var(--stamp);
+      }
+      .nav-links {
+        display: flex;
+        gap: 20px;
+        margin-left: auto;
+      }
+      .nav-links a {
+        color: var(--ink-3);
+        text-decoration: none;
+        font-size: 0.8125rem;
+      }
+      .nav-links a:hover {
+        color: var(--cyan);
+      }
+      .nav-links a.active {
+        color: var(--ink);
+      }
+
+      .hero {
+        padding: 80px 0 40px;
+      }
+      .hero-stamp {
+        display: inline-block;
+        font-family: "Syne", sans-serif;
+        font-size: 0.625rem;
+        font-weight: 700;
+        letter-spacing: 0.25em;
+        text-transform: uppercase;
+        color: var(--stamp);
+        border: 2px solid var(--stamp);
+        padding: 4px 12px;
+        margin-bottom: 24px;
+        transform: rotate(-1.5deg);
+      }
+      h1 {
+        font-family: "Syne", sans-serif;
+        font-size: clamp(2.5rem, 6vw, 4rem);
+        font-weight: 800;
+        letter-spacing: -0.04em;
+        line-height: 1.2;
+        margin-bottom: 24px;
+        padding-bottom: 0.15em;
+        border-bottom: 2px solid var(--ink);
+      }
+      .lead {
+        font-size: 1.1rem;
+        color: var(--ink-2);
+        max-width: 700px;
+        margin-bottom: 40px;
+      }
+
+      h2 {
+        font-family: "Syne", sans-serif;
+        font-size: 1.5rem;
+        font-weight: 800;
+        color: var(--yellow);
+        margin: 60px 0 24px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        padding-bottom: 0.15em;
+        border-bottom: 1px solid var(--yellow);
+      }
+      h3 {
+        font-size: 1rem;
+        color: var(--ink);
+        margin-bottom: 12px;
+        font-weight: 600;
+        border-left: 3px solid var(--cyan);
+        padding-left: 12px;
+      }
+      p {
+        margin-bottom: 20px;
+        color: var(--ink-2);
+        font-size: 0.95rem;
+      }
+
+      .dossier-card {
+        border: 1px solid var(--border);
+        padding: 28px;
+        background: rgba(36, 32, 24, 0.4);
+        position: relative;
+        margin-bottom: 40px;
+      }
+      .dossier-card::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 40px;
+        height: 1px;
+        background: var(--yellow);
+      }
+      .card-label {
+        font-size: 0.65rem;
+        color: var(--ink-4);
+        text-transform: uppercase;
+        letter-spacing: 0.2em;
+        margin-bottom: 16px;
+        display: block;
+      }
+
+      .diagram-container {
+        margin: 32px 0;
+        padding: 24px;
+        background: rgba(0, 0, 0, 0.2);
+        border: 1px dashed var(--border);
+        overflow-x: auto;
+      }
+
+      .flow-step {
+        position: relative;
+        padding-left: 40px;
+        margin-bottom: 32px;
+      }
+      .flow-step::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 0.5em;
+        width: 12px;
+        height: 12px;
+        border: 2px solid var(--cyan);
+        transform: rotate(45deg);
+      }
+      .flow-step::after {
+        content: "";
+        position: absolute;
+        left: 5px;
+        top: 1.5em;
+        bottom: -2em;
+        width: 2px;
+        background: var(--border);
+      }
+      .flow-step:last-child::after {
+        display: none;
+      }
+
+      code {
+        font-family: "DM Mono", monospace;
+        color: var(--cyan);
+        background: rgba(0, 212, 232, 0.08);
+        padding: 2px 6px;
+      }
+      strong {
+        color: var(--ink);
+        font-weight: 500;
+      }
+
+      .spec-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 20px;
+        margin-top: 20px;
+      }
+      .spec-item {
+        padding: 16px;
+        border: 1px solid var(--border);
+        background: rgba(0, 0, 0, 0.1);
+      }
+      .spec-item strong {
+        display: block;
+        color: var(--yellow);
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+      }
+
+      .comparison {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 24px;
+        margin-top: 40px;
+      }
+      .comp-box {
+        padding: 20px;
+        border: 1px solid var(--border);
+      }
+      .comp-box.bad {
+        border-color: rgba(224, 64, 48, 0.3);
+      }
+      .comp-box.good {
+        border-color: rgba(72, 200, 104, 0.3);
+      }
+      .comp-label {
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        margin-bottom: 12px;
+        display: block;
+        font-weight: 700;
+      }
+      .bad .comp-label {
+        color: var(--red);
+      }
+      .good .comp-label {
+        color: var(--cyan);
+      }
+
+      footer {
+        margin-top: 100px;
+        padding: 40px 0;
+        border-top: 2px solid var(--border);
+        color: var(--ink-4);
+        font-size: 0.8rem;
+        display: flex;
+        justify-content: space-between;
+      }
+      footer a {
+        color: var(--ink-3);
+        text-decoration: none;
+        margin-left: 16px;
+      }
+
+      @media (max-width: 768px) {
+        .comparison {
+          grid-template-columns: 1fr;
+        }
+        h1 {
+          font-size: 2.2rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grain"></div>
+    <div class="scanline"></div>
+
+    <div class="page">
+      <nav></nav>
+
+      <section class="hero">
+        <div class="hero-stamp">System Architecture Dossier</div>
+        <h1>Practical Agent Sovereignty</h1>
+        <p class="lead">
+          Identity that moves with the agent runtime, not the human operator. A
+          technical deep-dive into short-lived bridge certificates, mTLS
+          enforcement, and stateful revocation.
+        </p>
+      </section>
+
+      <section>
+        <h2>01. Convergent Bootstrap</h2>
+        <p>
+          There are two entry points for an agent session. Both converge on a
+          single proof-of-possession credential that allows access to the MCP
+          edge.
+        </p>
+
+        <div class="diagram-container">
+          <pre class="mermaid">
+graph LR
+    subgraph P1 [Path 1: Human-Assisted]
+        A[OIDC Login] --> B[Authorize Issuance]
+    end
+    subgraph P2 [Path 2: Direct Machine]
+        C[Existing Cert] --> D[Rotation Event]
+    end
+    B --> E[Bridge Authority]
+    D --> E
+    E --> F[mTLS Edge Gate]
+    G[Local Keypair] --> F
+    F --> H[Protected MCP Origin]
+    
+    style A fill:#1c1810,stroke:#f0d040,color:#e8dcc8
+    style B fill:#1c1810,stroke:#f0d040,color:#e8dcc8
+    style C fill:#1c1810,stroke:#00d4e8,color:#e8dcc8
+    style D fill:#1c1810,stroke:#00d4e8,color:#e8dcc8
+    style E fill:#1c1810,stroke:#e8dcc8,color:#e8dcc8
+    style F fill:#1c1810,stroke:#f0d040,color:#e8dcc8,stroke-width:2px
+    style G fill:#1c1810,stroke:#00d4e8,color:#e8dcc8
+    style H fill:#242018,stroke:#48c868,color:#e8dcc8
+          </pre>
+        </div>
+
+        <div class="dossier-card">
+          <span class="card-label">Design Spec: Bootstrap</span>
+          <div class="flow-step">
+            <h3>Separation of Concerns</h3>
+            <p>
+              The human <code>OIDC</code> session is only a control plane for
+              <strong>issuance</strong>. It never becomes the runtime
+              credential. If the browser session is stolen, the attacker can't
+              use existing machine certs because they lack the local private
+              key.
+            </p>
+          </div>
+          <div class="flow-step">
+            <h3>Ed25519 Local Keygen</h3>
+            <p>
+              The agent generates a unique <code>Ed25519</code> keypair at
+              runtime. The private key remains in the agent's memory or secure
+              enclave. Only the public key is signed by the Bridge Authority.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>02. The Bridge Certificate</h2>
+        <p>
+          The Bridge Cert is a tactical handoff. It encodes exactly enough
+          identity to authorize a machine without granting broad impersonation
+          rights.
+        </p>
+
+        <div class="spec-grid">
+          <div class="spec-item">
+            <strong>Subject</strong>
+            <p>Binds the machine key to the specific Human Sponsor identity.</p>
+          </div>
+          <div class="spec-item">
+            <strong>Scope</strong>
+            <p>
+              Bound to a verified identity. Task scope is enforced by the
+              orchestrator, not embedded in the cert.
+            </p>
+          </div>
+          <div class="spec-item">
+            <strong>Algorithm</strong>
+            <p>Ed25519 by default. Post-quantum (ML-DSA) ready.</p>
+          </div>
+          <div class="spec-item">
+            <strong>TTL</strong>
+            <p>Hours, not days. Short windows reduce the audit-gap risk.</p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>03. Edge Enforcement & Revocation</h2>
+        <p>
+          Revocation is not a batch job &mdash; it is a real-time state machine.
+          <strong>Cloudflare Durable Objects</strong> track and kill credentials
+          in seconds at the edge.
+        </p>
+
+        <div class="diagram-container">
+          <pre class="mermaid">
+sequenceDiagram
+    participant Agent
+    participant Edge as mTLS Edge
+    participant DO as CertAgent (Durable Object)
+    participant D1 as Analytics (SQLite)
+
+    Agent->>Edge: TLS Handshake (Client Cert)
+    Edge->>DO: Check Serial Status
+    Note over DO: SQLite-backed state lookup
+    alt is Revoked or Expired
+        DO-->>Edge: 403 Forbidden
+        Edge-->>Agent: Connection Terminated
+    else is Valid
+        DO-->>Edge: 200 OK (Principal Identity)
+        Edge->>D1: Log Access Event
+        Edge->>Agent: Route to Origin
+    end
+          </pre>
+        </div>
+
+        <div class="dossier-card">
+          <span class="card-label">Technical Readout: Revocation</span>
+          <div class="flow-step">
+            <h3>Stateful Ledger (SQLite in DO)</h3>
+            <p>
+              Every bridge cert is registered in a
+              <strong>Durable Object</strong>. This provides a strongly
+              consistent state machine for issuance, expiration, and manual
+              revocation.
+            </p>
+          </div>
+          <div class="flow-step">
+            <h3>Scheduled Alarms</h3>
+            <p>
+              Cloudflare Alarm APIs pre-schedule the exact moment of expiry.
+              Trust is withdrawn proactively at the edge, rather than waiting
+              for CRL propagation.
+            </p>
+          </div>
+          <div class="flow-step">
+            <h3>Route Classification</h3>
+            <p>
+              The edge differentiates between
+              <code>Public</code> (Landing/Explainer) and
+              <code>Protected</code> (MCP/API) routes. Public routes are open;
+              Protected routes require valid mTLS handshakes.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>04. Headless CI/CD Provenance</h2>
+        <p>
+          Agents don't just run on laptops—they run in CI/CD pipelines. We
+          support <strong>OIDC token exchange</strong> to give headless runners
+          their own sovereign identity without long-lived secrets.
+        </p>
+
+        <div class="diagram-container">
+          <pre class="mermaid">
+graph TD
+    subgraph GHA [GitHub Actions Runner]
+        ID[OIDC ID Token] --> EX[Signet Exchange]
+        EX --> BC[Bridge Certificate]
+        BC --> SG[Commit Re-signing]
+    end
+    EX -- Prove Identity --> BA[Bridge Authority]
+    BC -- proof of possession --> MT[mTLS Edge]
+    SG --> AR[Signed Artifacts / APAS]
+
+    style ID fill:#1c1810,stroke:#00d4e8,color:#e8dcc8
+    style EX fill:#1c1810,stroke:#f0d040,color:#e8dcc8
+    style BC fill:#1c1810,stroke:#00d4e8,color:#e8dcc8
+    style SG fill:#1c1810,stroke:#48c868,color:#e8dcc8
+    style BA fill:#242018,stroke:#3a3428,color:#e8dcc8
+    style MT fill:#1c1810,stroke:#f0d040,color:#e8dcc8
+    style AR fill:#242018,stroke:#00d4e8,color:#e8dcc8
+          </pre>
+        </div>
+
+        <div class="dossier-card">
+          <span class="card-label">Automation Spec: Headless Auth</span>
+          <div class="flow-step">
+            <h3>OIDC Identity Exchange</h3>
+            <p>
+              Instead of a human login, the runner uses its
+              <strong>GitHub OIDC ID Token</strong> to prove its repository,
+              workflow, and actor context to the Bridge Authority. This
+              eliminates the need for long-lived PATs or shared SSH keys.
+            </p>
+          </div>
+          <div class="flow-step">
+            <h3>Commit Re-signing</h3>
+            <p>
+              Standard GitHub squash-merges are signed by GitHub's web-flow key.
+              Our headless agents re-sign these commits with their own
+              <code>Bridge Cert</code>, ensuring that the final history on
+              <code>main</code> carries authentic agent provenance.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>05. The Signing Chain</h2>
+        <p>
+          One identity model spans transport authentication, workload signing,
+          and future artifact provenance.
+        </p>
+        <div class="dossier-card">
+          <span class="card-label">Chain of Trust</span>
+          <p>
+            <strong>Master Key:</strong> Ed25519 authority signs bridge certs at
+            the edge.
+          </p>
+          <p>
+            <strong>Bridge Cert:</strong> The primary machine credential for
+            mTLS and API auth.
+          </p>
+          <p>
+            <strong>Work Cert:</strong> Ephemeral, agent-scoped certs with
+            per-repo scope claims (<code>signet-git</code>, 5-min TTL, CMS/PKCS#7).
+          </p>
+          <p>
+            <strong>Artifacts:</strong> Commits signed with bridge certs. Chain
+            hashing is shipped; DSSE envelope signing is in progress.
+          </p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Security Delta</h2>
+        <div class="comparison">
+          <div class="comp-box bad">
+            <span class="comp-label">Bearer-Token Model</span>
+            <p>
+              <strong>Stolen PAT:</strong> Attacker inherits your full identity
+              across all repos. Revocation is blunt (kill the token).
+            </p>
+            <p>
+              <strong>Detection:</strong> Hard to distinguish agent work from
+              your own interactive sessions.
+            </p>
+          </div>
+          <div class="comp-box good">
+            <span class="comp-label">Sovereign Model (notme)</span>
+            <p>
+              <strong>Stolen Cert:</strong> Inert without private key.
+              Revocation is surgical (kill the specific machine cert).
+            </p>
+            <p>
+              <strong>Detection:</strong> Every commit signed by a distinct
+              bridge cert. Chain hashing for provenance trails shipped;
+              DSSE envelope signing in progress.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        <span>notme &middot; 2026</span>
+        <div>
+          <a href="/research">research</a>
+          <a href="/apas">apas spec</a>
+          <a href="/">back to home</a>
+        </div>
+      </footer>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script>
+      mermaid.initialize({
+        startOnLoad: true,
+        theme: "base",
+        themeVariables: {
+          primaryColor: "#1c1810",
+          primaryTextColor: "#e8dcc8",
+          primaryBorderColor: "#f0d040",
+          lineColor: "#00d4e8",
+          secondaryColor: "#242018",
+          tertiaryColor: "#141210",
+          fontFamily: "DM Mono",
+          fontSize: "12px",
+        },
+      });
+    </script>
+    <script src="nav.js" defer></script>
+  </body>
+</html>

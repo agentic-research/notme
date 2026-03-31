@@ -1,0 +1,127 @@
+name: GHA Identity Exchange
+
+# Reusable workflow: one OIDC token → two exchanges.
+#
+#   1. octo-sts  → scoped GitHub App token   (eliminates stored PATs)
+#   2. notme.bot → signet bridge cert         (eliminates SIGNET_MASTER_KEY in GH)
+#
+# Usage:
+#
+#   jobs:
+#     identity:
+#       uses: agentic-research/signet/.github/workflows/gha-identity.yml@main
+#       with:
+#         octo_sts_scope: agentic-research/ley-line
+#         octo_sts_identity: mache-release
+#       permissions:
+#         id-token: write
+#
+#     next-job:
+#       needs: identity
+#       steps:
+#         - env:
+#             GH_TOKEN: ${{ needs.identity.outputs.github_token }}
+#           run: gh release download ...
+#         - run: |
+#             echo "${{ needs.identity.outputs.bridge_cert }}" | base64 -d > cert.pem
+#             echo "${{ needs.identity.outputs.bridge_key }}"  | base64 -d > key.pem
+
+on:
+  workflow_call:
+    inputs:
+      octo_sts_scope:
+        description: 'octo-sts scope (org/repo). Leave empty to skip GitHub token exchange.'
+        required: false
+        type: string
+        default: ''
+      octo_sts_identity:
+        description: 'Trust policy identity name (filename without .sts.yaml)'
+        required: false
+        type: string
+        default: 'default'
+      bridge_audience:
+        description: 'Audience for the signet bridge cert OIDC token request'
+        required: false
+        type: string
+        default: 'notme.bot'
+      skip_bridge_cert:
+        description: 'Set to true to skip bridge cert exchange (octo-sts only)'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      github_token:
+        description: 'Scoped GitHub token from octo-sts. Empty if octo_sts_scope not provided.'
+        value: ${{ jobs.exchange.outputs.github_token }}
+      bridge_cert:
+        description: 'Base64-encoded signet bridge cert PEM (5-min TTL)'
+        value: ${{ jobs.exchange.outputs.bridge_cert }}
+      bridge_key:
+        description: 'Base64-encoded signet bridge private key PEM'
+        value: ${{ jobs.exchange.outputs.bridge_key }}
+      bridge_expires_at:
+        description: 'Bridge cert expiry as Unix timestamp'
+        value: ${{ jobs.exchange.outputs.bridge_expires_at }}
+
+jobs:
+  exchange:
+    name: OIDC Exchange
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      github_token: ${{ steps.octo-sts.outputs.token }}
+      bridge_cert: ${{ steps.signet.outputs.cert }}
+      bridge_key: ${{ steps.signet.outputs.key }}
+      bridge_expires_at: ${{ steps.signet.outputs.expires_at }}
+
+    steps:
+      - name: Exchange OIDC → GitHub token (octo-sts)
+        id: octo-sts
+        if: inputs.octo_sts_scope != ''
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        with:
+          scope: ${{ inputs.octo_sts_scope }}
+          identity: ${{ inputs.octo_sts_identity }}
+
+      - name: Exchange OIDC → signet bridge cert
+        id: signet
+        if: '!inputs.skip_bridge_cert'
+        env:
+          BRIDGE_AUDIENCE: ${{ inputs.bridge_audience }}
+        run: |
+          set -euo pipefail
+
+          # URL-encode the audience (safe for query string)
+          AUDIENCE_ENC=$(printf '%s' "$BRIDGE_AUDIENCE" | jq -sRr @uri)
+
+          TOKEN=$(curl -sSf \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE_ENC}" \
+            | jq -r '.value')
+
+          RESULT=$(curl -sSfX POST "https://auth.notme.bot/cert/gha" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json")
+
+          if echo "$RESULT" | jq -e '.error' > /dev/null 2>&1; then
+            echo "::error::signet exchange failed: $(echo "$RESULT" | jq -r '.error')"
+            exit 1
+          fi
+
+          # Extract and validate required fields (jq -e fails on null)
+          CERT=$(echo "$RESULT" | jq -er '.certificate')
+          KEY=$(echo "$RESULT" | jq -er '.private_key')
+          EXPIRES=$(echo "$RESULT" | jq -er '.expires_at')
+
+          # Mask both raw PEM and base64-encoded form
+          echo "::add-mask::${KEY}"
+          KEY_B64=$(echo "$KEY" | base64 -w0)
+          echo "::add-mask::${KEY_B64}"
+
+          echo "cert=$(echo "$CERT" | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "key=${KEY_B64}" >> "$GITHUB_OUTPUT"
+          echo "expires_at=${EXPIRES}" >> "$GITHUB_OUTPUT"
+
+          echo "Bridge cert issued for: $(echo "$RESULT" | jq -r '.subject')"

@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>APAS — Agent Provenance Attestation Standard</title>
+    <meta
+      name="description"
+      content="Agent Provenance Attestation Standard — a cryptographic framework for verifiable agent identity, dispatch provenance, and tamper-evident audit trails."
+    />
+    <meta
+      property="og:title"
+      content="APAS — Agent Provenance Attestation Standard"
+    />
+    <meta property="og:url" content="https://notme.bot/apas" />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="canonical" href="https://notme.bot/apas" />
+    <link rel="stylesheet" href="styles.css" />
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300;1,400&display=swap");
+
+      :root {
+        /* ── Earthy paper — warm sepia, cyberpunk warmth ── */
+        --paper: #1c1810;
+        --paper-warm: #242018;
+        --paper-dark: #141210;
+        --ink: #e8dcc8;
+        --ink-2: #c8b8a0;
+        --ink-3: #988870;
+        --ink-4: #8a7b6a;
+        --ink-5: #6b6050;
+        /* ── Accents: CP2077 yellow + warm cyan ── */
+        --cyan: #00d4e8;
+        --cyan-dark: #00a8b8;
+        --yellow: #f0d040;
+        --yellow-dim: #c8a830;
+        --red: #e04030;
+        --red-dim: #c03828;
+        --green: #48c868;
+        --stamp: #f0d040;
+        /* ── Surfaces ── */
+        --card: #242018;
+        --card-hover: #2c2820;
+        --border: #3a3428;
+        --border-dim: #302a20;
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html {
+        font-size: 17px;
+        scroll-behavior: smooth;
+      }
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: "DM Mono", monospace;
+        font-weight: 400;
+        line-height: 1.8;
+        overflow-x: hidden;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* ── Global Links ── */
+      a {
+        color: var(--cyan);
+        text-decoration: none;
+        border-bottom: 1px dotted rgba(0, 212, 232, 0.3);
+        transition: all 150ms ease;
+      }
+      a:hover {
+        color: var(--yellow);
+        border-bottom-style: solid;
+        border-bottom-color: rgba(240, 208, 64, 0.4);
+      }
+
+      /* Layout & Nav — Inlined for robustness */
+      .page {
+        position: relative;
+        z-index: 1;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 0 28px;
+      }
+      nav {
+        padding: 28px 0;
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        border-bottom: 2px solid var(--ink);
+        min-height: 90px;
+      }
+      .nav-links {
+        display: flex;
+        gap: 20px;
+        margin-left: auto;
+      }
+      .nav-links a {
+        color: var(--ink-3);
+        text-decoration: none;
+        font-size: 0.8125rem;
+        transition: color 150ms ease;
+      }
+      .nav-links a:hover {
+        color: var(--cyan);
+      }
+      .nav-links a.active {
+        color: var(--ink);
+      }
+      .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+        color: var(--ink);
+      }
+      .logo-text {
+        font-family: "Syne", sans-serif;
+        font-size: 1.25rem;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+        color: var(--stamp);
+      }
+
+      /* Atmospheric Effects — Inlined from styles.css */
+      .grain {
+        position: fixed;
+        inset: 0;
+        z-index: 9998;
+        pointer-events: none;
+        opacity: 0.4;
+        mix-blend-mode: overlay;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)' opacity='0.03'/%3E%3C/svg%3E");
+        background-size: 256px 256px;
+      }
+      .scanline {
+        position: fixed;
+        left: 0;
+        right: 0;
+        height: 4px;
+        background: linear-gradient(
+          180deg,
+          transparent,
+          rgba(0, 212, 232, 0.06),
+          rgba(240, 208, 64, 0.04),
+          transparent
+        );
+        z-index: 9995;
+        pointer-events: none;
+        animation: scanline-pass 8s linear infinite;
+      }
+      @keyframes scanline-pass {
+        0% {
+          top: -4px;
+        }
+        100% {
+          top: 100%;
+        }
+      }
+      .static-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 9994;
+        pointer-events: none;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='s'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='2.5' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23s)' opacity='0.15'/%3E%3C/svg%3E");
+        background-size: 256px 256px;
+        animation: static-flash 4s ease infinite;
+      }
+      @keyframes static-flash {
+        0% {
+          opacity: 0;
+        }
+        5% {
+          opacity: 0.08;
+        }
+        10% {
+          opacity: 0;
+        }
+        50% {
+          opacity: 0;
+        }
+        55% {
+          opacity: 0.05;
+        }
+        60% {
+          opacity: 0;
+        }
+        100% {
+          opacity: 0;
+        }
+      }
+
+      footer {
+        padding: 28px 0;
+        border-top: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 0.75rem;
+        color: var(--ink-4);
+      }
+      footer a {
+        color: var(--ink-3);
+        text-decoration: none;
+        transition: color 150ms ease;
+      }
+      footer a:hover {
+        color: var(--cyan-dark);
+      }
+
+      /* Your Original Design Primitives */
+      .t {
+        font-family: "DM Mono", monospace;
+        font-size: 0.875rem;
+        line-height: 1.8;
+        color: var(--ink-2);
+        white-space: pre-wrap;
+        word-break: break-word;
+        margin: 0;
+      }
+      .t-bold {
+        font-weight: 700;
+        color: var(--ink);
+      }
+      .t-dim {
+        color: var(--ink-4);
+      }
+      .t-red {
+        color: var(--red);
+      }
+      .t-grn {
+        color: var(--green);
+      }
+      .t-yel {
+        color: var(--yellow);
+      }
+      .t-cyn {
+        color: var(--cyan);
+      }
+      .t-wht {
+        color: var(--ink);
+      }
+      .t-bred {
+        color: var(--red);
+        font-weight: 700;
+      }
+      .t-bgrn {
+        color: var(--green);
+        font-weight: 700;
+      }
+      .t-byel {
+        color: var(--yellow);
+        font-weight: 700;
+      }
+      .t-bcyn {
+        color: var(--cyan);
+        font-weight: 700;
+      }
+      .t-bwht {
+        color: var(--ink);
+        font-weight: 700;
+      }
+      .t-str {
+        color: var(--green);
+      }
+      .t-key {
+        color: var(--cyan);
+      }
+      .badge-r {
+        background: var(--red);
+        color: var(--paper-dark);
+        padding: 1px 6px;
+        font-weight: 700;
+        display: inline-block;
+        line-height: 1.2;
+      }
+      .badge-g {
+        background: var(--green);
+        color: var(--paper-dark);
+        padding: 1px 6px;
+        font-weight: 700;
+        display: inline-block;
+        line-height: 1.2;
+      }
+      .badge-y {
+        background: var(--yellow);
+        color: var(--paper-dark);
+        padding: 1px 6px;
+        font-weight: 700;
+        display: inline-block;
+        line-height: 1.2;
+      }
+
+      .term-line {
+        opacity: 0;
+        animation: reveal 0.12s ease forwards;
+      }
+      @keyframes reveal {
+        to {
+          opacity: 1;
+        }
+      }
+
+      /* The Fixes: Fluid Blocks */
+      .json-box {
+        border: 1px solid var(--border);
+        background: var(--paper-dark);
+        padding: 1.5rem;
+        margin: 1rem 0 1rem 2ch;
+        width: calc(100% - 4ch);
+        max-width: 800px;
+        box-sizing: border-box;
+      }
+      .term-table-wrapper {
+        width: 100%;
+        overflow-x: auto;
+        margin: 1rem 0;
+        padding-left: 2ch;
+      }
+      .term-table {
+        border-collapse: collapse;
+        min-width: 500px;
+        width: 100%;
+        max-width: 800px;
+      }
+      .term-table th,
+      .term-table td {
+        border: 1px solid var(--border-dim);
+        padding: 8px 12px;
+        text-align: left;
+        vertical-align: top;
+        white-space: normal;
+      }
+      .term-table th {
+        color: var(--ink);
+        font-weight: 700;
+        background: var(--paper-warm);
+      }
+
+      .t-btn {
+        display: inline-block;
+        padding: 0 10px;
+        text-decoration: none;
+        transition: all 150ms ease;
+        line-height: 1.6;
+        margin: 4px 0;
+        border: 1px solid transparent;
+      }
+      .t-btn-cyn {
+        border-color: var(--cyan);
+        color: var(--cyan) !important;
+      }
+      .t-btn-cyn:hover {
+        background: var(--cyan);
+        color: var(--paper-dark) !important;
+        box-shadow: 0 0 12px rgba(0, 212, 232, 0.3);
+      }
+      .t-btn-yel {
+        border-color: var(--yellow);
+        color: var(--yellow) !important;
+      }
+      .t-btn-yel:hover {
+        background: var(--yellow);
+        color: var(--paper-dark) !important;
+        box-shadow: 0 0 12px rgba(240, 208, 64, 0.3);
+      }
+
+      @media (max-width: 640px) {
+        .t {
+          font-size: 0.8125rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grain"></div>
+    <div class="scanline"></div>
+    <div class="static-overlay"></div>
+    <div class="page">
+      <nav></nav>
+      <main><div id="spec" style="padding: 40px 0"></div></main>
+      <footer>
+        <span>notme &middot; 2026</span>
+        <div style="display: flex; gap: 16px">
+          <a
+            href="https://github.com/agentic-research/signet/blob/main/docs/apas/agent-provenance-standard.md"
+            >apas draft spec</a
+          >
+        </div>
+      </footer>
+    </div>
+
+    <script>
+      const spec = document.getElementById("spec");
+
+      const content = [
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+        '  <span class="t-bold t-byel">AGENT PROVENANCE ATTESTATION STANDARD</span>  <span class="t-dim">(APAS)</span>',
+        "",
+        '  <span class="t-dim">Version</span>  0.1.0-draft',
+        '  <span class="t-dim">Status</span>   <span class="badge-y"> PROPOSAL </span>',
+        '  <span class="t-dim">Authors</span>  Agentic Research',
+        '  <span class="t-dim">Date</span>     2026-03-25',
+        "",
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+        '  <span class="t-bwht">Abstract</span>',
+        "",
+        '  APAS defines a protocol for <span class="t-bcyn">cryptographically verifiable provenance chains</span>',
+        "  across autonomous AI agent pipelines. It specifies how orchestrators record,",
+        "  sign, and verify the complete chain from work decomposition through",
+        "  agent execution to code delivery.",
+        "",
+        "  APAS is implementation-agnostic.",
+        "",
+        '  <span class="t-dim">Ecosystem:</span>',
+        '  \u25b8 <a href="https://github.com/agentic-research/signet" class="t-btn t-btn-yel">signet</a>  — the identity primitive (foundation)',
+        '  \u25b8 <a href="https://auth.notme.bot" class="t-btn t-btn-cyn">auth.notme.bot</a> — the identity authority',
+        "",
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+        '  <span class="t-bwht">1. Problem Statement</span>',
+        "",
+        "  AI coding agents autonomously modify source code. Current supply",
+        "  chain security (SBOM, SLSA, in-toto) tracks software components",
+        '  and build provenance but <span class="t-bred">NOT</span> agent decision chains.',
+        "",
+        "  This gap means:",
+        "",
+        '  <span class="t-red">\u25b8</span> Agent work is indistinguishable from human work after commit',
+        '  <span class="t-red">\u25b8</span> Supply chain attacks can inject code via compromised pipelines',
+        '  <span class="t-red">\u25b8</span> No forensic trail linking changes to decisions that produced them',
+        '  <span class="t-red">\u25b8</span> No way to verify an agent operated within authorized scope',
+        "",
+        `  <div class="term-table-wrapper"><table class="term-table"><thead><tr><th>Property</th><th>SBOM</th><th>Agent Provenance</th></tr></thead><tbody><tr><td>Scope</td><td>Components</td><td class="t-cyn">Decisions + Actions</td></tr><tr><td>Temporal</td><td>Point-in-time</td><td class="t-cyn">Causal chain</td></tr><tr><td>Identity</td><td>Package origin</td><td class="t-cyn">Agent + user</td></tr><tr><td>Verification</td><td>Hash matching</td><td class="t-cyn">Signature chain</td></tr><tr><td>Trust model</td><td>Publisher</td><td class="t-cyn">Multi-party</td></tr></tbody></table></div>`,
+        "",
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+        '  <span class="t-bwht">2. Conformance Levels</span>',
+        "",
+        "  Inspired by SLSA, APAS defines four conformance levels.",
+        "  Each builds on the previous.",
+        "",
+        '  <span class="t-bold t-byel">L1</span> <span class="t-bold">Audit Trail</span>           <span class="badge-g"> CURRENT </span>',
+        "",
+        "     Every agent action recorded with structured metadata.",
+        "     Dispatch manifests, tool call logs, phase transitions.",
+        '     <span class="t-dim">Proves: "We know what happened."</span>',
+        '     <span class="t-dim"><span class="t-red">Does NOT prove: records haven\'t been tampered with.</span></span>',
+        "",
+        '  <span class="t-bold t-byel">L2</span> <span class="t-bold">Signed Attestations</span>   <span class="badge-y"> TARGET </span>',
+        "",
+        "     Every attestation cryptographically signed.",
+        '     Hash chain links content hashes <span class="t-bgrn">(shipped)</span>.',
+        '     DSSE envelope + in-toto predicate <span class="t-red">(not yet)</span>.',
+        '     <span class="t-dim">Proves: "We know what happened AND who attests to it."</span>',
+        "",
+        '  <span class="t-bold t-byel">L3</span> <span class="t-bold">Isolated Execution</span>    <span class="badge-y"> TARGET </span>',
+        "",
+        "     Agent execution isolated from attestation authority.",
+        "     Sandbox, permission boundary, scoped filesystem.",
+        '     <span class="t-dim">Proves: "The agent operated within declared boundaries."</span>',
+        "",
+        '  <span class="t-bold t-byel">L4</span> <span class="t-bold">Verified Inputs</span>       <span class="badge-r"> FUTURE </span>',
+        "",
+        "     Agent inputs are themselves attested and verified.",
+        "     System prompts, MCP responses, bead descriptions",
+        "     are content-hashed and included in attestation.",
+        '     <span class="t-dim">Proves: "The full chain from input to output is verifiable."</span>',
+        "",
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+        '  <span class="t-bwht">3. Attestation Format</span>',
+        "",
+        '  APAS uses <span class="t-cyn">in-toto</span> attestation framework with a custom predicate.',
+        "",
+        `  <div class="json-box"><span class="t-yel">{</span>\n    <span class="t-key">"_type"</span>: <span class="t-str">"https://in-toto.io/Statement/v1"</span>,\n    <span class="t-key">"subject"</span>: [{\n      <span class="t-key">"name"</span>: <span class="t-str">"bead-11214e"</span>,\n      <span class="t-key">"digest"</span>: { <span class="t-key">"sha256"</span>: <span class="t-str">"&lt;bead_hash&gt;"</span> }\n    }],\n    <span class="t-key">"predicateType"</span>:\n      <span class="t-str">"https://notme.bot/provenance/dispatch/v1"</span>,\n    <span class="t-key">"predicate"</span>: { <span class="t-dim">...</span> }\n  <span class="t-yel">}</span></div>`,
+        "",
+        '  <span class="t-bold">Predicate: <span class="t-cyn">dispatch/v1</span></span>',
+        "",
+        "  Records the full dispatch context:",
+        '  <span class="t-dim">\u25b8</span> <span class="t-bold">beadRef</span>      — work item reference + content hash',
+        '  <span class="t-dim">\u25b8</span> <span class="t-bold">agent</span>        — name, model, provider, permissions',
+        '  <span class="t-dim">\u25b8</span> <span class="t-bold">pipeline</span>     — phase sequence + current phase',
+        '  <span class="t-dim">\u25b8</span> <span class="t-bold">execution</span>    — workspace, timing, isolation level',
+        '  <span class="t-dim">\u25b8</span> <span class="t-bold">work</span>         — commits, files changed, lines +/-',
+        '  <span class="t-dim">\u25b8</span> <span class="t-bold">verification</span> — tier results, pass/fail per check',
+        '  <span class="t-dim">\u25b8</span> <span class="t-bold">handoffChain</span> — hash links to previous/root phase',
+        "",
+        '  Signed via <span class="t-cyn">DSSE</span> (Dead Simple Signing Envelope):',
+        "  Ed25519 signature over base64-encoded attestation.",
+        "",
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+        '  <span class="t-bwht">4. Normative References</span>',
+        "",
+        `  <div class="term-table-wrapper"><table class="term-table"><thead><tr><th>Spec</th><th>APAS Usage</th></tr></thead><tbody><tr><td class="t-cyn">Signet Token Format</td><td>Identity tokens (CBOR+COSE)</td></tr><tr><td class="t-cyn">in-toto Statement v1</td><td>Attestation envelope format</td></tr><tr><td class="t-cyn">DSSE</td><td>Signature wrapper</td></tr><tr><td class="t-cyn">SLSA v1.0</td><td>Conformance level model</td></tr><tr><td class="t-cyn">Ley-line CMS</td><td>Ed25519 signing (RFC 5652)</td></tr></tbody></table></div>`,
+        "",
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+        '  <span class="t-bwht">5. Implementation Status</span>',
+        "",
+        '  <span class="t-bgrn">\u25a0</span> L1 audit trail         — <span class="t-grn">partial (dispatch manifests, stream logs)</span>',
+        '  <span class="t-byel">\u25a0</span> L2 signed attestations — <span class="t-yel">chain hash shipped, DSSE not yet</span>',
+        '  <span class="t-byel">\u25a0</span> L3 isolated execution  — <span class="t-yel">ACP foundation, sandbox TODO</span>',
+        '  <span class="t-bred">\u25a0</span> L4 verified inputs     — <span class="t-red">future</span>',
+        "",
+        '  APAS spec:           <span class="t-cyn"><a href="https://github.com/agentic-research/signet/blob/main/docs/apas/agent-provenance-standard.md" style="color:inherit">signet/docs/apas/agent-provenance-standard.md</a></span>',
+        '  Identity primitives: <span class="t-cyn"><a href="https://github.com/agentic-research/signet" style="color:inherit">github.com/agentic-research/signet</a></span>',
+        "",
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+        '  <span class="t-bold t-byel">This is a proposal. We want your input.</span>',
+        "",
+        '  <span class="t-dim">Read the draft, open an issue, or reach out.</span>',
+        '  <span class="t-dim">Especially interested in:</span>',
+        "",
+        '  <span class="t-grn">\u25b8</span> Other orchestrators implementing L1 / L2',
+        '  <span class="t-grn">\u25b8</span> Security review of the attestation format',
+        '  <span class="t-grn">\u25b8</span> Gaps in the conformance level model',
+        "",
+        '  <a href="https://github.com/agentic-research/signet/blob/main/docs/apas/agent-provenance-standard.md" class="t-btn t-btn-yel">read the draft spec</a>  <a href="https://github.com/agentic-research/signet/issues/new" class="t-btn t-btn-cyn">open an issue</a>',
+        "",
+        '<span class="t-dim">────────────────────────────────────────────────────────────────</span>',
+        "",
+      ];
+
+      // Renderer: Using <div> instead of <pre> to allow block elements (tables/boxes) to function.
+      // We keep the .t class which provides the white-space: pre-wrap behavior.
+      const fragment = document.createDocumentFragment();
+      const baseDelay = 150 + Math.random() * 200; // Randomized "wire sync" delay
+
+      content.forEach(function (html, i) {
+        const el = document.createElement("div");
+        el.className = "t term-line";
+        el.style.animationDelay = baseDelay + i * 8 + "ms";
+        el.innerHTML = html || "\u00a0";
+        fragment.appendChild(el);
+      });
+      spec.appendChild(fragment);
+    </script>
+
+    <script src="nav.js" defer></script>
+  </body>
+</html>

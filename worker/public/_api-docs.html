@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>API — auth.notme.bot</title>
+    <meta
+      name="description"
+      content="API reference for the notme.bot signet identity authority. Bridge certificates, GHA OIDC exchange, authority discovery."
+    />
+    <link
+      rel="icon"
+      href="https://notme.bot/favicon.svg"
+      type="image/svg+xml"
+    />
+    <link rel="canonical" href="https://auth.notme.bot/api/docs" />
+    <link rel="stylesheet" href="https://notme.bot/styles.css" />
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300;1,400&display=swap");
+      :root {
+        --paper: #1c1810;
+        --paper-warm: #242018;
+        --paper-dark: #141210;
+        --ink: #e8dcc8;
+        --ink-2: #c8b8a0;
+        --ink-3: #988870;
+        --ink-4: #706050;
+        --cyan: #00d4e8;
+        --yellow: #f0d040;
+        --red: #e04030;
+        --green: #48c868;
+        --border: #3a3428;
+        --stamp: #f0d040;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html {
+        font-size: 17px;
+        background: var(--paper);
+      }
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: "DM Mono", monospace;
+        line-height: 1.8;
+        overflow-x: hidden;
+      }
+      .static-overlay {
+        position: fixed; inset: 0; z-index: 9994; pointer-events: none;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='s'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='2.5' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23s)' opacity='0.15'/%3E%3C/svg%3E");
+        background-size: 256px 256px;
+        animation: static-flash 4s ease infinite;
+      }
+      @keyframes static-flash {
+        0% { opacity: 0; } 5% { opacity: 0.08; } 10% { opacity: 0; }
+        50% { opacity: 0; } 55% { opacity: 0.05; } 60% { opacity: 0; } 100% { opacity: 0; }
+      }
+      .grain {
+        position: fixed;
+        inset: 0;
+        z-index: 9998;
+        pointer-events: none;
+        opacity: 0.4;
+        mix-blend-mode: overlay;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)' opacity='0.03'/%3E%3C/svg%3E");
+      }
+      .scanline {
+        position: fixed;
+        left: 0;
+        right: 0;
+        height: 4px;
+        z-index: 9995;
+        pointer-events: none;
+        background: linear-gradient(
+          180deg,
+          transparent,
+          rgba(0, 212, 232, 0.04),
+          transparent
+        );
+        animation: scanline-pass 8s linear infinite;
+      }
+      @keyframes scanline-pass {
+        0% {
+          top: -4px;
+        }
+        100% {
+          top: 100%;
+        }
+      }
+      .page {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 0 28px 100px;
+      }
+      nav {
+        padding: 28px 0;
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        border-bottom: 2px solid var(--ink);
+      }
+      .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+        color: var(--ink);
+      }
+      .logo-text {
+        font-family: "Syne", sans-serif;
+        font-size: 1.25rem;
+        font-weight: 800;
+        color: var(--stamp);
+      }
+      .nav-links {
+        display: flex;
+        gap: 20px;
+        margin-left: auto;
+      }
+      .nav-links a {
+        color: var(--ink-3);
+        text-decoration: none;
+        font-size: 0.8125rem;
+      }
+      .nav-links a:hover {
+        color: var(--cyan);
+      }
+      .nav-links a.active {
+        color: var(--ink);
+      }
+      .hero {
+        padding: 80px 0 40px;
+      }
+      .hero-stamp {
+        display: inline-block;
+        font-family: "Syne", sans-serif;
+        font-size: 0.625rem;
+        font-weight: 700;
+        letter-spacing: 0.25em;
+        text-transform: uppercase;
+        color: var(--stamp);
+        border: 2px solid var(--stamp);
+        padding: 4px 12px;
+        margin-bottom: 24px;
+        transform: rotate(-1.5deg);
+      }
+      h1 {
+        font-family: "Syne", sans-serif;
+        font-size: clamp(2rem, 5vw, 3rem);
+        font-weight: 800;
+        letter-spacing: -0.04em;
+        line-height: 1.2;
+        margin-bottom: 24px;
+        padding-bottom: 0.15em;
+        border-bottom: 2px solid var(--ink);
+      }
+      .lead {
+        font-size: 1rem;
+        color: var(--ink-2);
+        max-width: 700px;
+        margin-bottom: 40px;
+      }
+      h2 {
+        font-family: "Syne", sans-serif;
+        font-size: 1.3rem;
+        font-weight: 800;
+        color: var(--yellow);
+        margin: 48px 0 20px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        padding-bottom: 0.15em;
+        border-bottom: 1px solid var(--yellow);
+      }
+      p {
+        margin-bottom: 16px;
+        color: var(--ink-2);
+        font-size: 0.9rem;
+      }
+      code {
+        color: var(--cyan);
+        background: rgba(0, 212, 232, 0.06);
+        padding: 1px 5px;
+        font-size: 0.85em;
+      }
+      a {
+        color: var(--cyan);
+        text-decoration: none;
+      }
+      a:hover {
+        color: var(--yellow);
+      }
+
+      .endpoint {
+        border: 1px solid var(--border);
+        margin-bottom: 32px;
+        background: rgba(36, 32, 24, 0.3);
+      }
+      .ep-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 16px 20px;
+        border-bottom: 1px solid var(--border);
+      }
+      .ep-method {
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        padding: 3px 10px;
+      }
+      .ep-method.post {
+        color: var(--cyan);
+        background: rgba(0, 212, 232, 0.1);
+      }
+      .ep-method.get {
+        color: var(--yellow);
+        background: rgba(240, 208, 64, 0.1);
+      }
+      .ep-path {
+        color: var(--ink);
+        font-weight: 600;
+        font-size: 0.95rem;
+      }
+      .ep-body {
+        padding: 20px;
+      }
+      .ep-desc {
+        color: var(--ink-2);
+        font-size: 0.875rem;
+        margin-bottom: 16px;
+      }
+      .ep-label {
+        font-size: 0.625rem;
+        color: var(--ink-4);
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        margin: 16px 0 8px;
+      }
+      .ep-example {
+        background: var(--paper-dark);
+        border-left: 3px solid var(--cyan);
+        padding: 14px 18px;
+        font-size: 0.75rem;
+        color: var(--cyan);
+        line-height: 1.7;
+        overflow-x: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .ep-response {
+        background: var(--paper-dark);
+        border-left: 3px solid var(--yellow);
+        padding: 14px 18px;
+        font-size: 0.75rem;
+        color: var(--ink-2);
+        line-height: 1.7;
+        overflow-x: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .ep-field {
+        display: flex;
+        gap: 12px;
+        padding: 4px 0;
+        font-size: 0.85rem;
+      }
+      .ep-field-name {
+        color: var(--ink);
+        font-weight: 600;
+        min-width: 120px;
+      }
+      .ep-field-type {
+        color: var(--ink-4);
+        min-width: 80px;
+      }
+      .ep-field-desc {
+        color: var(--ink-3);
+      }
+      .ep-note {
+        color: var(--ink-4);
+        font-size: 0.8rem;
+        margin-top: 12px;
+      }
+
+      .base-url {
+        background: var(--paper-dark);
+        border: 1px solid var(--border);
+        padding: 12px 18px;
+        font-size: 0.9rem;
+        margin-bottom: 32px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .base-label {
+        color: var(--ink-4);
+        font-size: 0.625rem;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+      .base-value {
+        color: var(--cyan);
+        font-weight: 600;
+      }
+
+      @media (max-width: 600px) {
+        .page {
+          padding: 0 16px 60px;
+        }
+        .ep-header {
+          flex-wrap: wrap;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grain"></div>
+    <div class="scanline"></div>
+    <div class="static-overlay"></div>
+    <div class="page">
+      <nav></nav>
+
+      <div class="hero">
+        <div class="hero-stamp">api reference</div>
+        <h1>auth.notme.bot</h1>
+        <p class="lead">
+          signet identity authority API. bridge certificates via OIDC token
+          exchange, GHA automation, and agent registration.
+        </p>
+      </div>
+
+      <div class="base-url">
+        <span class="base-label">base</span>
+        <span class="base-value">https://auth.notme.bot</span>
+      </div>
+
+      <h2>certificate exchange</h2>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method post">POST</span>
+          <span class="ep-path">/cert</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">Generalized cert exchange. Present any proof, get a scoped bridge cert. This is the core signet protocol endpoint.</div>
+          <div class="ep-label">request</div>
+          <div class="ep-example">{
+  "proof": {
+    "type": "session"
+  },
+  "scopes": ["bridgeCert"]
+}
+
+// or with OIDC:
+{
+  "proof": {
+    "type": "oidc",
+    "token": "&lt;JWT from any issuer&gt;"
+  }
+}
+
+// or bootstrap (deployer only):
+{
+  "proof": {
+    "type": "bootstrap",
+    "code": "abc12345"
+  }
+}</div>
+          <div class="ep-label">response</div>
+          <div class="ep-response">{
+  "certificate": "-----BEGIN CERTIFICATE-----\n...",
+  "private_key": "-----BEGIN PRIVATE KEY-----\n...",
+  "expires_at": 1711670400,
+  "subject": "a1b2c3d4-...",
+  "authority": { "epoch": 1, "key_id": "3b8b237e" },
+  "principal_id": "a1b2c3d4-...",
+  "scopes": ["bridgeCert"],
+  "auth_method": "passkey"
+}</div>
+          <div class="ep-note">Proof types: session (passkey cookie), oidc (any JWT), bootstrap (deployer code). Scopes are intersected with the principal's capability grants.</div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method post">POST</span>
+          <span class="ep-path">/cert/gha</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            Exchange a GitHub Actions OIDC token for a 5-minute bridge
+            certificate. No stored secrets needed — the OIDC JWT is the
+            credential. Edge-handled (no VPC roundtrip).
+          </div>
+          <div class="ep-label">authorization</div>
+          <p>
+            <code>Bearer &lt;GHA OIDC token&gt;</code> with audience
+            <code>notme.bot</code>
+          </p>
+          <div class="ep-label">request</div>
+          <div class="ep-example">
+            curl -X POST https://auth.notme.bot/cert/gha \ -H "Authorization:
+            Bearer ${TOKEN}"
+          </div>
+          <div class="ep-label">response</div>
+          <div class="ep-response">
+            { "certificate": "-----BEGIN CERTIFICATE-----\n...", "private_key":
+            "-----BEGIN PRIVATE KEY-----\n...", "expires_at": 1711670400,
+            "subject": "repo:agentic-research/signet:ref:refs/heads/main",
+            "claims": { "repository": "agentic-research/signet", "ref":
+            "refs/heads/main", "sha": "abc123...", "actor": "github-actions",
+            "workflow": "ci.yml", "run_id": "12345", "event_name": "push" } }
+          </div>
+          <div class="ep-note">
+            Allowed owners: <code>agentic-research</code> (configurable via
+            GHA_ALLOWED_OWNERS). Ephemeral P-256 keypair generated at edge —
+            private key returned once, never stored.
+          </div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method post">POST</span>
+          <span class="ep-path">/exchange-token</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            Exchange an OIDC token for a bridge certificate. Used by
+            <code>signet auth login</code> (human auth flow). Proxied to signet
+            authority on Fly.
+          </div>
+          <div class="ep-label">authorization</div>
+          <p>OIDC token from OAuth callback flow.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method post">POST</span>
+          <span class="ep-path">/api/cert/register</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            Register an agent identity using a GitHub PAT. For
+            headless/automated environments where browser OAuth isn't possible.
+            Proxied to signet authority on Fly.
+          </div>
+        </div>
+      </div>
+
+      <h2>discovery</h2>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/.well-known/signet-authority.json</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            Authority discovery document. Lists all endpoints, supported
+            algorithms, and grant types. Analogous to OpenID Connect's
+            <code>/.well-known/openid-configuration</code>, but signet consumes
+            OIDC — it does not issue tokens.
+          </div>
+          <div class="ep-label">response</div>
+          <div class="ep-response">
+            { "issuer": "https://auth.notme.bot", "exchange_token_endpoint":
+            "https://auth.notme.bot/exchange-token", "cert_gha_endpoint":
+            "https://auth.notme.bot/cert/gha", "registration_endpoint":
+            "https://auth.notme.bot/api/cert/register", "ca_bundle_endpoint":
+            "https://auth.notme.bot/.well-known/ca-bundle.pem",
+            "algorithms_supported": ["Ed25519"], "grant_types_supported": [
+            "oidc_token_exchange", "github_actions_oidc", "github_pat" ],
+            "cert_types_supported": ["bridge_certificate"], "documentation":
+            "https://notme.bot/architecture" }
+          </div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/.well-known/ca-bundle.pem</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            CA trust anchor — the authority's Ed25519 public key in PEM format.
+            Configure MCP servers and verifiers with this to validate bridge
+            certificates. Served from the SigningAuthority Durable Object
+            (edge-fast, zero VPC roundtrip).
+          </div>
+          <div class="ep-label">response</div>
+          <div class="ep-response">
+            -----BEGIN PUBLIC KEY----- MCowBQYDK2VwAyEA... -----END PUBLIC
+            KEY-----
+          </div>
+          <div class="ep-note">
+            Cache-Control: 1 hour. Key is generated in CF and never leaves —
+            there is no PEM file to exfiltrate.
+          </div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            Content-negotiated landing. Returns HTML (browser) or JSON authority
+            metadata (<code>Accept: application/json</code>).
+          </div>
+        </div>
+      </div>
+
+      <h2>health</h2>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/healthz</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            Health check. Proxied to signet authority on Fly.
+          </div>
+        </div>
+      </div>
+
+      <h2>authentication model</h2>
+      <p>
+        signet is not an identity provider — it is an identity
+        <em>attester</em>. You own your key. signet signs a short-lived
+        certificate binding your public key to your verified identity.
+      </p>
+      <p>Three grant types:</p>
+      <div style="margin-bottom: 24px">
+        <div class="ep-field">
+          <span class="ep-field-name">oidc_token_exchange</span
+          ><span class="ep-field-desc"
+            >Human OAuth → browser flow via <code>signet auth login</code></span
+          >
+        </div>
+        <div class="ep-field">
+          <span class="ep-field-name">github_actions_oidc</span
+          ><span class="ep-field-desc"
+            >GHA CI → <code>POST /cert/gha</code> with OIDC JWT (zero
+            secrets)</span
+          >
+        </div>
+        <div class="ep-field">
+          <span class="ep-field-name">github_pat</span
+          ><span class="ep-field-desc"
+            >Headless agent → <code>POST /api/cert/register</code> with
+            PAT</span
+          >
+        </div>
+      </div>
+      <p>
+        All certificates are Ed25519-signed X.509 with custom OID extensions for
+        subject identity and issuance time, matching the
+        <a href="https://github.com/agentic-research/signet"
+          >Go authority format</a
+        >.
+      </p>
+    </div>
+
+    <script src="https://notme.bot/nav.js" defer></script>
+  </body>
+</html>

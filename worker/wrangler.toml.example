@@ -1,0 +1,69 @@
+#:schema node_modules/wrangler/config-schema.json
+# Copy to wrangler.toml and fill in your CF resource IDs.
+name = "notme-bot"
+main = "worker.ts"
+compatibility_date = "2026-03-01"
+
+workers_dev = false
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# Custom domain routes — adjust zone_name to your domain.
+[[routes]]
+pattern = "notme.bot/*"
+zone_name = "notme.bot"
+
+[[routes]]
+pattern = "auth.notme.bot/*"
+zone_name = "notme.bot"
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+not_found_handling = "404-page"
+# Worker handles routing first — prevents Assets from auto-serving index.html
+# on auth.notme.bot (subdomain needs different content than main domain /).
+run_worker_first = true
+
+[vars]
+SITE_URL = "https://notme.bot"
+SIGNET_AUTHORITY_URL = "https://auth.notme.bot"
+# Comma-separated list of GitHub org/user names allowed to exchange GHA OIDC tokens
+# for bridge certs at auth.notme.bot/cert/gha.
+GHA_ALLOWED_OWNERS = "your-org"
+
+# Workers VPC — direct tunnel to signet on Fly (identity server).
+# Create via: wrangler vpc create <name>
+# CF TF provider does not support vpc_service binding type — configured here directly.
+[[vpc_services]]
+binding = "VPC_AUTH"
+service_id = "<your-vpc-service-id>"
+
+# CA bundle cache — stores current CA bundle for edge revocation checks.
+# Create via: wrangler kv namespace create CA_BUNDLE_CACHE
+[[kv_namespaces]]
+binding = "CA_BUNDLE_CACHE"
+id = "<your-kv-namespace-id>"
+
+# Signing authority — DO-stored Ed25519 CA key (zero-copy, born in CF).
+[[durable_objects.bindings]]
+name = "SIGNING_AUTHORITY"
+class_name = "SigningAuthority"
+
+# Revocation authority — Durable Object for atomic seqno tracking (rollback protection).
+[[durable_objects.bindings]]
+name = "REVOCATION"
+class_name = "RevocationAuthority"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RevocationAuthority"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["SigningAuthority"]

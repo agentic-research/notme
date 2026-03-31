@@ -1,0 +1,552 @@
+// SigningAuthority — Durable Object that generates and stores the Ed25519 CA master key.
+//
+// Zero-copy: key is born in CF and never leaves. No wrangler secret put,
+// no PEM on anyone's machine. This is the reference implementation that
+// `npx notme auth init` replicates to BYO CF accounts.
+//
+// SQLite schema:
+//   keys  — singleton authority keypair (Ed25519)
+//   state — epoch, seqno, keyId for bundle generation
+//
+// The DO owns the full lifecycle: key generation, bundle signing, rotation.
+// The Worker writes signed bundles to KV for the revocation verifier.
+
+import { DurableObject } from "cloudflare:workers";
+import type { CABundle } from "./revocation";
+
+interface SigningAuthorityEnv {
+  CA_BUNDLE_CACHE: KVNamespace;
+}
+
+// Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
+const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
+
+export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
+  private initialized = false;
+  private signingKey: CryptoKey | null = null;
+  private verifyKey: CryptoKey | null = null;
+
+  private ensureSchema(): void {
+    if (this.initialized) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS keys (
+        id          TEXT PRIMARY KEY DEFAULT 'authority',
+        private_jwk TEXT NOT NULL,
+        public_spki TEXT NOT NULL,
+        key_id      TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        algorithm   TEXT NOT NULL DEFAULT 'Ed25519'
+      )
+    `);
+    // Migration: add key_id column if missing (v1 → v2)
+    try {
+      this.ctx.storage.sql.exec("SELECT key_id FROM keys LIMIT 0");
+    } catch {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE keys ADD COLUMN key_id TEXT NOT NULL DEFAULT ''",
+      );
+    }
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS state (
+        id     TEXT PRIMARY KEY DEFAULT 'authority',
+        epoch  INTEGER NOT NULL DEFAULT 1,
+        seqno  INTEGER NOT NULL DEFAULT 1
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO state (id, epoch, seqno) VALUES ('authority', 1, 1)",
+    );
+    this.initialized = true;
+  }
+
+  // Generate a short key ID from the public key (first 8 bytes hex).
+  private static keyIdFromSpki(spkiB64: string): string {
+    const raw = atob(spkiB64);
+    // SPKI for Ed25519 is 44 bytes: 12-byte header + 32-byte key. Hash the key part.
+    const keyBytes = raw.slice(-32);
+    let hash = 0;
+    for (let i = 0; i < keyBytes.length; i++) {
+      hash = ((hash << 5) - hash + keyBytes.charCodeAt(i)) | 0;
+    }
+    return Math.abs(hash).toString(16).padStart(8, "0");
+  }
+
+  // Load or generate the authority keypair. Cached in memory for the DO lifetime.
+  async getOrCreateSigningKey(): Promise<{
+    signingKey: CryptoKey;
+    verifyKey: CryptoKey;
+    keyId: string;
+  }> {
+    if (this.signingKey && this.verifyKey) {
+      const kid = this.getKeyId();
+      return {
+        signingKey: this.signingKey,
+        verifyKey: this.verifyKey,
+        keyId: kid,
+      };
+    }
+
+    this.ensureSchema();
+
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT private_jwk, public_spki, key_id FROM keys WHERE id = 'authority'",
+      )
+      .toArray() as Array<{
+      private_jwk: string;
+      public_spki: string;
+      key_id: string;
+    }>;
+
+    if (rows.length > 0) {
+      const row = rows[0]!;
+      const jwk = JSON.parse(row.private_jwk);
+      this.signingKey = await crypto.subtle.importKey(
+        "jwk",
+        jwk,
+        { name: "Ed25519" } as any,
+        true,
+        ["sign"],
+      );
+      const spkiBytes = Uint8Array.from(atob(row.public_spki), (c) =>
+        c.charCodeAt(0),
+      );
+      this.verifyKey = await crypto.subtle.importKey(
+        "spki",
+        spkiBytes,
+        { name: "Ed25519" } as any,
+        true,
+        ["verify"],
+      );
+      // Backfill key_id if empty (v1 key created before key_id tracking)
+      let keyId = row.key_id;
+      if (!keyId) {
+        keyId = SigningAuthority.keyIdFromSpki(row.public_spki);
+        this.ctx.storage.sql.exec(
+          "UPDATE keys SET key_id = ? WHERE id = 'authority'",
+          keyId,
+        );
+      }
+      return { signingKey: this.signingKey, verifyKey: this.verifyKey, keyId };
+    }
+
+    // First call ever — generate the authority keypair
+    const kp = (await crypto.subtle.generateKey(
+      { name: "Ed25519" } as any,
+      true,
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+
+    const privateJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+    const publicSpki = (await crypto.subtle.exportKey(
+      "spki",
+      kp.publicKey,
+    )) as ArrayBuffer;
+    const publicSpkiB64 = btoa(
+      String.fromCharCode(...new Uint8Array(publicSpki)),
+    );
+    const keyId = SigningAuthority.keyIdFromSpki(publicSpkiB64);
+
+    this.ctx.storage.sql.exec(
+      "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
+      JSON.stringify(privateJwk),
+      publicSpkiB64,
+      keyId,
+    );
+
+    this.signingKey = kp.privateKey;
+    this.verifyKey = kp.publicKey;
+
+    // First key ever — start the bundle refresh alarm
+    await this.scheduleNextRefresh();
+
+    return { signingKey: this.signingKey, verifyKey: this.verifyKey, keyId };
+  }
+
+  private getKeyId(): string {
+    this.ensureSchema();
+    const rows = this.ctx.storage.sql
+      .exec("SELECT key_id FROM keys WHERE id = 'authority'")
+      .toArray() as Array<{ key_id: string }>;
+    return rows[0]?.key_id ?? "unknown";
+  }
+
+  // Return the authority's public key as PEM.
+  async getPublicKeyPem(): Promise<string> {
+    const { verifyKey } = await this.getOrCreateSigningKey();
+    const spki = (await crypto.subtle.exportKey(
+      "spki",
+      verifyKey,
+    )) as ArrayBuffer;
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(spki)));
+    const lines = b64.match(/.{1,64}/g)!;
+    return `-----BEGIN PUBLIC KEY-----\n${lines.join("\n")}\n-----END PUBLIC KEY-----\n`;
+  }
+
+  // Return the raw 32-byte Ed25519 public key as base64 (for CABundle.keys).
+  async getPublicKeyRawB64(): Promise<string> {
+    const { verifyKey } = await this.getOrCreateSigningKey();
+    const raw = (await crypto.subtle.exportKey(
+      "raw",
+      verifyKey,
+    )) as ArrayBuffer;
+    return btoa(String.fromCharCode(...new Uint8Array(raw)));
+  }
+
+  // Sign arbitrary data with the authority key.
+  async sign(data: ArrayBuffer): Promise<ArrayBuffer> {
+    const { signingKey } = await this.getOrCreateSigningKey();
+    return crypto.subtle.sign("Ed25519" as any, signingKey, data);
+  }
+
+  // Current epoch and keyId for embedding in issued certs.
+  async getAuthorityState(): Promise<{
+    epoch: number;
+    seqno: number;
+    keyId: string;
+  }> {
+    this.ensureSchema();
+    const { keyId } = await this.getOrCreateSigningKey();
+    const rows = this.ctx.storage.sql
+      .exec("SELECT epoch, seqno FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number; seqno: number }>;
+    const state = rows[0] ?? { epoch: 1, seqno: 1 };
+    return { epoch: state.epoch, seqno: state.seqno, keyId };
+  }
+
+  // Generate a signed CABundle for the revocation verifier.
+  // Caller writes this to CA_BUNDLE_CACHE KV.
+  async generateBundle(): Promise<CABundle> {
+    const { signingKey, keyId } = await this.getOrCreateSigningKey();
+    const pubKeyB64 = await this.getPublicKeyRawB64();
+
+    this.ensureSchema();
+
+    // Advance seqno
+    this.ctx.storage.sql.exec(
+      "UPDATE state SET seqno = seqno + 1 WHERE id = 'authority'",
+    );
+    const rows = this.ctx.storage.sql
+      .exec("SELECT epoch, seqno FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number; seqno: number }>;
+    const { epoch, seqno } = rows[0]!;
+
+    // Build the unsigned bundle
+    const bundle: Omit<CABundle, "signature"> & { signature?: string } = {
+      epoch,
+      seqno,
+      keys: { [keyId]: pubKeyB64 },
+      keyId,
+      issuedAt: Math.floor(Date.now() / 1000),
+    };
+
+    // Canonical JSON for signing (same as revocation.ts bundleCanonical)
+    const sorted: Record<string, unknown> = {};
+    for (const k of Object.keys(bundle).sort()) {
+      sorted[k] = bundle[k as keyof typeof bundle];
+    }
+    const canonical = new TextEncoder().encode(JSON.stringify(sorted));
+
+    // Sign
+    const sig = await crypto.subtle.sign(
+      "Ed25519" as any,
+      signingKey,
+      canonical,
+    );
+    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
+
+    return { ...bundle, signature: sigB64 } as CABundle;
+  }
+
+  // Rotate the CA key. Increments epoch, generates new keypair.
+  // Previous keyId is preserved in the bundle as prevKeyId for graceful transition.
+  async rotate(): Promise<{ newKeyId: string; epoch: number }> {
+    this.ensureSchema();
+    const oldKeyId = this.getKeyId();
+
+    // Delete old key
+    this.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");
+    this.signingKey = null;
+    this.verifyKey = null;
+
+    // Increment epoch
+    this.ctx.storage.sql.exec(
+      "UPDATE state SET epoch = epoch + 1, seqno = seqno + 1 WHERE id = 'authority'",
+    );
+
+    // Generate new key (getOrCreateSigningKey will create since we deleted)
+    const { keyId: newKeyId } = await this.getOrCreateSigningKey();
+
+    // Store prevKeyId for the transition window
+    await this.ctx.storage.put("prevKeyId", oldKeyId);
+
+    const rows = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+
+    return { newKeyId, epoch: rows[0]!.epoch };
+  }
+
+  // ── Passkey operations (delegates to passkey module, uses DO's SQLite) ──
+
+  async passkeyRegistrationOptions(
+    userId: string,
+    displayName: string,
+    rpId: string,
+  ): Promise<any> {
+    const { registrationOptions } = await import("./auth/passkey");
+    return registrationOptions(userId, displayName, rpId, this.ctx.storage.sql);
+  }
+
+  async passkeyVerifyRegistration(
+    userId: string,
+    displayName: string,
+    response: any,
+    rpId: string,
+    origin: string,
+  ): Promise<{ verified: boolean; isAdmin: boolean }> {
+    const { verifyRegistration } = await import("./auth/passkey");
+    return verifyRegistration(
+      userId,
+      displayName,
+      response,
+      rpId,
+      origin,
+      this.ctx.storage.sql,
+    );
+  }
+
+  async passkeyAuthenticationOptions(rpId: string): Promise<any> {
+    const { authenticationOptions } = await import("./auth/passkey");
+    return authenticationOptions(rpId, this.ctx.storage.sql);
+  }
+
+  async passkeyVerifyAuthentication(
+    response: any,
+    rpId: string,
+    origin: string,
+  ): Promise<{ verified: boolean; userId: string | null; isAdmin: boolean }> {
+    const { verifyAuthentication } = await import("./auth/passkey");
+    return verifyAuthentication(response, rpId, origin, this.ctx.storage.sql);
+  }
+
+  // Get or generate the session HMAC secret (stored in DO SQLite)
+  async getSessionSecret(): Promise<string> {
+    this.ensureSchema();
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_config (
+        id     TEXT PRIMARY KEY DEFAULT 'session',
+        secret TEXT NOT NULL
+      )
+    `);
+    const rows = this.ctx.storage.sql
+      .exec("SELECT secret FROM session_config WHERE id = 'session'")
+      .toArray() as Array<{ secret: string }>;
+    if (rows.length > 0) return rows[0]!.secret;
+
+    // Generate on first call
+    const buf = new Uint8Array(32);
+    crypto.getRandomValues(buf);
+    const secret = btoa(String.fromCharCode(...buf));
+    this.ctx.storage.sql.exec(
+      "INSERT INTO session_config (id, secret) VALUES ('session', ?)",
+      secret,
+    );
+    return secret;
+  }
+
+  // ── Invites: time-limited, single-use, scoped ──
+
+  async createInviteToken(
+    createdBy: string,
+    scopes: string[],
+    ttlSeconds = 3600,
+  ): Promise<{ token: string; expiresAt: string }> {
+    const { createInvite } = await import("./auth/principals");
+    const invite = createInvite(this.ctx.storage.sql, createdBy, scopes, ttlSeconds);
+    return { token: invite.token, expiresAt: invite.expiresAt };
+  }
+
+  async redeemInviteToken(
+    token: string,
+    redeemedBy: string,
+  ): Promise<{ scopes: string[] } | null> {
+    const { redeemInvite } = await import("./auth/principals");
+    return redeemInvite(this.ctx.storage.sql, token, redeemedBy);
+  }
+
+  // ── Principal management ──
+
+  async createPrincipalWithCapabilities(
+    principalId: string,
+    scopes: string[],
+    createdBy?: string,
+  ): Promise<void> {
+    const { createPrincipal, grantCapability } = await import("./auth/principals");
+    createPrincipal(this.ctx.storage.sql, principalId, undefined, createdBy);
+    for (const scope of scopes) {
+      grantCapability(this.ctx.storage.sql, principalId, scope, createdBy);
+    }
+  }
+
+  async getPrincipalScopes(principalId: string): Promise<string[]> {
+    const { getCapabilities } = await import("./auth/principals");
+    return getCapabilities(this.ctx.storage.sql, principalId);
+  }
+
+  async linkFederatedId(
+    principalId: string,
+    provider: string,
+    providerSub: string,
+  ): Promise<void> {
+    const { linkFederatedIdentity } = await import("./auth/principals");
+    linkFederatedIdentity(this.ctx.storage.sql, principalId, provider, providerSub);
+  }
+
+  async findPrincipalByOIDC(
+    provider: string,
+    providerSub: string,
+  ): Promise<string | null> {
+    const { findPrincipalByFederated } = await import("./auth/principals");
+    return findPrincipalByFederated(this.ctx.storage.sql, provider, providerSub);
+  }
+
+  // ── Connections: OIDC/x509 identity associations ──
+
+  async storeConnection(input: {
+    credentialId: string;
+    provider: string;
+    providerSubject: string;
+    providerEmail?: string;
+  }): Promise<void> {
+    const { createConnection } = await import("./auth/connections");
+    await createConnection(this.ctx.storage.sql, input);
+  }
+
+  async getConnectionsForUser(
+    credentialId: string,
+  ): Promise<Array<{ provider: string; subject: string; connectedAt: string }>> {
+    const { getConnections } = await import("./auth/connections");
+    const conns = await getConnections(this.ctx.storage.sql, credentialId);
+    return conns.map((c) => ({
+      provider: c.provider,
+      subject: c.providerSubject,
+      connectedAt: c.connectedAt,
+    }));
+  }
+
+  // Reset passkey data — for when credentials are corrupted (e.g. userId mismatch bug)
+  async resetPasskeyData(): Promise<{ deleted: number }> {
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    ensurePasskeySchema(this.ctx.storage.sql);
+    const creds = this.ctx.storage.sql
+      .exec("SELECT COUNT(*) as c FROM passkey_credentials")
+      .toArray() as Array<{ c: number }>;
+    const count = creds[0]?.c ?? 0;
+    this.ctx.storage.sql.exec("DELETE FROM passkey_credentials");
+    this.ctx.storage.sql.exec("DELETE FROM passkey_users");
+    this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
+    // Reset bootstrap so deployer can re-register
+    this.ctx.storage.sql.exec("DELETE FROM bootstrap");
+    return { deleted: count };
+  }
+
+  // ── Bootstrap code: one-time admin registration gate ──
+  // Generated on first call, deleted after first passkey registration.
+  // Only visible to the deployer (via wrangler tail / console).
+
+  async getOrCreateBootstrapCode(): Promise<string | null> {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap (
+        id   TEXT PRIMARY KEY DEFAULT 'code',
+        code TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    const rows = this.ctx.storage.sql
+      .exec("SELECT code, used FROM bootstrap WHERE id = 'code'")
+      .toArray() as Array<{ code: string; used: number }>;
+
+    if (rows.length > 0) {
+      return rows[0]!.used ? null : rows[0]!.code;
+    }
+
+    // Generate on first call
+    const code = crypto.randomUUID().slice(0, 8);
+    this.ctx.storage.sql.exec(
+      "INSERT INTO bootstrap (id, code) VALUES ('code', ?)",
+      code,
+    );
+    console.log(`\n${"=".repeat(50)}\nBOOTSTRAP CODE: ${code}\nEnter this at auth.notme.bot/login to register the admin passkey.\nThis code is single-use and will be deleted after registration.\n${"=".repeat(50)}\n`);
+    return code;
+  }
+
+  async consumeBootstrapCode(code: string): Promise<boolean> {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap (
+        id   TEXT PRIMARY KEY DEFAULT 'code',
+        code TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    const rows = this.ctx.storage.sql
+      .exec("SELECT code FROM bootstrap WHERE id = 'code' AND used = 0")
+      .toArray() as Array<{ code: string }>;
+
+    if (rows.length === 0 || rows[0]!.code !== code) return false;
+
+    this.ctx.storage.sql.exec(
+      "UPDATE bootstrap SET used = 1 WHERE id = 'code'",
+    );
+    return true;
+  }
+
+  // Passkey stats — no PII, just counts for diagnostics
+  async passkeyStats(): Promise<{
+    users: number;
+    credentials: number;
+    admins: number;
+  }> {
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    ensurePasskeySchema(this.ctx.storage.sql);
+    const users = this.ctx.storage.sql
+      .exec("SELECT COUNT(*) as c FROM passkey_users")
+      .toArray() as Array<{ c: number }>;
+    const creds = this.ctx.storage.sql
+      .exec("SELECT COUNT(*) as c FROM passkey_credentials")
+      .toArray() as Array<{ c: number }>;
+    const admins = this.ctx.storage.sql
+      .exec("SELECT COUNT(*) as c FROM passkey_users WHERE is_admin = 1")
+      .toArray() as Array<{ c: number }>;
+    return {
+      users: users[0]?.c ?? 0,
+      credentials: creds[0]?.c ?? 0,
+      admins: admins[0]?.c ?? 0,
+    };
+  }
+
+  // ── Alarm: periodic bundle publish ──────────────────────────────────
+  // Ensures CA bundle in KV stays fresh (< BUNDLE_MAX_AGE_MS).
+  // Scheduled on first getOrCreateSigningKey() and re-arms after each fire.
+
+  async scheduleNextRefresh(): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (!current) {
+      await this.ctx.storage.setAlarm(Date.now() + BUNDLE_REFRESH_MS);
+    }
+  }
+
+  override async alarm(): Promise<void> {
+    try {
+      const bundle = await this.generateBundle();
+      await this.env.CA_BUNDLE_CACHE.put(
+        "bundle:current",
+        JSON.stringify(bundle),
+      );
+    } catch (e) {
+      console.error("[signing-authority] bundle refresh failed:", e);
+    }
+    // Re-arm
+    await this.ctx.storage.setAlarm(Date.now() + BUNDLE_REFRESH_MS);
+  }
+}

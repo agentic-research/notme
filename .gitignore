@@ -1,0 +1,60 @@
+# Default deny: ignore everything unless explicitly allowlisted below.
+*
+
+# Keep gitignore itself tracked.
+!.gitignore
+
+# Project metadata
+!LICENSE
+!README.md
+!Taskfile.yml
+
+# Cap'n Proto schemas (source of truth for all cross-language types)
+!schema/
+!schema/**/*.capnp
+!schema/codegen/
+!schema/codegen/**
+
+# Generated code from schemas (committed so consumers don't need capnp toolchain)
+!gen/
+!gen/ts/
+!gen/ts/**
+!gen/go/
+!gen/go/**
+
+# CF Worker — signet identity authority at auth.notme.bot
+!worker/
+!worker/**
+!worker/src/
+!worker/src/**
+
+# Wasm — ley-line-sign (signing ops at edge)
+!wasm/
+!wasm/**
+
+# GHA TypeScript action — identity exchange (zero env vars)
+!action/
+!action/**
+!action/package-lock.json
+
+# Worker lockfile
+!worker/package-lock.json
+
+# Design docs
+!docs/
+!docs/**
+
+# GitHub Actions workflows
+!.github/
+!.github/**
+
+# Wrangler config contains CF resource IDs — use wrangler.toml.example as template
+worker/wrangler.toml
+
+# Explicitly ignore artifacts
+.wrangler/
+.dolt/
+*.db
+.DS_Store
+node_modules/
+dist/

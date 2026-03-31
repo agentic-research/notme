@@ -1,0 +1,15 @@
+{
+  "name": "notme-action",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --outfile=dist/index.js"
+  },
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@actions/http-client": "^2.2.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}

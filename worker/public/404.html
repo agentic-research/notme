@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>404 — notme.bot</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      .not-found {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 60vh;
+        text-align: center;
+        padding: 40px;
+      }
+      .code {
+        font-family: "Syne", sans-serif;
+        font-size: 8rem;
+        font-weight: 800;
+        color: var(--yellow);
+        line-height: 1;
+        margin-bottom: 24px;
+        opacity: 0.9;
+      }
+      .msg {
+        font-family: "DM Mono", monospace;
+        font-size: 1.25rem;
+        color: var(--ink-2);
+        margin-bottom: 32px;
+      }
+      .home-link {
+        font-family: "DM Mono", monospace;
+        font-size: 1rem;
+        color: var(--cyan);
+        text-decoration: none;
+        border-bottom: 1px dotted rgba(0, 212, 232, 0.3);
+        transition: all 150ms ease;
+      }
+      .home-link:hover {
+        color: var(--yellow);
+        border-bottom-color: var(--yellow);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grain"></div>
+    <div class="page">
+      <nav></nav>
+      <main>
+        <div class="not-found">
+          <div class="code">404</div>
+          <div class="msg">Document redacted or not found.</div>
+          <a href="/" class="home-link">&larr; Return to base</a>
+        </div>
+      </main>
+    </div>
+    <script src="/nav.js" defer></script>
+  </body>
+</html>

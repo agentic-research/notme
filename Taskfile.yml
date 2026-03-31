@@ -1,0 +1,65 @@
+version: "3"
+
+tasks:
+  schema:ts:
+    desc: Generate TypeScript types + Zod schemas from Cap'n Proto
+    cmds:
+      - npx tsx schema/codegen/capnp-to-ts.ts schema/identity.capnp > gen/ts/identity.ts
+      - echo "Generated gen/ts/identity.ts"
+
+  schema:go:
+    desc: Generate Go types from Cap'n Proto
+    cmds:
+      - capnp compile -o go:gen/go --src-prefix=schema -I "$HOME/go/pkg/mod/capnproto.org/go/capnp/v3@v3.1.0-alpha.2/std" schema/identity.capnp
+      - echo "Generated gen/go/identity.capnp.go"
+
+  schema:all:
+    desc: Generate all language bindings
+    deps: [schema:ts, schema:go]
+
+  schema:check:
+    desc: Type-check generated code
+    deps: [schema:ts]
+    cmds:
+      - npx tsc --noEmit --strict --moduleResolution bundler --module ES2022 --target ES2022 --skipLibCheck gen/ts/identity.ts
+
+  worker:dev:
+    desc: Start local dev server
+    dir: worker
+    cmds:
+      - npx wrangler dev
+
+  worker:check:
+    desc: Type-check + test
+    dir: worker
+    cmds:
+      - npx tsc --noEmit
+      - npx vitest run
+
+  worker:deploy:
+    desc: Deploy to Cloudflare
+    dir: worker
+    cmds:
+      - npx wrangler deploy
+
+  worker:verify:
+    desc: Smoke test live endpoints
+    cmds:
+      - |
+        echo "=== auth.notme.bot ==="
+        curl -sf https://auth.notme.bot/ | grep -q "identity authority" && echo "✓ landing" || echo "✗ landing"
+        curl -sf https://auth.notme.bot/login | grep -q "passkey" && echo "✓ login" || echo "✗ login"
+        curl -sf https://auth.notme.bot/.well-known/signet-authority.json | grep -q "issuer" && echo "✓ discovery" || echo "✗ discovery"
+        curl -sf https://auth.notme.bot/.well-known/ca-bundle.pem | grep -q "PUBLIC KEY" && echo "✓ ca-bundle" || echo "✗ ca-bundle"
+        curl -sf https://auth.notme.bot/api/docs | grep -q "auth.notme.bot" && echo "✓ api-docs" || echo "✗ api-docs"
+        curl -sf https://auth.notme.bot/auth/passkey/status | grep -q "rpId" && echo "✓ passkey-status" || echo "✗ passkey-status"
+        echo "=== notme.bot ==="
+        curl -sf https://notme.bot/ | grep -q "notme" && echo "✓ homepage" || echo "✗ homepage"
+        curl -sf https://notme.bot/apas | grep -q "APAS" && echo "✓ apas" || echo "✗ apas"
+
+  ship:
+    desc: "Golden path: check → deploy → verify"
+    cmds:
+      - task: worker:check
+      - task: worker:deploy
+      - task: worker:verify

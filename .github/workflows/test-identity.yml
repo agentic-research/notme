@@ -1,0 +1,10 @@
+name: Test Identity Exchange
+on:
+  workflow_dispatch:
+
+jobs:
+  identity:
+    uses: ./.github/workflows/gha-identity.yml
+    permissions:
+      id-token: write
+      contents: read
