@@ -209,7 +209,7 @@ a:hover {
   );
   z-index: 9995;
   pointer-events: none;
-  animation: scanline-pass 8s linear infinite;
+  animation: scanline-pass 30s linear infinite;
 }
 
 /* Static overlay — flickers intermittently */

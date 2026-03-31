@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pretext phosphor playground — notme.bot</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@300;400;500&display=swap");
+
+      :root {
+        --paper: #1c1810;
+        --ink: #e8dcc8;
+        --ink-2: #c8b8a0;
+        --ink-3: #988870;
+        --cyan: #00d4e8;
+        --yellow: #f0d040;
+        --red: #e04030;
+      }
+
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: "DM Mono", monospace;
+        line-height: 1.8;
+        overflow-x: hidden;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .page {
+        position: relative;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 40px 28px;
+      }
+
+      h1 {
+        font-family: "Syne", sans-serif;
+        font-size: clamp(2.4rem, 6vw, 4rem);
+        font-weight: 800;
+        letter-spacing: -0.04em;
+        line-height: 1.2;
+        margin-bottom: 24px;
+      }
+
+      h1 .strike { text-decoration: line-through; text-decoration-color: var(--red); color: #706050; }
+      h1 .correction { color: var(--yellow); }
+
+      h2 {
+        font-family: "Syne", sans-serif;
+        font-size: 1.5rem;
+        font-weight: 800;
+        margin: 48px 0 16px;
+        color: var(--ink);
+      }
+
+      p {
+        font-size: 1rem;
+        color: var(--ink-2);
+        margin-bottom: 20px;
+        max-width: 600px;
+      }
+
+      .stat-row {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 24px;
+        margin: 32px 0;
+        padding: 32px 0;
+        border-top: 2px solid var(--ink);
+        border-bottom: 2px solid var(--ink);
+      }
+
+      .stat-num {
+        font-family: "Syne", sans-serif;
+        font-size: 2.5rem;
+        font-weight: 800;
+        line-height: 1;
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .stat-num.danger { color: var(--red); }
+      .stat-num.cyan { color: var(--cyan); }
+
+      .stat-label {
+        font-size: 0.75rem;
+        color: var(--ink-3);
+      }
+
+      .quote {
+        margin: 40px 0;
+        padding: 32px 0 32px 28px;
+        border-left: 4px solid var(--cyan);
+      }
+
+      .quote p {
+        font-family: "Syne", sans-serif;
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: var(--ink);
+        line-height: 1.5;
+      }
+
+      .mono-block {
+        font-size: 0.8125rem;
+        color: var(--ink-3);
+        margin: 32px 0;
+        line-height: 2;
+      }
+
+      #phosphor {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 9999;
+      }
+
+      .controls {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        background: #242018;
+        border: 1px solid #3a3428;
+        padding: 16px;
+        font-size: 0.75rem;
+        color: var(--ink-3);
+        z-index: 10000;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-width: 240px;
+      }
+
+      .controls label {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .controls input[type="range"] {
+        width: 120px;
+        accent-color: var(--cyan);
+      }
+
+      .controls .val {
+        font-family: "DM Mono", monospace;
+        color: var(--cyan);
+        min-width: 40px;
+        text-align: right;
+      }
+
+      .controls-title {
+        font-family: "Syne", sans-serif;
+        font-size: 0.625rem;
+        font-weight: 700;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        color: var(--yellow);
+        margin-bottom: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="phosphor"></canvas>
+
+    <div class="page">
+      <h1>
+        your agents<br>
+        are <span class="strike">you</span>
+        <span class="correction">not me</span>
+      </h1>
+
+      <p>
+        every commit, every API call, every push your AI agent makes
+        carries <strong>your identity</strong>. no separation. no scope.
+        no revocation. when it gets compromised, the attacker is you.
+      </p>
+
+      <p>
+        we're building the open-source identity layer so agents can be
+        themselves &mdash; short-lived, cryptographically distinct from
+        the humans who deploy them.
+      </p>
+
+      <div class="stat-row">
+        <div>
+          <span class="stat-num danger">9/10</span>
+          <span class="stat-label">AI tools use your creds</span>
+        </div>
+        <div>
+          <span class="stat-num danger">24</span>
+          <span class="stat-label">CVEs in AI IDEs</span>
+        </div>
+        <div>
+          <span class="stat-num cyan">5 min</span>
+          <span class="stat-label">ephemeral cert TTL</span>
+        </div>
+      </div>
+
+      <h2>the thesis</h2>
+
+      <div class="quote">
+        <p>
+          agents aren't users &mdash; they're machines. they need
+          machine identity, not hacked human identity.
+        </p>
+      </div>
+
+      <h2>proof-of-possession</h2>
+
+      <p>
+        stolen cert without the key is useless. stolen key expires in
+        5 minutes. there is no lateral movement, no privilege escalation,
+        no persistence. the blast radius is one task.
+      </p>
+
+      <div class="mono-block">
+        CN=signet-authority,O=notme<br>
+        epoch:3 seqno:1847 keyId:a8f3e201<br>
+        sha256:e3b0c44298fc1c149afb...<br>
+        Ed25519 CA:TRUE pathlen:0<br>
+        bridgeCert authorityManage certMint<br>
+        ttl:300s scope:agent revocable:true<br>
+        proof-of-possession != bearer<br>
+      </div>
+
+      <h2>before &amp; after</h2>
+
+      <p>
+        today: your GitHub PAT, all your repos, until you rotate,
+        the attacker is you. with notme: agent's own cert, per-repo scope,
+        5-minute lifetime, near-real-time revocation, not me.
+      </p>
+
+      <p style="color: var(--ink-3); font-size: 0.75rem; margin-top: 60px;">
+        scroll to see the phosphor sweep illuminate text as it passes.
+        use the controls to tune parameters.
+      </p>
+    </div>
+
+    <script type="module">
+      import { prepare, layout, prepareWithSegments, layoutWithLines } from 'https://esm.sh/@chenglou/pretext@0.0.3';
+
+      const canvas = document.getElementById('phosphor');
+      const ctx = canvas.getContext('2d');
+
+      // ── Tunable parameters ──
+      const params = {
+        speed: 0.3,
+        glowRadius: 100,
+        glowIntensity: 1.0,
+        lineOpacity: 0.15,
+        lineHeight: 2,
+      };
+
+      // ── Measure character positions using Pretext ──
+      // Pretext does line-breaking; we use a hidden canvas for per-char x offsets.
+      const measureCanvas = document.createElement('canvas').getContext('2d');
+
+      function getTextRects() {
+        const rects = [];
+        const elements = document.querySelectorAll(
+          '.page h1, .page h2, .page p, .page .stat-num, .page .stat-label, ' +
+          '.page .quote p, .page .mono-block, .page strong'
+        );
+
+        for (const el of elements) {
+          const style = getComputedStyle(el);
+          const font = style.fontWeight + ' ' + style.fontSize + ' ' + style.fontFamily;
+          const color = style.color;
+          const text = el.textContent || '';
+          if (!text.trim()) continue;
+
+          const elRect = el.getBoundingClientRect();
+          const maxWidth = elRect.width;
+          if (maxWidth <= 0) continue;
+
+          const fontSize = parseFloat(style.fontSize);
+          const lh = parseFloat(style.lineHeight) || fontSize * 1.8;
+
+          try {
+            // Pretext handles line-breaking (bidi, hyphen, CJK-aware)
+            const prepared = prepareWithSegments(text, font);
+            const result = layoutWithLines(prepared, maxWidth, lh);
+
+            // canvas.measureText for per-character x positions within each line
+            measureCanvas.font = font;
+
+            let lineY = 0;
+            for (const line of result.lines) {
+              const lineText = line.text;
+              if (!lineText || !lineText.trim()) {
+                lineY += lh;
+                continue;
+              }
+
+              for (let ci = 0; ci < lineText.length; ci++) {
+                const ch = lineText[ci];
+                if (ch === ' ' || ch === '\t' || ch === '\n') continue;
+
+                const prefix = lineText.slice(0, ci);
+                const charX = measureCanvas.measureText(prefix).width;
+                const charW = measureCanvas.measureText(ch).width;
+
+                rects.push({
+                  x: elRect.left + charX,
+                  pageY: elRect.top + window.scrollY + lineY,
+                  charW: charW,
+                  charH: fontSize,
+                  char: ch,
+                  font: font,
+                  color: color,
+                });
+              }
+              lineY += lh;
+            }
+          } catch (e) {
+            // Fallback: block-level glow
+            rects.push({
+              x: elRect.left,
+              pageY: elRect.top + window.scrollY,
+              width: elRect.width,
+              height: elRect.height,
+              isBlock: true,
+              color: color,
+            });
+          }
+        }
+        return rects;
+      }
+
+      // ── Canvas sizing ──
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = window.innerWidth * dpr;
+        canvas.height = window.innerHeight * dpr;
+        canvas.style.width = window.innerWidth + 'px';
+        canvas.style.height = window.innerHeight + 'px';
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      // ── Main loop ──
+      let scanY = 0;
+      let textRects = [];
+      let lastMeasure = 0;
+
+      function draw() {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const scrollTop = window.scrollY;
+
+        ctx.clearRect(0, 0, w, h);
+
+        // Re-measure periodically (handles scroll/resize shifts)
+        const now = performance.now();
+        if (now - lastMeasure > 2000) {
+          textRects = getTextRects();
+          lastMeasure = now;
+        }
+
+        // Advance scanline in page coordinates
+        scanY += params.speed;
+        const pageHeight = document.documentElement.scrollHeight;
+        if (scanY > pageHeight) scanY = 0;
+
+        const scanViewY = scanY - scrollTop;
+
+        // Glow band — text near the scanline gets a soft cyan halo
+        // We draw one wide gradient band, then boost characters within it
+        if (scanViewY > -params.glowRadius && scanViewY < h + params.glowRadius) {
+          // Per-character cyan rectangles within the glow band
+          for (const rect of textRects) {
+            const viewY = rect.pageY - scrollTop;
+            if (viewY < scanViewY - params.glowRadius || viewY > scanViewY + params.glowRadius) continue;
+
+            const dist = Math.abs(rect.pageY - scanY);
+            const intensity = (1 - dist / params.glowRadius) * params.glowIntensity;
+            if (intensity <= 0) continue;
+
+            if (rect.isBlock) {
+              ctx.fillStyle = 'rgba(0, 212, 232, ' + (intensity * 0.15) + ')';
+              ctx.fillRect(rect.x, viewY, rect.width, rect.height);
+            } else {
+              ctx.fillStyle = 'rgba(0, 212, 232, ' + (intensity * 0.35) + ')';
+              ctx.fillRect(rect.x, viewY, rect.charW, rect.charH);
+            }
+          }
+
+          // Scanline core — bright thin line
+          ctx.fillStyle = 'rgba(0, 212, 232, ' + params.lineOpacity + ')';
+          ctx.fillRect(0, scanViewY, w, params.lineHeight);
+        }
+
+        requestAnimationFrame(draw);
+      }
+
+      // ── Controls ──
+      function buildControls() {
+        const div = document.createElement('div');
+        div.className = 'controls';
+
+        const title = document.createElement('div');
+        title.className = 'controls-title';
+        title.textContent = 'phosphor tuning';
+        div.appendChild(title);
+
+        const sliders = [
+          ['speed', 0.05, 2, 0.05, 'px/f'],
+          ['glowRadius', 20, 200, 5, 'px'],
+          ['glowIntensity', 0.1, 1, 0.05, ''],
+          ['lineOpacity', 0.01, 0.15, 0.005, ''],
+          ['lineHeight', 1, 6, 0.5, 'px'],
+        ];
+
+        for (const [key, min, max, step, unit] of sliders) {
+          const label = document.createElement('label');
+
+          const name = document.createTextNode(key + ' ');
+          label.appendChild(name);
+
+          const input = document.createElement('input');
+          input.type = 'range';
+          input.min = min;
+          input.max = max;
+          input.step = step;
+          input.value = params[key];
+          label.appendChild(input);
+
+          const val = document.createElement('span');
+          val.className = 'val';
+          val.textContent = params[key] + unit;
+          label.appendChild(val);
+
+          input.addEventListener('input', function() {
+            params[key] = parseFloat(input.value);
+            val.textContent = params[key].toFixed(step < 0.1 ? 2 : 1) + unit;
+          });
+
+          div.appendChild(label);
+        }
+
+        document.body.appendChild(div);
+      }
+
+      // ── Boot ──
+      resize();
+      window.addEventListener('resize', resize);
+      textRects = getTextRects();
+      lastMeasure = performance.now();
+      buildControls();
+      draw();
+    </script>
+  </body>
+</html>

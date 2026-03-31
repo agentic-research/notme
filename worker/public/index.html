@@ -247,7 +247,7 @@
         );
         z-index: 9995;
         pointer-events: none;
-        animation: scanline-pass 8s linear infinite;
+        animation: scanline-pass 30s linear infinite;
       }
 
       /* Static overlay — flickers intermittently */
@@ -707,8 +707,7 @@
   </head>
   <body>
     <div class="grain"></div>
-    <!-- scanline moved to canvas (pretext-fx.js) — reveals data stream as it passes -->
-    <noscript><div class="scanline"></div></noscript>
+    <div class="scanline"></div>
     <div class="static-overlay"></div>
 
     <div class="page">
@@ -902,6 +901,5 @@
     </div>
 
     <script src="nav.js" defer></script>
-    <script src="pretext-fx.js" defer></script>
   </body>
 </html>
