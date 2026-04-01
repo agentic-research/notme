@@ -40,6 +40,10 @@
 # Worker lockfile
 !worker/package-lock.json
 
+# Scripts (doc-check, etc.)
+!scripts/
+!scripts/**
+
 # Design docs
 !docs/
 !docs/**

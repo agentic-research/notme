@@ -1,3 +1,8 @@
+<!--
+@doc-check
+@types: CABundle, BridgeCertResult, CertScope
+@endpoints: POST /cert, POST /cert/gha, GET /me, POST /invites, GET /.well-known/signet-authority.json, GET /.well-known/ca-bundle.pem, GET /api/docs
+-->
 # notme
 
 your agents are you. they shouldn't be.

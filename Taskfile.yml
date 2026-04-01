@@ -70,10 +70,16 @@ tasks:
         curl -sf https://notme.bot/ | grep -q "notme" && echo "✓ homepage" || echo "✗ homepage"
         curl -sf https://notme.bot/apas | grep -q "APAS" && echo "✓ apas" || echo "✗ apas"
 
+  docs:check:
+    desc: Verify doc claims against code
+    cmds:
+      - npx tsx scripts/doc-check.ts --skip-external
+
   ship:
-    desc: "Golden path: install → check → deploy → verify"
+    desc: "Golden path: install → check → docs → deploy → verify"
     cmds:
       - task: worker:install
       - task: worker:check
+      - task: docs:check
       - task: worker:deploy
       - task: worker:verify

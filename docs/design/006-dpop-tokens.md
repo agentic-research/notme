@@ -1,3 +1,8 @@
+<!--
+@doc-check
+@types: CertScope
+@endpoints: POST /token, GET /.well-known/jwks.json, GET /.well-known/signet-authority.json
+-->
 # ADR-006: DPoP Sender-Constrained Tokens
 
 **Status:** Accepted
