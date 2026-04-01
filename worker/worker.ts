@@ -322,6 +322,257 @@ function parseCookie(cookieHeader: string, name: string): string | null {
   return match ? match.slice(name.length + 1) : null;
 }
 
+// ── GET /authorize — inline HTML page for cross-origin DPoP token issuance ──
+//
+// Browser generates ephemeral ECDSA P-256 keypair, builds a DPoP proof,
+// POSTs to /token (same origin — cookie sent automatically), then redirects
+// back to the caller with ?token=<jwt>&state=<state>.
+//
+// All params are injected via data attributes on a hidden div — no inline
+// script variables, no eval. The JS reads them via dataset.
+
+function authorizePageHtml(redirectUri: string, audience: string, state: string): string {
+  // HTML-escape to prevent injection via query params
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+     .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>authorize — auth.notme.bot</title>
+  <link rel="icon" href="https://notme.bot/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@700;800&display=swap">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1c1810;
+      color: #e8dcc8;
+      font-family: 'DM Mono', monospace;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 40px 20px;
+    }
+    .term-window {
+      max-width: 520px;
+      width: 100%;
+      background: rgba(28, 24, 16, 0.9);
+      backdrop-filter: blur(12px);
+      padding: 32px;
+      border: 1px solid #3a3428;
+    }
+    .term-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #3a3428;
+    }
+    .term-dots { display: flex; gap: 6px; }
+    .term-dots span { width: 6px; height: 6px; border-radius: 50%; }
+    .term-dots span:nth-child(1) { background: #e04030; opacity: 0.6; }
+    .term-dots span:nth-child(2) { background: #f0d040; opacity: 0.6; }
+    .term-dots span:nth-child(3) { background: #48c868; opacity: 0.6; }
+    .term-title {
+      font-size: 0.5625rem;
+      color: #706050;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      margin-left: auto;
+    }
+    .term-output { min-height: 60px; margin-bottom: 16px; }
+    .term-line {
+      font-size: 0.8125rem;
+      line-height: 1.8;
+      white-space: pre-wrap;
+    }
+    .term-line.dim { color: #706050; }
+    .term-line.info { color: #988870; }
+    .term-line.ok { color: #48c868; }
+    .term-line.err { color: #e04030; }
+    .term-line .hl { color: #f0d040; }
+    .term-line .cyn { color: #00d4e8; }
+    .spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #706050;
+      border-top-color: #f0d040;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      vertical-align: middle;
+      margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .term-footer {
+      margin-top: 24px;
+      text-align: center;
+      font-size: 0.5625rem;
+      color: #706050;
+    }
+    .term-footer a {
+      color: #988870;
+      text-decoration: none;
+      border-bottom: 1px dotted #988870;
+    }
+    .term-footer a:hover { color: #00d4e8; border-color: #00d4e8; }
+  </style>
+</head>
+<body>
+
+<div id="params"
+  data-redirect-uri="${esc(redirectUri)}"
+  data-audience="${esc(audience)}"
+  data-state="${esc(state)}"
+  style="display:none"></div>
+
+<div class="term-window">
+  <div class="term-header">
+    <div class="term-dots"><span></span><span></span><span></span></div>
+    <span class="term-title">auth.notme.bot/authorize</span>
+  </div>
+
+  <div class="term-output" id="output">
+    <div class="term-line dim">notme — token issuance</div>
+    <div class="term-line dim">&nbsp;</div>
+    <div class="term-line info"><span class="spinner"></span>generating keypair + requesting token...</div>
+  </div>
+
+  <div id="statusLine" class="term-line dim">&nbsp;</div>
+
+  <div class="term-footer">
+    <a href="/">&#8592; back to authority</a>
+  </div>
+</div>
+
+<script>
+(function() {
+  var el = document.getElementById('params');
+  var redirectUri = el.getAttribute('data-redirect-uri');
+  var audience = el.getAttribute('data-audience');
+  var state = el.getAttribute('data-state');
+  var output = document.getElementById('output');
+  var statusLine = document.getElementById('statusLine');
+
+  function addLine(text, cls) {
+    var line = document.createElement('div');
+    line.className = 'term-line ' + (cls || 'dim');
+    line.textContent = text;
+    output.appendChild(line);
+  }
+
+  function setStatus(text, cls) {
+    statusLine.textContent = text;
+    statusLine.className = 'term-line ' + (cls || 'dim');
+  }
+
+  // Base64url helpers (no padding)
+  function bufToB64url(buf) {
+    var a = new Uint8Array(buf);
+    var s = '';
+    for (var i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+    return btoa(s).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+  }
+
+  // Build a minimal DPoP proof JWT
+  async function buildDpopProof(privateKey, publicJwk) {
+    // Header
+    var header = { typ: 'dpop+jwt', alg: 'ES256', jwk: publicJwk };
+    var headerB64 = bufToB64url(new TextEncoder().encode(JSON.stringify(header)));
+
+    // Payload
+    var payload = {
+      jti: crypto.randomUUID(),
+      htm: 'POST',
+      htu: 'https://auth.notme.bot/token',
+      iat: Math.floor(Date.now() / 1000)
+    };
+    var payloadB64 = bufToB64url(new TextEncoder().encode(JSON.stringify(payload)));
+
+    // Sign
+    var sigInput = new TextEncoder().encode(headerB64 + '.' + payloadB64);
+    var rawSig = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      privateKey,
+      sigInput
+    );
+
+    // ECDSA raw signature (r||s, 64 bytes) — already correct for ES256 JWS
+    return headerB64 + '.' + payloadB64 + '.' + bufToB64url(rawSig);
+  }
+
+  async function run() {
+    try {
+      // 1. Generate ephemeral ECDSA P-256 keypair (private key NOT extractable)
+      var kp = await crypto.subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        false,
+        ['sign']
+      );
+
+      // 2. Export public key as JWK (for the DPoP proof header)
+      var pubJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
+      // Strip private fields just in case (only kty, crv, x, y needed)
+      var publicJwk = { kty: pubJwk.kty, crv: pubJwk.crv, x: pubJwk.x, y: pubJwk.y };
+
+      addLine('keypair generated (P-256, non-extractable)', 'dim');
+
+      // 3. Build DPoP proof JWT
+      var proof = await buildDpopProof(kp.privateKey, publicJwk);
+      addLine('dpop proof signed', 'dim');
+
+      // 4. POST to /token (same origin — cookie sent automatically)
+      addLine('requesting access token...', 'info');
+      var res = await fetch('/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'DPoP': proof
+        },
+        body: JSON.stringify({ audience: audience }),
+        credentials: 'same-origin'
+      });
+
+      if (!res.ok) {
+        var err;
+        try { err = (await res.json()).error; } catch(e) { err = res.statusText; }
+        throw new Error(err || 'token request failed (' + res.status + ')');
+      }
+
+      var data = await res.json();
+      var token = data.access_token;
+      if (!token) throw new Error('no access_token in response');
+
+      addLine('token issued (DPoP, 5min TTL)', 'ok');
+
+      // 5. Redirect back to caller with token + state
+      var sep = redirectUri.indexOf('?') === -1 ? '?' : '&';
+      var dest = redirectUri + sep + 'token=' + encodeURIComponent(token);
+      if (state) dest += '&state=' + encodeURIComponent(state);
+
+      setStatus('redirecting to ' + new URL(redirectUri).hostname + '...', 'ok');
+      setTimeout(function() { window.location.href = dest; }, 600);
+
+    } catch(e) {
+      setStatus('error: ' + e.message, 'err');
+      addLine('', 'dim');
+      addLine('token issuance failed. try signing in again.', 'info');
+    }
+  }
+
+  run();
+})();
+</script>
+</body>
+</html>`;
+}
+
 const SPEC_URL =
   "https://github.com/agentic-research/signet/blob/main/docs/apas/agent-provenance-standard.md";
 const IMPL_URL =
@@ -979,6 +1230,72 @@ export default {
       // POST /cert/gha — GHA OIDC JWT → bridge cert (legacy, kept for compat)
       if (pathname === "/cert/gha") {
         return handleCertGHA(request, env);
+      }
+
+      // GET /authorize — OAuth-style redirect for cross-origin DPoP token issuance
+      if (pathname === "/authorize" && request.method === "GET") {
+        const url = new URL(request.url);
+        const redirectUri = url.searchParams.get("redirect_uri") || "";
+        const audience = url.searchParams.get("audience") || "https://rosary.bot";
+        const state = url.searchParams.get("state") || "";
+
+        // Validate redirect_uri
+        if (!redirectUri) {
+          return jsonErr("redirect_uri required", 400);
+        }
+        let parsed: URL;
+        try {
+          parsed = new URL(redirectUri);
+        } catch {
+          return jsonErr("invalid redirect_uri", 400);
+        }
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+          return jsonErr("redirect_uri must be https", 400);
+        }
+        // Allow: *.rosary.bot, *.notme.bot, localhost (dev)
+        const host = parsed.hostname;
+        const allowed =
+          host === "localhost" ||
+          host === "rosary.bot" ||
+          host.endsWith(".rosary.bot") ||
+          host === "notme.bot" ||
+          host.endsWith(".notme.bot");
+        if (!allowed) {
+          return jsonErr("redirect_uri not on allowed domain", 403);
+        }
+
+        // Check session
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        if (!cookie) {
+          // No session — redirect to login, then come back
+          const returnTo = `/authorize?${url.searchParams.toString()}`;
+          return Response.redirect(
+            `https://auth.notme.bot/login?return_to=${encodeURIComponent(returnTo)}`,
+            302,
+          );
+        }
+
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const sessionSecret = await authority.getSessionSecret();
+        const session = await verifySessionCookie(cookie, sessionSecret);
+        if (!session) {
+          const returnTo = `/authorize?${url.searchParams.toString()}`;
+          return Response.redirect(
+            `https://auth.notme.bot/login?return_to=${encodeURIComponent(returnTo)}`,
+            302,
+          );
+        }
+
+        // Session valid — serve the authorize page
+        // Params are injected into a data attribute and read by JS (no inline eval)
+        return new Response(authorizePageHtml(redirectUri, audience, state), {
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        });
       }
 
       // POST /token — DPoP sender-constrained access token (RFC 9449)

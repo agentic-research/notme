@@ -198,8 +198,14 @@ function setStatus(text, cls) {
   statusLine.className = 'term-line ' + (cls || 'dim');
 }
 
+// Return-to URL after auth (used by /authorize redirect flow)
+var urlParams = new URLSearchParams(window.location.search);
+var returnTo = urlParams.get('return_to') || '/me';
+// Safety: only allow same-origin paths (no open redirect)
+if (returnTo.indexOf('/') !== 0 || returnTo.indexOf('//') === 0) returnTo = '/me';
+
 // Check for invite token in URL
-var inviteToken = new URLSearchParams(window.location.search).get('t');
+var inviteToken = urlParams.get('t');
 if (inviteToken) {
   addLine('invite token detected.', 'info');
   addLine('register a passkey or paste an oidc token to join.', 'dim');
@@ -252,7 +258,7 @@ async function loginPasskey() {
     }
 
     setStatus('authenticated — redirecting...', 'ok');
-    setTimeout(function() { window.location.href = '/me'; }, 800);
+    setTimeout(function() { window.location.href = returnTo; }, 800);
   } catch(e) {
     if (e.name === 'NotAllowedError') { setStatus('cancelled', 'dim'); return; }
     setStatus(e.message, 'err');
@@ -328,7 +334,7 @@ async function registerPasskey() {
 
     if (!verifyRes.ok) throw new Error((await verifyRes.json()).error || 'registration failed');
     setStatus('registered — redirecting...', 'ok');
-    setTimeout(function() { window.location.href = '/me'; }, 800);
+    setTimeout(function() { window.location.href = returnTo; }, 800);
   } catch(e) {
     if (e.name === 'NotAllowedError') { setStatus('cancelled', 'dim'); return; }
     setStatus(e.message, 'err');
@@ -359,7 +365,7 @@ async function submitToken() {
       });
       if (joinRes.ok) {
         setStatus('joined — redirecting...', 'ok');
-        setTimeout(function() { window.location.href = '/me'; }, 800);
+        setTimeout(function() { window.location.href = returnTo; }, 800);
         return;
       }
     } catch(e) {}
@@ -378,7 +384,7 @@ async function submitToken() {
       catch(e) { throw new Error(text.slice(0, 200)); }
     }
     setStatus('authenticated — redirecting...', 'ok');
-    setTimeout(function() { window.location.href = '/me'; }, 800);
+    setTimeout(function() { window.location.href = returnTo; }, 800);
   } catch(e) {
     setStatus(e.message, 'err');
   }
