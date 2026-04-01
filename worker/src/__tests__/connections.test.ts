@@ -140,7 +140,7 @@ describe("connections.lookup", () => {
       providerSubject: "alice",
     });
 
-    const result = await findByProvider(mockSql, "github", "jamestexas");
+    const result = await findByProvider(mockSql, "github", "alice");
     expect(result).not.toBeNull();
     expect(result!.credentialId).toBe("passkey-abc");
   });

@@ -981,6 +981,86 @@ export default {
         return handleCertGHA(request, env);
       }
 
+      // POST /token — DPoP sender-constrained access token (RFC 9449)
+      if (pathname === "/token" && request.method === "POST") {
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+
+        // Parse session
+        let session = null;
+        if (cookie) {
+          const { verifySessionCookie } = await import("./src/auth/session");
+          const sessionSecret = await authority.getSessionSecret();
+          session = await verifySessionCookie(cookie, sessionSecret);
+        }
+
+        // Parse body for audience
+        let audience = "";
+        try {
+          const body = await request.json() as { audience?: string };
+          audience = body.audience || "";
+        } catch { /* empty body */ }
+
+        const dpopProof = request.headers.get("DPoP");
+
+        const { handleToken } = await import("./src/auth/dpop-handler");
+        const { signingKey, keyId } = await authority.getOrCreateSigningKey();
+
+        const result = await handleToken({
+          dpopProof,
+          session,
+          audience,
+          signingKey,
+          keyId,
+          checkJtiReplay: async (jti: string) => {
+            const key = `dpop:jti:${jti}`;
+            const seen = await env.CA_BUNDLE_CACHE.get(key);
+            return seen !== null;
+          },
+          storeJti: async (jti: string) => {
+            const key = `dpop:jti:${jti}`;
+            await env.CA_BUNDLE_CACHE.put(key, "1", { expirationTtl: 600 });
+          },
+        });
+
+        if (!result.ok) {
+          return Response.json(
+            { error: result.error },
+            { status: result.status },
+          );
+        }
+        return Response.json({
+          access_token: result.accessToken,
+          token_type: result.tokenType,
+          expires_in: result.expiresIn,
+        });
+      }
+
+      // GET /.well-known/jwks.json — Ed25519 public key for token verification
+      if (pathname === "/.well-known/jwks.json") {
+        const cached = await cacheMatch(request);
+        if (cached) return cached;
+        try {
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const jwk = await authority.getPublicKeyJwk();
+          const { buildJwksResponse } = await import("./src/auth/dpop-handler");
+          const resp = Response.json(buildJwksResponse(jwk), {
+            headers: {
+              "Cache-Control": "public, max-age=3600",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+          return cachePut(request, resp);
+        } catch {
+          return jsonErr("authority unavailable", 503);
+        }
+      }
+
       // Authority discovery — signet equivalent of openid-configuration.
       // signet CONSUMES OIDC tokens; it does not issue them.
       if (pathname === "/.well-known/signet-authority.json") {
@@ -998,8 +1078,12 @@ export default {
               "oidc_token_exchange",
               "github_actions_oidc",
               "github_pat",
+              "dpop",
             ],
             cert_types_supported: ["bridge_certificate"],
+            token_endpoint: `${authorityUrl}/token`,
+            jwks_uri: `${authorityUrl}/.well-known/jwks.json`,
+            dpop_signing_alg_values_supported: ["ES256"],
             documentation: `${siteUrl}/architecture`,
           },
           {
