@@ -62,3 +62,4 @@ worker/wrangler.toml
 .DS_Store
 node_modules/
 dist/
+_agent_log/
