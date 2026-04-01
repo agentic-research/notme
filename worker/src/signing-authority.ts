@@ -13,6 +13,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
+import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 import type { CABundle } from "./revocation";
 
 interface SigningAuthorityEnv {
@@ -182,6 +183,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const b64 = btoa(String.fromCharCode(...new Uint8Array(spki)));
     const lines = b64.match(/.{1,64}/g)!;
     return `-----BEGIN PUBLIC KEY-----\n${lines.join("\n")}\n-----END PUBLIC KEY-----\n`;
+  }
+
+  // Return the authority's public key as JWK (for /.well-known/jwks.json).
+  async getPublicKeyJwk(): Promise<{
+    kty: string;
+    crv: string;
+    x: string;
+    kid: string;
+    use: string;
+    alg: string;
+  }> {
+    const { verifyKey, keyId } = await this.getOrCreateSigningKey();
+    const raw = (await crypto.subtle.exportKey(
+      "raw",
+      verifyKey,
+    )) as ArrayBuffer;
+    const x = encodeBase64urlNoPadding(new Uint8Array(raw));
+    return { kty: "OKP", crv: "Ed25519", x, kid: keyId, use: "sig", alg: "EdDSA" };
   }
 
   // Self-signed X.509 CA certificate for CF mTLS trust store.
