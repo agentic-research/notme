@@ -49,26 +49,49 @@ tasks:
       - npx tsc --noEmit
       - npx vitest run
 
+  worker:deploy-preview:
+    desc: Upload new version without routing traffic to it
+    dir: worker
+    cmds:
+      - npx wrangler versions upload
+
   worker:deploy:
-    desc: Deploy to Cloudflare
+    desc: Deploy to production (use ship for the safe path)
     dir: worker
     cmds:
       - npx wrangler deploy
+
+  worker:rollback:
+    desc: Roll back to previous version
+    dir: worker
+    cmds:
+      - npx wrangler rollback
 
   worker:verify:
     desc: Smoke test live endpoints
     cmds:
       - |
+        FAIL=0
+        check() { curl -sf "$1" | grep -q "$2" && echo "✓ $3" || { echo "✗ $3"; FAIL=1; }; }
         echo "=== auth.notme.bot ==="
-        curl -sf https://auth.notme.bot/ | grep -q "identity authority" && echo "✓ landing" || echo "✗ landing"
-        curl -sf https://auth.notme.bot/login | grep -q "passkey" && echo "✓ login" || echo "✗ login"
-        curl -sf https://auth.notme.bot/.well-known/signet-authority.json | grep -q "issuer" && echo "✓ discovery" || echo "✗ discovery"
-        curl -sf https://auth.notme.bot/.well-known/ca-bundle.pem | grep -q "CERTIFICATE" && echo "✓ ca-bundle" || echo "✗ ca-bundle"
-        curl -sf https://auth.notme.bot/api/docs | grep -q "auth.notme.bot" && echo "✓ api-docs" || echo "✗ api-docs"
-        curl -sf https://auth.notme.bot/auth/passkey/status | grep -q "rpId" && echo "✓ passkey-status" || echo "✗ passkey-status"
+        check "https://auth.notme.bot/" "identity authority" "landing"
+        check "https://auth.notme.bot/login" "passkey" "login"
+        check "https://auth.notme.bot/.well-known/signet-authority.json" "issuer" "discovery"
+        check "https://auth.notme.bot/.well-known/ca-bundle.pem" "CERTIFICATE" "ca-bundle"
+        check "https://auth.notme.bot/.well-known/jwks.json" "Ed25519" "jwks"
+        check "https://auth.notme.bot/api/docs" "auth.notme.bot" "api-docs"
+        check "https://auth.notme.bot/auth/passkey/status" "rpId" "passkey-status"
+        # /authorize without params should 400 (missing redirect_uri), not 404
+        STATUS=$(curl -so /dev/null -w "%{http_code}" "https://auth.notme.bot/authorize")
+        [ "$STATUS" = "400" ] && echo "✓ authorize (400 without params)" || { echo "✗ authorize (got $STATUS)"; FAIL=1; }
+        # /token without DPoP should 400, not 500
+        STATUS=$(curl -so /dev/null -w "%{http_code}" -X POST "https://auth.notme.bot/token" -H "Content-Type: application/json" -d '{"audience":"https://test"}')
+        [ "$STATUS" = "400" ] && echo "✓ token (400 without DPoP)" || { echo "✗ token (got $STATUS)"; FAIL=1; }
         echo "=== notme.bot ==="
-        curl -sf https://notme.bot/ | grep -q "notme" && echo "✓ homepage" || echo "✗ homepage"
-        curl -sf https://notme.bot/apas | grep -q "APAS" && echo "✓ apas" || echo "✗ apas"
+        check "https://notme.bot/" "notme" "homepage"
+        check "https://notme.bot/apas" "APAS" "apas"
+        echo "---"
+        [ $FAIL -eq 0 ] && echo "All checks passed." || { echo "SOME CHECKS FAILED"; exit 1; }
 
   docs:check:
     desc: Verify doc claims against code
@@ -76,7 +99,20 @@ tasks:
       - npx tsx scripts/doc-check.ts --skip-external
 
   ship:
-    desc: "Golden path: install → check → docs → deploy → verify"
+    desc: "Safe path: install → check → docs → preview → verify instructions"
+    cmds:
+      - task: worker:install
+      - task: worker:check
+      - task: docs:check
+      - task: worker:deploy-preview
+      - echo ""
+      - echo "Preview version uploaded. To go live:"
+      - echo "  task worker:deploy      # route traffic to new version"
+      - echo "  task worker:verify      # smoke test"
+      - echo "  task worker:rollback    # if something breaks"
+
+  ship-prod:
+    desc: "Full send: install → check → docs → deploy → verify (rollback on failure)"
     cmds:
       - task: worker:install
       - task: worker:check
