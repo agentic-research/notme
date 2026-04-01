@@ -983,61 +983,70 @@ export default {
 
       // POST /token — DPoP sender-constrained access token (RFC 9449)
       if (pathname === "/token" && request.method === "POST") {
-        const cookie = parseCookie(
-          request.headers.get("cookie") || "",
-          "notme_session",
-        );
-        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        try {
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          const dpopProof = request.headers.get("DPoP");
 
-        // Parse session
-        let session = null;
-        if (cookie) {
+          // Fast-fail: no cookie = no session = 401
+          if (!cookie) {
+            return Response.json({ error: "session_required" }, { status: 401 });
+          }
+          // Fast-fail: no DPoP proof = 400
+          if (!dpopProof) {
+            return Response.json({ error: "dpop_proof_required" }, { status: 400 });
+          }
+
+          // Parse body for audience
+          let audience = "";
+          try {
+            const body = await request.json() as { audience?: string };
+            audience = body.audience || "";
+          } catch { /* empty body */ }
+
+          // Resolve session via DO
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
           const { verifySessionCookie } = await import("./src/auth/session");
           const sessionSecret = await authority.getSessionSecret();
-          session = await verifySessionCookie(cookie, sessionSecret);
+          const session = await verifySessionCookie(cookie, sessionSecret);
+
+          const { handleToken } = await import("./src/auth/dpop-handler");
+          const { signingKey, keyId } = await authority.getOrCreateSigningKey();
+
+          const result = await handleToken({
+            dpopProof,
+            session,
+            audience,
+            signingKey,
+            keyId,
+            checkJtiReplay: async (jti: string) => {
+              const key = `dpop:jti:${jti}`;
+              const seen = await env.CA_BUNDLE_CACHE.get(key);
+              return seen !== null;
+            },
+            storeJti: async (jti: string) => {
+              const key = `dpop:jti:${jti}`;
+              await env.CA_BUNDLE_CACHE.put(key, "1", { expirationTtl: 600 });
+            },
+          });
+
+          if (!result.ok) {
+            return Response.json(
+              { error: result.error },
+              { status: result.status },
+            );
+          }
+          return Response.json({
+            access_token: result.accessToken,
+            token_type: result.tokenType,
+            expires_in: result.expiresIn,
+          });
+        } catch (e: any) {
+          return jsonErr("token endpoint error: " + e.message, 500);
         }
-
-        // Parse body for audience
-        let audience = "";
-        try {
-          const body = await request.json() as { audience?: string };
-          audience = body.audience || "";
-        } catch { /* empty body */ }
-
-        const dpopProof = request.headers.get("DPoP");
-
-        const { handleToken } = await import("./src/auth/dpop-handler");
-        const { signingKey, keyId } = await authority.getOrCreateSigningKey();
-
-        const result = await handleToken({
-          dpopProof,
-          session,
-          audience,
-          signingKey,
-          keyId,
-          checkJtiReplay: async (jti: string) => {
-            const key = `dpop:jti:${jti}`;
-            const seen = await env.CA_BUNDLE_CACHE.get(key);
-            return seen !== null;
-          },
-          storeJti: async (jti: string) => {
-            const key = `dpop:jti:${jti}`;
-            await env.CA_BUNDLE_CACHE.put(key, "1", { expirationTtl: 600 });
-          },
-        });
-
-        if (!result.ok) {
-          return Response.json(
-            { error: result.error },
-            { status: result.status },
-          );
-        }
-        return Response.json({
-          access_token: result.accessToken,
-          token_type: result.tokenType,
-          expires_in: result.expiresIn,
-        });
       }
 
       // GET /.well-known/jwks.json — Ed25519 public key for token verification
