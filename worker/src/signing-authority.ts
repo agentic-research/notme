@@ -276,6 +276,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return crypto.subtle.sign("Ed25519" as any, signingKey, data);
   }
 
+  // Mint a DPoP-bound access token inside the DO — CryptoKey never crosses RPC.
+  async mintDPoPToken(params: {
+    sub: string;
+    scope: string;
+    audience: string;
+    jkt: string; // JWK thumbprint of the DPoP proof key
+  }): Promise<string> {
+    const { signingKey, keyId } = await this.getOrCreateSigningKey();
+    const { mintAccessToken } = await import("./auth/token");
+    return mintAccessToken({
+      sub: params.sub,
+      scope: params.scope,
+      audience: params.audience,
+      jkt: params.jkt,
+      signingKey,
+      keyId,
+    });
+  }
+
   // Mint a bridge cert inside the DO — CryptoKey never crosses the RPC boundary.
   async mintBridgeCert(
     subject: string,

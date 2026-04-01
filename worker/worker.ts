@@ -1330,36 +1330,46 @@ export default {
           const sessionSecret = await authority.getSessionSecret();
           const session = await verifySessionCookie(cookie, sessionSecret);
 
-          const { handleToken } = await import("./src/auth/dpop-handler");
-          const { signingKey, keyId } = await authority.getOrCreateSigningKey();
+          // Validate DPoP proof (runs in Worker — no CryptoKey needed)
+          if (!dpopProof) {
+            return Response.json({ error: "dpop_proof_required" }, { status: 400 });
+          }
+          if (!session) {
+            return Response.json({ error: "session_required" }, { status: 401 });
+          }
 
-          const result = await handleToken({
-            dpopProof,
-            session,
+          const { validateDpopProof } = await import("./src/auth/dpop");
+          let proofResult;
+          try {
+            proofResult = await validateDpopProof(dpopProof, {
+              htm: "POST",
+              htu: "https://auth.notme.bot/token",
+            });
+          } catch {
+            return Response.json({ error: "invalid_dpop_proof" }, { status: 401 });
+          }
+
+          // JTI replay check
+          const jtiKey = `dpop:jti:${proofResult.jti}`;
+          if (await env.CA_BUNDLE_CACHE.get(jtiKey)) {
+            return Response.json({ error: "proof_reused" }, { status: 401 });
+          }
+
+          // Mint token inside DO — CryptoKey never crosses RPC boundary
+          const accessToken = await authority.mintDPoPToken({
+            sub: session.principalId,
+            scope: session.scopes.join(" "),
             audience,
-            signingKey,
-            keyId,
-            checkJtiReplay: async (jti: string) => {
-              const key = `dpop:jti:${jti}`;
-              const seen = await env.CA_BUNDLE_CACHE.get(key);
-              return seen !== null;
-            },
-            storeJti: async (jti: string) => {
-              const key = `dpop:jti:${jti}`;
-              await env.CA_BUNDLE_CACHE.put(key, "1", { expirationTtl: 600 });
-            },
+            jkt: proofResult.thumbprint,
           });
 
-          if (!result.ok) {
-            return Response.json(
-              { error: result.error },
-              { status: result.status },
-            );
-          }
+          // Store JTI after successful mint
+          await env.CA_BUNDLE_CACHE.put(jtiKey, "1", { expirationTtl: 600 });
+
           return Response.json({
-            access_token: result.accessToken,
-            token_type: result.tokenType,
-            expires_in: result.expiresIn,
+            access_token: accessToken,
+            token_type: "DPoP",
+            expires_in: 300,
           });
         } catch (e: any) {
           return jsonErr("token endpoint error: " + e.message, 500);
