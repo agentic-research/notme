@@ -497,7 +497,7 @@ function authorizePageHtml(redirectUri: string, audience: string, state: string)
     var payload = {
       jti: crypto.randomUUID(),
       htm: 'POST',
-      htu: 'https://auth.notme.bot/token',
+      htu: window.location.origin + '/token',
       iat: Math.floor(Date.now() / 1000)
     };
     var payloadB64 = bufToB64url(new TextEncoder().encode(JSON.stringify(payload)));
@@ -865,6 +865,32 @@ async function cacheMatch(request: Request, vary?: string): Promise<Response | u
 
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
+    // ── CORS: handle preflight + restrict origins ──
+    const requestOrigin = request.headers.get("Origin") || "";
+    const CORS_ALLOWED_ORIGINS = new Set([
+      "https://rosary.bot",
+      "https://auth.rosary.bot",
+      "https://notme.bot",
+      "https://auth.notme.bot",
+      "https://mcp.rosary.bot",
+      "https://mache.rosary.bot",
+    ]);
+    // Allow localhost for dev
+    const corsAllowed = CORS_ALLOWED_ORIGINS.has(requestOrigin) ||
+      requestOrigin.startsWith("http://localhost:");
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": corsAllowed ? requestOrigin : "",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, DPoP",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
     const url = new URL(request.url);
     const pathname = url.pathname;
     const host = request.headers.get("host") || "";
@@ -898,7 +924,7 @@ export default {
           "notme_session",
         );
         if (!cookie) {
-          return Response.redirect("https://auth.notme.bot/login", 302);
+          return Response.redirect(`${siteUrl}/login`, 302);
         }
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
@@ -906,7 +932,7 @@ export default {
         const sessionSecret = await authority.getSessionSecret();
         const session = await verifySessionCookie(cookie, sessionSecret);
         if (!session) {
-          return Response.redirect("https://auth.notme.bot/login", 302);
+          return Response.redirect(`${siteUrl}/login`, 302);
         }
         if (wantsJson(request)) {
           return Response.json({
@@ -1296,7 +1322,7 @@ export default {
           // No session — redirect to login, then come back
           const returnTo = `/authorize?${url.searchParams.toString()}`;
           return Response.redirect(
-            `https://auth.notme.bot/login?return_to=${encodeURIComponent(returnTo)}`,
+            `${siteUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
             302,
           );
         }
@@ -1309,7 +1335,7 @@ export default {
         if (!session) {
           const returnTo = `/authorize?${url.searchParams.toString()}`;
           return Response.redirect(
-            `https://auth.notme.bot/login?return_to=${encodeURIComponent(returnTo)}`,
+            `${siteUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
             302,
           );
         }
