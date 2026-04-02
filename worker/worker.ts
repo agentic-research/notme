@@ -1299,18 +1299,11 @@ export default {
       }
 
       // POST /token — DPoP sender-constrained access token (RFC 9449)
+      // Identity: session cookie OR client cert PEM in X-Client-Cert header.
       if (pathname === "/token" && request.method === "POST") {
         try {
-          const cookie = parseCookie(
-            request.headers.get("cookie") || "",
-            "notme_session",
-          );
           const dpopProof = request.headers.get("DPoP");
 
-          // Fast-fail: no cookie = no session = 401
-          if (!cookie) {
-            return Response.json({ error: "session_required" }, { status: 401 });
-          }
           // Fast-fail: no DPoP proof = 400
           if (!dpopProof) {
             return Response.json({ error: "dpop_proof_required" }, { status: 400 });
@@ -1323,21 +1316,48 @@ export default {
             audience = body.audience || "";
           } catch { /* empty body */ }
 
-          // Resolve session via DO
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const { verifySessionCookie } = await import("./src/auth/session");
-          const sessionSecret = await authority.getSessionSecret();
-          const session = await verifySessionCookie(cookie, sessionSecret);
 
-          // Validate DPoP proof (runs in Worker — no CryptoKey needed)
-          if (!dpopProof) {
-            return Response.json({ error: "dpop_proof_required" }, { status: 400 });
+          // ── Resolve identity: session cookie OR client cert ──
+          let principalId: string | null = null;
+          let scopes: string[] = [];
+
+          // Try session cookie first (browser/passkey users)
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          if (cookie) {
+            const { verifySessionCookie } = await import("./src/auth/session");
+            const sessionSecret = await authority.getSessionSecret();
+            const session = await verifySessionCookie(cookie, sessionSecret);
+            if (session) {
+              principalId = session.principalId;
+              scopes = session.scopes;
+            }
           }
-          if (!session) {
+
+          // Fall back to client cert (agents with bridge certs)
+          if (!principalId) {
+            const certPem = request.headers.get("X-Client-Cert");
+            if (certPem) {
+              try {
+                const { verifyX509 } = await import("./src/auth/verify-proof");
+                const identity = await verifyX509(decodeURIComponent(certPem), "");
+                principalId = identity.subject;
+                scopes = await authority.getPrincipalScopes(principalId);
+              } catch {
+                return Response.json({ error: "invalid_client_cert" }, { status: 401 });
+              }
+            }
+          }
+
+          if (!principalId) {
             return Response.json({ error: "session_required" }, { status: 401 });
           }
 
+          // Validate DPoP proof
           const { validateDpopProof } = await import("./src/auth/dpop");
           let proofResult;
           try {
@@ -1357,8 +1377,8 @@ export default {
 
           // Mint token inside DO — CryptoKey never crosses RPC boundary
           const accessToken = await authority.mintDPoPToken({
-            sub: session.principalId,
-            scope: session.scopes.join(" "),
+            sub: principalId,
+            scope: scopes.join(" "),
             audience,
             jkt: proofResult.thumbprint,
           });
