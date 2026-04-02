@@ -240,13 +240,7 @@ export async function verifyAuthentication(
   }>;
 
   if (creds.length === 0) {
-    // Debug: list all credential IDs to find mismatch
-    const allCreds = sql
-      .exec("SELECT credential_id FROM passkey_credentials")
-      .toArray() as Array<{ credential_id: string }>;
-    console.error(
-      `[passkey] credential not found: looked for "${response.id}", have: ${JSON.stringify(allCreds.map((c) => c.credential_id))}`,
-    );
+    // Don't log credential IDs — leaks registered credential list to worker logs
     return { verified: false, userId: null, isAdmin: false };
   }
 

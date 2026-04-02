@@ -177,8 +177,11 @@ async function handlePasskey(
 
   const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
   const authority = env.SIGNING_AUTHORITY.get(authorityId);
-  const host = request.headers.get("host") || "auth.notme.bot";
-  const origin = `https://${host}`;
+  // Derive origin from SITE_URL (env), not from attacker-controlled Host header.
+  // Host header can be spoofed in non-CF environments (local dev, proxies).
+  const siteUrl = env.SIGNET_AUTHORITY_URL || env.SITE_URL || "https://auth.notme.bot";
+  const host = new URL(siteUrl).hostname;
+  const origin = siteUrl;
 
   try {
     if (pathname === "/auth/passkey/register/options") {
@@ -1329,12 +1332,25 @@ export default {
             return Response.json({ error: "dpop_proof_required" }, { status: 400 });
           }
 
-          // Parse body for audience
+          // Parse body for audience — validated against allowlist
           let audience = "";
           try {
             const body = await request.json() as { audience?: string };
             audience = body.audience || "";
           } catch { /* empty body */ }
+
+          // Audience allowlist — only issue tokens for known resource servers
+          const ALLOWED_AUDIENCES = new Set([
+            "https://rosary.bot",
+            "https://mcp.rosary.bot",
+            "https://auth.notme.bot",
+            "https://notme.bot",
+            "https://mache.rosary.bot",
+            "",  // empty = no audience restriction (legacy compat)
+          ]);
+          if (audience && !ALLOWED_AUDIENCES.has(audience)) {
+            return Response.json({ error: "invalid_audience", allowed: [...ALLOWED_AUDIENCES].filter(Boolean) }, { status: 400 });
+          }
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
