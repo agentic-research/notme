@@ -1200,9 +1200,18 @@ export default {
         }
       }
 
-      // Passkey diagnostics (no auth — returns counts only, no PII)
-      // Must be before the /auth/passkey/ prefix match (which requires POST)
+      // Passkey diagnostics — requires admin session (leaks user/admin counts, epoch, keyId)
       if (pathname === "/auth/passkey/status") {
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const authId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authDO = env.SIGNING_AUTHORITY.get(authId);
+        const statusCookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        if (!statusCookie) return jsonErr("unauthorized", 401);
+        const statusSecret = await authDO.getSessionSecret();
+        const statusSession = await verifySessionCookie(statusCookie, statusSecret);
+        if (!statusSession || !statusSession.scopes.includes("authorityManage")) {
+          return jsonErr("admin required", 403);
+        }
         try {
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
@@ -1367,6 +1376,18 @@ export default {
           if (!principalId) {
             return Response.json({ error: "session_required" }, { status: 401 });
           }
+
+          // Rate limit — 20 tokens per principal per hour
+          const tokenRlKey = `ratelimit:token:${principalId}`;
+          const tokenRlRaw = await env.CA_BUNDLE_CACHE.get(tokenRlKey);
+          const tokenRlCount = tokenRlRaw ? parseInt(tokenRlRaw) : 0;
+          if (tokenRlCount >= 20) {
+            return Response.json(
+              { error: "rate_limited", retry_after_seconds: 3600 },
+              { status: 429 },
+            );
+          }
+          await env.CA_BUNDLE_CACHE.put(tokenRlKey, String(tokenRlCount + 1), { expirationTtl: 3600 });
 
           // Validate DPoP proof
           const { validateDpopProof } = await import("./src/auth/dpop");
