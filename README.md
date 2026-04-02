@@ -5,6 +5,8 @@
 -->
 # notme
 
+> **⚠️ Experimental / Proof of Concept** — under active development. Not audited. See [SECURITY.md](SECURITY.md).
+
 your agents are you. they shouldn't be.
 
 every AI coding tool uses your credentials. your PAT, your SSH key, your OAuth token. when the agent is compromised, the attacker is you. there's no separation, no scope, no revocation.

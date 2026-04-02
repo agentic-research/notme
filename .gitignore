@@ -7,6 +7,7 @@
 # Project metadata
 !LICENSE
 !README.md
+!SECURITY.md
 !Taskfile.yml
 
 # Cap'n Proto schemas (source of truth for all cross-language types)
