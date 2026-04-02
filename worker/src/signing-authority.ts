@@ -575,26 +575,42 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async getOrCreateBootstrapCode(): Promise<string | null> {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap (
-        id   TEXT PRIMARY KEY DEFAULT 'code',
-        code TEXT NOT NULL,
-        used INTEGER NOT NULL DEFAULT 0
+        id         TEXT PRIMARY KEY DEFAULT 'code',
+        code       TEXT NOT NULL,
+        used       INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
       )
     `);
     const rows = this.ctx.storage.sql
-      .exec("SELECT code, used FROM bootstrap WHERE id = 'code'")
-      .toArray() as Array<{ code: string; used: number }>;
+      .exec("SELECT code, used, created_at FROM bootstrap WHERE id = 'code'")
+      .toArray() as Array<{ code: string; used: number; created_at: string }>;
 
     if (rows.length > 0) {
-      return rows[0]!.used ? null : rows[0]!.code;
+      if (rows[0]!.used) return null;
+      // Expire after 15 minutes
+      const created = new Date(rows[0]!.created_at + "Z").getTime();
+      const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
+      if (Date.now() - created > BOOTSTRAP_TTL_MS) {
+        this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
+      } else {
+        return rows[0]!.code;
+      }
     }
 
-    // Generate on first call
     const code = crypto.randomUUID();
     this.ctx.storage.sql.exec(
       "INSERT INTO bootstrap (id, code) VALUES ('code', ?)",
       code,
     );
-    console.log(`\n${"=".repeat(50)}\nBOOTSTRAP CODE: ${code}\nEnter this at auth.notme.bot/login to register the admin passkey.\nThis code is single-use and will be deleted after registration.\n${"=".repeat(50)}\n`);
+    console.log([
+      "",
+      "=".repeat(50),
+      "BOOTSTRAP CODE: " + code,
+      "Enter this at auth.notme.bot/login to register the admin passkey.",
+      "Single-use. Expires in 15 minutes.",
+      "=".repeat(50),
+      "",
+    ].join("\n"));
     return code;
   }
 
