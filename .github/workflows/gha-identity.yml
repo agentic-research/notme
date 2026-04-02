@@ -88,7 +88,7 @@ jobs:
       - name: Exchange OIDC → signet bridge cert
         id: signet
         if: '!inputs.skip_bridge_cert'
-        uses: agentic-research/notme/action@main
+        uses: agentic-research/notme/action@01e332901af3d7cc0cc74c408f83437f6a8a4629 # main 2026-04-02
         with:
           audience: ${{ inputs.bridge_audience }}
           authority_url: https://auth.notme.bot
