@@ -90,6 +90,11 @@ export class RevocationAuthority {
       seqno: number;
     }>();
 
+    // Validate seqno is a positive integer — null/undefined/NaN bypasses rollback check
+    if (typeof seqno !== "number" || !Number.isFinite(seqno) || seqno < 1) {
+      return Response.json({ ok: false, reason: "invalid_seqno" }, { status: 400 });
+    }
+
     const result = await this.state.storage.transaction(async (txn) => {
       const key = `seqno:${issuerId}`;
       const last = (await txn.get<number>(key)) ?? 0;

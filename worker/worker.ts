@@ -1372,9 +1372,12 @@ export default {
             "https://auth.notme.bot",
             "https://notme.bot",
             "https://mache.rosary.bot",
-            "",  // empty = no audience restriction (legacy compat)
+            // Empty audience no longer allowed — tokens must be scoped
           ]);
-          if (audience && !ALLOWED_AUDIENCES.has(audience)) {
+          if (!audience) {
+            return Response.json({ error: "audience_required" }, { status: 400 });
+          }
+          if (!ALLOWED_AUDIENCES.has(audience)) {
             return Response.json({ error: "invalid_audience", allowed: [...ALLOWED_AUDIENCES].filter(Boolean) }, { status: 400 });
           }
 

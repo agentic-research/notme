@@ -563,8 +563,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec("DELETE FROM passkey_credentials");
     this.ctx.storage.sql.exec("DELETE FROM passkey_users");
     this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
-    // Reset bootstrap so deployer can re-register
-    this.ctx.storage.sql.exec("DELETE FROM bootstrap");
+    // Mark bootstrap as used — do NOT delete it.
+    // A new code only appears on fresh DO instantiation, not after reset.
+    // This prevents: know code → reset → new code → reset → infinite wipe loop.
+    this.ctx.storage.sql.exec("UPDATE bootstrap SET used = 1 WHERE id = 'code'");
     return { deleted: count };
   }
 
