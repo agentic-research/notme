@@ -72,9 +72,9 @@ jobs:
       contents: read
     outputs:
       github_token: ${{ steps.octo-sts.outputs.token }}
-      bridge_cert: ${{ steps.signet.outputs.cert }}
-      bridge_key: ${{ steps.signet.outputs.key }}
-      bridge_expires_at: ${{ steps.signet.outputs.expires_at }}
+      bridge_cert: ${{ steps.signet.outputs.bridge_cert }}
+      bridge_key: ${{ steps.signet.outputs.bridge_key }}
+      bridge_expires_at: ${{ steps.signet.outputs.bridge_expires_at }}
 
     steps:
       - name: Exchange OIDC → GitHub token (octo-sts)
@@ -88,40 +88,7 @@ jobs:
       - name: Exchange OIDC → signet bridge cert
         id: signet
         if: '!inputs.skip_bridge_cert'
-        env:
-          BRIDGE_AUDIENCE: ${{ inputs.bridge_audience }}
-        run: |
-          set -euo pipefail
-
-          # URL-encode the audience (safe for query string)
-          AUDIENCE_ENC=$(printf '%s' "$BRIDGE_AUDIENCE" | jq -sRr @uri)
-
-          TOKEN=$(curl -sSf \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE_ENC}" \
-            | jq -r '.value')
-
-          RESULT=$(curl -sSfX POST "https://auth.notme.bot/cert/gha" \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H "Content-Type: application/json")
-
-          if echo "$RESULT" | jq -e '.error' > /dev/null 2>&1; then
-            echo "::error::signet exchange failed: $(echo "$RESULT" | jq -r '.error')"
-            exit 1
-          fi
-
-          # Extract and validate required fields (jq -e fails on null)
-          CERT=$(echo "$RESULT" | jq -er '.certificate')
-          KEY=$(echo "$RESULT" | jq -er '.private_key')
-          EXPIRES=$(echo "$RESULT" | jq -er '.expires_at')
-
-          # Mask both raw PEM and base64-encoded form
-          echo "::add-mask::${KEY}"
-          KEY_B64=$(echo "$KEY" | base64 -w0)
-          echo "::add-mask::${KEY_B64}"
-
-          echo "cert=$(echo "$CERT" | base64 -w0)" >> "$GITHUB_OUTPUT"
-          echo "key=${KEY_B64}" >> "$GITHUB_OUTPUT"
-          echo "expires_at=${EXPIRES}" >> "$GITHUB_OUTPUT"
-
-          echo "Bridge cert issued for: $(echo "$RESULT" | jq -r '.subject')"
+        uses: agentic-research/notme/action@main
+        with:
+          audience: ${{ inputs.bridge_audience }}
+          authority_url: https://auth.notme.bot
