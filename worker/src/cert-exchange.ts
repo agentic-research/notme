@@ -94,15 +94,19 @@ export async function handleCertExchange(
       );
     }
 
-    // Look up principal by federated identity
+    // OIDC principal lookup not yet wired to DO — return 501 instead of crashing
+    // TODO: wire findPrincipalByFederated via SigningAuthority DO RPC
+    return Response.json(
+      { error: "oidc_not_implemented", message: "OIDC proof path not yet wired to DO — use passkey or GHA OIDC at /cert/gha" },
+      { status: 501 },
+    );
+
+    /* Disabled until DO RPC is wired:
     const { findPrincipalByFederated, getCapabilities } = await import(
       "./auth/principals"
     );
     const found = findPrincipalByFederated(
-      // Need DO sql access — delegate to authority
-      // For now, we don't have direct sql access from here.
-      // This will be wired via DO RPC.
-      null as any, // TODO: wire via authority RPC
+      null as any,
       identity.issuer,
       identity.subject,
     );
@@ -119,8 +123,9 @@ export async function handleCertExchange(
     }
 
     principalId = found;
-    grantedScopes = getCapabilities(null as any, principalId); // TODO: wire via DO
+    grantedScopes = getCapabilities(null as any, principalId);
     authMethod = `oidc:${identity.issuer}`;
+    */
   } else if (body.proof.type === "bootstrap") {
     // Bootstrap code — deployer only
     const valid = await authority.consumeBootstrapCode(body.proof.code);

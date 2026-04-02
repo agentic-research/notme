@@ -82,7 +82,10 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
   }
 
   // JTI replay protection — each OIDC token can be exchanged exactly once
-  if (claims.jti) {
+  if (!claims.jti) {
+    return jsonErr("jti claim required for replay protection", 400);
+  }
+  {
     const jtiKey = `jti:${claims.jti}`;
     const seen = await env.CA_BUNDLE_CACHE.get(jtiKey);
     if (seen) {
@@ -233,10 +236,11 @@ async function handlePasskey(
         return jsonErr("registration verification failed", 400);
       }
 
-      // Create principal with scopes from the options response
-      const scopes = body.scopes ?? (result.isAdmin
+      // Scopes derived server-side from admin status — NEVER from client body.
+      // Client-supplied body.scopes is intentionally ignored (scope escalation vector).
+      const scopes = result.isAdmin
         ? ["bridgeCert", "authorityManage", "certMint"]
-        : ["bridgeCert"]);
+        : ["bridgeCert"];
 
       // Issue session immediately after registration
       const { createSessionCookie } = await import("./src/auth/session");
@@ -1249,18 +1253,25 @@ export default {
         } catch {
           return jsonErr("invalid redirect_uri", 400);
         }
-        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        // Enforce https for all non-localhost
+        const isLocalhost = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+        if (!isLocalhost && parsed.protocol !== "https:") {
           return jsonErr("redirect_uri must be https", 400);
         }
-        // Allow: *.rosary.bot, *.notme.bot, localhost (dev)
-        const host = parsed.hostname;
-        const allowed =
-          host === "localhost" ||
-          host === "rosary.bot" ||
-          host.endsWith(".rosary.bot") ||
-          host === "notme.bot" ||
-          host.endsWith(".notme.bot");
-        if (!allowed) {
+        if (isLocalhost && parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          return jsonErr("redirect_uri must be http or https", 400);
+        }
+        // Strict allowlist — exact domains only (no wildcard subdomains)
+        const redirectHost = parsed.hostname;
+        const ALLOWED_REDIRECT_HOSTS = new Set([
+          "localhost",
+          "127.0.0.1",
+          "rosary.bot",
+          "auth.rosary.bot",
+          "notme.bot",
+          "auth.notme.bot",
+        ]);
+        if (!ALLOWED_REDIRECT_HOSTS.has(redirectHost)) {
           return jsonErr("redirect_uri not on allowed domain", 403);
         }
 
@@ -1363,7 +1374,7 @@ export default {
           try {
             proofResult = await validateDpopProof(dpopProof, {
               htm: "POST",
-              htu: "https://auth.notme.bot/token",
+              htu: `${new URL(request.url).origin}/token`,
             });
           } catch {
             return Response.json({ error: "invalid_dpop_proof" }, { status: 401 });

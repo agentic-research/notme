@@ -44,10 +44,20 @@ interface JWK {
   y?: string;
 }
 
+// Trusted OIDC issuers — prevents SSRF via attacker-controlled iss claim
+const TRUSTED_ISSUERS = new Set([
+  "https://token.actions.githubusercontent.com",
+  "https://auth.notme.bot",
+  "https://accounts.google.com",
+]);
+
 // Simple JWKS cache — per-issuer, 1 hour TTL
 const jwksCache = new Map<string, { keys: JWK[]; at: number }>();
 
 async function fetchJWKS(issuer: string): Promise<JWK[]> {
+  if (!TRUSTED_ISSUERS.has(issuer)) {
+    throw new Error(`untrusted issuer: ${issuer}`);
+  }
   const now = Date.now();
   const cached = jwksCache.get(issuer);
   if (cached && now - cached.at < 3600_000) return cached.keys;
@@ -90,7 +100,8 @@ export async function verifyOIDC(token: string): Promise<VerifiedIdentity> {
   const exp = payload.exp as number;
   if (!iss) throw new Error("missing issuer");
   if (!sub) throw new Error("missing subject");
-  if (exp && exp < Math.floor(Date.now() / 1000)) throw new Error("token expired");
+  if (typeof exp !== "number") throw new Error("missing exp claim");
+  if (exp < Math.floor(Date.now() / 1000)) throw new Error("token expired");
 
   // Fetch JWKS and verify signature
   const keys = await fetchJWKS(iss);
@@ -148,14 +159,18 @@ export async function verifyX509(
   certPem: string,
   caPublicKeyPem: string,
 ): Promise<VerifiedIdentity> {
-  // For now, extract the subject CN from the cert without full chain validation.
-  // Full X.509 chain verification would need @peculiar/x509 — already in deps.
   const { X509Certificate } = await import("@peculiar/x509");
   const cert = new X509Certificate(certPem);
 
   // Check not expired
   if (cert.notAfter < new Date()) throw new Error("cert expired");
   if (cert.notBefore > new Date()) throw new Error("cert not yet valid");
+
+  // Verify cert was signed by the CA — THE critical check.
+  // Without this, any self-signed cert with valid dates would pass.
+  const caCert = new X509Certificate(caPublicKeyPem);
+  const signatureValid = await cert.verify({ publicKey: caCert.publicKey });
+  if (!signatureValid) throw new Error("cert signature invalid — not signed by trusted CA");
 
   // Extract subject CN
   const subject = cert.subjectName.getField("CN")?.[0] ?? cert.subject;

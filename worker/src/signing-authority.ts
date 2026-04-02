@@ -589,7 +589,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
 
     // Generate on first call
-    const code = crypto.randomUUID().slice(0, 8);
+    const code = crypto.randomUUID();
     this.ctx.storage.sql.exec(
       "INSERT INTO bootstrap (id, code) VALUES ('code', ?)",
       code,
