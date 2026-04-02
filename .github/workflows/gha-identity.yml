@@ -9,7 +9,7 @@ name: GHA Identity Exchange
 #
 #   jobs:
 #     identity:
-#       uses: agentic-research/signet/.github/workflows/gha-identity.yml@main
+#       uses: agentic-research/notme/.github/workflows/gha-identity.yml@<sha>
 #       with:
 #         octo_sts_scope: agentic-research/ley-line
 #         octo_sts_identity: mache-release
