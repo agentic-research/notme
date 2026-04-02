@@ -28,6 +28,10 @@
 !worker/src/
 !worker/src/**
 
+# Credential vault — zero-secret proxy gated by notme identity
+!vault/
+!vault/**
+
 # Wasm — ley-line-sign (signing ops at edge)
 !wasm/
 !wasm/**
