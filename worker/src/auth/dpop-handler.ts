@@ -18,6 +18,8 @@ export interface HandleTokenInput {
   dpopProof: string | null;
   session: SessionPayload | null;
   audience: string;
+  /** The token endpoint URL — must match the DPoP proof htu claim exactly. */
+  tokenEndpointUrl: string;
   signingKey: CryptoKey;
   keyId: string;
   /** Returns true if this JTI has been seen before. */
@@ -51,7 +53,7 @@ export async function handleToken(input: HandleTokenInput): Promise<HandleTokenR
   try {
     proofResult = await validateDpopProof(input.dpopProof, {
       htm: "POST",
-      htu: "https://auth.notme.bot/token",
+      htu: input.tokenEndpointUrl,
     });
   } catch (e: any) {
     return { ok: false, status: 401, error: "invalid_dpop_proof" };

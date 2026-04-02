@@ -1358,20 +1358,9 @@ export default {
             }
           }
 
-          // Fall back to client cert (agents with bridge certs)
-          if (!principalId) {
-            const certPem = request.headers.get("X-Client-Cert");
-            if (certPem) {
-              try {
-                const { verifyX509 } = await import("./src/auth/verify-proof");
-                const identity = await verifyX509(decodeURIComponent(certPem), "");
-                principalId = identity.subject;
-                scopes = await authority.getPrincipalScopes(principalId);
-              } catch {
-                return Response.json({ error: "invalid_client_cert" }, { status: 401 });
-              }
-            }
-          }
+          // X-Client-Cert path REMOVED — mTLS not configured in wrangler.toml,
+          // so the header is attacker-controlled. Re-enable only when CF mTLS
+          // bindings are active and CF injects the cert (not the client).
 
           if (!principalId) {
             return Response.json({ error: "session_required" }, { status: 401 });
@@ -1407,6 +1396,10 @@ export default {
             return Response.json({ error: "proof_reused" }, { status: 401 });
           }
 
+          // Store JTI BEFORE minting — prevents TOCTOU race across edge nodes.
+          // If mint fails after this, the JTI is burned (acceptable — client retries with new proof).
+          await env.CA_BUNDLE_CACHE.put(jtiKey, "1", { expirationTtl: 600 });
+
           // Mint token inside DO — CryptoKey never crosses RPC boundary
           const accessToken = await authority.mintDPoPToken({
             sub: principalId,
@@ -1414,9 +1407,6 @@ export default {
             audience,
             jkt: proofResult.thumbprint,
           });
-
-          // Store JTI after successful mint
-          await env.CA_BUNDLE_CACHE.put(jtiKey, "1", { expirationTtl: 600 });
 
           return Response.json({
             access_token: accessToken,

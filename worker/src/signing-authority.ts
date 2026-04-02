@@ -61,16 +61,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.initialized = true;
   }
 
-  // Generate a short key ID from the public key (first 8 bytes hex).
-  private static keyIdFromSpki(spkiB64: string): string {
+  // Generate a key ID from SHA-256 of the public key (first 8 hex chars).
+  // Previous djb2 hash had 32-bit collision space — SHA-256 is cryptographically strong.
+  private static async keyIdFromSpki(spkiB64: string): Promise<string> {
     const raw = atob(spkiB64);
-    // SPKI for Ed25519 is 44 bytes: 12-byte header + 32-byte key. Hash the key part.
-    const keyBytes = raw.slice(-32);
-    let hash = 0;
-    for (let i = 0; i < keyBytes.length; i++) {
-      hash = ((hash << 5) - hash + keyBytes.charCodeAt(i)) | 0;
-    }
-    return Math.abs(hash).toString(16).padStart(8, "0");
+    const keyBytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) keyBytes[i] = raw.charCodeAt(i);
+    const hashBuf = await crypto.subtle.digest("SHA-256", keyBytes);
+    return Array.from(new Uint8Array(hashBuf).slice(0, 4))
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("");
   }
 
   // Load or generate the authority keypair. Cached in memory for the DO lifetime.
@@ -123,7 +123,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // Backfill key_id if empty (v1 key created before key_id tracking)
       let keyId = row.key_id;
       if (!keyId) {
-        keyId = SigningAuthority.keyIdFromSpki(row.public_spki);
+        keyId = await SigningAuthority.keyIdFromSpki(row.public_spki);
         this.ctx.storage.sql.exec(
           "UPDATE keys SET key_id = ? WHERE id = 'authority'",
           keyId,
@@ -147,7 +147,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const publicSpkiB64 = btoa(
       String.fromCharCode(...new Uint8Array(publicSpki)),
     );
-    const keyId = SigningAuthority.keyIdFromSpki(publicSpkiB64);
+    const keyId = await SigningAuthority.keyIdFromSpki(publicSpkiB64);
 
     this.ctx.storage.sql.exec(
       "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
@@ -617,16 +617,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async consumeBootstrapCode(code: string): Promise<boolean> {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap (
-        id   TEXT PRIMARY KEY DEFAULT 'code',
-        code TEXT NOT NULL,
-        used INTEGER NOT NULL DEFAULT 0
+        id         TEXT PRIMARY KEY DEFAULT 'code',
+        code       TEXT NOT NULL,
+        used       INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
       )
     `);
     const rows = this.ctx.storage.sql
-      .exec("SELECT code FROM bootstrap WHERE id = 'code' AND used = 0")
-      .toArray() as Array<{ code: string }>;
+      .exec("SELECT code, created_at FROM bootstrap WHERE id = 'code' AND used = 0")
+      .toArray() as Array<{ code: string; created_at: string }>;
 
     if (rows.length === 0 || rows[0]!.code !== code) return false;
+
+    // Enforce 15-minute TTL here too (not just in getOrCreateBootstrapCode)
+    const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
+    const created = new Date(rows[0]!.created_at + "Z").getTime();
+    if (Date.now() - created > BOOTSTRAP_TTL_MS) {
+      this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
+      return false;
+    }
 
     this.ctx.storage.sql.exec(
       "UPDATE bootstrap SET used = 1 WHERE id = 'code'",

@@ -100,6 +100,7 @@ describe("handleToken", () => {
     const result = await handleToken({
       dpopProof: proof,
       session: null,
+      tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
@@ -120,6 +121,7 @@ describe("handleToken", () => {
     const result = await handleToken({
       dpopProof: null,
       session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
@@ -145,6 +147,7 @@ describe("handleToken", () => {
     const result = await handleToken({
       dpopProof: proof,
       session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
@@ -170,6 +173,7 @@ describe("handleToken", () => {
     const result = await handleToken({
       dpopProof: proof,
       session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
@@ -195,6 +199,7 @@ describe("handleToken", () => {
     const result = await handleToken({
       dpopProof: proof,
       session: { principalId: "alice", scopes: ["bridgeCert", "authorityManage"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
@@ -237,6 +242,7 @@ describe("handleToken", () => {
     const result = await handleToken({
       dpopProof: proof,
       session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
