@@ -44,6 +44,10 @@
 !scripts/
 !scripts/**
 
+# Packaging — distroless OCI image (melange + apko)
+!packages/
+!packages/**
+
 # Design docs
 !docs/
 !docs/**

@@ -1,0 +1,45 @@
+# melange-workerd.yaml — workerd runtime binary
+#
+# Cloudflare Workers runtime (Apache 2.0).
+# Binary from npm @cloudflare/workerd-{linux-64,linux-arm64}.
+#
+# Usage: melange build melange-workerd.yaml --arch x86_64 --signing-key melange.rsa --out-dir ./out
+
+package:
+  name: workerd
+  version: 1.20260402.1
+  epoch: 0
+  description: "Cloudflare Workers runtime"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ca-certificates-bundle
+
+environment:
+  contents:
+    repositories:
+      - https://packages.wolfi.dev/os
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    packages:
+      - busybox
+
+pipeline:
+  - if: ${{build.arch}} == 'x86_64'
+    uses: fetch
+    with:
+      uri: https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-${{package.version}}.tgz
+      expected-sha256: c9c212ff46f991a82b538db97c001917473faac3974de45c818c94e1a70d4ae6
+      strip-components: 1
+  - if: ${{build.arch}} == 'aarch64'
+    uses: fetch
+    with:
+      uri: https://registry.npmjs.org/@cloudflare/workerd-linux-arm64/-/workerd-linux-arm64-${{package.version}}.tgz
+      expected-sha256: 250ac8e2c5d9f451ecdd7223510c52f988f81dd4571bef68b4cc20b6cca3f81c
+      strip-components: 1
+  - runs: install -Dm755 bin/workerd "${{targets.destdir}}/usr/bin/workerd"
+
+test:
+  pipeline:
+    - runs: workerd --version
