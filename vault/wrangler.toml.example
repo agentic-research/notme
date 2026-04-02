@@ -1,0 +1,50 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "notme-vault"
+main = "src/worker.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
+
+workers_dev = false
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[vars]
+# Principal ID of the admin who can store/delete credentials.
+# Set this to your notme principal ID after first passkey registration.
+ADMIN_SUB = ""
+
+# ── Durable Object: credential storage ──
+[[durable_objects.bindings]]
+name = "VAULT"
+class_name = "CredentialVault"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CredentialVault"]
+
+# ── Routes: deploy to your own domain ──
+# Uncomment and set to your domain:
+# [[routes]]
+# pattern = "vault.your-domain.com/*"
+# zone_name = "your-domain.com"
+
+# ── Staging environment ──
+[env.staging]
+name = "notme-vault-staging"
+workers_dev = true
+
+[env.staging.vars]
+ADMIN_SUB = ""
+
+[[env.staging.durable_objects.bindings]]
+name = "VAULT"
+class_name = "CredentialVault"
+
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["CredentialVault"]
