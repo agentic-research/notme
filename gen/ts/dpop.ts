@@ -4,6 +4,7 @@
  * Provides:
  *   - computeJwkThumbprint() — RFC 7638 JWK Thumbprint
  *   - verifyDPoPToken()      — Full DPoP-bound access token verification
+ *   - verifyAccessToken()    — Token-only verification (redirect flows, no DPoP proof)
  *
  * Used by notme (issuer), rig (verifier), and any Cloudflare Worker
  * that needs to verify tokens from auth.notme.bot.
@@ -17,6 +18,18 @@
 export interface KVLike {
   get(key: string): Promise<string | null>;
   put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+}
+
+/** Options for verifyAccessToken() — token-only verification without DPoP proof. */
+export interface VerifyAccessTokenOptions {
+  /** The access_token JWT (EdDSA-signed by auth.notme.bot). */
+  token: string;
+  /** JWKS endpoint URL (e.g. "https://auth.notme.bot/.well-known/jwks.json"). */
+  jwksUrl: string;
+  /** Optional KV store for caching the JWKS (1-hour TTL). Falls back to fetch-only. */
+  kv?: KVLike;
+  /** Provide the Ed25519 public key directly — skips JWKS fetch entirely. */
+  publicKey?: CryptoKey;
 }
 
 /** Options for verifyDPoPToken(). */
@@ -224,6 +237,68 @@ export async function verifyDPoPToken(
     aud: tPayload.aud ?? "",
     exp: tPayload.exp,
     jti: tPayload.jti ?? "",
+  };
+}
+
+// ── Access Token Verifier (no DPoP proof) ──────────────────────────────────
+
+/**
+ * Verify an access token from auth.notme.bot without requiring a DPoP proof.
+ *
+ * Use this for redirect flows where the DPoP keypair is ephemeral and lost
+ * after the browser redirect. The token's EdDSA signature and claims are
+ * verified against the JWKS, but DPoP binding (cnf.jkt) is not checked.
+ *
+ * The token is still trustworthy: notme verified the DPoP binding at mint time,
+ * the token is EdDSA-signed, short-lived (5 min), and JTI-unique.
+ */
+export async function verifyAccessToken(
+  opts: VerifyAccessTokenOptions,
+): Promise<VerifiedTokenClaims> {
+  const { token, jwksUrl, kv, publicKey } = opts;
+
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new Error("Malformed access token: expected 3 parts");
+  }
+  const [headerB64, payloadB64, sigB64] = parts;
+
+  // Get the signing key
+  const signingKey = publicKey ?? (await fetchSigningKey(jwksUrl, kv));
+
+  // Verify Ed25519 signature
+  const sigInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+  const sig = base64urlDecodeBytes(sigB64);
+  const valid = await crypto.subtle.verify(
+    { name: "Ed25519" } as any,
+    signingKey,
+    sig,
+    sigInput,
+  );
+  if (!valid) {
+    throw new Error("Invalid access token signature");
+  }
+
+  // Parse and validate claims
+  const payload = jsonParse(base64urlDecodeStr(payloadB64), "access token payload");
+  const now = Math.floor(Date.now() / 1000);
+
+  if (typeof payload.exp !== "number" || payload.exp <= now) {
+    throw new Error("Access token expired");
+  }
+  if (typeof payload.iat === "number" && payload.iat > now + 60) {
+    throw new Error("Access token iat is in the future");
+  }
+  if (!payload.sub || typeof payload.sub !== "string") {
+    throw new Error("Access token missing sub claim");
+  }
+
+  return {
+    sub: payload.sub,
+    scope: payload.scope ?? "",
+    aud: payload.aud ?? "",
+    exp: payload.exp,
+    jti: payload.jti ?? "",
   };
 }
 

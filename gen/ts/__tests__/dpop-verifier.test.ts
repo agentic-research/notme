@@ -9,6 +9,7 @@ import { describe, expect, it, beforeAll } from "vitest";
 import {
   computeJwkThumbprint,
   verifyDPoPToken,
+  verifyAccessToken,
   type KVLike,
 } from "../dpop";
 
@@ -534,5 +535,75 @@ describe("verifyDPoPToken", () => {
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/signature/i);
+  });
+});
+
+// ── verifyAccessToken (redirect flow, no DPoP proof) ──────────────────────
+
+describe("verifyAccessToken", () => {
+  let edKp: CryptoKeyPair;
+  let jkt: string;
+
+  const JWKS_URL = "https://auth.notme.bot/.well-known/jwks.json";
+
+  beforeAll(async () => {
+    edKp = await generateEd25519();
+    const ec = await generateP256();
+    jkt = await computeJwkThumbprint(ec.jwk);
+  });
+
+  it("verifies a valid token without requiring a DPoP proof", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      scope: "bridgeCert authorityManage",
+      audience: "https://rosary.bot",
+    });
+
+    const claims = await verifyAccessToken({
+      token,
+      jwksUrl: JWKS_URL,
+      publicKey: edKp.publicKey,
+    });
+
+    expect(claims.sub).toBe("principal:alice");
+    expect(claims.scope).toBe("bridgeCert authorityManage");
+    expect(claims.aud).toBe("https://rosary.bot");
+    expect(claims.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  it("rejects an expired token", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      iatOverride: now - 600,
+      expOverride: now - 300,
+    });
+
+    await expect(
+      verifyAccessToken({ token, jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
+    ).rejects.toThrow(/expired/i);
+  });
+
+  it("rejects a token signed by a different key", async () => {
+    const otherKp = await generateEd25519();
+    const token = await mintToken({
+      signingKey: otherKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+
+    await expect(
+      verifyAccessToken({ token, jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
+    ).rejects.toThrow(/signature/i);
+  });
+
+  it("rejects malformed token", async () => {
+    await expect(
+      verifyAccessToken({ token: "bad", jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
+    ).rejects.toThrow(/malformed|parts/i);
   });
 });
