@@ -2,6 +2,8 @@ name: Test Identity Exchange
 on:
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   identity:
     uses: ./.github/workflows/gha-identity.yml
