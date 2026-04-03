@@ -152,26 +152,13 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
     await env.CA_BUNDLE_CACHE.put(jtiKey, "1", { expirationTtl: ttl });
   }
 
-  // Rate limit — 10 certs per repo per hour
-  const rlKey = `ratelimit:cert:${claims.repository}`;
-  const rlRaw = await env.CA_BUNDLE_CACHE.get(rlKey);
-  const now = Date.now();
-  const RL_WINDOW = cfg.rateLimitWindowMs;
-  const RL_MAX = cfg.rateLimitMaxCerts;
-  let rl = rlRaw
-    ? (JSON.parse(rlRaw) as { count: number; windowStart: number })
-    : null;
-  if (!rl || now - rl.windowStart > RL_WINDOW) {
-    rl = { count: 1, windowStart: now };
-  } else {
-    rl.count++;
+  // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
+  if (env.CERT_LIMITER) {
+    const { success } = await env.CERT_LIMITER.limit({ key: `cert:${claims.repository}` });
+    if (!success) {
+      return jsonErr("rate limit exceeded", 429);
+    }
   }
-  if (rl.count > RL_MAX) {
-    return jsonErr(`rate limit exceeded (${cfg.rateLimitMaxCerts} certs/repo/hour)`, 429);
-  }
-  await env.CA_BUNDLE_CACHE.put(rlKey, JSON.stringify(rl), {
-    expirationTtl: cfg.rateLimitKvTtlSeconds,
-  });
 
   // Generate ephemeral ECDSA P-256 keypair at edge — private key returned once, never stored
   const kp = (await crypto.subtle.generateKey(
@@ -1468,17 +1455,13 @@ export default {
             return Response.json({ error: "session_required" }, { status: 401 });
           }
 
-          // Rate limit — 20 tokens per principal per hour
-          const tokenRlKey = `ratelimit:token:${principalId}`;
-          const tokenRlRaw = await env.CA_BUNDLE_CACHE.get(tokenRlKey);
-          const tokenRlCount = tokenRlRaw ? parseInt(tokenRlRaw) : 0;
-          if (tokenRlCount >= 20) {
-            return Response.json(
-              { error: "rate_limited", retry_after_seconds: 3600 },
-              { status: 429 },
-            );
+          // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
+          if (env.TOKEN_LIMITER) {
+            const { success } = await env.TOKEN_LIMITER.limit({ key: `token:${principalId}` });
+            if (!success) {
+              return Response.json({ error: "rate_limited" }, { status: 429 });
+            }
           }
-          await env.CA_BUNDLE_CACHE.put(tokenRlKey, String(tokenRlCount + 1), { expirationTtl: 3600 });
 
           // Validate DPoP proof
           const { validateDpopProof } = await import("./src/auth/dpop");

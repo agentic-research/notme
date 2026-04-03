@@ -13,6 +13,31 @@ enabled = true
 enabled = true
 invocation_logs = true
 
+# Rate limiting — atomic, edge-fast, replaces KV-based limiter
+# Token endpoint: 20 per principal per minute
+[[ratelimits]]
+name = "TOKEN_LIMITER"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 20
+  period = 60
+
+# Cert exchange: 10 per repo per minute
+[[ratelimits]]
+name = "CERT_LIMITER"
+namespace_id = "1002"
+  [ratelimits.simple]
+  limit = 10
+  period = 60
+
+# Passkey registration: 5 attempts per IP per minute
+[[ratelimits]]
+name = "PASSKEY_LIMITER"
+namespace_id = "1003"
+  [ratelimits.simple]
+  limit = 5
+  period = 60
+
 # Custom domain routes — adjust zone_name to your domain.
 [[routes]]
 pattern = "notme.bot/*"
