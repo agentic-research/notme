@@ -52,6 +52,9 @@ export default {
               url: req.url,
               jwksUrl: "https://auth.notme.bot/.well-known/jwks.json",
             });
+            // JTI replay check — DO tracks seen proofs for 120s
+            const replayed = await vault.checkAndStoreJti(claims.jti);
+            if (replayed) return null;
             return claims.sub;
           } catch {
             return null;
@@ -119,6 +122,29 @@ export class CredentialVault {
         updated_at TEXT DEFAULT (datetime('now'))
       )
     `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS seen_jti (
+        jti TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+  }
+
+  /**
+   * Check if a DPoP proof JTI has been seen. If not, store it with 120s expiry.
+   * Returns true if this is a replay (already seen), false if fresh.
+   * Purges expired entries on each call.
+   */
+  async checkAndStoreJti(jti: string): Promise<boolean> {
+    const now = Math.floor(Date.now() / 1000);
+    // Purge expired entries
+    this.sql.exec("DELETE FROM seen_jti WHERE expires_at < ?", now);
+    // Check if seen
+    const rows = this.sql.exec("SELECT 1 FROM seen_jti WHERE jti = ?", jti).toArray();
+    if (rows.length > 0) return true; // replay
+    // Store with 120s TTL (2x the 60s iat window — safety margin)
+    this.sql.exec("INSERT INTO seen_jti (jti, expires_at) VALUES (?, ?)", jti, now + 120);
+    return false;
   }
 
   /** Lazy KEK derivation — derived once per DO lifetime, cached. */
