@@ -1109,7 +1109,7 @@ export default {
         if (body.proof?.type === "oidc" && body.proof.token) {
           const { verifyOIDC } = await import("./src/auth/verify-proof");
           try {
-            const identity = await verifyOIDC(body.proof.token);
+            const identity = await verifyOIDC(body.proof.token, "notme.bot");
             await authority.linkFederatedId(
               principalId,
               identity.issuer,
@@ -1152,7 +1152,7 @@ export default {
         const { verifyOIDC } = await import("./src/auth/verify-proof");
         let identity;
         try {
-          identity = await verifyOIDC(body.token);
+          identity = await verifyOIDC(body.token, "notme.bot");
         } catch (e: any) {
           return jsonErr("invalid token: " + e.message, 401);
         }

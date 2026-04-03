@@ -86,7 +86,7 @@ export async function handleCertExchange(
     const { verifyOIDC } = await import("./auth/verify-proof");
     let identity;
     try {
-      identity = await verifyOIDC(body.proof.token);
+      identity = await verifyOIDC(body.proof.token, "notme.bot");
     } catch (e: any) {
       return Response.json(
         { error: "invalid token: " + e.message },
