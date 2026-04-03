@@ -40,6 +40,17 @@ async function run(): Promise<void> {
     return;
   }
 
+  // ── Enforce HTTPS on authority URL (prevent OIDC token interception) ──
+  if (
+    authorityUrl.startsWith("http://") &&
+    !authorityUrl.includes("localhost") &&
+    !authorityUrl.includes("127.0.0.1")
+  ) {
+    throw new Error(
+      "authority_url must be HTTPS — an HTTP URL would transmit the OIDC token in plaintext",
+    );
+  }
+
   // ── OIDC token (no env vars — core.getIDToken handles everything) ──
   core.info(`requesting OIDC token (audience: ${audience})`);
   let oidcToken: string;
@@ -74,7 +85,17 @@ async function run(): Promise<void> {
   }
 
   // ── mask + encode + output ──
+  // Mask the full PEM (catches exact match in logs)
   core.setSecret(cert.private_key);
+  // Mask individual PEM lines — GHA masks line-by-line, so the full
+  // multi-line string won't match if printed across multiple log lines.
+  // Skip BEGIN/END headers (generic strings that break log readability).
+  for (const line of cert.private_key.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length > 0 && !trimmed.startsWith("-----")) {
+      core.setSecret(trimmed);
+    }
+  }
   const certB64 = Buffer.from(cert.certificate).toString("base64");
   const keyB64 = Buffer.from(cert.private_key).toString("base64");
   core.setSecret(keyB64);
