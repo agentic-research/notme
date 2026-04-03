@@ -201,6 +201,45 @@ describe("ATTACK: SSRF via upstream URL", () => {
     expect(validateUpstreamUrl("https://admin:password@api.example.com/")).toBe(false);
     expect(validateUpstreamUrl("https://user@api.example.com/")).toBe(false);
   });
+
+  it("blocks IPv4-mapped IPv6 addresses (SSRF bypass)", async () => {
+    const { validateUpstreamUrl } = await getVault();
+
+    // These resolve to internal IPs at the network level but bypass string regex
+    const ipv6Bypasses = [
+      "https://[::ffff:169.254.169.254]/latest/meta-data",  // metadata via IPv4-mapped IPv6
+      "https://[::ffff:127.0.0.1]/steal",                    // localhost via IPv4-mapped
+      "https://[::ffff:10.0.0.1]/internal",                  // RFC1918 via IPv4-mapped
+      "https://[::ffff:192.168.1.1]/internal",               // RFC1918 via IPv4-mapped
+      "https://[::ffff:172.16.0.1]/internal",                // RFC1918 via IPv4-mapped
+      "https://[0:0:0:0:0:ffff:127.0.0.1]/steal",           // expanded form
+      "https://[::ffff:a9fe:a9fe]/metadata",                 // hex form of 169.254.169.254
+      "https://[::ffff:7f00:1]/steal",                       // hex form of 127.0.0.1
+    ];
+
+    for (const url of ipv6Bypasses) {
+      expect(validateUpstreamUrl(url)).toBe(false);
+    }
+  });
+
+  it("blocks all IPv6 addresses (allowlist approach)", async () => {
+    const { validateUpstreamUrl } = await getVault();
+
+    // Any bracketed IPv6 should be rejected — we only allow domain names
+    expect(validateUpstreamUrl("https://[::1]/api")).toBe(false);
+    expect(validateUpstreamUrl("https://[fe80::1]/api")).toBe(false);
+    expect(validateUpstreamUrl("https://[2001:db8::1]/api")).toBe(false);
+    expect(validateUpstreamUrl("https://[::ffff:8.8.8.8]/api")).toBe(false);  // even public IPs in IPv6 form
+  });
+
+  it("blocks raw IP addresses (only domain names allowed)", async () => {
+    const { validateUpstreamUrl } = await getVault();
+
+    // Even public IPs should be rejected — domains only
+    expect(validateUpstreamUrl("https://8.8.8.8/api")).toBe(false);
+    expect(validateUpstreamUrl("https://1.1.1.1/api")).toBe(false);
+    expect(validateUpstreamUrl("https://203.0.113.1/api")).toBe(false);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

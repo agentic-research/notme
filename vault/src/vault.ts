@@ -60,7 +60,20 @@ export function validateServiceName(name: string): boolean {
   return /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(name);
 }
 
-/** Validate an upstream URL — must be HTTPS to a public host. */
+/**
+ * Validate an upstream URL — must be HTTPS to a public domain name.
+ *
+ * ALLOWLIST approach (not blocklist). Only accepts:
+ *   - HTTPS protocol
+ *   - No userinfo (username/password in URL)
+ *   - Domain names only (no IP addresses, no IPv6, no localhost)
+ *
+ * This eliminates entire classes of SSRF bypass:
+ *   - IPv4-mapped IPv6 (::ffff:169.254.169.254)
+ *   - Hex/octal IP representations
+ *   - DNS rebinding is mitigated by CF Workers' fetch() which blocks
+ *     private IPs at the network level regardless of DNS resolution
+ */
 export function validateUpstreamUrl(url: string): boolean {
   let parsed: URL;
   try {
@@ -76,25 +89,23 @@ export function validateUpstreamUrl(url: string): boolean {
 
   const host = parsed.hostname.toLowerCase();
 
-  // Block localhost (all representations)
-  if (host === "localhost" || host === "0.0.0.0" || host === "[::1]" || host === "::1") {
-    return false;
-  }
-  // Block 127.x.x.x (entire loopback range)
-  if (/^127\./.test(host)) return false;
+  // Must be a domain name — reject everything else.
+  // Domain names: letters, digits, hyphens, dots. No brackets, no colons.
+  // This rejects all IP addresses (v4 and v6), localhost, and special names.
 
-  // Block cloud metadata endpoints
-  if (host === "169.254.169.254" || host === "metadata.google.internal") {
-    return false;
-  }
+  // Reject IPv6 (contains brackets or colons)
+  if (host.includes("[") || host.includes("]") || host.includes(":")) return false;
 
-  // Block link-local (169.254.x.x)
-  if (/^169\.254\./.test(host)) return false;
+  // Reject if hostname is all digits and dots (IPv4 address)
+  if (/^[\d.]+$/.test(host)) return false;
 
-  // Block private RFC1918 ranges
-  if (/^10\./.test(host)) return false;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
-  if (/^192\.168\./.test(host)) return false;
+  // Reject localhost and other special hostnames
+  if (host === "localhost" || host.endsWith(".localhost")) return false;
+  if (host.endsWith(".internal")) return false;  // metadata.google.internal etc.
+
+  // Must look like a domain: has at least one dot, only valid DNS chars
+  if (!host.includes(".")) return false;
+  if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(host)) return false;
 
   return true;
 }

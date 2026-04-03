@@ -93,7 +93,9 @@
 | scope escalation via glob injection | regex metacharacters in sub bypass matching | glob uses linear segment matching (no regex). control characters rejected | `vault-adversarial.glob-injection` |
 | ReDoS via crafted pattern | catastrophic backtracking in glob matcher | no regex — linear-time segment matching, completes in <100ms | `vault-adversarial.redos` |
 | service name path traversal | `../admin` or `nvd/../other` as service name | alphanumeric + hyphen + underscore only (`/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/`) | `vault-adversarial.path-traversal` |
-| SSRF via upstream URL | vault fetches from 169.254.169.254 or localhost | URL validation: HTTPS only, block loopback/private/link-local/metadata. CF runtime also blocks private IP fetch | `vault-adversarial.ssrf` |
+| SSRF via upstream URL | vault fetches from 169.254.169.254 or localhost | **ALLOWLIST approach** — domain names only, no IP addresses (v4/v6). Rejects all IPv6 (brackets/colons), all numeric hostnames, localhost, .internal. CF runtime also blocks private IP fetch at network level | `vault-adversarial.ssrf` |
+| SSRF via IPv4-mapped IPv6 | `https://[::ffff:169.254.169.254]/` bypasses regex blocklist | **FIXED** — all IPv6 rejected (brackets/colons check). All raw IPs rejected (digits+dots check). Allowlist, not blocklist | `vault-adversarial.ssrf-ipv6` |
+| SSRF via DNS rebinding | attacker domain resolves to internal IP | CF Workers fetch() blocks private IPs at network level regardless of DNS. Domain allowlist prevents IP-only hostnames | `vault-adversarial.ssrf-rebinding` |
 | SSRF via userinfo | `https://admin:pass@api.example.com` | reject URLs with username or password | `vault-adversarial.ssrf-userinfo` |
 | header injection via CRLF | stored credential with `\r\n` in header value | Headers API rejects or sanitizes CRLF | `vault-adversarial.crlf-injection` |
 | cross-service credential leak | request service A, receive service B's headers | buildProxyRequest takes a single credential — no global state | `vault-adversarial.cross-service` |
