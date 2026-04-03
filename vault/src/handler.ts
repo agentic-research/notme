@@ -9,7 +9,6 @@
 // Identity resolution and storage are injected — no DO/CF coupling here.
 
 import {
-  type StoredCredential,
   type VaultStorage,
   getCredential,
   storeCredential,
@@ -19,7 +18,6 @@ import {
   validateServiceName,
   validateUpstreamUrl,
   buildProxyRequest,
-  sanitizeResponse,
   buildErrorResponse,
 } from "./vault";
 
@@ -28,10 +26,16 @@ export interface HandleRequestInput {
   storage: VaultStorage;
   resolveIdentity: (req: Request) => Promise<string | null>;
   adminSub: string;
+  /**
+   * Proxy via the DO — decrypts credentials and fetches upstream INSIDE the DO.
+   * Plaintext headers never leave the DO boundary.
+   * If not provided (tests), falls back to building proxy request in the handler.
+   */
+  proxyViaVault?: (service: string, request: Request) => Promise<Response>;
 }
 
 export async function handleRequest(input: HandleRequestInput): Promise<Response> {
-  const { request, storage, resolveIdentity, adminSub } = input;
+  const { request, storage, resolveIdentity, adminSub, proxyViaVault } = input;
   const url = new URL(request.url);
   const pathname = url.pathname;
 
@@ -114,6 +118,7 @@ export async function handleRequest(input: HandleRequestInput): Promise<Response
   }
 
   // ── Proxy: GET/POST/etc → upstream ────────────────────────────────────
+  // Check credential exists and caller has access (metadata only — no decrypted headers)
   const cred = await getCredential(storage, service);
   if (!cred) return json(buildErrorResponse("not_found", sub, service, null), 404);
 
@@ -121,24 +126,27 @@ export async function handleRequest(input: HandleRequestInput): Promise<Response
     return json(buildErrorResponse("forbidden", sub, service, cred), 403);
   }
 
-  const proxyReq = buildProxyRequest(request, cred);
-
   console.log(JSON.stringify(buildAuditEntry({
     event: "proxy",
     sub,
     service,
     method: request.method,
-    status: 0,  // will be updated after fetch in real Worker
+    status: 0,
   })));
 
-  // In tests, we don't actually fetch — the test validates the proxy request
-  // construction. In the real Worker, this would be: return sanitizeResponse(await fetch(proxyReq));
-  // For the handler test, return a marker response so we can assert routing worked.
+  // Production: proxy via DO — credentials decrypted and used INSIDE the DO.
+  // Plaintext headers never cross the RPC boundary.
+  if (proxyViaVault) {
+    return proxyViaVault(service, request);
+  }
+
+  // Test fallback: build proxy request with the (empty) headers from metadata.
+  // Tests validate routing, access control, and audit — not the actual fetch.
+  const proxyReq = buildProxyRequest(request, cred);
   return new Response(JSON.stringify({
     _proxy: true,
     url: proxyReq.url,
     method: proxyReq.method,
-    hasCredentialHeader: Object.keys(cred.headers).some(k => proxyReq.headers.get(k) !== null),
   }), {
     status: 200,
     headers: { "Content-Type": "application/json" },

@@ -11,6 +11,8 @@ import { verifyAccessToken, verifyDPoPToken } from "../../gen/ts/dpop";
 export interface Env {
   VAULT: DurableObjectNamespace;
   ADMIN_SUB: string;
+  /** Secret string used to derive the KEK for credential encryption. */
+  VAULT_KEK_SECRET: string;
 }
 
 export default {
@@ -73,28 +75,45 @@ export default {
         return null;
       },
       adminSub: env.ADMIN_SUB || "",
+      // Proxy via DO — credentials decrypted INSIDE the DO, never cross RPC.
+      proxyViaVault: async (service, req) => vault.proxyRequest(service, req),
     });
   },
 };
 
 // ── Durable Object: CredentialVault ─────────────────────────────────────────
+//
+// The DO is the security kernel. It:
+//   1. Derives the KEK from this.env.VAULT_KEK_SECRET (non-extractable)
+//   2. Encrypts credential headers before writing to SQLite
+//   3. Decrypts only when proxying (plaintext never crosses RPC)
+//   4. Performs the upstream fetch itself — plaintext headers stay in DO memory
+//
+// The Worker is just a routing/auth shell. It never sees decrypted credentials.
+
+import { deriveKEK, encrypt, decrypt, type SealedCredential } from "./crypto";
+import { buildProxyRequest, sanitizeResponse } from "./vault";
 
 interface StoredRow {
   upstream: string;
-  headers_json: string;
+  sealed_headers: string;  // JSON-serialized SealedCredential
   allowed_subs_json: string;
 }
 
+// DurableObject base class provides this.ctx and this.env automatically.
+// Using the type annotation for documentation — actual base class import
+// requires cloudflare:workers which is only available at runtime.
 export class CredentialVault {
   private sql: any;
+  private kekPromise: Promise<CryptoKey> | null = null;
 
-  constructor(private ctx: DurableObjectState) {
+  constructor(private ctx: any, private env: Env) {
     this.sql = ctx.storage.sql;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS credentials (
         service TEXT PRIMARY KEY,
         upstream TEXT NOT NULL,
-        headers_json TEXT NOT NULL,
+        sealed_headers TEXT NOT NULL,
         allowed_subs_json TEXT NOT NULL,
         created_at TEXT DEFAULT (datetime('now')),
         updated_at TEXT DEFAULT (datetime('now'))
@@ -102,32 +121,46 @@ export class CredentialVault {
     `);
   }
 
+  /** Lazy KEK derivation — derived once per DO lifetime, cached. */
+  #getKEK(): Promise<CryptoKey> {
+    if (!this.kekPromise) {
+      this.kekPromise = deriveKEK(this.env.VAULT_KEK_SECRET);
+    }
+    return this.kekPromise;
+  }
+
+  /** Get credential metadata (upstream, scopes) WITHOUT decrypting headers. */
   async getCredential(service: string) {
     const rows = this.sql.exec(
-      "SELECT upstream, headers_json, allowed_subs_json FROM credentials WHERE service = ?",
+      "SELECT upstream, sealed_headers, allowed_subs_json FROM credentials WHERE service = ?",
       service,
     ).toArray();
     if (!rows.length) return null;
     const row = rows[0] as StoredRow;
     return {
       upstream: row.upstream,
-      headers: JSON.parse(row.headers_json),
+      // Return a stub — headers are encrypted, not returned to Worker
+      headers: {} as Record<string, string>,
       allowedSubs: JSON.parse(row.allowed_subs_json),
     };
   }
 
+  /** Store a credential — headers are encrypted before writing to SQLite. */
   async putCredential(service: string, cred: { upstream: string; headers: Record<string, string>; allowedSubs: string[] }) {
+    const kek = await this.#getKEK();
+    const sealed = await encrypt(cred.headers, kek);
+
     this.sql.exec(
-      `INSERT INTO credentials (service, upstream, headers_json, allowed_subs_json)
+      `INSERT INTO credentials (service, upstream, sealed_headers, allowed_subs_json)
        VALUES (?, ?, ?, ?)
        ON CONFLICT(service) DO UPDATE SET
          upstream = excluded.upstream,
-         headers_json = excluded.headers_json,
+         sealed_headers = excluded.sealed_headers,
          allowed_subs_json = excluded.allowed_subs_json,
          updated_at = datetime('now')`,
       service,
       cred.upstream,
-      JSON.stringify(cred.headers),
+      JSON.stringify(sealed),
       JSON.stringify(cred.allowedSubs),
     );
   }
@@ -143,7 +176,36 @@ export class CredentialVault {
       .map((r: { service: string }) => r.service);
   }
 
-  async fetch(request: Request): Promise<Response> {
-    return new Response("DO internal only", { status: 500 });
+  /**
+   * Proxy a request to the upstream service.
+   * Decrypts credential headers INSIDE the DO, builds the proxy request,
+   * performs the fetch, sanitizes the response. Plaintext headers never
+   * leave this DO's memory.
+   */
+  async proxyRequest(service: string, incomingRequest: Request): Promise<Response> {
+    const rows = this.sql.exec(
+      "SELECT upstream, sealed_headers, allowed_subs_json FROM credentials WHERE service = ?",
+      service,
+    ).toArray();
+    if (!rows.length) return Response.json({ error: "not_found" }, { status: 404 });
+
+    const row = rows[0] as StoredRow;
+    const kek = await this.#getKEK();
+    const sealed = JSON.parse(row.sealed_headers) as SealedCredential;
+    const headers = await decrypt(sealed, kek);
+
+    const cred = {
+      upstream: row.upstream,
+      headers,
+      allowedSubs: JSON.parse(row.allowed_subs_json),
+    };
+
+    const proxyReq = buildProxyRequest(incomingRequest, cred);
+    const upstream = await fetch(proxyReq);
+    return sanitizeResponse(upstream);
+  }
+
+  async fetch(_request: Request): Promise<Response> {
+    return new Response("Use RPC methods, not fetch", { status: 500 });
   }
 }
