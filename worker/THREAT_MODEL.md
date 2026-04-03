@@ -36,13 +36,73 @@
 | bundle forgery | publish unsigned/tampered bundle | bundle Ed25519-signed by DO key | `bundle.signature.verification` |
 | stale bundle | serve expired bundle | BUNDLE_MAX_AGE_MS (5 min) staleness check | `bundle.staleness` |
 
-### 4. static content / routing
+### 4. DPoP token endpoint (POST /token)
+
+| threat | attack | defense | test |
+|--------|--------|---------|------|
+| proof forgery | craft a DPoP proof with a different key | ES256 signature verification against embedded JWK | `dpop.signature.verification` |
+| proof replay | reuse a valid DPoP proof | JTI stored in KV (600s TTL), checked before mint | `dpop.jti.replay` |
+| proof expiry | use a stale proof | iat must be within 60s of server time | `dpop.iat.expiry` |
+| htm/htu mismatch | proof for different method/URL | exact match on htm (POST) and htu (auth.notme.bot/token) | `dpop.htm-htu.mismatch` |
+| audience bypass | request token for unauthorized service | audience allowlist (rosary.bot, mache.rosary.bot, notme.bot, auth.notme.bot) | `dpop.audience.allowlist` |
+| rate exhaustion | flood token mints | CF rate limiting binding: 20/principal/minute (atomic, edge-fast) | `dpop.rate-limit` |
+| session theft | use stolen session cookie to mint tokens | DPoP binding — token is useless without the client's private key. session cookie is HttpOnly/Secure/SameSite=Strict | `dpop.session.binding` |
+| thumbprint collision | craft a key with same JWK thumbprint | SHA-256 thumbprint (RFC 7638) — collision infeasible | `dpop.thumbprint.collision` |
+| nonce bypass | skip server nonce | **NOT YET IMPLEMENTED** — defense-in-depth, tracked as known limitation | — |
+
+### 5. DPoP authorize redirect (GET /authorize)
+
+| threat | attack | defense | test |
+|--------|--------|---------|------|
+| open redirect | redirect_uri to attacker-controlled domain | allowlist: *.rosary.bot, *.notme.bot, localhost only | `authorize.redirect.allowlist` |
+| state CSRF | forge the state parameter | state is opaque UUID, validated by consuming app (rig checks KV) | `authorize.state.csrf` |
+| token in URL logs | access token visible in redirect URL query params | token is DPoP-bound (useless without ephemeral key), 5-min expiry, JTI unique | `authorize.token.url-exposure` |
+| session fixation | attacker sets up session then redirects victim | session cookie is SameSite=Strict, HMAC-signed with user-specific claims | `authorize.session.fixation` |
+| return_to injection | craft /login?return_to=//evil.com | return_to must start with / and not start with // | `authorize.return-to.validation` |
+
+### 6. CORS
+
+| threat | attack | defense | test |
+|--------|--------|---------|------|
+| origin bypass | cross-origin request from unauthorized domain | explicit origin allowlist (6 domains), no wildcards | `cors.origin.allowlist` |
+| preflight cache poisoning | cache a permissive preflight for wrong origin | Access-Control-Allow-Origin echoes only the matched origin, not * | `cors.preflight.origin-echo` |
+| credential leak via CORS | browser sends cookies cross-origin | Access-Control-Allow-Credentials not set (DPoP tokens used instead of cookies cross-origin) | `cors.credentials.omitted` |
+
+### 7. AuthService RPC (service bindings)
+
+| threat | attack | defense | test |
+|--------|--------|---------|------|
+| unauthorized RPC | external caller invokes AuthService methods | service bindings are capability-based — only Workers with the binding can call. No public URL, no HTTP surface | `rpc.capability.isolation` |
+| capability leak | consuming Worker exposes AuthService to its clients | AuthService methods return structured data (not CryptoKeys). Consuming Worker must add its own auth layer | `rpc.data.boundary` |
+| CryptoKey extraction | extract signing key via RPC | CryptoKey is not Structured Cloneable — cannot cross RPC boundary. All signing happens inside the DO | `rpc.cryptokey.isolation` |
+
+### 8. static content / routing
 
 | threat | attack | defense | test |
 |--------|--------|---------|------|
 | path traversal | access internal files (.env, wrangler.toml) | blockedPaths + dotfile check in worker.ts | `routing.blocked-paths` |
 | subdomain confusion | auth.notme.bot serves main site content | run_worker_first=true, explicit subdomain routing | `routing.subdomain.isolation` |
 | cache poisoning | CF cache serves wrong content for subdomain | Vary header on content-negotiated responses | `routing.cache.vary` |
+
+### 9. credential vault (vault/)
+
+| threat | attack | defense | test |
+|--------|--------|---------|------|
+| credential exfiltration via headers | upstream echoes API key in response headers | response sanitization: allowlist-only headers (content-type, cache-control, rate-limit) | `vault-adversarial.exfil-headers` |
+| credential exfiltration via error | trigger error that includes API key | buildErrorResponse ignores credential parameter entirely | `vault-adversarial.exfil-error` |
+| scope escalation via glob injection | regex metacharacters in sub bypass matching | glob uses linear segment matching (no regex). control characters rejected | `vault-adversarial.glob-injection` |
+| ReDoS via crafted pattern | catastrophic backtracking in glob matcher | no regex — linear-time segment matching, completes in <100ms | `vault-adversarial.redos` |
+| service name path traversal | `../admin` or `nvd/../other` as service name | alphanumeric + hyphen + underscore only (`/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/`) | `vault-adversarial.path-traversal` |
+| SSRF via upstream URL | vault fetches from 169.254.169.254 or localhost | URL validation: HTTPS only, block loopback/private/link-local/metadata. CF runtime also blocks private IP fetch | `vault-adversarial.ssrf` |
+| SSRF via userinfo | `https://admin:pass@api.example.com` | reject URLs with username or password | `vault-adversarial.ssrf-userinfo` |
+| header injection via CRLF | stored credential with `\r\n` in header value | Headers API rejects or sanitizes CRLF | `vault-adversarial.crlf-injection` |
+| cross-service credential leak | request service A, receive service B's headers | buildProxyRequest takes a single credential — no global state | `vault-adversarial.cross-service` |
+| caller auth leak to upstream | Authorization/Cookie/DPoP forwarded to upstream | explicit strip list: auth headers + CF headers + hop-by-hop headers | `vault-security.header-stripping` |
+| CF header leak to upstream | CF-Connecting-IP, CF-Ray etc. forwarded | stripped before proxy. CF-Worker header auto-added by CF (cannot strip — documented, not a vulnerability) | `vault-security.cf-header-stripping` |
+| plaintext credentials at rest | dump DO SQLite to read API keys | AES-GCM envelope encryption: per-credential DEK wrapped by KEK derived from Worker secret (non-extractable) | `vault-encryption.roundtrip` |
+| KEK extraction | export the KEK via code injection | KEK is non-extractable CryptoKey. No exportKey calls in production code | `vault-encryption.kek-nonextractable` |
+| plaintext across RPC | Worker reads decrypted headers via DO RPC | DO is security kernel — decrypts only during proxyRequest(), does the fetch itself. getCredential() returns metadata only (empty headers) | `vault-worker.proxy-via-vault` |
+| admin impersonation | non-admin stores/deletes credentials | admin sub checked against ADMIN_SUB env var on all PUT/DELETE/list operations | `vault-worker.admin-only` |
 
 ## out of scope (v1)
 
@@ -61,6 +121,21 @@ worker/src/__tests__/
   passkey.test.ts        — WebAuthn registration, authentication, session
   cert-gha.test.ts       — OIDC validation, JTI, rate limiting, owner check
   signing.test.ts        — SigningAuthority DO, key lifecycle, bundle generation
-  revocation.test.ts     — epoch, seqno, bundle verification (existing)
+  revocation.test.ts     — epoch, seqno, bundle verification
   routing.test.ts        — path blocking, subdomain isolation, content negotiation
+  dpop.test.ts           — DPoP proof validation (signature, claims, replay, nonce)
+  token.test.ts          — JWT access token minting + verification (EdDSA)
+  routes-dpop.test.ts    — /token endpoint integration (handler, JWKS)
+  session.test.ts        — session cookie creation, verification, expiry
+  connections.test.ts    — identity linking (OIDC/x509 proofs)
+
+gen/ts/__tests__/
+  dpop-verifier.test.ts  — shared SDK: verifyDPoPToken + verifyAccessToken
+
+vault/src/__tests__/
+  vault.test.ts          — core CRUD, proxy building, glob matching
+  vault-security.test.ts — header stripping, SSRF, service name validation, response sanitization
+  vault-adversarial.test.ts — red team: exfiltration, injection, ReDoS, SSRF, scope escalation
+  encryption.test.ts     — AES-GCM envelope encryption roundtrip, KEK isolation
+  worker.test.ts         — handler routing, admin auth, access control, audit logging
 ```
