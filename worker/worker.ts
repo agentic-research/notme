@@ -375,9 +375,9 @@ function parseCookie(cookieHeader: string, name: string): string | null {
 
 // ── GET /authorize — inline HTML page for cross-origin DPoP token issuance ──
 //
-// Browser generates ephemeral ECDSA P-256 keypair, builds a DPoP proof,
-// POSTs to /token (same origin — cookie sent automatically), then redirects
-// back to the caller with ?token=<jwt>&state=<state>.
+// Browser POSTs to /authorize/token (same origin — session cookie automatic),
+// receives an unbound redirect token (no cnf.jkt — not DPoP-bound),
+// then redirects back to the caller with ?token=<jwt>&state=<state>.
 //
 // All params are injected via data attributes on a hidden div — no inline
 // script variables, no eval. The JS reads them via dataset.
@@ -523,69 +523,15 @@ function authorizePageHtml(redirectUri: string, audience: string, state: string)
     statusLine.className = 'term-line ' + (cls || 'dim');
   }
 
-  // Base64url helpers (no padding)
-  function bufToB64url(buf) {
-    var a = new Uint8Array(buf);
-    var s = '';
-    for (var i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
-    return btoa(s).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
-  }
-
-  // Build a minimal DPoP proof JWT
-  async function buildDpopProof(privateKey, publicJwk) {
-    // Header
-    var header = { typ: 'dpop+jwt', alg: 'ES256', jwk: publicJwk };
-    var headerB64 = bufToB64url(new TextEncoder().encode(JSON.stringify(header)));
-
-    // Payload
-    var payload = {
-      jti: crypto.randomUUID(),
-      htm: 'POST',
-      htu: window.location.origin + '/token',
-      iat: Math.floor(Date.now() / 1000)
-    };
-    var payloadB64 = bufToB64url(new TextEncoder().encode(JSON.stringify(payload)));
-
-    // Sign
-    var sigInput = new TextEncoder().encode(headerB64 + '.' + payloadB64);
-    var rawSig = await crypto.subtle.sign(
-      { name: 'ECDSA', hash: 'SHA-256' },
-      privateKey,
-      sigInput
-    );
-
-    // ECDSA raw signature (r||s, 64 bytes) — already correct for ES256 JWS
-    return headerB64 + '.' + payloadB64 + '.' + bufToB64url(rawSig);
-  }
-
   async function run() {
     try {
-      // 1. Generate ephemeral ECDSA P-256 keypair (private key NOT extractable)
-      var kp = await crypto.subtle.generateKey(
-        { name: 'ECDSA', namedCurve: 'P-256' },
-        false,
-        ['sign']
-      );
-
-      // 2. Export public key as JWK (for the DPoP proof header)
-      var pubJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
-      // Strip private fields just in case (only kty, crv, x, y needed)
-      var publicJwk = { kty: pubJwk.kty, crv: pubJwk.crv, x: pubJwk.x, y: pubJwk.y };
-
-      addLine('keypair generated (P-256, non-extractable)', 'dim');
-
-      // 3. Build DPoP proof JWT
-      var proof = await buildDpopProof(kp.privateKey, publicJwk);
-      addLine('dpop proof signed', 'dim');
-
-      // 4. POST to /token (same origin — cookie sent automatically)
-      addLine('requesting access token...', 'info');
-      var res = await fetch('/token', {
+      // POST to /authorize/token — mints an unbound redirect token (no DPoP).
+      // Session cookie sent automatically (same origin).
+      // No client-side crypto needed — the session IS the identity proof.
+      addLine('requesting redirect token...', 'info');
+      var res = await fetch('/authorize/token', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'DPoP': proof
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audience: audience }),
         credentials: 'same-origin'
       });
@@ -600,7 +546,7 @@ function authorizePageHtml(redirectUri: string, audience: string, state: string)
       var token = data.access_token;
       if (!token) throw new Error('no access_token in response');
 
-      addLine('token issued (DPoP, 5min TTL)', 'ok');
+      addLine('redirect token issued (5min TTL)', 'ok');
 
       // 5. Redirect back to caller with token + state
       var sep = redirectUri.indexOf('?') === -1 ? '?' : '&';
@@ -1391,8 +1337,55 @@ export default {
         });
       }
 
+      // POST /authorize/token — Unbound redirect token for /authorize flow.
+      // Session cookie required. No DPoP — token has no cnf.jkt.
+      // Used by the /authorize page JS after passkey login.
+      if (pathname === "/authorize/token" && request.method === "POST") {
+        try {
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          if (!cookie) {
+            return Response.json({ error: "session_required" }, { status: 401 });
+          }
+
+          let audience = "";
+          try {
+            const body = await request.json() as { audience?: string };
+            audience = body.audience || "";
+          } catch { /* empty body */ }
+
+          if (!audience) {
+            return Response.json({ error: "audience_required" }, { status: 400 });
+          }
+
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const { verifySessionCookie } = await import("./src/auth/session");
+          const sessionSecret = await authority.getSessionSecret();
+          const session = await verifySessionCookie(cookie, sessionSecret);
+          if (!session) {
+            return Response.json({ error: "invalid_session" }, { status: 401 });
+          }
+
+          const accessToken = await authority.mintRedirectToken({
+            sub: session.principalId,
+            scope: session.scopes.join(" "),
+            audience,
+          });
+
+          return Response.json({
+            access_token: accessToken,
+            token_type: "Bearer",
+            expires_in: 300,
+          });
+        } catch (e: any) {
+          return Response.json({ error: "authorize token error: " + e.message }, { status: 500 });
+        }
+      }
+
       // POST /token — DPoP sender-constrained access token (RFC 9449)
-      // Identity: session cookie OR client cert PEM in X-Client-Cert header.
       if (pathname === "/token" && request.method === "POST") {
         try {
           const dpopProof = request.headers.get("DPoP");

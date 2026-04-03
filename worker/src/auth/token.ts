@@ -18,7 +18,8 @@ export interface MintAccessTokenParams {
   sub: string;
   scope: string;
   audience: string;
-  jkt: string;
+  /** JWK thumbprint — if provided, token is DPoP-bound (cnf.jkt). If omitted, token is unbound (Bearer/redirect). */
+  jkt?: string;
   signingKey: CryptoKey;
   keyId: string;
 }
@@ -65,7 +66,7 @@ export async function mintAccessToken(
     exp: iat + TOKEN_LIFETIME_SECONDS,
     jti: crypto.randomUUID(),
     scope,
-    cnf: { jkt },
+    ...(jkt ? { cnf: { jkt } } : {}),
   };
 
   const headerB64 = encodeJwtPart(header);

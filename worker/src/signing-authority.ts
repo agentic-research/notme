@@ -295,6 +295,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     });
   }
 
+  // Mint an unbound redirect token — no cnf.jkt, safe for verifyAccessToken (Bearer path).
+  // Used by /authorize redirect flow where the DPoP keypair is ephemeral and lost after navigation.
+  async mintRedirectToken(params: {
+    sub: string;
+    scope: string;
+    audience: string;
+  }): Promise<string> {
+    const { signingKey, keyId } = await this.getOrCreateSigningKey();
+    const { mintAccessToken } = await import("./auth/token");
+    return mintAccessToken({
+      sub: params.sub,
+      scope: params.scope,
+      audience: params.audience,
+      // No jkt — unbound token, accepted by verifyAccessToken
+      signingKey,
+      keyId,
+    });
+  }
+
   // Mint a bridge cert inside the DO — CryptoKey never crosses the RPC boundary.
   async mintBridgeCert(
     subject: string,
