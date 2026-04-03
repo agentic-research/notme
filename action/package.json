@@ -9,6 +9,7 @@
     "@actions/http-client": "^2.2.3"
   },
   "devDependencies": {
+    "@types/node": "^25.5.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.8.0"
   }
