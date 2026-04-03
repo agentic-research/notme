@@ -4,6 +4,63 @@
 export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+// ── Private RPC surface — only callable via service binding ──
+// Consuming Workers bind to this entrypoint:
+//   [[services]]
+//   binding = "AUTH"
+//   service = "notme-bot"
+//   entrypoint = "AuthService"
+//
+// Then call: await env.AUTH.mintBridgeCert(subject, publicKeyPem)
+// No HTTP, no public URL, no CORS, no tokens needed.
+
+export class AuthService extends WorkerEntrypoint<any> {
+  private getAuthority() {
+    const id = this.env.SIGNING_AUTHORITY.idFromName("default");
+    return this.env.SIGNING_AUTHORITY.get(id);
+  }
+
+  /** Mint a bridge cert for a verified subject. */
+  async mintBridgeCert(subject: string, publicKeyPem: string, ttlMs?: number) {
+    const authority = this.getAuthority();
+    return authority.mintBridgeCert(subject, publicKeyPem, ttlMs);
+  }
+
+  /** Mint a DPoP-bound access token. */
+  async mintDPoPToken(params: { sub: string; scope: string; audience: string; jkt: string }) {
+    const authority = this.getAuthority();
+    return authority.mintDPoPToken(params);
+  }
+
+  /** Get the CA public key PEM. */
+  async getPublicKeyPem() {
+    const authority = this.getAuthority();
+    return authority.getPublicKeyPem();
+  }
+
+  /** Get the X.509 CA certificate PEM (for mTLS trust store). */
+  async getCACertificatePem() {
+    const authority = this.getAuthority();
+    return authority.getCACertificatePem();
+  }
+
+  /** Get authority state (epoch, seqno, keyId). */
+  async getAuthorityState() {
+    const authority = this.getAuthority();
+    return authority.getAuthorityState();
+  }
+
+  /** Verify a session cookie, return principal info. */
+  async verifySession(cookie: string) {
+    const authority = this.getAuthority();
+    const { verifySessionCookie } = await import("./src/auth/session");
+    const secret = await authority.getSessionSecret();
+    return verifySessionCookie(cookie, secret);
+  }
+}
+
 // ── auth.notme.bot/cert/gha — GitHub Actions OIDC → bridge cert exchange ──
 //
 // GHA CI jobs request an OIDC token (audience: notme.bot) and POST it here.
