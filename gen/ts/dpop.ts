@@ -207,6 +207,22 @@ export async function verifyDPoPToken(
   // Validate proof claims (strict per RFC 9449 Section 4.3)
   const pPayload = jsonParse(base64urlDecodeStr(pPayloadB64), "DPoP proof payload");
 
+  // jti required — without it, replay detection is impossible
+  if (!pPayload.jti || typeof pPayload.jti !== "string") {
+    throw new Error("DPoP proof missing jti claim");
+  }
+
+  // iat required and must be within 60s — prevents replay of intercepted proofs
+  if (typeof pPayload.iat !== "number") {
+    throw new Error("DPoP proof missing iat claim");
+  }
+  const proofAge = now - pPayload.iat;
+  if (proofAge > 60 || proofAge < -60) {
+    throw new Error(
+      `DPoP proof iat is too old or in the future (age: ${proofAge}s, max: 60s)`,
+    );
+  }
+
   if (pPayload.htm !== method) {
     throw new Error(
       `DPoP proof htm mismatch: expected "${method}", got "${pPayload.htm}"`,
@@ -291,6 +307,15 @@ export async function verifyAccessToken(
   }
   if (!payload.sub || typeof payload.sub !== "string") {
     throw new Error("Access token missing sub claim");
+  }
+
+  // RFC 9449 Section 3: a DPoP-bound token (has cnf.jkt) MUST NOT be
+  // accepted as a plain Bearer token. Rejecting here prevents downgrade
+  // attacks where an attacker strips the DPoP header from a stolen token.
+  if (payload.cnf) {
+    throw new Error(
+      "DPoP-bound token cannot be verified as Bearer — use verifyDPoPToken with a proof",
+    );
   }
 
   return {

@@ -87,6 +87,38 @@ async function mintToken(opts: {
   return `${headerB64}.${payloadB64}.${b64url(sig)}`;
 }
 
+/** Mint an EdDSA access token WITHOUT cnf binding (for Bearer/redirect flows). */
+async function mintUnboundToken(opts: {
+  signingKey: CryptoKey;
+  sub: string;
+  scope?: string;
+  audience?: string;
+  expOverride?: number;
+  iatOverride?: number;
+}): Promise<string> {
+  const header = { typ: "at+jwt", alg: "EdDSA", kid: "test-kid" };
+  const iat = opts.iatOverride ?? Math.floor(Date.now() / 1000);
+  const payload: Record<string, unknown> = {
+    sub: opts.sub,
+    iss: "https://auth.notme.bot",
+    aud: opts.audience ?? "https://example.com",
+    iat,
+    nbf: iat,
+    exp: opts.expOverride ?? iat + 300,
+    jti: crypto.randomUUID(),
+    scope: opts.scope ?? "read",
+    // No cnf — this is a Bearer/redirect token, not DPoP-bound
+  };
+
+  const headerB64 = b64urlStr(JSON.stringify(header));
+  const payloadB64 = b64urlStr(JSON.stringify(payload));
+  const sigInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+  const sig = new Uint8Array(
+    await crypto.subtle.sign("Ed25519" as any, opts.signingKey, sigInput),
+  );
+  return `${headerB64}.${payloadB64}.${b64url(sig)}`;
+}
+
 /** Build and sign a DPoP proof JWT (ES256). */
 async function buildProof(opts: {
   keyPair: CryptoKeyPair;
@@ -536,6 +568,97 @@ describe("verifyDPoPToken", () => {
       }),
     ).rejects.toThrow(/signature/i);
   });
+
+  // ── HIGH: Proof replay (missing iat/jti validation) ───────────────────
+
+  it("HIGH: rejects DPoP proof with missing iat claim", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    // Proof without iat — enables indefinite replay
+    const proof = await buildProof({
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+      payloadOverrides: { iat: undefined },
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow(/iat/i);
+  });
+
+  it("HIGH: rejects DPoP proof with stale iat (>60s old)", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+      payloadOverrides: { iat: Math.floor(Date.now() / 1000) - 120 },
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow(/iat|old|expired|future/i);
+  });
+
+  it("HIGH: rejects DPoP proof with future iat", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+      payloadOverrides: { iat: Math.floor(Date.now() / 1000) + 120 },
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow(/iat|old|expired|future/i);
+  });
+
+  it("HIGH: rejects DPoP proof with missing jti claim", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+      payloadOverrides: { jti: undefined },
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow(/jti/i);
+  });
 });
 
 // ── verifyAccessToken (redirect flow, no DPoP proof) ──────────────────────
@@ -552,11 +675,10 @@ describe("verifyAccessToken", () => {
     jkt = await computeJwkThumbprint(ec.jwk);
   });
 
-  it("verifies a valid token without requiring a DPoP proof", async () => {
-    const token = await mintToken({
+  it("verifies a valid unbound token", async () => {
+    const token = await mintUnboundToken({
       signingKey: edKp.privateKey,
       sub: "principal:alice",
-      jkt,
       scope: "bridgeCert authorityManage",
       audience: "https://rosary.bot",
     });
@@ -575,10 +697,9 @@ describe("verifyAccessToken", () => {
 
   it("rejects an expired token", async () => {
     const now = Math.floor(Date.now() / 1000);
-    const token = await mintToken({
+    const token = await mintUnboundToken({
       signingKey: edKp.privateKey,
       sub: "principal:alice",
-      jkt,
       iatOverride: now - 600,
       expOverride: now - 300,
     });
@@ -590,10 +711,9 @@ describe("verifyAccessToken", () => {
 
   it("rejects a token signed by a different key", async () => {
     const otherKp = await generateEd25519();
-    const token = await mintToken({
+    const token = await mintUnboundToken({
       signingKey: otherKp.privateKey,
       sub: "principal:alice",
-      jkt,
     });
 
     await expect(
@@ -605,5 +725,22 @@ describe("verifyAccessToken", () => {
     await expect(
       verifyAccessToken({ token: "bad", jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
     ).rejects.toThrow(/malformed|parts/i);
+  });
+
+  it("CRITICAL: rejects DPoP-bound token used as Bearer (downgrade attack)", async () => {
+    // RFC 9449 Section 3: a DPoP-bound token (has cnf.jkt) MUST NOT be accepted
+    // as a plain Bearer token. An attacker who steals the token from logs can
+    // strip the DPoP header and replay as Bearer.
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,  // <-- this token is DPoP-bound (has cnf.jkt)
+      scope: "read",
+    });
+
+    // verifyAccessToken (Bearer path) must reject tokens with cnf claim
+    await expect(
+      verifyAccessToken({ token, jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
+    ).rejects.toThrow(/dpop.bound|cnf|bearer/i);
   });
 });
