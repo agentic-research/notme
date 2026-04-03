@@ -7,9 +7,10 @@
 // No npm JWT libraries — this is intentionally minimal.
 
 import {
-  encodeBase64urlNoPadding,
-  decodeBase64urlIgnorePadding,
-} from "@oslojs/encoding";
+  base64urlEncode,
+  base64urlDecode,
+  validateClaims,
+} from "../../../gen/ts/dpop";
 
 const ISSUER = "https://auth.notme.bot";
 const TOKEN_LIFETIME_SECONDS = 300; // 5 minutes
@@ -35,7 +36,7 @@ export interface AccessTokenClaims {
 
 function encodeJwtPart(obj: Record<string, unknown>): string {
   const json = JSON.stringify(obj);
-  return encodeBase64urlNoPadding(new TextEncoder().encode(json));
+  return base64urlEncode(new TextEncoder().encode(json));
 }
 
 /**
@@ -76,7 +77,7 @@ export async function mintAccessToken(
   const signature = new Uint8Array(
     await crypto.subtle.sign("Ed25519" as any, signingKey, signingInput),
   );
-  const signatureB64 = encodeBase64urlNoPadding(signature);
+  const signatureB64 = base64urlEncode(signature);
 
   return `${headerB64}.${payloadB64}.${signatureB64}`;
 }
@@ -106,7 +107,7 @@ export async function verifyAccessToken(
   const signingInput = new TextEncoder().encode(
     `${headerB64}.${payloadB64}`,
   );
-  const signature = decodeBase64urlIgnorePadding(signatureB64);
+  const signature = base64urlDecode(signatureB64);
 
   const valid = await crypto.subtle.verify(
     "Ed25519" as any,
@@ -120,14 +121,13 @@ export async function verifyAccessToken(
   }
 
   // Parse payload
-  const payloadBytes = decodeBase64urlIgnorePadding(payloadB64);
+  const payloadBytes = base64urlDecode(payloadB64);
   const payload = JSON.parse(new TextDecoder().decode(payloadBytes));
 
-  // Check expiry
-  const now = Math.floor(Date.now() / 1000);
-  if (payload.exp <= now) {
-    throw new Error("Token expired");
-  }
+  // Validate claims — type-checked exp, nbf, iat per jose patterns
+  validateClaims(payload, {
+    issuer: ISSUER,
+  });
 
   return {
     sub: payload.sub,

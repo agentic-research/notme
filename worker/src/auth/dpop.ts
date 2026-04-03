@@ -5,7 +5,7 @@
  * Uses Web Crypto for signature verification — no npm crypto dependencies.
  */
 
-import { computeJwkThumbprint } from "../../../gen/ts/dpop";
+import { computeJwkThumbprint, base64urlDecode, jsonParseSafe } from "../../../gen/ts/dpop";
 
 /** Maximum allowed age of a DPoP proof (seconds). */
 const MAX_IAT_AGE_SECONDS = 60;
@@ -54,8 +54,8 @@ export async function validateDpopProof(
   }
   const [headerB64, payloadB64, signatureB64] = parts;
 
-  const header = jsonParse(base64urlDecode(headerB64), "header");
-  const payload = jsonParse(base64urlDecode(payloadB64), "payload");
+  const header = jsonParseSafe(new TextDecoder().decode(base64urlDecode(headerB64)), "DPoP header");
+  const payload = jsonParseSafe(new TextDecoder().decode(base64urlDecode(payloadB64)), "DPoP payload");
 
   // ── 2. Validate header ─────────────────────────────────────────────────
   if (header.typ !== "dpop+jwt") {
@@ -85,7 +85,7 @@ export async function validateDpopProof(
   );
 
   const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
-  const signature = base64urlDecodeBytes(signatureB64);
+  const signature = base64urlDecode(signatureB64);
 
   const valid = await crypto.subtle.verify(
     { name: "ECDSA", hash: "SHA-256" },
@@ -153,40 +153,3 @@ export async function validateDpopProof(
   };
 }
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
-
-/** Decode a base64url string to a UTF-8 string. */
-function base64urlDecode(s: string): string {
-  // Restore standard base64
-  const base64 = s.replace(/-/g, "+").replace(/_/g, "/");
-  // Pad to multiple of 4
-  const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-  const binary = atob(padded);
-  // Decode as UTF-8
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return new TextDecoder().decode(bytes);
-}
-
-/** Decode a base64url string to raw bytes. */
-function base64urlDecodeBytes(s: string): Uint8Array {
-  const base64 = s.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-  const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-/** Parse JSON with a descriptive error. */
-function jsonParse(s: string, label: string): Record<string, any> {
-  try {
-    return JSON.parse(s);
-  } catch {
-    throw new Error(`DPoP proof ${label} is not valid JSON`);
-  }
-}
