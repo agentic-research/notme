@@ -119,3 +119,16 @@ tasks:
       - task: docs:check
       - task: worker:deploy
       - task: worker:verify
+
+  worker:build-local:
+    desc: Bundle worker for local workerd
+    dir: worker
+    cmds:
+      - npx esbuild worker.ts --bundle --format=esm --outfile=dist/worker.js --conditions=workerd --external:cloudflare:workers --external:@cloudflare/vitest-pool-workers
+
+  worker:serve:
+    desc: Run local identity authority via workerd
+    dir: worker
+    deps: [worker:build-local]
+    cmds:
+      - npx workerd serve config.capnp --experimental

@@ -26,11 +26,19 @@ const config :Workerd.Config = (
         allow = ["public"],
       ),
     ),
+
+    # Local disk for DO SQLite storage
+    ( name = "do-storage",
+      disk = (
+        path = "/data/do",
+        writable = true,
+      ),
+    ),
   ],
 
   sockets = [
     ( name = "http",
-      address = "*:8787",
+      address = "*:8788",
       http = (),
       service = "notme",
     ),
@@ -43,20 +51,32 @@ const notmeWorker :Workerd.Worker = (
 
   modules = [
     ( name = "worker",
-      esModule = embed "dist/index.js",
+      esModule = embed "dist/worker.js",
     ),
   ],
 
   bindings = [
     # Environment variables
     ( name = "SITE_URL",
-      text = "http://localhost:8787",
+      text = "http://localhost:8788",
     ),
     ( name = "SIGNET_AUTHORITY_URL",
-      text = "http://localhost:8787",
+      text = "http://localhost:8788",
     ),
     ( name = "GHA_ALLOWED_OWNERS",
       text = "agentic-research",
+    ),
+    # Key storage mode — ephemeral for local dev (no private key on disk)
+    ( name = "NOTME_KEY_STORAGE",
+      text = "ephemeral",
+    ),
+
+    # Durable Object namespace bindings (must match env.SIGNING_AUTHORITY etc. in code)
+    ( name = "SIGNING_AUTHORITY",
+      durableObjectNamespace = "SigningAuthority",
+    ),
+    ( name = "REVOCATION",
+      durableObjectNamespace = "RevocationAuthority",
     ),
   ],
 
@@ -64,13 +84,16 @@ const notmeWorker :Workerd.Worker = (
   durableObjectNamespaces = [
     ( className = "SigningAuthority",
       uniqueKey = "signing-authority-local",
+      enableSql = true,
     ),
     ( className = "RevocationAuthority",
       uniqueKey = "revocation-authority-local",
+      enableSql = true,
     ),
   ],
 
-  durableObjectStorage = (localDisk = "/data"),
+  durableObjectStorage = (localDisk = "do-storage"),
+  cacheApiOutbound = "internet",
 
   globalOutbound = "internet",
 );
