@@ -5,6 +5,7 @@ export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
+import type { Platform } from "./src/platform";
 
 // ── Private RPC surface — only callable via service binding ──
 // Consuming Workers bind to this entrypoint:
@@ -97,7 +98,7 @@ function jsonErr(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
 }
 
-async function handleCertGHA(request: Request, env: any): Promise<Response> {
+async function handleCertGHA(request: Request, env: any, platform: Platform): Promise<Response> {
   if (request.method !== "POST") {
     return jsonErr("method not allowed", 405);
   }
@@ -109,10 +110,10 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
   const authority = env.SIGNING_AUTHORITY.get(authorityId);
   try {
     // Ensure CA bundle is published to KV (lazy init — first request bootstraps)
-    const existingBundle = await env.CA_BUNDLE_CACHE?.get("bundle:current");
+    const existingBundle = await platform.cache.get("bundle:current");
     if (!existingBundle) {
       const bundle = await authority.generateBundle();
-      await env.CA_BUNDLE_CACHE.put("bundle:current", JSON.stringify(bundle));
+      await platform.cache.put("bundle:current", JSON.stringify(bundle));
     }
   } catch (e: any) {
     return jsonErr("authority unavailable: " + e.message, 503);
@@ -144,18 +145,18 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
   }
   {
     const jtiKey = `jti:${claims.jti}`;
-    const seen = await env.CA_BUNDLE_CACHE.get(jtiKey);
+    const seen = await platform.cache.get(jtiKey);
     if (seen) {
       return jsonErr("token already used", 401);
     }
     const ttl = Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000));
-    await env.CA_BUNDLE_CACHE.put(jtiKey, "1", { expirationTtl: ttl });
+    await platform.cache.put(jtiKey, "1", { expirationTtl: ttl });
   }
 
   // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
-  if (env.CERT_LIMITER) {
-    const { success } = await env.CERT_LIMITER.limit({ key: `cert:${claims.repository}` });
-    if (!success) {
+  if (platform.rateLimit) {
+    const allowed = await platform.rateLimit(`cert:${claims.repository}`);
+    if (!allowed) {
       return jsonErr("rate limit exceeded", 429);
     }
   }
@@ -888,6 +889,9 @@ export default {
     const envSiteUrl: string = env.SITE_URL || "";
     const isLocal = envSiteUrl.startsWith("http://localhost");
 
+    const { createPlatform } = await import("./src/platform");
+    const platform = createPlatform(env);
+
     // ── Canonical host enforcement ──
     // Redirect any non-notme.bot host (e.g. workers.dev) to the canonical domain.
     // This prevents Google from indexing the workers.dev URL as a duplicate.
@@ -1263,7 +1267,7 @@ export default {
 
       // POST /cert/gha — GHA OIDC JWT → bridge cert (legacy, kept for compat)
       if (pathname === "/cert/gha") {
-        return handleCertGHA(request, env);
+        return handleCertGHA(request, env, platform);
       }
 
       // GET /authorize — OAuth-style redirect for cross-origin DPoP token issuance
@@ -1472,13 +1476,13 @@ export default {
 
           // JTI replay check
           const jtiKey = `dpop:jti:${proofResult.jti}`;
-          if (await env.CA_BUNDLE_CACHE.get(jtiKey)) {
+          if (await platform.cache.get(jtiKey)) {
             return Response.json({ error: "proof_reused" }, { status: 401 });
           }
 
           // Store JTI BEFORE minting — prevents TOCTOU race across edge nodes.
           // If mint fails after this, the JTI is burned (acceptable — client retries with new proof).
-          await env.CA_BUNDLE_CACHE.put(jtiKey, "1", { expirationTtl: 600 });
+          await platform.cache.put(jtiKey, "1", { expirationTtl: 600 });
 
           // Mint token inside DO — CryptoKey never crosses RPC boundary
           const accessToken = await authority.mintDPoPToken({

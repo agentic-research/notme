@@ -732,10 +732,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   override async alarm(): Promise<void> {
     try {
       const bundle = await this.generateBundle();
-      await this.env.CA_BUNDLE_CACHE.put(
-        "bundle:current",
-        JSON.stringify(bundle),
-      );
+      if (this.env.CA_BUNDLE_CACHE) {
+        await this.env.CA_BUNDLE_CACHE.put(
+          "bundle:current",
+          JSON.stringify(bundle),
+        );
+      }
     } catch (e) {
       console.error("[signing-authority] bundle refresh failed:", e);
     }
