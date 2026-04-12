@@ -28,9 +28,9 @@ export interface CertExchangeRequest {
 }
 
 export interface CertExchangeResponse {
-  certificate: string;
-  private_key: string;
-  expires_at: number;
+  token: string;
+  token_type: string;
+  expires_in: number;
   subject: string;
   authority: { epoch: number; key_id: string };
   principal_id: string;
@@ -38,7 +38,6 @@ export interface CertExchangeResponse {
   auth_method: string;
 }
 
-const CERT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 export async function handleCertExchange(
   request: Request,
@@ -161,49 +160,29 @@ export async function handleCertExchange(
     );
   }
 
-  // ── Mint bridge cert (signing stays inside the DO — CryptoKey can't cross RPC) ──
-
-  // Generate ephemeral P-256 keypair
-  const kp = (await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-256" },
-    true,
-    ["sign", "verify"],
-  )) as CryptoKeyPair;
-
-  const pubDer = (await crypto.subtle.exportKey(
-    "spki",
-    kp.publicKey,
-  )) as ArrayBuffer;
-  const pubB64 = btoa(String.fromCharCode(...new Uint8Array(pubDer)));
-  const publicKeyPem = `-----BEGIN PUBLIC KEY-----\n${pubB64.match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
-
-  const privDer = (await crypto.subtle.exportKey(
-    "pkcs8",
-    kp.privateKey,
-  )) as ArrayBuffer;
-  const privB64 = btoa(String.fromCharCode(...new Uint8Array(privDer)));
-  const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${privB64.match(/.{1,64}/g)!.join("\n")}\n-----END PRIVATE KEY-----`;
-
-  let mintResult;
+  // ── Mint access token (signing stays inside the DO — no private key crosses RPC) ──
+  let accessToken: string;
   try {
-    mintResult = await authority.mintBridgeCert(
-      principalId, // CN = principal UUID
-      publicKeyPem,
-      CERT_TTL_MS,
-    );
+    accessToken = await authority.mintRedirectToken({
+      sub: principalId,
+      scope: effectiveScopes.join(" "),
+      audience: "notme.bot",
+    });
   } catch (e: any) {
     return Response.json(
-      { error: "cert minting failed: " + e.message },
+      { error: "token minting failed: " + e.message },
       { status: 500 },
     );
   }
 
+  const state = await authority.getAuthorityState();
+
   const response: CertExchangeResponse = {
-    certificate: mintResult.certificate,
-    private_key: privateKeyPem,
-    expires_at: mintResult.expires_at,
-    subject: mintResult.subject,
-    authority: mintResult.authority,
+    token: accessToken,
+    token_type: "Bearer",
+    expires_in: 300,
+    subject: principalId,
+    authority: { epoch: state.epoch, key_id: state.keyId },
     principal_id: principalId,
     scopes: effectiveScopes,
     auth_method: authMethod,

@@ -55,12 +55,31 @@ export function validateKeyStorageConfig(
   }
 }
 
-/** No-op cache — used when no cache binding is available. */
-export class NullCache implements CacheStore {
-  async get(): Promise<string | null> {
-    return null;
+/** In-memory cache with TTL — used in local workerd where KV is unavailable.
+ *  Provides real JTI replay protection (not a no-op). Entries expire by TTL. */
+export class MemoryCache implements CacheStore {
+  private store = new Map<string, { value: string; expiresAt: number | null }>();
+
+  async get(key: string): Promise<string | null> {
+    const entry = this.store.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt !== null && entry.expiresAt <= Math.floor(Date.now() / 1000)) {
+      this.store.delete(key);
+      return null;
+    }
+    return entry.value;
   }
-  async put(): Promise<void> {}
+
+  async put(
+    key: string,
+    value: string,
+    opts?: { expirationTtl?: number },
+  ): Promise<void> {
+    const expiresAt = opts?.expirationTtl
+      ? Math.floor(Date.now() / 1000) + opts.expirationTtl
+      : null;
+    this.store.set(key, { value, expiresAt });
+  }
 }
 
 /** CF KV-backed cache. */
@@ -135,7 +154,7 @@ export function createPlatform(
   } else if (sql) {
     cache = new SQLiteCache(sql);
   } else {
-    cache = new NullCache();
+    cache = new MemoryCache();
   }
 
   const platform: Platform = {

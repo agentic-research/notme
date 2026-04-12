@@ -3,16 +3,22 @@
 // JS string === is not constant-time. For security-sensitive comparisons
 // (bootstrap codes, session tokens), compare HMAC digests instead.
 
-const HMAC_KEY_MATERIAL = new TextEncoder().encode("notme-timing-safe-cmp");
+let cachedKey: CryptoKey | null = null;
 
-async function hmacDigest(value: string): Promise<ArrayBuffer> {
-  const key = await crypto.subtle.importKey(
+async function getHmacKey(): Promise<CryptoKey> {
+  if (cachedKey) return cachedKey;
+  cachedKey = await crypto.subtle.importKey(
     "raw",
-    HMAC_KEY_MATERIAL,
+    new TextEncoder().encode("notme-timing-safe-cmp"),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
+  return cachedKey;
+}
+
+async function hmacDigest(value: string): Promise<ArrayBuffer> {
+  const key = await getHmacKey();
   return crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
 }
 

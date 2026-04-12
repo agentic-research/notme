@@ -124,7 +124,10 @@ export async function verifyAccessToken(
   const payloadBytes = base64urlDecode(payloadB64);
   const payload = JSON.parse(new TextDecoder().decode(payloadBytes));
 
-  // Validate claims — type-checked exp, nbf, iat per jose patterns
+  // Require exp — tokens without expiry must never be accepted
+  if (typeof payload.exp !== "number") {
+    throw new Error("missing exp claim");
+  }
   validateClaims(payload, {
     issuer: ISSUER,
   });

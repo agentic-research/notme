@@ -17,7 +17,9 @@ import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 import type { CABundle } from "./revocation";
 
 interface SigningAuthorityEnv {
-  CA_BUNDLE_CACHE: KVNamespace;
+  CA_BUNDLE_CACHE?: KVNamespace;
+  NOTME_KEY_STORAGE?: string;
+  NOTME_KEK_SECRET?: string;
 }
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
@@ -27,10 +29,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
   private signingKey: CryptoKey | null = null;
   private verifyKey: CryptoKey | null = null;
-  private keyStorageMode: "ephemeral" | "encrypted" | "cf-managed" = "cf-managed";
-
-  setKeyStorageMode(mode: "ephemeral" | "encrypted" | "cf-managed"): void {
-    this.keyStorageMode = mode;
+  /** Key storage mode — auto-detected from env. No external call needed. */
+  private get keyStorageMode(): "ephemeral" | "encrypted" | "cf-managed" {
+    const explicit = this.env.NOTME_KEY_STORAGE;
+    if (explicit === "ephemeral") return "ephemeral";
+    if (explicit === "encrypted") return "encrypted";
+    if (explicit === "cf-managed") return "cf-managed";
+    if (this.env.NOTME_KEK_SECRET) return "encrypted";
+    return "cf-managed";
   }
 
   private ensureSchema(): void {

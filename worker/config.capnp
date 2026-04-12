@@ -4,12 +4,12 @@
 # No Cloudflare account needed.
 #
 # Usage:
-#   cd worker && npm run build   # bundle worker.ts → dist/
+#   cd worker && npm run build:local   # bundle worker.ts → dist/
 #   npx workerd serve config.capnp --experimental
-#   # → http://localhost:8787
+#   # → http://localhost:8788
 #
 # Or via Docker:
-#   docker run -p 8787:8787 -v $PWD:/app notme:latest
+#   docker run -p 8788:8788 ghcr.io/agentic-research/notme:latest
 
 using Workerd = import "/workerd/workerd.capnp";
 

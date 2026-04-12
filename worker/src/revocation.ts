@@ -56,7 +56,7 @@ export type RevocationResult =
   | { revoked: true; reason: RevocationReason };
 
 export interface RevocationEnv {
-  CA_BUNDLE_CACHE: KVNamespace;
+  CA_BUNDLE_CACHE?: KVNamespace;
   REVOCATION: DurableObjectNamespace;
 }
 
@@ -195,6 +195,10 @@ export async function checkRevocation(
   rootPublicKeyB64: string,
 ): Promise<RevocationResult> {
   // 1. Fetch bundle from KV
+  if (!env.CA_BUNDLE_CACHE) {
+    // No KV binding (local workerd) — fail open (same as no bundle)
+    return { revoked: false };
+  }
   const bundle = await env.CA_BUNDLE_CACHE.get<CABundle>(
     "bundle:current",
     "json",
