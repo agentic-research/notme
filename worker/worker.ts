@@ -885,11 +885,13 @@ export default {
     const pathname = url.pathname;
     const host = request.headers.get("host") || "";
     const sub = getSubdomain(host);
+    const envSiteUrl: string = env.SITE_URL || "";
+    const isLocal = envSiteUrl.startsWith("http://localhost");
 
     // ── Canonical host enforcement ──
     // Redirect any non-notme.bot host (e.g. workers.dev) to the canonical domain.
     // This prevents Google from indexing the workers.dev URL as a duplicate.
-    if (!host.endsWith("notme.bot") && host !== "") {
+    if (!isLocal && !host.endsWith("notme.bot") && host !== "") {
       const canonicalUrl = `https://notme.bot${pathname}${url.search}`;
       const redirect = new Response(null, {
         status: 301,
@@ -902,7 +904,7 @@ export default {
     }
 
     // ── auth.notme.bot — signet identity authority ──
-    if (sub === "auth") {
+    if (sub === "auth" || isLocal) {
       const authorityUrl: string =
         env.SIGNET_AUTHORITY_URL || "https://auth.notme.bot";
       const siteUrl: string = env.SITE_URL || "https://notme.bot";
