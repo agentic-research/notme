@@ -677,7 +677,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .exec("SELECT code, created_at FROM bootstrap WHERE id = 'code' AND used = 0")
       .toArray() as Array<{ code: string; created_at: string }>;
 
-    if (rows.length === 0 || rows[0]!.code !== code) return false;
+    const { timingSafeEqual } = await import("./auth/timing-safe");
+    if (rows.length === 0 || !(await timingSafeEqual(rows[0]!.code, code))) return false;
 
     // Enforce 15-minute TTL here too (not just in getOrCreateBootstrapCode)
     const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
