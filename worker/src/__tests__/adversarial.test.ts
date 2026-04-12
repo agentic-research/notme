@@ -64,7 +64,7 @@ describe("adversarial: key extraction", () => {
     // Public key should still be exportable (SubtleCrypto allows this)
     const spki = await crypto.subtle.exportKey("spki", kp.publicKey);
     expect(spki).toBeInstanceOf(ArrayBuffer);
-    expect(spki.byteLength).toBeGreaterThan(0);
+    expect((spki as ArrayBuffer).byteLength).toBeGreaterThan(0);
   });
 
   it("non-extractable key can still sign (functional after lockdown)", async () => {
@@ -345,7 +345,7 @@ describe("adversarial: error message leak", () => {
       ["sign", "verify"],
     )) as CryptoKeyPair;
 
-    const privateJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+    const privateJwk = (await crypto.subtle.exportKey("jwk", kp.privateKey)) as JsonWebKey;
     const signingKey = await crypto.subtle.importKey(
       "jwk",
       privateJwk,
@@ -379,7 +379,7 @@ describe("adversarial: error message leak", () => {
     expect(errorMessage).not.toMatch(/"d"\s*:\s*"[A-Za-z0-9_-]+"/);
     expect(errorMessage).not.toContain("BEGIN PRIVATE KEY");
     // The private JWK 'd' value itself must not appear
-    expect(errorMessage).not.toContain(privateJwk.d as string);
+    expect(errorMessage).not.toContain(privateJwk.d);
   });
 
   it("validateGHAToken error for alg:none does not leak private key", async () => {
