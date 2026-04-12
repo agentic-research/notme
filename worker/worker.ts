@@ -161,42 +161,23 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
     }
   }
 
-  // Generate ephemeral ECDSA P-256 keypair at edge — private key returned once, never stored
-  const kp = (await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-256" },
-    true,
-    ["sign", "verify"],
-  )) as CryptoKeyPair;
-  const pubDer = (await crypto.subtle.exportKey(
-    "spki",
-    kp.publicKey,
-  )) as ArrayBuffer;
-  const pubB64 = btoa(String.fromCharCode(...new Uint8Array(pubDer)));
-  const publicKeyPem = `-----BEGIN PUBLIC KEY-----\n${pubB64.match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
-  const privDer = (await crypto.subtle.exportKey(
-    "pkcs8",
-    kp.privateKey,
-  )) as ArrayBuffer;
-  const privB64 = btoa(String.fromCharCode(...new Uint8Array(privDer)));
-  const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${privB64.match(/.{1,64}/g)!.join("\n")}\n-----END PRIVATE KEY-----`;
+  // ── Secretless mode: mint an access token, no private key crosses the boundary ──
+  // The signing key stays inside the DO. Callers get a signed JWT that proves
+  // their GHA identity. No cert+key pair, no file, no $GITHUB_OUTPUT secret.
+  const accessToken = await authority.mintRedirectToken({
+    sub: claims.sub,
+    scope: "bridgeCert",
+    audience: cfg.ghaCertAudience,
+  });
 
-  let result;
-  try {
-    result = await authority.mintBridgeCert(
-      claims.sub,
-      publicKeyPem,
-      cfg.ghaCertTtlMs,
-    );
-  } catch (e: any) {
-    return jsonErr(e.message || "cert minting failed", 500);
-  }
+  const state = await authority.getAuthorityState();
 
   return Response.json({
-    certificate: result.certificate,
-    private_key: privateKeyPem,
-    expires_at: result.expires_at,
-    subject: result.subject,
-    authority: result.authority,
+    token: accessToken,
+    token_type: "Bearer",
+    expires_in: 300,
+    subject: claims.sub,
+    authority: { epoch: state.epoch, key_id: state.keyId },
     claims: {
       repository: claims.repository,
       ref: claims.ref,

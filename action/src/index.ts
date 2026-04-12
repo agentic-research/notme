@@ -1,10 +1,10 @@
 import * as core from "@actions/core";
 import * as http from "@actions/http-client";
 
-interface CertResponse {
-  certificate: string;
-  private_key: string;
-  expires_at: number;
+interface AuthResponse {
+  token: string;
+  token_type: string;
+  expires_in: number;
   subject: string;
   authority: { epoch: number; key_id: string };
   claims: {
@@ -26,9 +26,6 @@ async function run(): Promise<void> {
   // ── octo-sts (optional) ──
   const octoStsScope = core.getInput("octo_sts_scope");
   if (octoStsScope) {
-    // octo-sts is a separate action — call it inline would require
-    // importing their code. For now, log that it's not yet supported
-    // in the TS action and recommend the YAML workflow for octo-sts.
     core.warning(
       "octo-sts is not yet supported in the TS action. " +
         "Use agentic-research/notme/.github/workflows/gha-identity.yml for octo-sts + bridge cert.",
@@ -36,7 +33,7 @@ async function run(): Promise<void> {
   }
 
   if (skipBridgeCert) {
-    core.info("skip_bridge_cert is true — skipping bridge cert exchange");
+    core.info("skip_bridge_cert is true — skipping identity exchange");
     return;
   }
 
@@ -62,50 +59,38 @@ async function run(): Promise<void> {
     );
   }
 
-  // ── exchange for bridge cert ──
+  // ── Exchange OIDC for access token (secretless — no private key returned) ──
   const certUrl = `${authorityUrl}/cert/gha`;
   core.info(`exchanging OIDC token at ${certUrl}`);
 
   const client = new http.HttpClient("notme-action");
-  const res = await client.postJson<CertResponse>(certUrl, null, {
+  const res = await client.postJson<AuthResponse>(certUrl, null, {
     Authorization: `Bearer ${oidcToken}`,
     "Content-Type": "application/json",
   });
 
   if (res.statusCode !== 200 || !res.result) {
     throw new Error(
-      `cert exchange failed (${res.statusCode}): ${JSON.stringify(res.result)}`,
+      `identity exchange failed (${res.statusCode}): ${JSON.stringify(res.result)}`,
     );
   }
 
-  const cert = res.result;
+  const auth = res.result;
 
-  if (!cert.certificate || !cert.private_key) {
-    throw new Error("response missing certificate or private_key");
+  if (!auth.token) {
+    throw new Error("response missing token");
   }
 
-  // ── mask + encode + output ──
-  // Mask the full PEM (catches exact match in logs)
-  core.setSecret(cert.private_key);
-  // Mask individual PEM lines — GHA masks line-by-line, so the full
-  // multi-line string won't match if printed across multiple log lines.
-  // Skip BEGIN/END headers (generic strings that break log readability).
-  for (const line of cert.private_key.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed.length > 0 && !trimmed.startsWith("-----")) {
-      core.setSecret(trimmed);
-    }
-  }
-  const certB64 = Buffer.from(cert.certificate).toString("base64");
-  const keyB64 = Buffer.from(cert.private_key).toString("base64");
-  core.setSecret(keyB64);
+  // Mask the token in logs (it's a Bearer credential)
+  core.setSecret(auth.token);
 
-  core.setOutput("bridge_cert", certB64);
-  core.setOutput("bridge_key", keyB64);
-  core.setOutput("bridge_expires_at", cert.expires_at.toString());
+  // ── Outputs: URL + token, never a private key ──
+  core.setOutput("notme_url", authorityUrl);
+  core.setOutput("notme_token", auth.token);
+  core.setOutput("expires_in", auth.expires_in.toString());
 
   core.info(
-    `bridge cert issued for ${cert.subject} (epoch ${cert.authority.epoch}, expires ${cert.expires_at})`,
+    `identity established for ${auth.subject} (epoch ${auth.authority.epoch}, key ${auth.authority.key_id})`,
   );
 }
 
