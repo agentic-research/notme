@@ -999,8 +999,7 @@ export default {
           return jsonErr("proof verification failed: " + e.message, 401);
         }
 
-        // Store the connection
-        const { createConnection } = await import("./src/auth/connections");
+        // Store the connection (via DO RPC, not the imported function)
         await authority.storeConnection({
           credentialId: session.userId,
           provider: `${identity.type}:${identity.issuer}`,

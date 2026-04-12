@@ -7,6 +7,10 @@
 
 export type KeyStorageMode = "ephemeral" | "encrypted" | "cf-managed";
 
+// Ed25519 is not in the WebCrypto TypeScript types (@cloudflare/workers-types).
+// Single declaration avoids scattered `as any` casts in security-critical code.
+export const ED25519 = { name: "Ed25519" } as any;
+
 export interface CacheStore {
   get(key: string): Promise<string | null>;
   put(
@@ -29,29 +33,26 @@ export function detectKeyStorage(env: Record<string, unknown>): KeyStorageMode {
   if (explicit === "encrypted") return "encrypted";
   if (explicit === "cf-managed") return "cf-managed";
 
-  // Auto-detect: KEK secret present -> encrypted, otherwise ephemeral
+  // Auto-detect: KEK secret present -> encrypted, otherwise cf-managed.
+  // cf-managed is the safe default — CF handles encryption at rest.
+  // Local workerd sets NOTME_KEY_STORAGE=ephemeral in config.capnp.
   if (env.NOTME_KEK_SECRET) return "encrypted";
-  return "ephemeral";
+  return "cf-managed";
 }
 
 /** Validate config — fail closed on misconfiguration. */
 export function validateKeyStorageConfig(
   mode: KeyStorageMode,
-  kekSecret: string | undefined,
+  _kekSecret?: string | undefined,
 ): void {
   if (mode === "encrypted") {
-    if (!kekSecret) {
-      throw new Error(
-        "FATAL: NOTME_KEY_STORAGE=encrypted requires NOTME_KEK_SECRET.\n" +
-          "Generate with: openssl rand -hex 32",
-      );
-    }
-    if (kekSecret.length < 32) {
-      throw new Error(
-        "FATAL: NOTME_KEK_SECRET must be at least 128 bits (32 hex chars).\n" +
-          "Generate with: openssl rand -hex 32",
-      );
-    }
+    // Encrypted mode is designed but not yet implemented (HKDF wrapping).
+    // Fail hard so operators don't get a false sense of security.
+    throw new Error(
+      "FATAL: encrypted key storage is not yet implemented.\n" +
+        "Use NOTME_KEY_STORAGE=ephemeral (local/CI) or cf-managed (production).\n" +
+        "See docs/design/007-secretless-local-proxy.md for roadmap.",
+    );
   }
 }
 
@@ -59,6 +60,8 @@ export function validateKeyStorageConfig(
  *  Provides real JTI replay protection (not a no-op). Entries expire by TTL. */
 export class MemoryCache implements CacheStore {
   private store = new Map<string, { value: string; expiresAt: number | null }>();
+  private putCount = 0;
+  private static readonly SWEEP_INTERVAL = 100; // evict expired entries every N puts
 
   async get(key: string): Promise<string | null> {
     const entry = this.store.get(key);
@@ -79,6 +82,14 @@ export class MemoryCache implements CacheStore {
       ? Math.floor(Date.now() / 1000) + opts.expirationTtl
       : null;
     this.store.set(key, { value, expiresAt });
+
+    // Periodic sweep — prevents unbounded growth from one-shot JTI entries
+    if (++this.putCount % MemoryCache.SWEEP_INTERVAL === 0) {
+      const now = Math.floor(Date.now() / 1000);
+      for (const [k, v] of this.store) {
+        if (v.expiresAt !== null && v.expiresAt <= now) this.store.delete(k);
+      }
+    }
   }
 }
 

@@ -15,6 +15,7 @@ import { DurableObject } from "cloudflare:workers";
 import { X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
 import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 import type { CABundle } from "./revocation";
+import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 
 interface SigningAuthorityEnv {
   CA_BUNDLE_CACHE?: KVNamespace;
@@ -29,14 +30,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
   private signingKey: CryptoKey | null = null;
   private verifyKey: CryptoKey | null = null;
-  /** Key storage mode — auto-detected from env. No external call needed. */
-  private get keyStorageMode(): "ephemeral" | "encrypted" | "cf-managed" {
-    const explicit = this.env.NOTME_KEY_STORAGE;
-    if (explicit === "ephemeral") return "ephemeral";
-    if (explicit === "encrypted") return "encrypted";
-    if (explicit === "cf-managed") return "cf-managed";
-    if (this.env.NOTME_KEK_SECRET) return "encrypted";
-    return "cf-managed";
+  /** Key storage mode — uses shared detectKeyStorage() for consistency with Worker. */
+  private get keyStorageMode(): KeyStorageMode {
+    const mode = detectKeyStorage(this.env as Record<string, unknown>);
+    if (mode === "encrypted") {
+      throw new Error(
+        "encrypted key storage is not yet implemented. " +
+          "Use ephemeral (local/CI) or cf-managed (production). " +
+          "See docs/design/007-secretless-local-proxy.md for roadmap.",
+      );
+    }
+    return mode;
   }
 
   private ensureSchema(): void {
@@ -123,7 +127,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         this.signingKey = await crypto.subtle.importKey(
           "jwk",
           jwk,
-          { name: "Ed25519" } as any,
+          ED25519,
           false, // NON-EXTRACTABLE after import
           ["sign"],
         );
@@ -133,7 +137,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         this.verifyKey = await crypto.subtle.importKey(
           "spki",
           spkiBytes,
-          { name: "Ed25519" } as any,
+          ED25519,
           true, // public key stays extractable (needed for JWKS, raw export)
           ["verify"],
         );
@@ -152,7 +156,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Generate the authority keypair
     const isEphemeral = this.keyStorageMode === "ephemeral";
     const kp = (await crypto.subtle.generateKey(
-      { name: "Ed25519" } as any,
+      ED25519,
       !isEphemeral, // extractable:false in ephemeral mode
       ["sign", "verify"],
     )) as CryptoKeyPair;
@@ -189,7 +193,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       this.signingKey = await crypto.subtle.importKey(
         "jwk",
         privateJwk,
-        { name: "Ed25519" } as any,
+        ED25519,
         false,
         ["sign"],
       );
@@ -276,7 +280,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       name: "CN=signet-authority,O=notme",
       notBefore: now,
       notAfter,
-      signingAlgorithm: { name: "Ed25519" } as any,
+      signingAlgorithm: ED25519,
       keys: { privateKey: signingKey, publicKey: verifyKey },
       serialNumber: serial,
       extensions: [

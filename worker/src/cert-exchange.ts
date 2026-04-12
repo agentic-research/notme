@@ -81,50 +81,21 @@ export async function handleCertExchange(
     grantedScopes = session.scopes;
     authMethod = session.authMethod;
   } else if (body.proof.type === "oidc") {
-    // Verify OIDC JWT from any issuer
+    // OIDC principal lookup not yet wired to DO RPC.
+    // Verify the token (to fail fast on bad input), then return 501.
     const { verifyOIDC } = await import("./auth/verify-proof");
-    let identity;
     try {
-      identity = await verifyOIDC(body.proof.token, "notme.bot");
+      await verifyOIDC(body.proof.token, "notme.bot");
     } catch (e: any) {
       return Response.json(
         { error: "invalid token: " + e.message },
         { status: 401 },
       );
     }
-
-    // OIDC principal lookup not yet wired to DO — return 501 instead of crashing
-    // TODO: wire findPrincipalByFederated via SigningAuthority DO RPC
     return Response.json(
       { error: "oidc_not_implemented", message: "OIDC proof path not yet wired to DO — use passkey or GHA OIDC at /cert/gha" },
       { status: 501 },
     );
-
-    /* Disabled until DO RPC is wired:
-    const { findPrincipalByFederated, getCapabilities } = await import(
-      "./auth/principals"
-    );
-    const found = findPrincipalByFederated(
-      null as any,
-      identity.issuer,
-      identity.subject,
-    );
-
-    if (!found) {
-      return Response.json(
-        {
-          error: "unknown identity — register first or get an invite",
-          issuer: identity.issuer,
-          subject: identity.subject,
-        },
-        { status: 403 },
-      );
-    }
-
-    principalId = found;
-    grantedScopes = getCapabilities(null as any, principalId);
-    authMethod = `oidc:${identity.issuer}`;
-    */
   } else if (body.proof.type === "bootstrap") {
     // Bootstrap code — deployer only
     const valid = await authority.consumeBootstrapCode(body.proof.code);

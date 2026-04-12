@@ -3,8 +3,8 @@ import { detectKeyStorage, validateKeyStorageConfig } from "../platform";
 
 describe("platform detection", () => {
   describe("detectKeyStorage", () => {
-    it("defaults to ephemeral when no env vars set", () => {
-      expect(detectKeyStorage({} as any)).toBe("ephemeral");
+    it("defaults to cf-managed when no env vars set", () => {
+      expect(detectKeyStorage({} as any)).toBe("cf-managed");
     });
 
     it("auto-detects encrypted when KEK secret present", () => {
@@ -19,7 +19,7 @@ describe("platform detection", () => {
       ).toBe("ephemeral");
     });
 
-    it("respects explicit NOTME_KEY_STORAGE=encrypted with valid KEK", () => {
+    it("respects explicit NOTME_KEY_STORAGE=encrypted", () => {
       expect(
         detectKeyStorage({
           NOTME_KEY_STORAGE: "encrypted",
@@ -36,27 +36,27 @@ describe("platform detection", () => {
   });
 
   describe("validateKeyStorageConfig (fail closed)", () => {
-    it("throws when encrypted mode has no KEK secret", () => {
-      expect(() =>
-        validateKeyStorageConfig("encrypted", undefined),
-      ).toThrow("NOTME_KEK_SECRET");
-    });
-
-    it("throws when KEK secret is too short", () => {
-      expect(() =>
-        validateKeyStorageConfig("encrypted", "tooshort"),
-      ).toThrow("128 bits");
-    });
-
-    it("accepts valid KEK secret (32+ hex chars)", () => {
+    it("throws on encrypted mode — not yet implemented", () => {
       expect(() =>
         validateKeyStorageConfig("encrypted", "ab".repeat(16)),
+      ).toThrow("not yet implemented");
+    });
+
+    it("throws on encrypted mode even without KEK", () => {
+      expect(() =>
+        validateKeyStorageConfig("encrypted", undefined),
+      ).toThrow("not yet implemented");
+    });
+
+    it("does not throw for ephemeral mode", () => {
+      expect(() =>
+        validateKeyStorageConfig("ephemeral", undefined),
       ).not.toThrow();
     });
 
-    it("does not throw for ephemeral mode regardless of KEK", () => {
+    it("does not throw for cf-managed mode", () => {
       expect(() =>
-        validateKeyStorageConfig("ephemeral", undefined),
+        validateKeyStorageConfig("cf-managed", undefined),
       ).not.toThrow();
     });
   });

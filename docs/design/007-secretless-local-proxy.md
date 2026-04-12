@@ -64,17 +64,10 @@ A thin abstraction layer that detects the runtime and provides unified APIs:
 
 ```typescript
 interface Platform {
-  // Phase A: runtime parity
-  readonly runtime: 'cf-edge' | 'workerd-local' | 'workerd-container';
-  cache: CacheStore;           // KV on CF, DO SQLite locally
+  readonly keyStorage: KeyStorageMode;
+  readonly cache: CacheStore;
   rateLimit?(key: string): Promise<boolean>;
-
-  // Key storage policy
-  readonly keyStorage: 'ephemeral' | 'encrypted' | 'cf-managed';
-
-  // Phase C: proxy mode
-  proxy?(req: Request, identity: BridgeCert): Promise<Response>;
-  holdCredential?(cert: SealedCredential): void;
+  // Phase C: proxy?(req, identity), holdCredential?(cert)
 }
 
 interface CacheStore {
@@ -83,13 +76,13 @@ interface CacheStore {
 }
 ```
 
-Production: `cache` wraps `env.CA_BUNDLE_CACHE` (KV). Local: `cache` wraps a `kv_cache` table in the signing authority DO's SQLite. Same interface, same code paths.
+Production: `cache` wraps `env.CA_BUNDLE_CACHE` (KV). Local: `cache` uses `MemoryCache` (in-memory Map with TTL and periodic eviction). Same interface, same code paths.
 
 ### Key storage modes
 
 **Ephemeral** (local dev, CI): `getOrCreateSigningKey()` generates the key with `extractable: false` and does NOT write the JWK to SQLite. The key lives only in `this.signingKey` as an opaque `CryptoKey` handle — the raw key bytes are inside BoringSSL, not on the V8 heap. `crypto.subtle.exportKey()` throws. `crypto.subtle.sign()` still works (BoringSSL signs internally). Restart = new key. `cat *.sqlite` yields nothing. No JS code path can exfiltrate the key material.
 
-**Encrypted** (self-hosted): Key is generated with `extractable: true` (needed to serialize for storage), but after writing the wrapped JWK to SQLite, the key is re-imported with `extractable: false`. Derive a KEK from a machine-generated secret via HKDF (`vault/src/crypto.ts`), wrap the JWK before writing to SQLite, unwrap and re-import as non-extractable on read. The plaintext JWK never touches disk.
+**Encrypted** (self-hosted, not yet implemented): Designed but not built. Will derive a KEK from a machine-generated secret via HKDF (`vault/src/crypto.ts`), wrap the JWK before writing to SQLite, unwrap and re-import as non-extractable on read. Currently, setting `NOTME_KEY_STORAGE=encrypted` is a hard startup error to prevent a false sense of security.
 
 **CF-managed** (production): Current behavior, with one change: after importing the key from SQLite, re-import with `extractable: false`. CF handles encryption at rest for DO SQLite. The key is non-extractable in memory.
 
@@ -301,25 +294,29 @@ Every endpoint gets a "try to hack it" test alongside the happy path. Tests are 
 ## Files changed
 
 ### New files
-- `worker/src/platform.ts` — Platform interface + runtime detection (~150 lines)
-- `worker/src/platform-cf.ts` — CF edge implementation (wraps KV, rate limiter)
-- `worker/src/platform-local.ts` — Local implementation (SQLite cache, ephemeral keys)
+- `worker/src/platform.ts` — Platform interface, CacheStore, MemoryCache, detection, ED25519 constant
+- `worker/src/auth/timing-safe.ts` — HMAC-based constant-time string comparison
 - `worker/src/__tests__/adversarial.test.ts` — Adversarial security tests
-- `worker/src/__tests__/platform.test.ts` — Platform abstraction tests
+- `worker/src/__tests__/platform.test.ts` — Platform detection + validation tests
+- `worker/e2e/contract.spec.ts` — Playwright e2e contract tests with virtual authenticator
+- `worker/test-local.sh` — workerd smoke test script
+- `worker/test-e2e.sh` — Playwright e2e runner (starts workerd, extracts bootstrap code)
+- `packages/melange-notme-app.yaml` — Melange package for worker bundle + config
 
 ### Modified files
-- `worker/worker.ts` — Replace `env.CA_BUNDLE_CACHE` with `platform.cache`, fix host routing
-- `worker/src/signing-authority.ts` — Key storage mode (ephemeral/encrypted/cf-managed)
-- `worker/config.capnp` — enableSql, storage path, env vars for key storage mode
-- `worker/package.json` — Add `build:local` script
-- `Taskfile.yml` — Add `worker:build-local` and `worker:serve` tasks
-- `action/src/index.ts` — Phase C: output `NOTME_URL` instead of `bridge_key`
-- `action/action.yml` — Phase C: new output schema
-
-### Not changed (intentionally)
-- `vault/src/crypto.ts` — Reused as-is for encrypted key storage mode
-- `gen/ts/dpop.ts` — SDK primitives already landed in PR #1
-- Production `wrangler.toml` — CF edge behavior unchanged
+- `worker/worker.ts` — Platform cache, localhost routing bypass, Cache API graceful degradation
+- `worker/src/signing-authority.ts` — Ephemeral key storage, extractable:false, auto-detect mode
+- `worker/src/cert-exchange.ts` — Returns access token, not private key
+- `worker/src/cert-authority.ts` — ED25519 constant
+- `worker/src/revocation.ts` — Guard missing KV binding
+- `worker/src/auth/token.ts` — Require exp claim, SDK imports
+- `worker/config.capnp` — enableSql, DO bindings, NOTME_KEY_STORAGE
+- `worker/package.json` — esbuild, @playwright/test, build:local script
+- `Taskfile.yml` — worker:build-local, worker:serve tasks
+- `action/src/index.ts` — Output notme_url + notme_token, not bridge_key
+- `action/action.yml` — New output schema
+- `.github/workflows/gha-identity.yml` — Secretless workflow outputs
+- `packages/apko-notme.yaml` — Add notme-app package, /data/do path
 
 ## Success criteria
 

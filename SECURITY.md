@@ -28,15 +28,26 @@ notme is an identity authority that issues ephemeral bridge certificates. Securi
 
 ## Design Principles
 
-- **Proof-of-possession over bearer tokens** — stolen certs are useless without the private key
-- **Ephemeral by default** — 5-minute cert TTL, no renewal, just expire
-- **Zero stored secrets** — CA key born in Durable Object, session secrets auto-generated
-- **Minimal blast radius** — epoch-based revocation (one KV write revokes all certs from an epoch)
+- **Secretless** — private keys exist only in process memory (`extractable: false` CryptoKey). No key material on disk, in `$GITHUB_OUTPUT`, or crossing the wire. See `docs/design/007-secretless-local-proxy.md`.
+- **Two enforcement planes** — local workerd holds credentials and enforces scope; CF edge validates independently. Neither trusts the other.
+- **Proof-of-possession over bearer tokens** — DPoP binding makes stolen tokens useless without the proof key.
+- **Ephemeral by default** — 5-minute token/cert TTL, no renewal, just expire.
+- **Zero stored secrets** — CA key born in Durable Object, session secrets auto-generated. In ephemeral mode (local/CI), the private JWK is never written to SQLite.
+- **Minimal blast radius** — epoch-based revocation (one KV write revokes all certs from an epoch).
+
+## Key Storage Modes
+
+| Mode | When | Private key on disk? |
+|---|---|---|
+| `ephemeral` | Local dev, CI | No — in-memory only, dies with process |
+| `encrypted` | Self-hosted (not yet implemented) | Wrapped with HKDF-derived KEK |
+| `cf-managed` | Production CF Workers | CF manages DO SQLite encryption |
+
+Set via `NOTME_KEY_STORAGE` env var. Default: `cf-managed`. Local workerd config sets `ephemeral`.
 
 ## Known Limitations
 
-- `workerLoader` binding is experimental (CF workerd)
 - WebAuthn implementation has not been independently audited
 - DPoP token endpoint does not yet implement nonce mechanism (defense-in-depth)
-- Rate limiting on `/token` not yet implemented
-- No formal threat model document (planned)
+- `encrypted` key storage mode is designed but not yet implemented (startup error if configured)
+- Threat model is documented in `docs/design/007-secretless-local-proxy.md` (adversarial test tables)

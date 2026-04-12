@@ -7,6 +7,7 @@
 // OIDs match the Go authority (cmd/signet/authority.go) for cert format parity.
 
 import { X509CertificateGenerator, Extension } from "@peculiar/x509";
+import { ED25519 } from "./platform";
 
 const OID_SUBJECT = "1.3.6.1.4.1.99999.1.1"; // Subject identity
 const OID_ISSUANCE_TIME = "1.3.6.1.4.1.99999.1.2"; // Issuance time (RFC3339)
@@ -45,7 +46,7 @@ async function importMasterKey(pem: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "pkcs8",
     der,
-    { name: "Ed25519" } as any,
+    ED25519,
     false,
     ["sign"],
   );
@@ -62,7 +63,7 @@ async function importPublicKey(pem: string): Promise<CryptoKey> {
     return await crypto.subtle.importKey(
       "spki",
       der,
-      { name: "Ed25519" } as any,
+      ED25519,
       true,
       ["verify"],
     );
@@ -112,7 +113,7 @@ export async function mintGHABridgeCert(
     issuer: `CN=signet-authority,O=notme`,
     notBefore: now,
     notAfter: expires,
-    signingAlgorithm: { name: "Ed25519" } as any,
+    signingAlgorithm: ED25519,
     publicKey: userPublicKey,
     signingKey: signingKey,
     serialNumber: serial,

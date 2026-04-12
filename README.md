@@ -142,14 +142,33 @@ cloudflare worker deployed at [`auth.notme.bot`](https://auth.notme.bot). the `S
 
 ## run your own
 
+three ways — same code, same behavior.
+
+**local (workerd)**
+```bash
+cd worker && npm run build:local
+npx workerd serve config.capnp --experimental
+# → http://localhost:8788
+```
+
+**container (melange + apko)**
+```bash
+cd packages
+melange build melange-notme-app.yaml --arch aarch64 --signing-key melange.rsa --out-dir ./out --source-dir ../worker/
+apko build apko-notme.yaml notme:latest notme.tar --keyring-append melange.rsa.pub --arch aarch64
+docker load < notme.tar
+docker run -p 8788:8788 notme:latest-arm64
+```
+
+**cloudflare workers**
 ```bash
 cd worker
 cp wrangler.toml.example wrangler.toml
-# edit wrangler.toml — fill in your CF KV namespace ID and VPC service ID
+# edit wrangler.toml — fill in your CF KV namespace ID
 wrangler deploy
 ```
 
-CA key is generated on first request. first passkey registration requires a bootstrap code (visible in `wrangler tail`).
+CA key is generated on first request. In ephemeral mode (local/container), the private key exists only in process memory — `cat *.sqlite | strings | grep '"d"'` returns nothing. First passkey registration requires a bootstrap code (visible in workerd stdout or `wrangler tail`).
 
 ## related
 
