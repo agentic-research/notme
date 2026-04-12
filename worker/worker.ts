@@ -836,22 +836,31 @@ function cacheKey(request: Request, vary?: string): Request {
   return request;
 }
 
+// Edge cache disabled when cacheApiOutbound is not configured (local workerd).
+let cacheEnabled = true;
+
 async function cachePut(request: Request, response: Response, vary?: string): Promise<Response> {
-  // Only cache GET responses (Cache API requirement).
-  // Cache 2xx and 301 (permanent redirects are safe to cache long-term).
-  if (request.method !== "GET") return response;
+  if (!cacheEnabled || request.method !== "GET") return response;
   if (!response.ok && response.status !== 301) return response;
-  const cache = caches.default;
-  // Clone before putting — the original body can only be consumed once.
-  const toCache = response.clone();
-  await cache.put(cacheKey(request, vary), toCache);
+  try {
+    const cache = caches.default;
+    const toCache = response.clone();
+    await cache.put(cacheKey(request, vary), toCache);
+  } catch {
+    cacheEnabled = false; // Disable for remainder of isolate lifetime
+  }
   return response;
 }
 
 async function cacheMatch(request: Request, vary?: string): Promise<Response | undefined> {
-  if (request.method !== "GET") return undefined;
-  const cache = caches.default;
-  return cache.match(cacheKey(request, vary));
+  if (!cacheEnabled || request.method !== "GET") return undefined;
+  try {
+    const cache = caches.default;
+    return cache.match(cacheKey(request, vary));
+  } catch {
+    cacheEnabled = false;
+    return undefined;
+  }
 }
 
 export default {
@@ -888,6 +897,7 @@ export default {
     const sub = getSubdomain(host);
     const envSiteUrl: string = env.SITE_URL || "";
     const isLocal = envSiteUrl.startsWith("http://localhost");
+    if (isLocal) cacheEnabled = false; // Cache API unavailable in local workerd
 
     const { createPlatform } = await import("./src/platform");
     const platform = createPlatform(env);

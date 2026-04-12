@@ -27,6 +27,7 @@ const config :Workerd.Config = (
       ),
     ),
 
+
     # Local disk for DO SQLite storage
     ( name = "do-storage",
       disk = (
@@ -93,7 +94,8 @@ const notmeWorker :Workerd.Worker = (
   ],
 
   durableObjectStorage = (localDisk = "do-storage"),
-  cacheApiOutbound = "internet",
+  # No cacheApiOutbound — Cache API not available locally.
+  # worker.ts detects local mode and skips caches.default entirely.
 
   globalOutbound = "internet",
 );
