@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest";
 import { validateGHAToken } from "../gha-oidc";
 import { mintAccessToken, verifyAccessToken } from "../auth/token";
 import { timingSafeEqual } from "../auth/timing-safe";
+import { verifyOIDC } from "../auth/verify-proof";
+import { validateDpopProof } from "../auth/dpop";
+import { MemoryCache, detectKeyStorage, validateKeyStorageConfig } from "../platform";
 
 /**
  * adversarial.test.ts — Verify key extraction invariants + adversarial token invariants.
@@ -409,5 +412,223 @@ describe("adversarial: error message leak", () => {
     expect(errorMessage).not.toBe("");
     expect(errorMessage).not.toMatch(/"d"\s*:\s*"[A-Za-z0-9_-]+"/);
     expect(errorMessage).not.toContain("BEGIN PRIVATE KEY");
+  });
+});
+
+// ── Wrong audience / confused deputy ────────────────────────────────────────
+
+describe("adversarial: confused deputy", () => {
+  it("verifyOIDC rejects token with wrong audience", async () => {
+    // Build a token claiming aud: "other-service.com" but we expect "notme.bot"
+    const header = btoa(JSON.stringify({ alg: "RS256", kid: "k1" }))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+    const payload = btoa(JSON.stringify({
+      iss: "https://token.actions.githubusercontent.com",
+      sub: "repo:agentic-research/notme:ref:refs/heads/main",
+      aud: "other-service.com", // wrong audience
+      exp: Math.floor(Date.now() / 1000) + 300,
+      iat: Math.floor(Date.now() / 1000),
+    })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+
+    await expect(
+      verifyOIDC(`${header}.${payload}.AAAA`, "notme.bot"),
+    ).rejects.toThrow(/audience/i);
+  });
+
+  it("validateGHAToken rejects token with wrong audience", async () => {
+    const header = btoa(JSON.stringify({ alg: "RS256", kid: "k1" }))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+    const payload = btoa(JSON.stringify({
+      iss: "https://token.actions.githubusercontent.com",
+      sub: "repo:agentic-research/notme:ref:refs/heads/main",
+      aud: "evil.com",
+      exp: Math.floor(Date.now() / 1000) + 300,
+      iat: Math.floor(Date.now() / 1000),
+    })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+
+    await expect(
+      validateGHAToken(`${header}.${payload}.AAAA`, "notme.bot"),
+    ).rejects.toThrow(/audience/i);
+  });
+});
+
+// ── Untrusted issuer ────────────────────────────────────────────────────────
+
+describe("adversarial: untrusted issuer", () => {
+  it("verifyOIDC rejects token from non-trusted issuer", async () => {
+    const header = btoa(JSON.stringify({ alg: "RS256", kid: "k1" }))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+    const payload = btoa(JSON.stringify({
+      iss: "https://evil-issuer.example.com",
+      sub: "user:attacker",
+      aud: "notme.bot",
+      exp: Math.floor(Date.now() / 1000) + 300,
+      iat: Math.floor(Date.now() / 1000),
+    })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+
+    // verifyOIDC fetches JWKS from the issuer URL — it should either reject
+    // the untrusted issuer or fail on JWKS fetch. Either way, it must not succeed.
+    await expect(
+      verifyOIDC(`${header}.${payload}.AAAA`, "notme.bot"),
+    ).rejects.toThrow();
+  });
+});
+
+// ── DPoP JWK injection ──────────────────────────────────────────────────────
+
+describe("adversarial: DPoP attacks", () => {
+  it("rejects DPoP proof with wrong alg", async () => {
+    const header = btoa(JSON.stringify({ typ: "dpop+jwt", alg: "none", jwk: { kty: "EC", crv: "P-256" } }))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+    const payload = btoa(JSON.stringify({
+      jti: crypto.randomUUID(),
+      htm: "POST",
+      htu: "https://auth.notme.bot/token",
+      iat: Math.floor(Date.now() / 1000),
+    })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+
+    await expect(
+      validateDpopProof(`${header}.${payload}.`, {
+        htm: "POST",
+        htu: "https://auth.notme.bot/token",
+      }),
+    ).rejects.toThrow(/alg/i);
+  });
+
+  it("rejects DPoP proof with non-EC JWK (key type confusion)", async () => {
+    // Attacker supplies an RSA key in the JWK header — should be rejected
+    const header = btoa(JSON.stringify({
+      typ: "dpop+jwt",
+      alg: "ES256",
+      jwk: { kty: "RSA", n: "AAAA", e: "AQAB" },
+    })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+    const payload = btoa(JSON.stringify({
+      jti: crypto.randomUUID(),
+      htm: "POST",
+      htu: "https://auth.notme.bot/token",
+      iat: Math.floor(Date.now() / 1000),
+    })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+
+    await expect(
+      validateDpopProof(`${header}.${payload}.AAAA`, {
+        htm: "POST",
+        htu: "https://auth.notme.bot/token",
+      }),
+    ).rejects.toThrow(/P-256|EC/i);
+  });
+
+  it("rejects DPoP proof with forged signature", async () => {
+    // Generate a real key, create a valid-looking header, but use wrong signature
+    const kp = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const pubJwk = await crypto.subtle.exportKey("jwk", kp.publicKey);
+
+    const header = btoa(JSON.stringify({ typ: "dpop+jwt", alg: "ES256", jwk: pubJwk }))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+    const payload = btoa(JSON.stringify({
+      jti: crypto.randomUUID(),
+      htm: "POST",
+      htu: "https://auth.notme.bot/token",
+      iat: Math.floor(Date.now() / 1000),
+    })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+
+    // Forged signature — not signed by the key in the header
+    await expect(
+      validateDpopProof(`${header}.${payload}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`, {
+        htm: "POST",
+        htu: "https://auth.notme.bot/token",
+      }),
+    ).rejects.toThrow(/signature/i);
+  });
+});
+
+// ── JTI replay via MemoryCache ──────────────────────────────────────────────
+
+describe("adversarial: JTI replay protection (MemoryCache)", () => {
+  it("second put+get for same JTI key blocks replay", async () => {
+    const cache = new MemoryCache();
+    const jtiKey = `jti:${crypto.randomUUID()}`;
+
+    // First check — not seen
+    expect(await cache.get(jtiKey)).toBeNull();
+
+    // Record it
+    await cache.put(jtiKey, "1", { expirationTtl: 600 });
+
+    // Second check — seen (replay blocked)
+    expect(await cache.get(jtiKey)).toBe("1");
+  });
+
+  it("expired JTI entries are evicted on read", async () => {
+    const cache = new MemoryCache();
+    const jtiKey = `jti:${crypto.randomUUID()}`;
+
+    // Insert with TTL of 0 (already expired)
+    await cache.put(jtiKey, "1", { expirationTtl: -1 });
+
+    // Should be evicted on read
+    expect(await cache.get(jtiKey)).toBeNull();
+  });
+
+  it("entries without TTL persist indefinitely", async () => {
+    const cache = new MemoryCache();
+    await cache.put("permanent", "value");
+    expect(await cache.get("permanent")).toBe("value");
+  });
+});
+
+// ── Scope escalation (additional vectors) ───────────────────────────────────
+
+describe("adversarial: scope escalation (additional)", () => {
+  it("verifyAccessToken rejects token without exp claim", async () => {
+    // Craft a token manually without exp — must be rejected
+    const kp = (await crypto.subtle.generateKey(
+      { name: "Ed25519" } as any,
+      true,
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+
+    // Build a JWT without exp
+    const header = btoa(JSON.stringify({ alg: "EdDSA", kid: "test" }))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+    const payload = btoa(JSON.stringify({
+      iss: "https://auth.notme.bot",
+      sub: "principal:attacker",
+      scope: "authorityManage", // attacker tries to escalate
+      iat: Math.floor(Date.now() / 1000),
+      // NO exp — attempt to create a never-expiring token
+    })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+
+    const signingInput = new TextEncoder().encode(`${header}.${payload}`);
+    const sig = await crypto.subtle.sign("Ed25519" as any, kp.privateKey, signingInput);
+    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+
+    const token = `${header}.${payload}.${sigB64}`;
+
+    await expect(
+      verifyAccessToken(token, kp.publicKey),
+    ).rejects.toThrow(/exp/i);
+  });
+});
+
+// ── Platform mode detection ─────────────────────────────────────────────────
+
+describe("adversarial: mode detection", () => {
+  it("encrypted mode throws not-yet-implemented", () => {
+    expect(() => validateKeyStorageConfig("encrypted")).toThrow(/not yet implemented/i);
+  });
+
+  it("default mode is cf-managed (not ephemeral) — safe for production", () => {
+    // On CF production, no NOTME_KEY_STORAGE is set. Must default to cf-managed,
+    // not ephemeral. Ephemeral on production would lose the CA key on DO eviction.
+    expect(detectKeyStorage({})).toBe("cf-managed");
+  });
+
+  it("NOTME_KEY_STORAGE=ephemeral is respected", () => {
+    expect(detectKeyStorage({ NOTME_KEY_STORAGE: "ephemeral" })).toBe("ephemeral");
   });
 });
