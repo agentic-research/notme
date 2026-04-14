@@ -19821,8 +19821,13 @@ async function run() {
     );
   }
   if (skipBridgeCert) {
-    core.info("skip_bridge_cert is true \u2014 skipping bridge cert exchange");
+    core.info("skip_bridge_cert is true \u2014 skipping identity exchange");
     return;
+  }
+  if (authorityUrl.startsWith("http://") && !authorityUrl.includes("localhost") && !authorityUrl.includes("127.0.0.1")) {
+    throw new Error(
+      "authority_url must be HTTPS \u2014 an HTTP URL would transmit the OIDC token in plaintext"
+    );
   }
   core.info(`requesting OIDC token (audience: ${audience})`);
   let oidcToken;
@@ -19842,22 +19847,19 @@ async function run() {
   });
   if (res.statusCode !== 200 || !res.result) {
     throw new Error(
-      `cert exchange failed (${res.statusCode}): ${JSON.stringify(res.result)}`
+      `identity exchange failed (${res.statusCode}): ${JSON.stringify(res.result)}`
     );
   }
-  const cert = res.result;
-  if (!cert.certificate || !cert.private_key) {
-    throw new Error("response missing certificate or private_key");
+  const auth = res.result;
+  if (!auth.token) {
+    throw new Error("response missing token");
   }
-  core.setSecret(cert.private_key);
-  const certB64 = Buffer.from(cert.certificate).toString("base64");
-  const keyB64 = Buffer.from(cert.private_key).toString("base64");
-  core.setSecret(keyB64);
-  core.setOutput("bridge_cert", certB64);
-  core.setOutput("bridge_key", keyB64);
-  core.setOutput("bridge_expires_at", cert.expires_at.toString());
+  core.setSecret(auth.token);
+  core.setOutput("notme_url", authorityUrl);
+  core.setOutput("notme_token", auth.token);
+  core.setOutput("expires_in", auth.expires_in.toString());
   core.info(
-    `bridge cert issued for ${cert.subject} (epoch ${cert.authority.epoch}, expires ${cert.expires_at})`
+    `identity established for ${auth.subject} (epoch ${auth.authority.epoch}, key ${auth.authority.key_id})`
   );
 }
 run().catch((err) => core.setFailed(err.message));

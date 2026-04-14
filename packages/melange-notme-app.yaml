@@ -1,0 +1,30 @@
+# melange-notme-app.yaml — bundle worker.js + config.capnp into /app
+#
+# Usage:
+#   cd worker && npm run build:local
+#   melange build packages/melange-notme-app.yaml \
+#     --arch aarch64 --signing-key packages/melange.rsa \
+#     --out-dir packages/out --source-dir worker/
+
+package:
+  name: notme-app
+  version: 0.1.0
+  epoch: 0
+  description: "notme identity authority — worker bundle + workerd config"
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    repositories:
+      - https://packages.wolfi.dev/os
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    packages:
+      - busybox
+
+pipeline:
+  - runs: |
+      mkdir -p "${{targets.destdir}}/app/dist"
+      install -Dm644 dist/worker.js "${{targets.destdir}}/app/dist/worker.js"
+      install -Dm644 config.capnp   "${{targets.destdir}}/app/config.capnp"

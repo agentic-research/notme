@@ -5,6 +5,7 @@ export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
+import type { Platform } from "./src/platform";
 
 // ── Private RPC surface — only callable via service binding ──
 // Consuming Workers bind to this entrypoint:
@@ -97,7 +98,7 @@ function jsonErr(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
 }
 
-async function handleCertGHA(request: Request, env: any): Promise<Response> {
+async function handleCertGHA(request: Request, env: any, platform: Platform): Promise<Response> {
   if (request.method !== "POST") {
     return jsonErr("method not allowed", 405);
   }
@@ -109,10 +110,10 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
   const authority = env.SIGNING_AUTHORITY.get(authorityId);
   try {
     // Ensure CA bundle is published to KV (lazy init — first request bootstraps)
-    const existingBundle = await env.CA_BUNDLE_CACHE?.get("bundle:current");
+    const existingBundle = await platform.cache.get("bundle:current");
     if (!existingBundle) {
       const bundle = await authority.generateBundle();
-      await env.CA_BUNDLE_CACHE.put("bundle:current", JSON.stringify(bundle));
+      await platform.cache.put("bundle:current", JSON.stringify(bundle));
     }
   } catch (e: any) {
     return jsonErr("authority unavailable: " + e.message, 503);
@@ -144,58 +145,39 @@ async function handleCertGHA(request: Request, env: any): Promise<Response> {
   }
   {
     const jtiKey = `jti:${claims.jti}`;
-    const seen = await env.CA_BUNDLE_CACHE.get(jtiKey);
+    const seen = await platform.cache.get(jtiKey);
     if (seen) {
       return jsonErr("token already used", 401);
     }
     const ttl = Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000));
-    await env.CA_BUNDLE_CACHE.put(jtiKey, "1", { expirationTtl: ttl });
+    await platform.cache.put(jtiKey, "1", { expirationTtl: ttl });
   }
 
   // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
-  if (env.CERT_LIMITER) {
-    const { success } = await env.CERT_LIMITER.limit({ key: `cert:${claims.repository}` });
-    if (!success) {
+  if (platform.rateLimit) {
+    const allowed = await platform.rateLimit(`cert:${claims.repository}`);
+    if (!allowed) {
       return jsonErr("rate limit exceeded", 429);
     }
   }
 
-  // Generate ephemeral ECDSA P-256 keypair at edge — private key returned once, never stored
-  const kp = (await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-256" },
-    true,
-    ["sign", "verify"],
-  )) as CryptoKeyPair;
-  const pubDer = (await crypto.subtle.exportKey(
-    "spki",
-    kp.publicKey,
-  )) as ArrayBuffer;
-  const pubB64 = btoa(String.fromCharCode(...new Uint8Array(pubDer)));
-  const publicKeyPem = `-----BEGIN PUBLIC KEY-----\n${pubB64.match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
-  const privDer = (await crypto.subtle.exportKey(
-    "pkcs8",
-    kp.privateKey,
-  )) as ArrayBuffer;
-  const privB64 = btoa(String.fromCharCode(...new Uint8Array(privDer)));
-  const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${privB64.match(/.{1,64}/g)!.join("\n")}\n-----END PRIVATE KEY-----`;
+  // ── Secretless mode: mint an access token, no private key crosses the boundary ──
+  // The signing key stays inside the DO. Callers get a signed JWT that proves
+  // their GHA identity. No cert+key pair, no file, no $GITHUB_OUTPUT secret.
+  const accessToken = await authority.mintRedirectToken({
+    sub: claims.sub,
+    scope: "bridgeCert",
+    audience: cfg.ghaCertAudience,
+  });
 
-  let result;
-  try {
-    result = await authority.mintBridgeCert(
-      claims.sub,
-      publicKeyPem,
-      cfg.ghaCertTtlMs,
-    );
-  } catch (e: any) {
-    return jsonErr(e.message || "cert minting failed", 500);
-  }
+  const state = await authority.getAuthorityState();
 
   return Response.json({
-    certificate: result.certificate,
-    private_key: privateKeyPem,
-    expires_at: result.expires_at,
-    subject: result.subject,
-    authority: result.authority,
+    token: accessToken,
+    token_type: "Bearer",
+    expires_in: 300,
+    subject: claims.sub,
+    authority: { epoch: state.epoch, key_id: state.keyId },
     claims: {
       repository: claims.repository,
       ref: claims.ref,
@@ -835,22 +817,31 @@ function cacheKey(request: Request, vary?: string): Request {
   return request;
 }
 
+// Edge cache disabled when cacheApiOutbound is not configured (local workerd).
+let cacheEnabled = true;
+
 async function cachePut(request: Request, response: Response, vary?: string): Promise<Response> {
-  // Only cache GET responses (Cache API requirement).
-  // Cache 2xx and 301 (permanent redirects are safe to cache long-term).
-  if (request.method !== "GET") return response;
+  if (!cacheEnabled || request.method !== "GET") return response;
   if (!response.ok && response.status !== 301) return response;
-  const cache = caches.default;
-  // Clone before putting — the original body can only be consumed once.
-  const toCache = response.clone();
-  await cache.put(cacheKey(request, vary), toCache);
+  try {
+    const cache = caches.default;
+    const toCache = response.clone();
+    await cache.put(cacheKey(request, vary), toCache);
+  } catch {
+    cacheEnabled = false; // Disable for remainder of isolate lifetime
+  }
   return response;
 }
 
 async function cacheMatch(request: Request, vary?: string): Promise<Response | undefined> {
-  if (request.method !== "GET") return undefined;
-  const cache = caches.default;
-  return cache.match(cacheKey(request, vary));
+  if (!cacheEnabled || request.method !== "GET") return undefined;
+  try {
+    const cache = caches.default;
+    return cache.match(cacheKey(request, vary));
+  } catch {
+    cacheEnabled = false;
+    return undefined;
+  }
 }
 
 export default {
@@ -885,11 +876,17 @@ export default {
     const pathname = url.pathname;
     const host = request.headers.get("host") || "";
     const sub = getSubdomain(host);
+    const envSiteUrl: string = env.SITE_URL || "";
+    const isLocal = envSiteUrl.startsWith("http://localhost");
+    if (isLocal) cacheEnabled = false; // Cache API unavailable in local workerd
+
+    const { createPlatform } = await import("./src/platform");
+    const platform = createPlatform(env);
 
     // ── Canonical host enforcement ──
     // Redirect any non-notme.bot host (e.g. workers.dev) to the canonical domain.
     // This prevents Google from indexing the workers.dev URL as a duplicate.
-    if (!host.endsWith("notme.bot") && host !== "") {
+    if (!isLocal && !host.endsWith("notme.bot") && host !== "") {
       const canonicalUrl = `https://notme.bot${pathname}${url.search}`;
       const redirect = new Response(null, {
         status: 301,
@@ -902,7 +899,7 @@ export default {
     }
 
     // ── auth.notme.bot — signet identity authority ──
-    if (sub === "auth") {
+    if (sub === "auth" || isLocal) {
       const authorityUrl: string =
         env.SIGNET_AUTHORITY_URL || "https://auth.notme.bot";
       const siteUrl: string = env.SITE_URL || "https://notme.bot";
@@ -1002,8 +999,7 @@ export default {
           return jsonErr("proof verification failed: " + e.message, 401);
         }
 
-        // Store the connection
-        const { createConnection } = await import("./src/auth/connections");
+        // Store the connection (via DO RPC, not the imported function)
         await authority.storeConnection({
           credentialId: session.userId,
           provider: `${identity.type}:${identity.issuer}`,
@@ -1261,7 +1257,7 @@ export default {
 
       // POST /cert/gha — GHA OIDC JWT → bridge cert (legacy, kept for compat)
       if (pathname === "/cert/gha") {
-        return handleCertGHA(request, env);
+        return handleCertGHA(request, env, platform);
       }
 
       // GET /authorize — OAuth-style redirect for cross-origin DPoP token issuance
@@ -1470,13 +1466,13 @@ export default {
 
           // JTI replay check
           const jtiKey = `dpop:jti:${proofResult.jti}`;
-          if (await env.CA_BUNDLE_CACHE.get(jtiKey)) {
+          if (await platform.cache.get(jtiKey)) {
             return Response.json({ error: "proof_reused" }, { status: 401 });
           }
 
           // Store JTI BEFORE minting — prevents TOCTOU race across edge nodes.
           // If mint fails after this, the JTI is burned (acceptable — client retries with new proof).
-          await env.CA_BUNDLE_CACHE.put(jtiKey, "1", { expirationTtl: 600 });
+          await platform.cache.put(jtiKey, "1", { expirationTtl: 600 });
 
           // Mint token inside DO — CryptoKey never crosses RPC boundary
           const accessToken = await authority.mintDPoPToken({

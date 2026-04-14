@@ -3,7 +3,7 @@
 # Run your own identity authority. Same code as auth.notme.bot.
 # No Cloudflare account needed. No wrangler. No cloud.
 #
-#   docker run -p 8787:8787 ghcr.io/agentic-research/notme:latest
+#   docker run -p 8788:8788 ghcr.io/agentic-research/notme:latest
 #
 # Usage:
 #   melange build melange-workerd.yaml --arch x86_64 --signing-key melange.rsa --out-dir ./out
@@ -19,6 +19,7 @@ contents:
     - ca-certificates-bundle
     - wolfi-baselayout
     - workerd
+    - notme-app
 
 accounts:
   groups:
@@ -40,6 +41,11 @@ paths:
     gid: 1000
     permissions: 0o755
   - path: /data
+    type: directory
+    uid: 1000
+    gid: 1000
+    permissions: 0o755
+  - path: /data/do
     type: directory
     uid: 1000
     gid: 1000

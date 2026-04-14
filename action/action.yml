@@ -1,14 +1,14 @@
 name: 'notme identity exchange'
-description: 'Exchange GHA OIDC token for a signet bridge cert at auth.notme.bot. Zero env vars, zero secrets.'
+description: 'Exchange GHA OIDC token for a signed access token. Zero secrets — private keys never leave the authority.'
 inputs:
   audience:
-    description: 'OIDC audience for the bridge cert request'
+    description: 'OIDC audience for the identity exchange'
     default: 'notme.bot'
   authority_url:
-    description: 'Authority base URL (for self-hosted)'
+    description: 'Authority base URL (for self-hosted or local workerd)'
     default: 'https://auth.notme.bot'
   skip_bridge_cert:
-    description: 'Skip bridge cert exchange (octo-sts only)'
+    description: 'Skip identity exchange'
     default: 'false'
   octo_sts_scope:
     description: 'octo-sts scope (org/repo). Empty = skip.'
@@ -17,12 +17,12 @@ inputs:
     description: 'octo-sts trust policy identity name'
     default: 'default'
 outputs:
-  bridge_cert:
-    description: 'Base64-encoded signet bridge cert PEM (5-min TTL)'
-  bridge_key:
-    description: 'Base64-encoded ephemeral private key PEM'
-  bridge_expires_at:
-    description: 'Bridge cert expiry (Unix timestamp)'
+  notme_url:
+    description: 'Authority URL for subsequent API calls'
+  notme_token:
+    description: 'Signed access token (Bearer) — NOT a private key'
+  expires_in:
+    description: 'Token lifetime in seconds'
   github_token:
     description: 'Scoped GitHub token from octo-sts (empty if not requested)'
 runs:

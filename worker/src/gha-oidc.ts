@@ -66,16 +66,8 @@ async function fetchJWKS(): Promise<JWK[]> {
   return body.keys;
 }
 
-function b64urlDecode(s: string): Uint8Array<ArrayBuffer> {
-  const b64 = s
-    .replace(/-/g, "+")
-    .replace(/_/g, "/")
-    .padEnd(s.length + ((4 - (s.length % 4)) % 4), "=");
-  const raw = atob(b64);
-  const buf = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-  return buf;
-}
+// b64urlDecode imported from SDK — single implementation for all JWT code
+import { base64urlDecode as b64urlDecode } from "../../gen/ts/dpop";
 
 // Validate a GHA OIDC JWT and return typed, Zod-parsed claims.
 // Throws on any validation failure — callers treat all errors as 401.

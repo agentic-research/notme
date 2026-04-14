@@ -3,7 +3,7 @@ name: GHA Identity Exchange
 # Reusable workflow: one OIDC token → two exchanges.
 #
 #   1. octo-sts  → scoped GitHub App token   (eliminates stored PATs)
-#   2. notme.bot → signet bridge cert         (eliminates SIGNET_MASTER_KEY in GH)
+#   2. notme.bot → signed access token        (secretless — no private key on disk)
 #
 # Usage:
 #
@@ -22,9 +22,13 @@ name: GHA Identity Exchange
 #         - env:
 #             GH_TOKEN: ${{ needs.identity.outputs.github_token }}
 #           run: gh release download ...
-#         - run: |
-#             echo "${{ needs.identity.outputs.bridge_cert }}" | base64 -d > cert.pem
-#             echo "${{ needs.identity.outputs.bridge_key }}"  | base64 -d > key.pem
+#         - env:
+#             NOTME_URL: ${{ needs.identity.outputs.notme_url }}
+#             NOTME_TOKEN: ${{ needs.identity.outputs.notme_token }}
+#           run: |
+#             # Authenticate to any notme-protected service using the token.
+#             # No cert files, no private keys — just a Bearer token.
+#             curl -H "Authorization: Bearer $NOTME_TOKEN" "$NOTME_URL/me"
 
 on:
   workflow_call:
@@ -40,12 +44,12 @@ on:
         type: string
         default: 'default'
       bridge_audience:
-        description: 'Audience for the signet bridge cert OIDC token request'
+        description: 'Audience for the OIDC token request'
         required: false
         type: string
         default: 'notme.bot'
       skip_bridge_cert:
-        description: 'Set to true to skip bridge cert exchange (octo-sts only)'
+        description: 'Set to true to skip identity exchange (octo-sts only)'
         required: false
         type: boolean
         default: false
@@ -53,15 +57,15 @@ on:
       github_token:
         description: 'Scoped GitHub token from octo-sts. Empty if octo_sts_scope not provided.'
         value: ${{ jobs.exchange.outputs.github_token }}
-      bridge_cert:
-        description: 'Base64-encoded signet bridge cert PEM (5-min TTL)'
-        value: ${{ jobs.exchange.outputs.bridge_cert }}
-      bridge_key:
-        description: 'Base64-encoded signet bridge private key PEM'
-        value: ${{ jobs.exchange.outputs.bridge_key }}
-      bridge_expires_at:
-        description: 'Bridge cert expiry as Unix timestamp'
-        value: ${{ jobs.exchange.outputs.bridge_expires_at }}
+      notme_url:
+        description: 'Authority URL for subsequent API calls'
+        value: ${{ jobs.exchange.outputs.notme_url }}
+      notme_token:
+        description: 'Signed access token (Bearer) — NOT a private key'
+        value: ${{ jobs.exchange.outputs.notme_token }}
+      expires_in:
+        description: 'Token lifetime in seconds'
+        value: ${{ jobs.exchange.outputs.expires_in }}
 
 jobs:
   exchange:
@@ -72,9 +76,9 @@ jobs:
       contents: read
     outputs:
       github_token: ${{ steps.octo-sts.outputs.token }}
-      bridge_cert: ${{ steps.signet.outputs.bridge_cert }}
-      bridge_key: ${{ steps.signet.outputs.bridge_key }}
-      bridge_expires_at: ${{ steps.signet.outputs.bridge_expires_at }}
+      notme_url: ${{ steps.signet.outputs.notme_url }}
+      notme_token: ${{ steps.signet.outputs.notme_token }}
+      expires_in: ${{ steps.signet.outputs.expires_in }}
 
     steps:
       - name: Exchange OIDC → GitHub token (octo-sts)
@@ -85,10 +89,10 @@ jobs:
           scope: ${{ inputs.octo_sts_scope }}
           identity: ${{ inputs.octo_sts_identity }}
 
-      - name: Exchange OIDC → signet bridge cert
+      - name: Exchange OIDC → notme access token
         id: signet
         if: '!inputs.skip_bridge_cert'
-        uses: agentic-research/notme/action@01e332901af3d7cc0cc74c408f83437f6a8a4629 # main 2026-04-02
+        uses: agentic-research/notme/action@feat/jwt-sdk-primitives
         with:
           audience: ${{ inputs.bridge_audience }}
           authority_url: https://auth.notme.bot

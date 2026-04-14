@@ -15,9 +15,12 @@ import { DurableObject } from "cloudflare:workers";
 import { X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
 import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 import type { CABundle } from "./revocation";
+import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 
 interface SigningAuthorityEnv {
-  CA_BUNDLE_CACHE: KVNamespace;
+  CA_BUNDLE_CACHE?: KVNamespace;
+  NOTME_KEY_STORAGE?: string;
+  NOTME_KEK_SECRET?: string;
 }
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
@@ -27,6 +30,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
   private signingKey: CryptoKey | null = null;
   private verifyKey: CryptoKey | null = null;
+  /** Key storage mode — uses shared detectKeyStorage() for consistency with Worker. */
+  private get keyStorageMode(): KeyStorageMode {
+    const mode = detectKeyStorage(this.env as Record<string, unknown>);
+    if (mode === "encrypted") {
+      throw new Error(
+        "encrypted key storage is not yet implemented. " +
+          "Use ephemeral (local/CI) or cf-managed (production). " +
+          "See docs/design/007-secretless-local-proxy.md for roadmap.",
+      );
+    }
+    return mode;
+  }
 
   private ensureSchema(): void {
     if (this.initialized) return;
@@ -102,44 +117,51 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     if (rows.length > 0) {
       const row = rows[0]!;
-      const jwk = JSON.parse(row.private_jwk);
-      this.signingKey = await crypto.subtle.importKey(
-        "jwk",
-        jwk,
-        { name: "Ed25519" } as any,
-        true,
-        ["sign"],
-      );
-      const spkiBytes = Uint8Array.from(atob(row.public_spki), (c) =>
-        c.charCodeAt(0),
-      );
-      this.verifyKey = await crypto.subtle.importKey(
-        "spki",
-        spkiBytes,
-        { name: "Ed25519" } as any,
-        true,
-        ["verify"],
-      );
-      // Backfill key_id if empty (v1 key created before key_id tracking)
-      let keyId = row.key_id;
-      if (!keyId) {
-        keyId = await SigningAuthority.keyIdFromSpki(row.public_spki);
-        this.ctx.storage.sql.exec(
-          "UPDATE keys SET key_id = ? WHERE id = 'authority'",
-          keyId,
+
+      // Ephemeral mode: private_jwk is empty — key only exists in memory.
+      // If we restarted, we need to generate a new key (fall through below).
+      if (!row.private_jwk) {
+        // Fall through to key generation
+      } else {
+        const jwk = JSON.parse(row.private_jwk);
+        this.signingKey = await crypto.subtle.importKey(
+          "jwk",
+          jwk,
+          ED25519,
+          false, // NON-EXTRACTABLE after import
+          ["sign"],
         );
+        const spkiBytes = Uint8Array.from(atob(row.public_spki), (c) =>
+          c.charCodeAt(0),
+        );
+        this.verifyKey = await crypto.subtle.importKey(
+          "spki",
+          spkiBytes,
+          ED25519,
+          true, // public key stays extractable (needed for JWKS, raw export)
+          ["verify"],
+        );
+        let keyId = row.key_id;
+        if (!keyId) {
+          keyId = await SigningAuthority.keyIdFromSpki(row.public_spki);
+          this.ctx.storage.sql.exec(
+            "UPDATE keys SET key_id = ? WHERE id = 'authority'",
+            keyId,
+          );
+        }
+        return { signingKey: this.signingKey, verifyKey: this.verifyKey, keyId };
       }
-      return { signingKey: this.signingKey, verifyKey: this.verifyKey, keyId };
     }
 
-    // First call ever — generate the authority keypair
+    // Generate the authority keypair
+    const isEphemeral = this.keyStorageMode === "ephemeral";
     const kp = (await crypto.subtle.generateKey(
-      { name: "Ed25519" } as any,
-      true,
+      ED25519,
+      !isEphemeral, // extractable:false in ephemeral mode
       ["sign", "verify"],
     )) as CryptoKeyPair;
 
-    const privateJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+    // Always extract public key (for key ID + JWKS)
     const publicSpki = (await crypto.subtle.exportKey(
       "spki",
       kp.publicKey,
@@ -149,19 +171,36 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     );
     const keyId = await SigningAuthority.keyIdFromSpki(publicSpkiB64);
 
-    this.ctx.storage.sql.exec(
-      "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
-      JSON.stringify(privateJwk),
-      publicSpkiB64,
-      keyId,
-    );
+    if (isEphemeral) {
+      // Store public key + key ID only — no private key material on disk
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', '', ?, ?)",
+        publicSpkiB64,
+        keyId,
+      );
+      this.signingKey = kp.privateKey;
+      this.verifyKey = kp.publicKey;
+    } else {
+      // Persistent: export JWK, store, then re-import as non-extractable
+      const privateJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+      this.ctx.storage.sql.exec(
+        "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
+        JSON.stringify(privateJwk),
+        publicSpkiB64,
+        keyId,
+      );
+      // Re-import as non-extractable — JWK is stored, no need to keep extractable
+      this.signingKey = await crypto.subtle.importKey(
+        "jwk",
+        privateJwk,
+        ED25519,
+        false,
+        ["sign"],
+      );
+      this.verifyKey = kp.publicKey;
+    }
 
-    this.signingKey = kp.privateKey;
-    this.verifyKey = kp.publicKey;
-
-    // First key ever — start the bundle refresh alarm
     await this.scheduleNextRefresh();
-
     return { signingKey: this.signingKey, verifyKey: this.verifyKey, keyId };
   }
 
@@ -241,7 +280,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       name: "CN=signet-authority,O=notme",
       notBefore: now,
       notAfter,
-      signingAlgorithm: { name: "Ed25519" } as any,
+      signingAlgorithm: ED25519,
       keys: { privateKey: signingKey, publicKey: verifyKey },
       serialNumber: serial,
       extensions: [
@@ -648,7 +687,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .exec("SELECT code, created_at FROM bootstrap WHERE id = 'code' AND used = 0")
       .toArray() as Array<{ code: string; created_at: string }>;
 
-    if (rows.length === 0 || rows[0]!.code !== code) return false;
+    const { timingSafeEqual } = await import("./auth/timing-safe");
+    if (rows.length === 0 || !(await timingSafeEqual(rows[0]!.code, code))) return false;
 
     // Enforce 15-minute TTL here too (not just in getOrCreateBootstrapCode)
     const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
@@ -702,10 +742,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   override async alarm(): Promise<void> {
     try {
       const bundle = await this.generateBundle();
-      await this.env.CA_BUNDLE_CACHE.put(
-        "bundle:current",
-        JSON.stringify(bundle),
-      );
+      if (this.env.CA_BUNDLE_CACHE) {
+        await this.env.CA_BUNDLE_CACHE.put(
+          "bundle:current",
+          JSON.stringify(bundle),
+        );
+      }
     } catch (e) {
       console.error("[signing-authority] bundle refresh failed:", e);
     }

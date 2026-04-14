@@ -20,18 +20,9 @@ export interface X509Proof {
 
 export type Proof = OIDCProof | X509Proof;
 
-// ── OIDC verification (any issuer with a JWKS endpoint) ──
+import { base64urlDecode } from "../../../gen/ts/dpop";
 
-function b64urlDecode(s: string): Uint8Array<ArrayBuffer> {
-  const b64 = s
-    .replace(/-/g, "+")
-    .replace(/_/g, "/")
-    .padEnd(s.length + ((4 - (s.length % 4)) % 4), "=");
-  const raw = atob(b64);
-  const buf = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-  return buf;
-}
+// ── OIDC verification (any issuer with a JWKS endpoint) ──
 
 interface JWK {
   kty: string;
@@ -98,10 +89,10 @@ export async function verifyOIDC(
   if (parts.length !== 3) throw new Error("malformed JWT");
 
   const header = JSON.parse(
-    new TextDecoder().decode(b64urlDecode(parts[0])),
+    new TextDecoder().decode(base64urlDecode(parts[0])),
   ) as { alg: string; kid?: string };
   const payload = JSON.parse(
-    new TextDecoder().decode(b64urlDecode(parts[1])),
+    new TextDecoder().decode(base64urlDecode(parts[1])),
   ) as Record<string, unknown>;
 
   // Basic claim checks
@@ -164,7 +155,7 @@ export async function verifyOIDC(
   const valid = await crypto.subtle.verify(
     algParams,
     cryptoKey,
-    b64urlDecode(parts[2]),
+    base64urlDecode(parts[2]),
     signingInput,
   );
   if (!valid) throw new Error("invalid signature");

@@ -418,18 +418,39 @@ function buildCanonicalJson(jwk: JsonWebKey): string {
   }
 }
 
-/** Base64url encode bytes (no padding). */
-function base64urlEncode(bytes: Uint8Array): string {
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+// ── Exported primitives ─────────────────────────────────────────────────────
+// Single implementation for all JWT code. Patterns from jose (MIT, Filip Skokan).
+
+/**
+ * Base64url encode bytes (no padding, URL-safe).
+ * Chunked at 32KB to prevent stack overflow on large payloads.
+ */
+export function base64urlEncode(bytes: Uint8Array): string {
+  const CHUNK = 0x8000; // 32KB
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    parts.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(parts.join(""))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
 }
 
-/** Decode a base64url string to raw bytes. */
-function base64urlDecodeBytes(s: string): Uint8Array {
+/**
+ * Base64url decode to bytes. Handles both URL-safe and standard base64.
+ * Throws on malformed input (try/catch around atob).
+ */
+export function base64urlDecode(s: string): Uint8Array {
+  if (s.length === 0) return new Uint8Array(0);
   const base64 = s.replace(/-/g, "+").replace(/_/g, "/");
   const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-  const binary = atob(padded);
+  let binary: string;
+  try {
+    binary = atob(padded);
+  } catch {
+    throw new Error("Failed to base64url decode: malformed input");
+  }
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -437,16 +458,123 @@ function base64urlDecodeBytes(s: string): Uint8Array {
   return bytes;
 }
 
-/** Decode a base64url string to a UTF-8 string. */
+// Internal aliases used by existing code — delegates to exported functions.
+function base64urlDecodeBytes(s: string): Uint8Array {
+  return base64urlDecode(s);
+}
 function base64urlDecodeStr(s: string): string {
-  return new TextDecoder().decode(base64urlDecodeBytes(s));
+  return new TextDecoder().decode(base64urlDecode(s));
 }
 
-/** Parse JSON with a descriptive error. */
-function jsonParse(s: string, label: string): Record<string, any> {
+/**
+ * Parse JSON with labeled error. Rejects non-object results (arrays, primitives, null).
+ * jose pattern: JWT Claims Set must be a top-level JSON object.
+ */
+export function jsonParseSafe(s: string, label: string): Record<string, any> {
+  let parsed: unknown;
   try {
-    return JSON.parse(s);
+    parsed = JSON.parse(s);
   } catch {
     throw new Error(`${label} is not valid JSON`);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return parsed as Record<string, any>;
+}
+
+// Internal alias for existing code.
+function jsonParse(s: string, label: string): Record<string, any> {
+  return jsonParseSafe(s, label);
+}
+
+/**
+ * Validate JWT claims per RFC 7519 + jose patterns.
+ *
+ * Checks: exp (required unless opts say otherwise), nbf, iat, iss, aud, sub.
+ * Type-checks all numeric claims before comparison.
+ * Clock tolerance applied to `now`, not claim values.
+ */
+export interface ValidateClaimsOptions {
+  /** Expected issuer — rejects if payload.iss doesn't match. */
+  issuer?: string;
+  /** Expected audience — string or array. Rejects if no match. */
+  audience?: string | string[];
+  /** Clock tolerance in seconds (default 0). */
+  clockTolerance?: number;
+  /** Require sub claim to be present and a string. */
+  requireSub?: boolean;
+}
+
+export function validateClaims(
+  payload: Record<string, unknown>,
+  opts: ValidateClaimsOptions,
+): void {
+  const tolerance = opts.clockTolerance ?? 0;
+  const now = Math.floor(Date.now() / 1000);
+
+  // ── exp: type-check, then compare with tolerance ──
+  if (payload.exp !== undefined) {
+    if (typeof payload.exp !== "number") {
+      throw new Error('"exp" claim must be a number');
+    }
+    if (payload.exp <= now - tolerance) {
+      throw new Error('"exp" claim timestamp check failed (token expired)');
+    }
+  }
+
+  // ── nbf: validate only if present ──
+  if (payload.nbf !== undefined) {
+    if (typeof payload.nbf !== "number") {
+      throw new Error('"nbf" claim must be a number');
+    }
+    if (payload.nbf > now + tolerance) {
+      throw new Error('"nbf" claim timestamp check failed (token not yet valid)');
+    }
+  }
+
+  // ── iat: validate only if present ──
+  if (payload.iat !== undefined) {
+    if (typeof payload.iat !== "number") {
+      throw new Error('"iat" claim must be a number');
+    }
+    if (payload.iat > now + 60 + tolerance) {
+      throw new Error('"iat" claim is too far in the future');
+    }
+  }
+
+  // ── iss: required when issuer option is set ──
+  if (opts.issuer !== undefined) {
+    if (payload.iss === undefined) {
+      throw new Error('"iss" claim missing (required by issuer option)');
+    }
+    if (payload.iss !== opts.issuer) {
+      throw new Error(`"iss" claim mismatch: expected "${opts.issuer}", got "${payload.iss}"`);
+    }
+  }
+
+  // ── aud: required when audience option is set (handles string + array) ──
+  if (opts.audience !== undefined) {
+    if (payload.aud === undefined) {
+      throw new Error('"aud" claim missing (required by audience option)');
+    }
+    const expected = Array.isArray(opts.audience) ? opts.audience : [opts.audience];
+    const actual = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    const match = actual.some(
+      (a: unknown) => typeof a === "string" && expected.includes(a),
+    );
+    if (!match) {
+      throw new Error(`"aud" claim mismatch: expected ${expected.join(",")}, got ${actual.join(",")}`);
+    }
+  }
+
+  // ── sub: required when requireSub option is set ──
+  if (opts.requireSub) {
+    if (payload.sub === undefined) {
+      throw new Error('"sub" claim missing (required)');
+    }
+    if (typeof payload.sub !== "string") {
+      throw new Error('"sub" claim must be a string');
+    }
   }
 }
