@@ -53,17 +53,18 @@ Agent authenticates (passkey, GHA OIDC, bootstrap code)
     → proof verified (verify-proof.ts or gha-oidc.ts)
       → SigningAuthority DO mints access token (Ed25519, 5-min TTL)
         → signing key never leaves DO process memory (extractable:false)
-          → token returned to agent (Bearer, not a private key)
+          → DPoP-bound token returned to agent (proof-of-possession, not bearer)
 ```
 
 ### GHA CI flow
 
 ```
 GHA runner requests OIDC token (audience: notme.bot)
-  → action/src/index.ts POSTs to /cert/gha with Bearer OIDC JWT
+  → action/src/index.ts POSTs to /cert/gha with OIDC JWT + DPoP proof
     → worker.ts validates: RS256 signature, audience, owner allowlist, JTI replay
-      → SigningAuthority.mintRedirectToken() — signs inside DO
-        → action outputs: notme_url + notme_token (no private key, no bridge_key)
+      → validates DPoP proof, computes JWK thumbprint
+        → SigningAuthority.mintDPoPToken(jkt) — signs inside DO, binds to caller's key
+          → action outputs: notme_url + notme_token (DPoP-bound, useless without proof key)
 ```
 
 ### Key lifecycle (ephemeral mode)

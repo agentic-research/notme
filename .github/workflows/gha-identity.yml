@@ -22,13 +22,11 @@ name: GHA Identity Exchange
 #         - env:
 #             GH_TOKEN: ${{ needs.identity.outputs.github_token }}
 #           run: gh release download ...
-#         - env:
-#             NOTME_URL: ${{ needs.identity.outputs.notme_url }}
-#             NOTME_TOKEN: ${{ needs.identity.outputs.notme_token }}
-#           run: |
-#             # Authenticate to any notme-protected service using the token.
-#             # No cert files, no private keys — just a Bearer token.
-#             curl -H "Authorization: Bearer $NOTME_TOKEN" "$NOTME_URL/me"
+#         - name: Use notme identity (DPoP-bound)
+#           # NOTE: The DPoP token from the identity job is bound to that job's
+#           # ephemeral keypair. For cross-job usage, each job should run the
+#           # action independently to get its own DPoP keypair + bound token.
+#           # The token alone is proof-of-possession — useless without the key.
 
 on:
   workflow_call:
@@ -61,7 +59,7 @@ on:
         description: 'Authority URL for subsequent API calls'
         value: ${{ jobs.exchange.outputs.notme_url }}
       notme_token:
-        description: 'Signed access token (Bearer) — NOT a private key'
+        description: 'DPoP-bound access token — useless without the matching proof key'
         value: ${{ jobs.exchange.outputs.notme_token }}
       expires_in:
         description: 'Token lifetime in seconds'
