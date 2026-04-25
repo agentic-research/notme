@@ -1,5 +1,5 @@
 name: 'notme identity exchange'
-description: 'Exchange GHA OIDC token for a signed access token. Zero secrets — private keys never leave the authority.'
+description: 'Exchange GHA OIDC token for a DPoP-bound access token. Zero secrets — private keys never leave process memory.'
 inputs:
   audience:
     description: 'OIDC audience for the identity exchange'
@@ -20,7 +20,9 @@ outputs:
   notme_url:
     description: 'Authority URL for subsequent API calls'
   notme_token:
-    description: 'Signed access token (Bearer) — NOT a private key'
+    description: 'DPoP-bound access token — useless without the matching DPoP proof key (which exists only in this steps process memory)'
+  notme_jkt:
+    description: 'JWK Thumbprint of the DPoP proof key (for verification, not a secret)'
   expires_in:
     description: 'Token lifetime in seconds'
   github_token:

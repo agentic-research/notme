@@ -161,21 +161,40 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
     }
   }
 
-  // ── Secretless mode: mint an access token, no private key crosses the boundary ──
-  // The signing key stays inside the DO. Callers get a signed JWT that proves
-  // their GHA identity. No cert+key pair, no file, no $GITHUB_OUTPUT secret.
-  const accessToken = await authority.mintRedirectToken({
+  // ── DPoP-bound token: proof-of-possession, not bearer ──
+  // The caller must include a DPoP proof header. The token is bound to the
+  // caller's DPoP key via cnf.jkt — useless without the matching private key.
+  // The DPoP private key stays in the caller's process memory (action, workerd).
+  const dpopHeader = request.headers.get("DPoP");
+  if (!dpopHeader) {
+    return jsonErr("DPoP proof required — include a DPoP header with your request", 400);
+  }
+
+  const { validateDpopProof } = await import("./src/auth/dpop");
+  let dpopResult;
+  try {
+    dpopResult = await validateDpopProof(dpopHeader, {
+      htm: "POST",
+      htu: `${env.SIGNET_AUTHORITY_URL || "https://auth.notme.bot"}/cert/gha`,
+    });
+  } catch (e: any) {
+    return jsonErr(`invalid DPoP proof: ${e.message}`, 401);
+  }
+
+  const accessToken = await authority.mintDPoPToken({
     sub: claims.sub,
     scope: "bridgeCert",
     audience: cfg.ghaCertAudience,
+    jkt: dpopResult.thumbprint,
   });
 
   const state = await authority.getAuthorityState();
 
   return Response.json({
     token: accessToken,
-    token_type: "Bearer",
+    token_type: "DPoP",
     expires_in: 300,
+    jkt: dpopResult.thumbprint,
     subject: claims.sub,
     authority: { epoch: state.epoch, key_id: state.keyId },
     claims: {

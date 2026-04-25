@@ -175,7 +175,7 @@ var require_file_command = __commonJS({
     };
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.prepareKeyValueMessage = exports2.issueFileCommand = void 0;
-    var crypto = __importStar(require("crypto"));
+    var crypto2 = __importStar(require("crypto"));
     var fs = __importStar(require("fs"));
     var os = __importStar(require("os"));
     var utils_1 = require_utils();
@@ -193,7 +193,7 @@ var require_file_command = __commonJS({
     }
     exports2.issueFileCommand = issueFileCommand;
     function prepareKeyValueMessage(key, value) {
-      const delimiter = `ghadelimiter_${crypto.randomUUID()}`;
+      const delimiter = `ghadelimiter_${crypto2.randomUUID()}`;
       const convertedValue = (0, utils_1.toCommandValue)(value);
       if (key.includes(delimiter)) {
         throw new Error(`Unexpected input: name should not contain the delimiter "${delimiter}"`);
@@ -3628,11 +3628,11 @@ var require_util2 = __commonJS({
     var assert = require("assert");
     var { isUint8Array } = require("util/types");
     var supportedHashes = [];
-    var crypto;
+    var crypto2;
     try {
-      crypto = require("crypto");
+      crypto2 = require("crypto");
       const possibleRelevantHashes = ["sha256", "sha384", "sha512"];
-      supportedHashes = crypto.getHashes().filter((hash) => possibleRelevantHashes.includes(hash));
+      supportedHashes = crypto2.getHashes().filter((hash) => possibleRelevantHashes.includes(hash));
     } catch {
     }
     function responseURL(response) {
@@ -3909,7 +3909,7 @@ var require_util2 = __commonJS({
       }
     }
     function bytesMatch(bytes, metadataList) {
-      if (crypto === void 0) {
+      if (crypto2 === void 0) {
         return true;
       }
       const parsedMetadata = parseMetadata(metadataList);
@@ -3924,7 +3924,7 @@ var require_util2 = __commonJS({
       for (const item of metadata) {
         const algorithm = item.algo;
         const expectedValue = item.hash;
-        let actualValue = crypto.createHash(algorithm).update(bytes).digest("base64");
+        let actualValue = crypto2.createHash(algorithm).update(bytes).digest("base64");
         if (actualValue[actualValue.length - 1] === "=") {
           if (actualValue[actualValue.length - 2] === "=") {
             actualValue = actualValue.slice(0, -2);
@@ -5270,8 +5270,8 @@ var require_body = __commonJS({
     var { parseMIMEType, serializeAMimeType } = require_dataURL();
     var random;
     try {
-      const crypto = require("node:crypto");
-      random = (max) => crypto.randomInt(0, max);
+      const crypto2 = require("node:crypto");
+      random = (max) => crypto2.randomInt(0, max);
     } catch {
       random = (max) => Math.floor(Math.random(max));
     }
@@ -16321,9 +16321,9 @@ var require_connection = __commonJS({
     channels.open = diagnosticsChannel.channel("undici:websocket:open");
     channels.close = diagnosticsChannel.channel("undici:websocket:close");
     channels.socketError = diagnosticsChannel.channel("undici:websocket:socket_error");
-    var crypto;
+    var crypto2;
     try {
-      crypto = require("crypto");
+      crypto2 = require("crypto");
     } catch {
     }
     function establishWebSocketConnection(url, protocols, ws, onEstablish, options) {
@@ -16342,7 +16342,7 @@ var require_connection = __commonJS({
         const headersList = new Headers(options.headers)[kHeadersList];
         request.headersList = headersList;
       }
-      const keyValue = crypto.randomBytes(16).toString("base64");
+      const keyValue = crypto2.randomBytes(16).toString("base64");
       request.headersList.append("sec-websocket-key", keyValue);
       request.headersList.append("sec-websocket-version", "13");
       for (const protocol of protocols) {
@@ -16371,7 +16371,7 @@ var require_connection = __commonJS({
             return;
           }
           const secWSAccept = response.headersList.get("Sec-WebSocket-Accept");
-          const digest = crypto.createHash("sha1").update(keyValue + uid).digest("base64");
+          const digest = crypto2.createHash("sha1").update(keyValue + uid).digest("base64");
           if (secWSAccept !== digest) {
             failWebsocketConnection(ws, "Incorrect hash received in Sec-WebSocket-Accept header.");
             return;
@@ -16451,9 +16451,9 @@ var require_frame = __commonJS({
   "node_modules/undici/lib/websocket/frame.js"(exports2, module2) {
     "use strict";
     var { maxUnsigned16Bit } = require_constants5();
-    var crypto;
+    var crypto2;
     try {
-      crypto = require("crypto");
+      crypto2 = require("crypto");
     } catch {
     }
     var WebsocketFrameSend = class {
@@ -16462,7 +16462,7 @@ var require_frame = __commonJS({
        */
       constructor(data) {
         this.frameData = data;
-        this.maskKey = crypto.randomBytes(4);
+        this.maskKey = crypto2.randomBytes(4);
       }
       createFrame(opcode) {
         const bodyLength = this.frameData?.byteLength ?? 0;
@@ -19810,6 +19810,49 @@ Support boolean input list: \`true | True | TRUE | false | False | FALSE\``);
 // src/index.ts
 var core = __toESM(require_core());
 var http = __toESM(require_lib());
+var crypto = __toESM(require("crypto"));
+function b64url(buf) {
+  return buf.toString("base64url");
+}
+async function generateDPoPProof(keypair, htm, htu) {
+  const wc = crypto.webcrypto;
+  const pubJwk = await wc.subtle.exportKey(
+    "jwk",
+    keypair.publicKey
+  );
+  const thumbprintInput = JSON.stringify({
+    crv: pubJwk.crv,
+    kty: pubJwk.kty,
+    x: pubJwk.x,
+    y: pubJwk.y
+  });
+  const thumbprintHash = await wc.subtle.digest(
+    "SHA-256",
+    Buffer.from(thumbprintInput)
+  );
+  const thumbprint = b64url(Buffer.from(thumbprintHash));
+  const header = {
+    typ: "dpop+jwt",
+    alg: "ES256",
+    jwk: { kty: pubJwk.kty, crv: pubJwk.crv, x: pubJwk.x, y: pubJwk.y }
+  };
+  const payload = {
+    jti: crypto.randomUUID(),
+    htm,
+    htu,
+    iat: Math.floor(Date.now() / 1e3)
+  };
+  const headerB64 = b64url(Buffer.from(JSON.stringify(header)));
+  const payloadB64 = b64url(Buffer.from(JSON.stringify(payload)));
+  const signingInput = Buffer.from(`${headerB64}.${payloadB64}`);
+  const sig = await wc.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    keypair.privateKey,
+    signingInput
+  );
+  const proof = `${headerB64}.${payloadB64}.${b64url(Buffer.from(sig))}`;
+  return { proof, thumbprint };
+}
 async function run() {
   const audience = core.getInput("audience");
   const authorityUrl = core.getInput("authority_url");
@@ -19838,11 +19881,25 @@ async function run() {
       `failed to get OIDC token \u2014 does the job have 'permissions: id-token: write'? ${err}`
     );
   }
+  core.info("generating ephemeral DPoP keypair (P-256, in-memory only)");
+  const wc = crypto.webcrypto;
+  const dpopKeypair = await wc.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    // NON-EXTRACTABLE — cannot be serialized or output
+    ["sign", "verify"]
+  );
   const certUrl = `${authorityUrl}/cert/gha`;
-  core.info(`exchanging OIDC token at ${certUrl}`);
+  const { proof, thumbprint } = await generateDPoPProof(
+    dpopKeypair,
+    "POST",
+    certUrl
+  );
+  core.info(`exchanging OIDC + DPoP proof at ${certUrl} (jkt: ${thumbprint.slice(0, 8)}...)`);
   const client = new http.HttpClient("notme-action");
   const res = await client.postJson(certUrl, null, {
     Authorization: `Bearer ${oidcToken}`,
+    DPoP: proof,
     "Content-Type": "application/json"
   });
   if (res.statusCode !== 200 || !res.result) {
@@ -19851,15 +19908,19 @@ async function run() {
     );
   }
   const auth = res.result;
-  if (!auth.token) {
-    throw new Error("response missing token");
+  if (!auth.token || auth.token_type !== "DPoP") {
+    throw new Error(`expected DPoP token, got ${auth.token_type || "nothing"}`);
   }
   core.setSecret(auth.token);
   core.setOutput("notme_url", authorityUrl);
   core.setOutput("notme_token", auth.token);
+  core.setOutput("notme_jkt", auth.jkt);
   core.setOutput("expires_in", auth.expires_in.toString());
   core.info(
-    `identity established for ${auth.subject} (epoch ${auth.authority.epoch}, key ${auth.authority.key_id})`
+    `DPoP-bound identity established for ${auth.subject} (epoch ${auth.authority.epoch}, key ${auth.authority.key_id}, jkt: ${thumbprint.slice(0, 8)}...)`
+  );
+  core.info(
+    "note: the DPoP private key exists only in this step's memory. downstream steps should run the action independently for their own keypair."
   );
 }
 run().catch((err) => core.setFailed(err.message));

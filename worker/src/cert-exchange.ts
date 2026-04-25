@@ -29,13 +29,14 @@ export interface CertExchangeRequest {
 
 export interface CertExchangeResponse {
   token: string;
-  token_type: string;
+  token_type: "DPoP" | "Bearer";
   expires_in: number;
   subject: string;
   authority: { epoch: number; key_id: string };
   principal_id: string;
   scopes: string[];
   auth_method: string;
+  jkt?: string;
 }
 
 
@@ -131,32 +132,70 @@ export async function handleCertExchange(
     );
   }
 
-  // ── Mint access token (signing stays inside the DO — no private key crosses RPC) ──
+  // ── Mint token (DPoP-bound if proof present, unbound otherwise) ──
+  const dpopHeader = request.headers.get("DPoP");
   let accessToken: string;
-  try {
-    accessToken = await authority.mintRedirectToken({
-      sub: principalId,
-      scope: effectiveScopes.join(" "),
-      audience: "notme.bot",
-    });
-  } catch (e: any) {
-    return Response.json(
-      { error: "token minting failed: " + e.message },
-      { status: 500 },
-    );
+  let tokenType: "DPoP" | "Bearer" = "Bearer";
+  let jkt: string | undefined;
+
+  if (dpopHeader) {
+    // DPoP proof present — bind the token to the caller's key
+    const { validateDpopProof } = await import("./auth/dpop");
+    let dpopResult;
+    try {
+      dpopResult = await validateDpopProof(dpopHeader, {
+        htm: "POST",
+        htu: new URL(request.url).origin + "/cert",
+      });
+    } catch (e: any) {
+      return Response.json(
+        { error: "invalid DPoP proof: " + e.message },
+        { status: 401 },
+      );
+    }
+    try {
+      accessToken = await authority.mintDPoPToken({
+        sub: principalId,
+        scope: effectiveScopes.join(" "),
+        audience: "notme.bot",
+        jkt: dpopResult.thumbprint,
+      });
+    } catch (e: any) {
+      return Response.json(
+        { error: "token minting failed: " + e.message },
+        { status: 500 },
+      );
+    }
+    tokenType = "DPoP";
+    jkt = dpopResult.thumbprint;
+  } else {
+    // No DPoP — unbound token (for bootstrap/passkey flows)
+    try {
+      accessToken = await authority.mintRedirectToken({
+        sub: principalId,
+        scope: effectiveScopes.join(" "),
+        audience: "notme.bot",
+      });
+    } catch (e: any) {
+      return Response.json(
+        { error: "token minting failed: " + e.message },
+        { status: 500 },
+      );
+    }
   }
 
   const state = await authority.getAuthorityState();
 
   const response: CertExchangeResponse = {
     token: accessToken,
-    token_type: "Bearer",
+    token_type: tokenType,
     expires_in: 300,
     subject: principalId,
     authority: { epoch: state.epoch, key_id: state.keyId },
     principal_id: principalId,
     scopes: effectiveScopes,
     auth_method: authMethod,
+    ...(jkt ? { jkt } : {}),
   };
 
   return Response.json(response);
