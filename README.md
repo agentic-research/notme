@@ -1,11 +1,11 @@
 <!--
 @doc-check
 @types: CABundle, BridgeCertResult, CertScope
-@endpoints: POST /cert, POST /cert/gha, GET /me, POST /invites, GET /.well-known/signet-authority.json, GET /.well-known/ca-bundle.pem, GET /api/docs
+@endpoints: POST /cert, POST /cert/gha, POST /token, GET /authorize, GET /me, POST /invites, GET /.well-known/signet-authority.json, GET /.well-known/jwks.json, GET /.well-known/ca-bundle.pem, GET /api/docs
 -->
 # notme
 
-> **⚠️ Experimental / Proof of Concept** — under active development. Not audited. See [SECURITY.md](SECURITY.md).
+> **experimental** — under active development. not audited. see [SECURITY.md](SECURITY.md).
 
 your agents are you. they shouldn't be.
 
@@ -54,10 +54,10 @@ graph TD
     Signet{"Proof-of-Possession"}:::signet
 
     Signet --> F1["Agent Identity Model<br/>(separate from human)"]:::feature
-    Signet --> F2["5-minute Ephemeral Certs<br/>(no renewal, just expire)"]:::feature
-    Signet --> F3["Offline-first Local CA<br/>(epoch-based rotation, no CRL/OCSP)"]:::feature
+    Signet --> F2["5-minute Ephemeral Tokens<br/>(no renewal, just expire)"]:::feature
+    Signet --> F3["Secretless Local Authority<br/>(keys never leave process memory)"]:::feature
 
-    F1 & F2 & F3 --> End((Stolen Cert = Useless Without Key<br/>Stolen Key = 5 Minutes Max)):::signet
+    F1 & F2 & F3 --> End((Stolen Token = 5 Minutes Max<br/>Private Key = Never Leaves Memory)):::signet
 ```
 
 ## how it works
@@ -66,79 +66,75 @@ graph TD
 graph LR
     classDef auth fill:#1c1810,stroke:#00d4e8,stroke-width:2px,color:#e8dcc8
     classDef protocol fill:#242018,stroke:#f0d040,stroke-width:2px,color:#f0d040
-    classDef cert fill:#1c1810,stroke:#48c868,stroke-width:2px,color:#48c868
+    classDef token fill:#1c1810,stroke:#48c868,stroke-width:2px,color:#48c868
     classDef use fill:#242018,stroke:#3a3428,stroke-width:1px,color:#988870
 
     subgraph auth_layer ["any auth layer"]
         Passkey["passkey / WebAuthn"]:::auth
         OIDC["GHA OIDC / k8s OIDC"]:::auth
-        PAT["GitHub PAT"]:::auth
         CFAccess["CF Access / mTLS"]:::auth
         Custom["your auth"]:::auth
     end
 
     subgraph signet_protocol ["signet protocol"]
         Verify["identity verified?"]:::protocol
-        CA["CA signs bridge cert<br/>(Ed25519, ephemeral key)"]:::protocol
+        Sign["authority signs token<br/>(Ed25519, key never exported)"]:::protocol
     end
 
     subgraph result ["what you get"]
-        Cert["bridge cert<br/>5 min · scoped · revocable<br/>proof-of-possession"]:::cert
+        Token["access token<br/>5 min · scoped · revocable<br/>proof-of-possession (DPoP)"]:::token
     end
 
     Passkey --> Verify
     OIDC --> Verify
-    PAT --> Verify
     CFAccess --> Verify
     Custom --> Verify
 
-    Verify -->|"yes"| CA
-    CA --> Cert
+    Verify -->|"yes"| Sign
+    Sign --> Token
 
-    Cert --> Git["sign commits"]:::use
-    Cert --> MCP["auth to MCP"]:::use
-    Cert --> APAS["APAS attestation"]:::use
-    Cert --> HTTP["mTLS requests"]:::use
+    Token --> Git["sign commits"]:::use
+    Token --> MCP["auth to MCP"]:::use
+    Token --> APAS["APAS attestation"]:::use
+    Token --> API["API requests"]:::use
 ```
 
-signet doesn't care how you authenticated. it cares that you did. any auth layer feeds into the same protocol — the output is always a scoped, ephemeral, proof-of-possession cert.
-
-`auth.notme.bot` is one implementation of this. run your own.
+the authority doesn't care how you authenticated. it cares that you did. any auth layer feeds into the same protocol — the output is a scoped, ephemeral, proof-of-possession token. the signing key never leaves process memory.
 
 ## what's here
 
 ```
-schema/     cap'n proto type definitions (single source of truth across Go, TS, Rust)
-gen/        auto-generated TS (Zod) + Go bindings from schema
-worker/     cloudflare worker — the identity authority at auth.notme.bot
-action/     reusable GHA action — OIDC token → bridge cert (zero secrets)
-.github/    reusable GHA workflows (OIDC-authed, SHA-pinned)
+worker/             identity authority — auth.notme.bot (CF Worker + Durable Objects)
+  src/                auth modules (passkey, DPoP, session, OIDC, principals)
+  src/platform.ts     runtime abstraction (CF edge vs local workerd)
+  e2e/                Playwright contract tests (virtual authenticator)
+action/             GHA action — OIDC → access token (zero secrets, zero files)
+gen/ts/             shared SDK — base64url, validateClaims, computeJwkThumbprint
+schema/             cap'n proto type definitions (CABundle, GHAClaims, etc.)
+vault/              credential vault Worker (HKDF + AES-GCM envelope encryption)
+packages/           container image pipeline (melange + apko, 40MB OCI)
+docs/design/        design specs (007-secretless-local-proxy)
 ```
 
-## schema
+see [ARCHITECTURE.md](ARCHITECTURE.md) for the full subsystem map, data flow, and security model.
 
-shared types defined once in `.capnp`, generated for every language. `CABundle`, bridge cert results, OIDC claims, APAS predicates — all from one schema, all producing identical bytes when serialized.
+## endpoints (auth.notme.bot)
 
-this matters because signature verification depends on canonical encoding. if two implementations serialize the same struct differently, signatures break silently. cap'n proto's binary format is deterministic by design.
-
-## worker
-
-cloudflare worker deployed at [`auth.notme.bot`](https://auth.notme.bot). the `SigningAuthority` durable object generates the Ed25519 CA key on first request and stores it in SQLite. the key never leaves cloudflare infrastructure — no secrets to manage, no PEM files, no `wrangler secret put`.
-
-**endpoints** (auth.notme.bot)
-
-| method | path | what it does |
-|--------|------|-------------|
-| `POST` | `/cert` | any proof (passkey session, OIDC, bootstrap) → scoped bridge cert |
-| `POST` | `/cert/gha` | GHA OIDC token → 5-min bridge cert (legacy compat) |
+| method | path | what |
+|--------|------|------|
+| `POST` | `/cert/gha` | GHA OIDC → signed access token (secretless — no private key returned) |
+| `POST` | `/cert` | any proof (passkey session, OIDC, bootstrap) → access token |
+| `POST` | `/token` | DPoP-bound token issuance (RFC 9449) |
+| `GET` | `/authorize` | OAuth-style redirect for cross-origin token issuance |
 | `POST` | `/auth/passkey/register/*` | WebAuthn passkey registration |
 | `POST` | `/auth/passkey/login/*` | WebAuthn passkey login |
-| `GET` | `/me` | current session info |
-| `POST` | `/invites` | create scoped invite token (requires authorityManage) |
+| `GET` | `/me` | current session info (JSON or HTML) |
+| `POST` | `/invites` | create scoped invite (requires authorityManage) |
 | `GET/POST` | `/join` | redeem invite |
+| `POST` | `/connect/*` | link federated identity (OIDC provider) |
 | `GET` | `/.well-known/signet-authority.json` | authority discovery |
-| `GET` | `/.well-known/ca-bundle.pem` | X.509 CA certificate (trust anchor) |
-| `GET` | `/api/docs` | full API reference |
+| `GET` | `/.well-known/jwks.json` | Ed25519 public key (JWK Set) |
+| `GET` | `/.well-known/ca-bundle.pem` | X.509 CA certificate |
 
 ## run your own
 
@@ -146,7 +142,7 @@ three ways — same code, same behavior.
 
 **local (workerd)**
 ```bash
-cd worker && npm run build:local
+cd worker && npm ci && npm run build:local
 npx workerd serve config.capnp --experimental
 # → http://localhost:8788
 ```
@@ -154,8 +150,10 @@ npx workerd serve config.capnp --experimental
 **container (melange + apko)**
 ```bash
 cd packages
-melange build melange-notme-app.yaml --arch aarch64 --signing-key melange.rsa --out-dir ./out --source-dir ../worker/
-apko build apko-notme.yaml notme:latest notme.tar --keyring-append melange.rsa.pub --arch aarch64
+melange build melange-notme-app.yaml --arch aarch64 \
+  --signing-key melange.rsa --out-dir ./out --source-dir ../worker/
+apko build apko-notme.yaml notme:latest notme.tar \
+  --keyring-append melange.rsa.pub --arch aarch64
 docker load < notme.tar
 docker run -p 8788:8788 notme:latest-arm64
 ```
@@ -164,11 +162,20 @@ docker run -p 8788:8788 notme:latest-arm64
 ```bash
 cd worker
 cp wrangler.toml.example wrangler.toml
-# edit wrangler.toml — fill in your CF KV namespace ID
+# edit wrangler.toml — set your CF KV namespace ID
 wrangler deploy
 ```
 
 CA key is generated on first request. In ephemeral mode (local/container), the private key exists only in process memory — `cat *.sqlite | strings | grep '"d"'` returns nothing. First passkey registration requires a bootstrap code (visible in workerd stdout or `wrangler tail`).
+
+## testing
+
+```bash
+cd worker
+npx vitest run         # 116 unit tests
+bash test-local.sh     # workerd smoke test
+bash test-e2e.sh       # Playwright e2e (virtual authenticator)
+```
 
 ## related
 
