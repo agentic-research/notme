@@ -25,7 +25,7 @@ worker.ts                    HTTP routing + CORS + host enforcement
 │   ├── src/auth/connections.ts  Federated identity linking
 │   ├── src/auth/timing-safe.ts  HMAC-based constant-time comparison
 │   └── src/cert-authority.ts    X.509 bridge cert generation (@peculiar/x509)
-├── src/cert-exchange.ts       Generalized proof → access token exchange
+├── src/cert-exchange.ts       Generalized proof → cert pair or token exchange
 ├── src/auth/dpop.ts           DPoP proof validation (ES256, RFC 9449)
 ├── src/auth/dpop-handler.ts   /token endpoint handler + JWKS builder
 ├── src/auth/verify-proof.ts   OIDC + X.509 proof verification (trusted issuer allowlist)
