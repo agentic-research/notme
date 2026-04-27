@@ -284,7 +284,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       keys: { privateKey: signingKey, publicKey: verifyKey },
       serialNumber: serial,
       extensions: [
-        new BasicConstraintsExtension(true, 0, true),
+        new BasicConstraintsExtension(true, 1, true), // pathlen=1: CA → orchestrator → agent
         new KeyUsagesExtension(KeyUsageFlags.keyCertSign | KeyUsageFlags.cRLSign, true),
       ],
     });
