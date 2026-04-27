@@ -632,3 +632,48 @@ describe("adversarial: mode detection", () => {
     expect(detectKeyStorage({ NOTME_KEY_STORAGE: "ephemeral" })).toBe("ephemeral");
   });
 });
+
+// ── Scope attenuation (008 — monotonic restriction) ─────────────────────────
+
+describe("adversarial: scope attenuation", () => {
+  function verifyScopeChain(parentScopes: string[], childScopes: string[]): boolean {
+    return childScopes.every(s => parentScopes.includes(s));
+  }
+
+  it("child scopes ⊆ parent scopes — valid narrowing", () => {
+    expect(verifyScopeChain(
+      ["bridgeCert", "certMint", "sign:git"],
+      ["bridgeCert", "sign:git"],
+    )).toBe(true);
+  });
+
+  it("child scopes = parent scopes — valid (no narrowing)", () => {
+    expect(verifyScopeChain(
+      ["bridgeCert", "sign:git"],
+      ["bridgeCert", "sign:git"],
+    )).toBe(true);
+  });
+
+  it("child scopes ⊃ parent scopes — REJECTED (scope escalation)", () => {
+    expect(verifyScopeChain(
+      ["bridgeCert"],
+      ["bridgeCert", "certMint"], // tries to add certMint
+    )).toBe(false);
+  });
+
+  it("child has scope not in parent — REJECTED", () => {
+    expect(verifyScopeChain(
+      ["bridgeCert", "sign:git"],
+      ["bridgeCert", "sign:attestation"], // attestation not granted by parent
+    )).toBe(false);
+  });
+
+  it("empty parent scopes — child must also be empty", () => {
+    expect(verifyScopeChain([], [])).toBe(true);
+    expect(verifyScopeChain([], ["bridgeCert"])).toBe(false);
+  });
+
+  it("empty child scopes — always valid (maximally restricted)", () => {
+    expect(verifyScopeChain(["bridgeCert", "certMint"], [])).toBe(true);
+  });
+});

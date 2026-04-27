@@ -15,19 +15,34 @@
 
 export interface CertExchangeRequest {
   proof: {
-    type: "session"; // passkey session cookie (already authenticated)
-    // Future: "oidc" | "x509" | "bootstrap"
+    type: "session";
   } | {
     type: "oidc";
-    token: string; // raw JWT from any issuer
+    token: string;
   } | {
     type: "bootstrap";
     code: string;
   };
-  scopes?: string[]; // requested scopes (default: ["bridgeCert"])
+  scopes?: string[];
+  // 008: optional PoP cert exchange — if present, returns cert pair instead of token
+  public_keys?: { mtls: string; signing: string };
+  proofs?: { mtls: string; signing: string };
 }
 
-export interface CertExchangeResponse {
+// Response when public_keys + proofs are provided (008 cert pair)
+export interface CertPairExchangeResponse {
+  certificates: { mtls: string; signing: string };
+  identity: string;
+  scopes: string[];
+  expires_at: number;
+  binding: string;
+  authority: { epoch: number; key_id: string };
+  principal_id: string;
+  auth_method: string;
+}
+
+// Legacy response when no public_keys (browser/passkey flows — DPoP or unbound)
+export interface TokenExchangeResponse {
   token: string;
   token_type: "DPoP" | "Bearer";
   expires_in: number;
@@ -132,73 +147,104 @@ export async function handleCertExchange(
     );
   }
 
-  // ── Mint token (DPoP-bound if proof present, unbound otherwise) ──
-  const dpopHeader = request.headers.get("DPoP");
-  let accessToken: string;
-  let tokenType: "DPoP" | "Bearer" = "Bearer";
-  let jkt: string | undefined;
+  // ── 008: cert pair if public_keys + proofs provided, else legacy token ──
+  if (body.public_keys?.mtls && body.public_keys?.signing &&
+      body.proofs?.mtls && body.proofs?.signing) {
+    // PoP cert pair exchange — verify proofs, issue certs
+    const { importPublicKey } = await import("./cert-authority");
+    let mtlsPubKey: CryptoKey;
+    let signingPubKey: CryptoKey;
+    try {
+      mtlsPubKey = await importPublicKey(body.public_keys.mtls);
+      signingPubKey = await importPublicKey(body.public_keys.signing);
+    } catch (e: any) {
+      return Response.json({ error: "invalid public key: " + e.message }, { status: 400 });
+    }
 
-  if (dpopHeader) {
-    // DPoP proof present — bind the token to the caller's key
-    const { validateDpopProof } = await import("./auth/dpop");
-    let dpopResult;
+    // Verify PoP proofs against a binding payload
+    // For /cert, binding = SHA-256(mtls_spki || signing_spki) — no OIDC JWT in this path
+    const mtlsSpki = (await crypto.subtle.exportKey("spki", mtlsPubKey)) as ArrayBuffer;
+    const signingSpki = (await crypto.subtle.exportKey("spki", signingPubKey)) as ArrayBuffer;
+    const bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
+    bindingInput.set(new Uint8Array(mtlsSpki), 0);
+    bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
+    const bindingPayload = await crypto.subtle.digest("SHA-256", bindingInput);
+
+    // Verify P-256 PoP
     try {
-      dpopResult = await validateDpopProof(dpopHeader, {
-        htm: "POST",
-        htu: new URL(request.url).origin + "/cert",
+      const proofBytes = Uint8Array.from(atob(body.proofs.mtls.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+      const valid = await crypto.subtle.verify(
+        { name: "ECDSA", hash: "SHA-256" }, mtlsPubKey, proofBytes, bindingPayload,
+      );
+      if (!valid) return Response.json({ error: "P-256 proof-of-possession failed" }, { status: 401 });
+    } catch (e: any) {
+      return Response.json({ error: "P-256 proof error: " + e.message }, { status: 401 });
+    }
+
+    // Verify Ed25519 PoP
+    try {
+      const proofBytes = Uint8Array.from(atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+      const valid = await crypto.subtle.verify(
+        "Ed25519" as any, signingPubKey, proofBytes, bindingPayload,
+      );
+      if (!valid) return Response.json({ error: "Ed25519 proof-of-possession failed" }, { status: 401 });
+    } catch (e: any) {
+      return Response.json({ error: "Ed25519 proof error: " + e.message }, { status: 401 });
+    }
+
+    const identity = `wimse://notme.bot/${authMethod}/${principalId}`;
+
+    let result;
+    try {
+      result = await authority.mintBridgeCertPair({
+        subject: principalId,
+        identity,
+        mtlsPublicKeyPem: body.public_keys.mtls,
+        signingPublicKeyPem: body.public_keys.signing,
+        scopes: effectiveScopes,
+        authMethod,
       });
     } catch (e: any) {
-      return Response.json(
-        { error: "invalid DPoP proof: " + e.message },
-        { status: 401 },
-      );
+      return Response.json({ error: "cert minting failed: " + e.message }, { status: 500 });
     }
-    try {
-      accessToken = await authority.mintDPoPToken({
-        sub: principalId,
-        scope: effectiveScopes.join(" "),
-        audience: "notme.bot",
-        jkt: dpopResult.thumbprint,
-      });
-    } catch (e: any) {
-      return Response.json(
-        { error: "token minting failed: " + e.message },
-        { status: 500 },
-      );
-    }
-    tokenType = "DPoP";
-    jkt = dpopResult.thumbprint;
-  } else {
-    // No DPoP — unbound token (for bootstrap/passkey flows)
-    try {
-      accessToken = await authority.mintRedirectToken({
-        sub: principalId,
-        scope: effectiveScopes.join(" "),
-        audience: "notme.bot",
-      });
-    } catch (e: any) {
-      return Response.json(
-        { error: "token minting failed: " + e.message },
-        { status: 500 },
-      );
-    }
+
+    const response: CertPairExchangeResponse = {
+      certificates: result.certificates,
+      identity: result.identity,
+      scopes: effectiveScopes,
+      expires_at: result.expires_at,
+      binding: result.binding,
+      authority: result.authority,
+      principal_id: principalId,
+      auth_method: authMethod,
+    };
+    return Response.json(response);
+  }
+
+  // ── Legacy: token for browser/passkey flows (no public_keys provided) ──
+  let accessToken: string;
+  try {
+    accessToken = await authority.mintRedirectToken({
+      sub: principalId,
+      scope: effectiveScopes.join(" "),
+      audience: "notme.bot",
+    });
+  } catch (e: any) {
+    return Response.json({ error: "token minting failed: " + e.message }, { status: 500 });
   }
 
   const state = await authority.getAuthorityState();
-
-  const response: CertExchangeResponse = {
+  const tokenResponse: TokenExchangeResponse = {
     token: accessToken,
-    token_type: tokenType,
+    token_type: "Bearer",
     expires_in: 300,
     subject: principalId,
     authority: { epoch: state.epoch, key_id: state.keyId },
     principal_id: principalId,
     scopes: effectiveScopes,
     auth_method: authMethod,
-    ...(jkt ? { jkt } : {}),
   };
-
-  return Response.json(response);
+  return Response.json(tokenResponse);
 }
 
 function parseCookie(cookieHeader: string, name: string): string | null {
