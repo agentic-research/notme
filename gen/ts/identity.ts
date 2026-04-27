@@ -73,9 +73,9 @@ export const RevocationResultSchema: z.ZodType<RevocationResult> = z.object({
 
 export interface BridgeCertResult {
   certificate: string; // PEM-encoded X.509 bridge cert
-  privateKey: string; // PEM-encoded ephemeral private key (returned once, never stored)
+  privateKey: string; // DEPRECATED — always empty in 008+. Kept for wire compat.
   expiresAt: number; // Unix timestamp (seconds)
-  subject: string; // CN from cert (OIDC sub claim for GHA)
+  subject: string; // CN from cert (principal UUID or OIDC sub)
   scope: CertScope;
 }
 
@@ -85,6 +85,28 @@ export const BridgeCertResultSchema: z.ZodType<BridgeCertResult> = z.object({
   expiresAt: z.number().int(),
   subject: z.string(),
   scope: CertScopeSchema,
+}) as any;
+
+export interface BridgeCertPair {
+  mtlsCert: string; // PEM — P-256 cert for mTLS transport auth
+  signingCert: string; // PEM — Ed25519 cert for git commits + APAS attestations
+  scopes: string[]; // Granted capabilities (string-based, not enum — extensible)
+  expiresAt: number; // Unix timestamp (seconds)
+  subject: string; // Principal UUID or OIDC sub
+  binding: string; // SHA-256(P-256 SPKI || Ed25519 SPKI) hex — proves both certs from same exchange
+  epoch: number; // CA epoch at issuance
+  authMethod: string; // How the caller authenticated (gha-oidc, passkey, bootstrap)
+}
+
+export const BridgeCertPairSchema: z.ZodType<BridgeCertPair> = z.object({
+  mtlsCert: z.string(),
+  signingCert: z.string(),
+  scopes: z.array(z.string()),
+  expiresAt: z.number().int(),
+  subject: z.string(),
+  binding: z.string(),
+  epoch: z.number().int().nonnegative(),
+  authMethod: z.string(),
 }) as any;
 
 export interface AuthorityState {
@@ -146,6 +168,38 @@ export const ProofSchema: z.ZodType<Proof> = z.object({
   bootstrapCode: z.string().optional(),
 }) as any;
 
+export interface CertPairPublicKeys {
+  mtls: string; // P-256 SPKI PEM
+  signing: string; // Ed25519 SPKI PEM
+}
+
+export const CertPairPublicKeysSchema: z.ZodType<CertPairPublicKeys> = z.object({
+  mtls: z.string(),
+  signing: z.string(),
+}) as any;
+
+export interface CertPairPoP {
+  mtls: Uint8Array; // ES256 signature over binding payload
+  signing: Uint8Array; // EdDSA signature over binding payload
+}
+
+export const CertPairPoPSchema: z.ZodType<CertPairPoP> = z.object({
+  mtls: z.instanceof(Uint8Array),
+  signing: z.instanceof(Uint8Array),
+}) as any;
+
+export interface CertPairRequest {
+  proof: Proof; // How the caller authenticated
+  publicKeys: CertPairPublicKeys; // P-256 + Ed25519 SPKI PEMs
+  proofs: CertPairPoP; // Signatures over binding payload
+}
+
+export const CertPairRequestSchema: z.ZodType<CertPairRequest> = z.object({
+  proof: ProofSchema,
+  publicKeys: CertPairPublicKeysSchema,
+  proofs: CertPairPoPSchema,
+}) as any;
+
 export interface CertRequest {
   scopes: CertScope[];
   proof: Proof;
@@ -196,7 +250,8 @@ export interface DispatchPredicate {
   beadRef: BeadRef;
   agent: AgentIdentity;
   pipeline: PipelineContext;
-  signingCert: BridgeCertResult; // the cert that signed this attestation
+  signingCert: BridgeCertResult; // the cert that signed this attestation (legacy format)
+  certPair: BridgeCertPair; // 008: full cert pair with WIMSE identity
 }
 
 export const DispatchPredicateSchema: z.ZodType<DispatchPredicate> = z.object({
@@ -204,6 +259,7 @@ export const DispatchPredicateSchema: z.ZodType<DispatchPredicate> = z.object({
   agent: AgentIdentitySchema,
   pipeline: PipelineContextSchema,
   signingCert: BridgeCertResultSchema,
+  certPair: BridgeCertPairSchema,
 }) as any;
 
 export interface HandoffPredicate {
@@ -215,6 +271,7 @@ export interface HandoffPredicate {
   previousChainHash: string;
   chainHash: string;
   signingCert: BridgeCertResult;
+  certPair: BridgeCertPair; // 008: full cert pair
 }
 
 export const HandoffPredicateSchema: z.ZodType<HandoffPredicate> = z.object({
@@ -226,5 +283,6 @@ export const HandoffPredicateSchema: z.ZodType<HandoffPredicate> = z.object({
   previousChainHash: z.string(),
   chainHash: z.string(),
   signingCert: BridgeCertResultSchema,
+  certPair: BridgeCertPairSchema,
 }) as any;
 

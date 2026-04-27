@@ -47,14 +47,28 @@ struct RevocationResult {
   reason  @1 :RevocationReason;
 }
 
-# ── Certificates ──
+# ── Certificates (008) ──
 
+# Legacy single cert result — kept for backward compat with DispatchPredicate
 struct BridgeCertResult {
   certificate @0 :Text;    # PEM-encoded X.509 bridge cert
-  privateKey  @1 :Text;    # PEM-encoded ephemeral private key (returned once, never stored)
+  privateKey  @1 :Text;    # DEPRECATED — always empty in 008+. Kept for wire compat.
   expiresAt   @2 :Int64;   # Unix timestamp (seconds)
-  subject     @3 :Text;    # CN from cert (OIDC sub claim for GHA)
+  subject     @3 :Text;    # CN from cert (principal UUID or OIDC sub)
   scope       @4 :CertScope;
+}
+
+# 008: Dual cert pair — P-256 (mTLS) + Ed25519 (signing)
+struct BridgeCertPair {
+  mtlsCert     @0 :Text;   # PEM — P-256 cert for mTLS transport auth
+  signingCert  @1 :Text;   # PEM — Ed25519 cert for git commits + APAS attestations
+  identity     @2 :Text;   # WIMSE identity URI (wimse://notme.bot/{context}/{id})
+  scopes       @3 :List(Text);  # Granted capabilities (string-based, not enum — extensible)
+  expiresAt    @4 :Int64;  # Unix timestamp (seconds)
+  subject      @5 :Text;   # Principal UUID or OIDC sub
+  binding      @6 :Text;   # SHA-256(P-256 SPKI || Ed25519 SPKI) hex — proves both certs from same exchange
+  epoch        @7 :UInt64; # CA epoch at issuance
+  authMethod   @8 :Text;   # How the caller authenticated (gha-oidc, passkey, bootstrap)
 }
 
 enum CertScope {
@@ -70,6 +84,24 @@ struct AuthorityState {
 
 # ── Authentication ──
 
+# 008: PoP cert exchange request — caller proves possession of both keys
+struct CertPairRequest {
+  proof      @0 :Proof;                # How the caller authenticated
+  publicKeys @1 :CertPairPublicKeys;   # P-256 + Ed25519 SPKI PEMs
+  proofs     @2 :CertPairPoP;          # Signatures over binding payload
+}
+
+struct CertPairPublicKeys {
+  mtls    @0 :Text;   # P-256 SPKI PEM
+  signing @1 :Text;   # Ed25519 SPKI PEM
+}
+
+struct CertPairPoP {
+  mtls    @0 :Data;   # ES256 signature over binding payload
+  signing @1 :Data;   # EdDSA signature over binding payload
+}
+
+# Legacy request format
 struct CertRequest {
   scopes @0 :List(CertScope);
   proof  @1 :Proof;
@@ -108,7 +140,8 @@ struct DispatchPredicate {
   beadRef      @0 :BeadRef;
   agent        @1 :AgentIdentity;
   pipeline     @2 :PipelineContext;
-  signingCert  @3 :BridgeCertResult;   # the cert that signed this attestation
+  signingCert  @3 :BridgeCertResult;   # the cert that signed this attestation (legacy format)
+  certPair     @4 :BridgeCertPair;     # 008: full cert pair with WIMSE identity
 }
 
 struct BeadRef {
@@ -139,4 +172,5 @@ struct HandoffPredicate {
   previousChainHash @5 :Text;
   chainHash         @6 :Text;
   signingCert       @7 :BridgeCertResult;
+  certPair          @8 :BridgeCertPair;  # 008: full cert pair
 }
