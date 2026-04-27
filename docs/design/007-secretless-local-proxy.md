@@ -37,23 +37,33 @@ The action stops outputting `bridge_key`. It starts the local workerd (or connec
 
 ### Two enforcement planes
 
-```
-Agent (Claude Code, MCP, CLI)
-  |
-  | plain HTTP to localhost:8788
-  v
-LOCAL PLANE (workerd)
-  - Holds bridge cert + key in memory
-  - Enforces scope before requests leave
-  - Generates ephemeral keypairs (CSR pattern)
-  - Signs/proxies on behalf of agent (phase C)
-  |
-  | mTLS / signed JWT
-  v
-EDGE PLANE (CF WAF / auth.notme.bot)
-  - Validates cert: CA signature, epoch, TTL, scope
-  - Rate limiting, JTI replay, revocation
-  - Independent validation — does not trust local
+```mermaid
+graph TD
+    A["Agent<br/>(Claude Code, MCP, CLI)"]
+
+    subgraph LOCAL["LOCAL PLANE (workerd)"]
+        L1["Holds bridge cert + key in memory"]
+        L2["Enforces scope before requests leave"]
+        L3["Generates ephemeral keypairs (CSR pattern)"]
+        L4["Signs/proxies on behalf of agent (phase C)"]
+    end
+
+    subgraph EDGE["EDGE PLANE (CF WAF / auth.notme.bot)"]
+        E1["Validates cert: CA signature, epoch, TTL, scope"]
+        E2["Rate limiting, JTI replay, revocation"]
+        E3["Independent validation — does not trust local"]
+    end
+
+    A -->|"plain HTTP to localhost:8788"| LOCAL
+    LOCAL -->|"mTLS / signed JWT"| EDGE
+
+    classDef agent fill:#e8f4fd,stroke:#2196F3,color:#000
+    classDef local fill:#fff3e0,stroke:#FF9800,color:#000
+    classDef edge fill:#e8f5e9,stroke:#4CAF50,color:#000
+
+    class A agent
+    class L1,L2,L3,L4 local
+    class E1,E2,E3 edge
 ```
 
 The bridge cert is the shared contract between planes. Local mints/holds/rotates it. Edge validates it. Neither trusts the other fully.
@@ -77,6 +87,31 @@ interface CacheStore {
 ```
 
 Production: `cache` wraps `env.CA_BUNDLE_CACHE` (KV). Local: `cache` uses `MemoryCache` (in-memory Map with TTL and periodic eviction). Same interface, same code paths.
+
+### Key lifecycle (ephemeral mode)
+
+```mermaid
+graph LR
+    S["workerd starts"]
+    G["generateKey<br/>extractable: false"]
+    M["signingKey lives<br/>in V8 heap only"]
+    U["crypto.subtle.sign()<br/>works (BoringSSL)"]
+    X["crypto.subtle.exportKey()<br/>THROWS"]
+    D["workerd exits<br/>→ key dies"]
+
+    S --> G --> M
+    M --> U
+    M --> X
+    M --> D
+
+    classDef ok fill:#e8f5e9,stroke:#4CAF50,color:#000
+    classDef blocked fill:#ffebee,stroke:#F44336,color:#000
+    classDef neutral fill:#f5f5f5,stroke:#9E9E9E,color:#000
+
+    class G,M,U,S ok
+    class X blocked
+    class D neutral
+```
 
 ### Key storage modes
 

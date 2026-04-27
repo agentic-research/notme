@@ -12,25 +12,41 @@ workerd (Cloudflare's open-source Workers runtime) provides **V8 isolate separat
 
 ## Architecture
 
+```mermaid
+graph TD
+    subgraph WORKERD["workerd (one process, one container)"]
+        subgraph AW["Agent Worker (V8 isolate)"]
+            A1["- no keys"]
+            A2["- fetch() disabled"]
+            A3["- no filesystem"]
+            A4["- isolated heap"]
+        end
+
+        subgraph NW["notme Worker (V8 isolate)"]
+            N1["bridge certs"]
+            N2["P-256 key (mTLS)"]
+            N3["Ed25519 key (signing)"]
+            N4["scope rules"]
+            N5["audit log"]
+        end
+
+        AW -->|"service binding: NOTME"| NW
+        AW -.->|"service binding: MACHE (future)"| NW
+    end
+
+    NW -->|"mTLS"| SVC["External Services"]
+    NW -->|"sign artifacts"| ART["Git / APAS / DSSE"]
+
+    classDef agent fill:#e8f4fd,stroke:#2196F3,color:#000
+    classDef notme fill:#fff3e0,stroke:#FF9800,color:#000
+    classDef ext fill:#e8f5e9,stroke:#4CAF50,color:#000
+
+    class A1,A2,A3,A4 agent
+    class N1,N2,N3,N4,N5 notme
+    class SVC,ART ext
 ```
-┌──────────────────────────────────────────────────────────┐
-│  workerd (one process, one container)                     │
-│                                                           │
-│  ┌─────────────┐                                         │
-│  │ Agent Worker │  service binding    ┌────────────────┐ │
-│  │             │─────────────────────→│ notme Worker   │─┼──→ mTLS to services
-│  │ - no keys   │  "NOTME"             │                │─┼──→ sign artifacts
-│  │ - no fetch  │                      │ - bridge certs │ │
-│  │ - isolated  │  service binding     │ - P-256 key    │ │
-│  │             │─────────────────────→│ - Ed25519 key  │ │
-│  │             │  "MACHE" (future)    │ - scope rules  │ │
-│  └─────────────┘                      │ - audit log    │ │
-│                                       └────────────────┘ │
-│  V8 isolate boundary ═══════════════════════════════════  │
-│  Agent cannot: read notme's memory, call fetch(),         │
-│  access the filesystem, or reach any network address      │
-└──────────────────────────────────────────────────────────┘
-```
+
+> V8 isolate boundary: Agent cannot read notme's memory, call fetch(), access the filesystem, or reach any network address.
 
 ### Why not a sidecar
 
@@ -235,21 +251,42 @@ export default {
 
 ### What the notme Worker checks before proxying
 
-```
-1. Is the destination in the allowlist?
-   → No: reject (403, "destination not allowed")
-   → Cloud metadata endpoints (169.254.169.254, etc.) are HARD DENIED
+```mermaid
+graph TD
+    REQ["Agent calls env.NOTME.proxy(url, ...)"]
 
-2. Is the request within the cert's scope?
-   → No: reject (403, "scope insufficient")
+    C1{"Destination in allowlist?"}
+    R1["403: destination not allowed<br/>(metadata endpoints HARD DENIED)"]
 
-3. Is the cert still valid?
-   → Expired: re-authenticate (transparent to agent)
-   → Epoch mismatch: reject (401, "cert revoked")
+    C2{"Request within cert scope?"}
+    R2["403: scope insufficient"]
 
-4. Proxy the request with mTLS using the P-256 bridge cert
-   → TLS CertificateVerify proves possession on every connection
-   → Log the request for audit trail
+    C3{"Cert still valid?"}
+    R3A["Re-authenticate transparently<br/>(cert expired)"]
+    R3B["401: cert revoked<br/>(epoch mismatch)"]
+
+    PROXY["Proxy with mTLS<br/>P-256 CertificateVerify on connection"]
+    LOG["Audit log entry"]
+
+    REQ --> C1
+    C1 -->|No| R1
+    C1 -->|Yes| C2
+    C2 -->|No| R2
+    C2 -->|Yes| C3
+    C3 -->|Expired| R3A
+    C3 -->|Epoch mismatch| R3B
+    C3 -->|Valid| PROXY
+    PROXY --> LOG
+
+    classDef check fill:#fff3e0,stroke:#FF9800,color:#000
+    classDef reject fill:#ffebee,stroke:#F44336,color:#000
+    classDef ok fill:#e8f5e9,stroke:#4CAF50,color:#000
+    classDef info fill:#e8f4fd,stroke:#2196F3,color:#000
+
+    class C1,C2,C3 check
+    class R1,R2,R3B reject
+    class PROXY ok
+    class REQ,LOG,R3A info
 ```
 
 ## Destination allowlist
@@ -294,6 +331,47 @@ These logs feed into APAS attestations — the identity service IS the execution
 
 ## Wiring: mache + ley-line integration
 
+```mermaid
+graph TD
+    subgraph WORKERD["workerd process"]
+        AW["Agent Worker"]
+        NW["notme Worker<br/>(bridge certs, scope rules)"]
+        MW["mache Worker<br/>(future: Path B WASM)"]
+        AW -->|"NOTME binding"| NW
+        AW -.->|"MACHE binding (future)"| MW
+        MW -->|"verify WIT+WPT"| NW
+    end
+
+    subgraph LEYL["ley-line"]
+        LN["leyline-net<br/>X25519 + ChaCha20"]
+        LS["leyline-sign<br/>Ed25519 CMS"]
+        LF["leyline-fs<br/>arena NFS/FUSE"]
+    end
+
+    subgraph MACHE_EXT["mache (Path A: separate process)"]
+        MA["HTTP server<br/>MCP tools"]
+        MA -->|"verify cert / WIT+WPT<br/>against notme JWKS"| NW
+    end
+
+    NW -->|"Ed25519 signing cert<br/>signs manifests"| LS
+    NW -->|"bridge cert authenticates peers<br/>before ECDH handshake"| LN
+    NW -.->|"arena scope gate<br/>(future)"| LF
+
+    NODES["nodes table (leyline-schema)<br/>shared contract: mache → ley-line-fs"]
+    MA --> NODES
+    LF --> NODES
+
+    classDef worker fill:#e8f4fd,stroke:#2196F3,color:#000
+    classDef leyl fill:#f3e5f5,stroke:#9C27B0,color:#000
+    classDef mext fill:#fff3e0,stroke:#FF9800,color:#000
+    classDef data fill:#e8f5e9,stroke:#4CAF50,color:#000
+
+    class AW,NW,MW worker
+    class LN,LS,LF leyl
+    class MA mext
+    class NODES data
+```
+
 The co-located Worker model extends to the broader stack. The seams:
 
 ### mache (code intelligence)
@@ -326,31 +404,38 @@ notme doesn't touch this contract — it gates *who can query* (via mache auth) 
 
 ## Credential lifecycle
 
-```
-1. workerd starts
-   → notme Worker initializes
-   → SigningAuthority DO generates CA key (extractable:false, ephemeral)
-   → Authority API available on :8788
+```mermaid
+sequenceDiagram
+    participant WD as workerd
+    participant NW as notme Worker
+    participant SA as SigningAuthority DO
+    participant AW as Agent Worker
+    participant EXT as External Trigger<br/>(GHA OIDC / passkey)
 
-2. Agent authenticates (external trigger — GHA OIDC, passkey, bootstrap)
-   → 008 PoP exchange: agent proves possession of P-256 + Ed25519 keys
-   → notme issues bridge cert pair (5-min TTL)
-   → Certs + keys held in notme Worker's V8 heap
+    WD->>NW: start
+    NW->>SA: initialize
+    SA-->>NW: CA key generated (extractable:false, ephemeral)
+    Note over NW: Authority API on :8788
 
-3. Agent Worker starts
-   → Receives NOTME service binding
-   → Calls env.NOTME.identity() to confirm credentials
-   → Makes requests via env.NOTME.proxy()
-   → Signs artifacts via env.NOTME.sign()
+    EXT->>NW: 008 PoP exchange (proves P-256 + Ed25519 possession)
+    NW->>SA: sign bridge cert pair
+    SA-->>NW: cert pair (5-min TTL)
+    Note over NW: Certs + keys held in V8 heap only
 
-4. Cert approaches expiry (TTL - 60s)
-   → notme Worker re-authenticates transparently
-   → Fresh cert pair loaded
-   → Agent Worker sees no interruption
+    WD->>AW: start (receives NOTME service binding)
+    AW->>NW: env.NOTME.identity()
+    NW-->>AW: {identity, scopes, expires_at}
+    AW->>NW: env.NOTME.proxy(url, ...)
+    AW->>NW: env.NOTME.sign(payload, format)
 
-5. workerd exits
-   → All keys die (V8 heap freed)
-   → No cleanup needed
+    Note over NW: cert TTL - 60s reached
+    NW->>EXT: re-authenticate (transparent)
+    EXT-->>NW: fresh PoP exchange
+    NW->>SA: sign fresh cert pair
+    Note over AW: no interruption seen
+
+    WD->>WD: exit
+    Note over NW,SA: All keys die (V8 heap freed)<br/>No cleanup needed
 ```
 
 ## Container deployment

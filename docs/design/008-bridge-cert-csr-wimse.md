@@ -105,6 +105,29 @@ This binding is embedded as a custom X.509 extension in both certs. It proves th
 
 **Single round-trip. Caller proves possession in the request body.**
 
+```mermaid
+sequenceDiagram
+    participant C as Caller<br/>(GHA action / workerd)
+    participant A as notme Authority<br/>(auth.notme.bot)
+    participant G as GitHub OIDC
+
+    Note over C: Generate P-256 + Ed25519 keypairs<br/>(extractable: false)
+    Note over C: binding_payload = SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
+    Note over C: Sign binding_payload with both private keys
+
+    C->>G: (pre-step) Request OIDC JWT
+    G-->>C: OIDC JWT (one-time JTI)
+
+    C->>A: POST /cert/gha<br/>Authorization: Bearer {oidc_jwt}<br/>Body: {public_keys, proofs}
+    Note over A: 1. Verify OIDC JWT signature + JTI (replay check)
+    Note over A: 2. Verify ES256 proof over binding_payload
+    Note over A: 3. Verify EdDSA proof over binding_payload
+    Note over A: 4. Issue P-256 cert + Ed25519 cert<br/>   signed by CA (extractable:false)
+    A-->>C: {certificates: {mtls, signing}, identity, scopes, expires_at}
+
+    Note over C: Private keys never leave the caller process
+```
+
 ```http
 POST /cert/gha HTTP/1.1
 Authorization: Bearer <GHA OIDC JWT>
@@ -150,22 +173,35 @@ No private key in request or response.
 
 ### Three levels
 
-```
-CA (Ed25519, born in authority, extractable:false)
-  │
-  │ Issuance exchange: caller proves possession of both keys
-  │ CA signs two certs, returns them
-  ▼
-Orchestrator bridge cert pair (scoped to dispatch, 5-min TTL)
-  │
-  │ Same exchange: agent proves possession to orchestrator
-  │ Orchestrator signs with its Ed25519 signing cert
-  ▼
-Agent session cert pair (scoped to step, ≤5-min TTL)
-  │
-  │ mTLS (P-256) or signed artifact (Ed25519)
-  ▼
-Service validates cert chain up to CA trust bundle
+```mermaid
+graph TD
+    CA["CA<br/>Ed25519, extractable:false<br/>scope: {bridgeCert, certMint, sign:git, sign:attestation}"]
+
+    subgraph ORC["Orchestrator bridge cert pair (5-min TTL)"]
+        O_MTLS["P-256 mTLS cert<br/>scope: {bridgeCert, sign:git}"]
+        O_SIGN["Ed25519 signing cert<br/>scope: {bridgeCert, sign:git}"]
+    end
+
+    subgraph AGT["Agent session cert pair (≤5-min TTL)"]
+        A_MTLS["P-256 mTLS cert<br/>scope: {bridgeCert}"]
+        A_SIGN["Ed25519 signing cert<br/>scope: {bridgeCert}"]
+    end
+
+    SVC["Service<br/>validates cert chain up to CA trust bundle"]
+
+    CA -->|"PoP exchange — caller proves both keys"| ORC
+    ORC -->|"Same exchange — agent proves to orchestrator"| AGT
+    AGT -->|"mTLS or signed artifact"| SVC
+
+    classDef ca fill:#fce4ec,stroke:#E91E63,color:#000
+    classDef orc fill:#fff3e0,stroke:#FF9800,color:#000
+    classDef agt fill:#e8f4fd,stroke:#2196F3,color:#000
+    classDef svc fill:#e8f5e9,stroke:#4CAF50,color:#000
+
+    class CA ca
+    class O_MTLS,O_SIGN orc
+    class A_MTLS,A_SIGN agt
+    class SVC svc
 ```
 
 ### Scope attenuation (monotonic restriction)
@@ -289,6 +325,36 @@ notme provides **identity** (who is this agent?), not **authorization** (what ca
 The cert carries identity claims (WIMSE URI, scopes). The relying service decides whether to honor those claims. notme does not enforce authorization at the destination — that's the service's job.
 
 This means the verifier side is intentionally simple:
+
+```mermaid
+graph LR
+    subgraph ISSUER["Issuer side (complex)"]
+        I1["OIDC token validation"]
+        I2["JTI replay protection"]
+        I3["PoP nonce generation + verification"]
+        I4["Dual-cert issuance (P-256 + Ed25519)"]
+        I5["Scope attenuation enforcement"]
+        I6["Epoch management + revocation"]
+    end
+
+    subgraph VERIFIER["Verifier side (simple)"]
+        V1["Fetch CA cert once<br/>/.well-known/ca-bundle.pem"]
+        V2["Standard TLS client cert validation<br/>(built into every TLS library)"]
+        V3["Read SAN URI for identity"]
+        V4["Apply YOUR authorization policy"]
+    end
+
+    ISSUER -->|"issues bridge cert"| CERT["Bridge cert<br/>(WIMSE URI + scopes)"]
+    CERT -->|"presented via mTLS"| VERIFIER
+
+    classDef heavy fill:#fce4ec,stroke:#E91E63,color:#000
+    classDef light fill:#e8f5e9,stroke:#4CAF50,color:#000
+    classDef cert fill:#fff3e0,stroke:#FF9800,color:#000
+
+    class I1,I2,I3,I4,I5,I6 heavy
+    class V1,V2,V3,V4 light
+    class CERT cert
+```
 
 **To verify a notme bridge cert, a service needs:**
 1. The CA certificate (fetched once from `/.well-known/ca-bundle.pem`, cached)
