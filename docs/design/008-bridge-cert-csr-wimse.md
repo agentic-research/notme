@@ -282,6 +282,66 @@ For emergency revocation (CA compromise, credential theft within the 5-minute wi
 
 Epoch verification policy: if `cert.epoch < bundle.epoch`, the cert is REJECTED. The grace window (if any) is a deployment-time configuration, not a protocol-level default.
 
+## Identity vs Authorization (asymmetric complexity)
+
+notme provides **identity** (who is this agent?), not **authorization** (what can this agent do here?).
+
+The cert carries identity claims (WIMSE URI, scopes). The relying service decides whether to honor those claims. notme does not enforce authorization at the destination — that's the service's job.
+
+This means the verifier side is intentionally simple:
+
+**To verify a notme bridge cert, a service needs:**
+1. The CA certificate (fetched once from `/.well-known/ca-bundle.pem`, cached)
+2. Standard X.509 client cert validation (built into every TLS library)
+3. Its own authorization policy (map identities/scopes to access rules)
+
+**A service does NOT need:**
+- workerd or the notme Worker
+- The notme SDK
+- WIMSE WIT/WPT parsing
+- DPoP validation
+- Service bindings or any notme-specific wiring
+
+This is the Let's Encrypt model: getting a cert is complex (ACME protocol, challenge-response). Verifying a cert is zero setup (every TLS library does it).
+
+### Example: nginx verifying a notme bridge cert
+
+```nginx
+server {
+    listen 443 ssl;
+
+    # Standard mTLS — require client cert signed by notme CA
+    ssl_client_certificate /etc/nginx/notme-ca.pem;  # fetched once
+    ssl_verify_client on;
+
+    # Read identity from cert SAN (nginx $ssl_client_s_dn)
+    # Apply YOUR authorization rules — notme doesn't decide this
+    location /api/ {
+        proxy_set_header X-Agent-Identity $ssl_client_s_dn;
+        proxy_pass http://backend;
+    }
+}
+```
+
+### Example: Go service verifying a notme bridge cert
+
+```go
+// One-time setup: load notme CA cert
+caCert, _ := os.ReadFile("notme-ca.pem")
+pool := x509.NewCertPool()
+pool.AppendCertsFromPEM(caCert)
+
+server := &http.Server{
+    TLSConfig: &tls.Config{
+        ClientAuth: tls.RequireAndVerifyClientCert,
+        ClientCAs:  pool,
+    },
+}
+// That's it. Standard Go TLS. No notme SDK.
+```
+
+The scopes in the cert extensions are **claims offered by the identity provider**. The service reads them if it wants, ignores them if it doesn't. A service that only cares about identity can just check the SAN URI. A service that wants fine-grained access control can read the scope extension. Neither requires any notme-specific code.
+
 ## Interoperability
 
 | System | How |
