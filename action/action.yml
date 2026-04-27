@@ -1,5 +1,5 @@
 name: 'notme identity exchange'
-description: 'Exchange GHA OIDC token for a DPoP-bound access token. Zero secrets — private keys never leave process memory.'
+description: 'Exchange GHA OIDC token for bridge cert pair (P-256 mTLS + Ed25519 signing). Zero secrets — private keys never leave process memory.'
 inputs:
   audience:
     description: 'OIDC audience for the identity exchange'
@@ -19,12 +19,14 @@ inputs:
 outputs:
   notme_url:
     description: 'Authority URL for subsequent API calls'
-  notme_token:
-    description: 'DPoP-bound access token — useless without the matching DPoP proof key (which exists only in this steps process memory)'
-  notme_jkt:
-    description: 'JWK Thumbprint of the DPoP proof key (for verification, not a secret)'
-  expires_in:
-    description: 'Token lifetime in seconds'
+  notme_cert:
+    description: 'P-256 bridge cert PEM — for mTLS transport auth (public data, useless without the private key held in process memory)'
+  notme_signing_cert:
+    description: 'Ed25519 bridge cert PEM — for git commit signing and APAS attestations (public data)'
+  notme_identity:
+    description: 'WIMSE identity URI (wimse://notme.bot/gha/{owner}/{repo})'
+  expires_at:
+    description: 'Cert expiry (Unix timestamp)'
   github_token:
     description: 'Scoped GitHub token from octo-sts (empty if not requested)'
 runs:

@@ -19659,10 +19659,10 @@ var require_core = __commonJS({
       (0, command_1.issueCommand)("set-env", { name }, convertedVal);
     }
     exports2.exportVariable = exportVariable;
-    function setSecret2(secret) {
+    function setSecret(secret) {
       (0, command_1.issueCommand)("add-mask", {}, secret);
     }
-    exports2.setSecret = setSecret2;
+    exports2.setSecret = setSecret;
     function addPath(inputPath) {
       const filePath = process.env["GITHUB_PATH"] || "";
       if (filePath) {
@@ -19814,44 +19814,12 @@ var crypto = __toESM(require("crypto"));
 function b64url(buf) {
   return buf.toString("base64url");
 }
-async function generateDPoPProof(keypair, htm, htu) {
-  const wc = crypto.webcrypto;
-  const pubJwk = await wc.subtle.exportKey(
-    "jwk",
-    keypair.publicKey
-  );
-  const thumbprintInput = JSON.stringify({
-    crv: pubJwk.crv,
-    kty: pubJwk.kty,
-    x: pubJwk.x,
-    y: pubJwk.y
-  });
-  const thumbprintHash = await wc.subtle.digest(
-    "SHA-256",
-    Buffer.from(thumbprintInput)
-  );
-  const thumbprint = b64url(Buffer.from(thumbprintHash));
-  const header = {
-    typ: "dpop+jwt",
-    alg: "ES256",
-    jwk: { kty: pubJwk.kty, crv: pubJwk.crv, x: pubJwk.x, y: pubJwk.y }
-  };
-  const payload = {
-    jti: crypto.randomUUID(),
-    htm,
-    htu,
-    iat: Math.floor(Date.now() / 1e3)
-  };
-  const headerB64 = b64url(Buffer.from(JSON.stringify(header)));
-  const payloadB64 = b64url(Buffer.from(JSON.stringify(payload)));
-  const signingInput = Buffer.from(`${headerB64}.${payloadB64}`);
-  const sig = await wc.subtle.sign(
-    { name: "ECDSA", hash: "SHA-256" },
-    keypair.privateKey,
-    signingInput
-  );
-  const proof = `${headerB64}.${payloadB64}.${b64url(Buffer.from(sig))}`;
-  return { proof, thumbprint };
+function exportSpkiPem(spki, label = "PUBLIC KEY") {
+  const b64 = Buffer.from(spki).toString("base64");
+  const lines = b64.match(/.{1,64}/g);
+  return `-----BEGIN ${label}-----
+${lines.join("\n")}
+-----END ${label}-----`;
 }
 async function run() {
   const audience = core.getInput("audience");
@@ -19860,7 +19828,7 @@ async function run() {
   const octoStsScope = core.getInput("octo_sts_scope");
   if (octoStsScope) {
     core.warning(
-      "octo-sts is not yet supported in the TS action. Use agentic-research/notme/.github/workflows/gha-identity.yml for octo-sts + bridge cert."
+      "octo-sts is not yet supported in the TS action. Use agentic-research/notme/.github/workflows/gha-identity.yml for octo-sts."
     );
   }
   if (skipBridgeCert) {
@@ -19881,46 +19849,75 @@ async function run() {
       `failed to get OIDC token \u2014 does the job have 'permissions: id-token: write'? ${err}`
     );
   }
-  core.info("generating ephemeral DPoP keypair (P-256, in-memory only)");
   const wc = crypto.webcrypto;
-  const dpopKeypair = await wc.subtle.generateKey(
+  core.info("generating ephemeral P-256 keypair (mTLS, in-memory only)");
+  const mtlsKeypair = await wc.subtle.generateKey(
     { name: "ECDSA", namedCurve: "P-256" },
     false,
-    // NON-EXTRACTABLE — cannot be serialized or output
     ["sign", "verify"]
   );
-  const certUrl = `${authorityUrl}/cert/gha`;
-  const { proof, thumbprint } = await generateDPoPProof(
-    dpopKeypair,
-    "POST",
-    certUrl
+  core.info("generating ephemeral Ed25519 keypair (signing, in-memory only)");
+  const signingKeypair = await wc.subtle.generateKey(
+    { name: "Ed25519" },
+    false,
+    ["sign", "verify"]
   );
-  core.info(`exchanging OIDC + DPoP proof at ${certUrl} (jkt: ${thumbprint.slice(0, 8)}...)`);
+  const mtlsSpki = await wc.subtle.exportKey("spki", mtlsKeypair.publicKey);
+  const signingSpki = await wc.subtle.exportKey("spki", signingKeypair.publicKey);
+  const mtlsPem = exportSpkiPem(mtlsSpki);
+  const signingPem = exportSpkiPem(signingSpki);
+  const oidcHash = await wc.subtle.digest("SHA-256", Buffer.from(oidcToken));
+  const bindingInput = Buffer.concat([
+    Buffer.from(mtlsSpki),
+    Buffer.from(signingSpki),
+    Buffer.from(oidcHash)
+  ]);
+  const bindingPayload = await wc.subtle.digest("SHA-256", bindingInput);
+  const mtlsProof = await wc.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    mtlsKeypair.privateKey,
+    bindingPayload
+  );
+  const signingProof = await wc.subtle.sign(
+    { name: "Ed25519" },
+    signingKeypair.privateKey,
+    bindingPayload
+  );
+  const certUrl = `${authorityUrl}/cert/gha`;
+  core.info(`exchanging OIDC + PoP proofs at ${certUrl}`);
   const client = new http.HttpClient("notme-action");
-  const res = await client.postJson(certUrl, null, {
+  const res = await client.postJson(certUrl, {
+    public_keys: {
+      mtls: mtlsPem,
+      signing: signingPem
+    },
+    proofs: {
+      mtls: b64url(Buffer.from(mtlsProof)),
+      signing: b64url(Buffer.from(signingProof))
+    }
+  }, {
     Authorization: `Bearer ${oidcToken}`,
-    DPoP: proof,
     "Content-Type": "application/json"
   });
   if (res.statusCode !== 200 || !res.result) {
     throw new Error(
-      `identity exchange failed (${res.statusCode}): ${JSON.stringify(res.result)}`
+      `cert exchange failed (${res.statusCode}): ${JSON.stringify(res.result)}`
     );
   }
-  const auth = res.result;
-  if (!auth.token || auth.token_type !== "DPoP") {
-    throw new Error(`expected DPoP token, got ${auth.token_type || "nothing"}`);
+  const result = res.result;
+  if (!result.certificates?.mtls || !result.certificates?.signing) {
+    throw new Error("response missing certificates");
   }
-  core.setSecret(auth.token);
   core.setOutput("notme_url", authorityUrl);
-  core.setOutput("notme_token", auth.token);
-  core.setOutput("notme_jkt", auth.jkt);
-  core.setOutput("expires_in", auth.expires_in.toString());
+  core.setOutput("notme_cert", result.certificates.mtls);
+  core.setOutput("notme_signing_cert", result.certificates.signing);
+  core.setOutput("notme_identity", result.identity);
+  core.setOutput("expires_at", result.expires_at.toString());
   core.info(
-    `DPoP-bound identity established for ${auth.subject} (epoch ${auth.authority.epoch}, key ${auth.authority.key_id}, jkt: ${thumbprint.slice(0, 8)}...)`
+    `bridge cert pair issued: ${result.identity} (epoch ${result.authority.epoch}, key ${result.authority.key_id}, binding ${result.binding.slice(0, 8)}..., expires ${result.expires_at})`
   );
   core.info(
-    "note: the DPoP private key exists only in this step's memory. downstream steps should run the action independently for their own keypair."
+    "note: private keys exist only in this step's memory \u2014 downstream steps should run the action independently for their own keypair."
   );
 }
 run().catch((err) => core.setFailed(err.message));
