@@ -144,23 +144,32 @@ export class AuthService extends WorkerEntrypoint<any> {
       throw new Error("scope insufficient — bridgeCert required for proxy");
     }
 
-    // Make the request (in workerd, fetch() is available to the notme Worker
-    // because it has globalOutbound configured)
+    // Make the request
+    const start = Date.now();
     const res = await fetch(request.url, {
       method: request.method || "GET",
       headers: request.headers || {},
       body: request.body,
     });
 
-    // Collect response headers
     const responseHeaders: Record<string, string> = {};
     res.headers.forEach((v, k) => { responseHeaders[k] = v; });
+    const body = await res.text();
 
-    return {
-      status: res.status,
-      headers: responseHeaders,
-      body: await res.text(),
-    };
+    // Audit log — structured JSON, feeds into APAS attestations
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      type: "proxy",
+      identity: heldCerts.identity,
+      destination: request.url,
+      method: request.method || "GET",
+      scope_checked: "bridgeCert",
+      allowed: true,
+      response_status: res.status,
+      duration_ms: Date.now() - start,
+    }));
+
+    return { status: res.status, headers: responseHeaders, body };
   }
 
   /**
@@ -193,6 +202,20 @@ export class AuthService extends WorkerEntrypoint<any> {
       heldCerts.signingKey,
       payload,
     );
+
+    // Audit log
+    const payloadHash = Array.from(new Uint8Array(
+      await crypto.subtle.digest("SHA-256", payload),
+    )).map(b => b.toString(16).padStart(2, "0")).join("");
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      type: "sign",
+      identity: heldCerts.identity,
+      format,
+      payload_hash: `sha256:${payloadHash}`,
+      scope_checked: format === "raw" ? "none" : signingScopes.find(s => heldCerts!.scopes.includes(s)),
+      allowed: true,
+    }));
 
     return {
       signature,
