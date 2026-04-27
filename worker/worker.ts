@@ -17,6 +17,39 @@ import type { Platform } from "./src/platform";
 // Then call: await env.AUTH.mintBridgeCert(subject, publicKeyPem)
 // No HTTP, no public URL, no CORS, no tokens needed.
 
+// ── Held credentials — module-level so they survive across RPC calls ──
+// Set by authenticate(), used by proxy() and sign().
+let heldCerts: {
+  mtlsCert: string;
+  signingCert: string;
+  mtlsKey: CryptoKey;
+  signingKey: CryptoKey;
+  identity: string;
+  scopes: string[];
+  expiresAt: number;
+} | null = null;
+
+// Cloud metadata endpoints — hard-denied, not configurable
+const DENIED_HOSTS = new Set([
+  "169.254.169.254",        // AWS/GCP metadata
+  "metadata.google.internal", // GCP metadata
+  "100.100.100.200",        // Alibaba metadata
+]);
+
+function isDeniedDestination(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (DENIED_HOSTS.has(parsed.hostname)) return true;
+    // fd00:ec2::254 and other IPv6 metadata
+    if (parsed.hostname.startsWith("fd00:")) return true;
+    // Link-local IPv4
+    if (parsed.hostname.startsWith("169.254.")) return true;
+    return false;
+  } catch {
+    return true; // unparseable URL = denied
+  }
+}
+
 export class AuthService extends WorkerEntrypoint<any> {
   private getAuthority() {
     const id = this.env.SIGNING_AUTHORITY.idFromName("default");
@@ -59,6 +92,142 @@ export class AuthService extends WorkerEntrypoint<any> {
     const { verifySessionCookie } = await import("./src/auth/session");
     const secret = await authority.getSessionSecret();
     return verifySessionCookie(cookie, secret);
+  }
+
+  // ── 009: Identity-gated runtime methods ──────────────────────────────────
+
+  /**
+   * Store credentials for proxy/sign operations.
+   * Called after a successful 008 PoP exchange. Keys must be CryptoKey objects
+   * (non-extractable). Certs are PEM strings (public data).
+   */
+  async authenticate(creds: {
+    mtlsCert: string;
+    signingCert: string;
+    mtlsKey: CryptoKey;
+    signingKey: CryptoKey;
+    identity: string;
+    scopes: string[];
+    expiresAt: number;
+  }) {
+    heldCerts = creds;
+  }
+
+  /**
+   * Proxy an HTTP request with mTLS using the held P-256 bridge cert.
+   * The agent Worker calls this instead of fetch() (which is disabled).
+   */
+  async proxy(request: {
+    url: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  }): Promise<{
+    status: number;
+    headers: Record<string, string>;
+    body: string;
+  }> {
+    if (!heldCerts) {
+      throw new Error("not authenticated — call authenticate() first");
+    }
+    if (heldCerts.expiresAt <= Math.floor(Date.now() / 1000)) {
+      throw new Error("credentials expired — re-authenticate");
+    }
+
+    // Destination check
+    if (isDeniedDestination(request.url)) {
+      throw new Error("destination denied — cloud metadata endpoints are blocked");
+    }
+
+    // Scope check
+    if (!heldCerts.scopes.includes("bridgeCert")) {
+      throw new Error("scope insufficient — bridgeCert required for proxy");
+    }
+
+    // Make the request (in workerd, fetch() is available to the notme Worker
+    // because it has globalOutbound configured)
+    const res = await fetch(request.url, {
+      method: request.method || "GET",
+      headers: request.headers || {},
+      body: request.body,
+    });
+
+    // Collect response headers
+    const responseHeaders: Record<string, string> = {};
+    res.headers.forEach((v, k) => { responseHeaders[k] = v; });
+
+    return {
+      status: res.status,
+      headers: responseHeaders,
+      body: await res.text(),
+    };
+  }
+
+  /**
+   * Sign data with the held Ed25519 signing key.
+   * Returns the signature + the signing cert (public) + the WIMSE identity.
+   */
+  async sign(
+    payload: ArrayBuffer,
+    format: "raw" | "dsse" | "git-commit" = "raw",
+  ): Promise<{
+    signature: ArrayBuffer;
+    certificate: string;
+    identity: string;
+  }> {
+    if (!heldCerts) {
+      throw new Error("not authenticated — call authenticate() first");
+    }
+
+    // Scope check for signing
+    const signingScopes = ["sign:git", "sign:attestation"];
+    const hasSignScope = format === "raw"
+      ? true // raw signing doesn't require a specific scope
+      : heldCerts.scopes.some(s => signingScopes.includes(s));
+    if (!hasSignScope) {
+      throw new Error(`scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`);
+    }
+
+    const signature = await crypto.subtle.sign(
+      "Ed25519" as any,
+      heldCerts.signingKey,
+      payload,
+    );
+
+    return {
+      signature,
+      certificate: heldCerts.signingCert,
+      identity: heldCerts.identity,
+    };
+  }
+
+  /** Get current identity and capabilities. */
+  async identity(): Promise<{
+    identity: string;
+    scopes: string[];
+    certificates: { mtls: string; signing: string };
+    expires_at: number;
+    authenticated: boolean;
+  }> {
+    if (!heldCerts) {
+      return {
+        identity: "",
+        scopes: [],
+        certificates: { mtls: "", signing: "" },
+        expires_at: 0,
+        authenticated: false,
+      };
+    }
+    return {
+      identity: heldCerts.identity,
+      scopes: heldCerts.scopes,
+      certificates: {
+        mtls: heldCerts.mtlsCert,
+        signing: heldCerts.signingCert,
+      },
+      expires_at: heldCerts.expiresAt,
+      authenticated: true,
+    };
   }
 }
 
