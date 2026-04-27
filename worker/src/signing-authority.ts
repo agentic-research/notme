@@ -374,6 +374,36 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     };
   }
 
+  // Mint a bridge cert PAIR (P-256 mTLS + Ed25519 signing) — 008 PoP exchange.
+  // Both certs carry the same WIMSE identity, scopes, epoch, and peer binding.
+  async mintBridgeCertPair(params: {
+    subject: string;
+    identity: string;
+    mtlsPublicKeyPem: string;
+    signingPublicKeyPem: string;
+    scopes: string[];
+    authMethod: string;
+    ttlMs?: number;
+  }): Promise<import("./cert-authority").BridgeCertPairResult & { authority: { epoch: number; key_id: string } }> {
+    const { signingKey } = await this.getOrCreateSigningKey();
+    const state = await this.getAuthorityState();
+    const { mintBridgeCertPair } = await import("./cert-authority");
+    const result = await mintBridgeCertPair(
+      params.subject,
+      params.identity,
+      params.mtlsPublicKeyPem,
+      params.signingPublicKeyPem,
+      signingKey,
+      {
+        scopes: params.scopes,
+        epoch: state.epoch,
+        authMethod: params.authMethod,
+        ttlMs: params.ttlMs,
+      },
+    );
+    return { ...result, authority: { epoch: state.epoch, key_id: state.keyId } };
+  }
+
   // Current epoch and keyId for embedding in issued certs.
   async getAuthorityState(): Promise<{
     epoch: number;

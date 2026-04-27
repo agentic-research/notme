@@ -161,42 +161,103 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
     }
   }
 
-  // ── DPoP-bound token: proof-of-possession, not bearer ──
-  // The caller must include a DPoP proof header. The token is bound to the
-  // caller's DPoP key via cnf.jkt — useless without the matching private key.
-  // The DPoP private key stays in the caller's process memory (action, workerd).
-  const dpopHeader = request.headers.get("DPoP");
-  if (!dpopHeader) {
-    return jsonErr("DPoP proof required — include a DPoP header with your request", 400);
+  // ── Bridge cert pair via PoP exchange (008) ──
+  // Caller sends two public keys + proof-of-possession signatures.
+  // Authority verifies proofs, issues a P-256 mTLS cert + Ed25519 signing cert.
+  // No private key in request or response. No bearer tokens issued.
+  let body: {
+    public_keys?: { mtls?: string; signing?: string };
+    proofs?: { mtls?: string; signing?: string };
+  };
+  try {
+    body = await request.json();
+  } catch {
+    return jsonErr("invalid JSON body", 400);
   }
 
-  const { validateDpopProof } = await import("./src/auth/dpop");
-  let dpopResult;
+  if (!body.public_keys?.mtls || !body.public_keys?.signing) {
+    return jsonErr("public_keys.mtls and public_keys.signing required (SPKI PEM)", 400);
+  }
+  if (!body.proofs?.mtls || !body.proofs?.signing) {
+    return jsonErr("proofs.mtls and proofs.signing required (signatures over binding payload)", 400);
+  }
+
+  // Import public keys to verify PoP proofs
+  const { importPublicKey } = await import("./src/cert-authority");
+  let mtlsPubKey: CryptoKey;
+  let signingPubKey: CryptoKey;
   try {
-    dpopResult = await validateDpopProof(dpopHeader, {
-      htm: "POST",
-      htu: `${env.SIGNET_AUTHORITY_URL || "https://auth.notme.bot"}/cert/gha`,
+    mtlsPubKey = await importPublicKey(body.public_keys.mtls);
+    signingPubKey = await importPublicKey(body.public_keys.signing);
+  } catch (e: any) {
+    return jsonErr(`invalid public key: ${e.message}`, 400);
+  }
+
+  // Compute binding payload: SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
+  const mtlsSpki = (await crypto.subtle.exportKey("spki", mtlsPubKey)) as ArrayBuffer;
+  const signingSpki = (await crypto.subtle.exportKey("spki", signingPubKey)) as ArrayBuffer;
+  const oidcHash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  const bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength + 32);
+  bindingInput.set(new Uint8Array(mtlsSpki), 0);
+  bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
+  bindingInput.set(new Uint8Array(oidcHash), mtlsSpki.byteLength + signingSpki.byteLength);
+  const bindingPayload = await crypto.subtle.digest("SHA-256", bindingInput);
+
+  // Verify PoP: caller must have signed the binding payload with both keys
+  // P-256 proof (ES256)
+  try {
+    const proofBytes = Uint8Array.from(atob(body.proofs.mtls.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      mtlsPubKey,
+      proofBytes,
+      bindingPayload,
+    );
+    if (!valid) return jsonErr("P-256 proof-of-possession failed", 401);
+  } catch (e: any) {
+    return jsonErr(`P-256 proof verification error: ${e.message}`, 401);
+  }
+
+  // Ed25519 proof
+  try {
+    const proofBytes = Uint8Array.from(atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify(
+      "Ed25519" as any,
+      signingPubKey,
+      proofBytes,
+      bindingPayload,
+    );
+    if (!valid) return jsonErr("Ed25519 proof-of-possession failed", 401);
+  } catch (e: any) {
+    return jsonErr(`Ed25519 proof verification error: ${e.message}`, 401);
+  }
+
+  // Build WIMSE identity URI
+  const identity = `wimse://notme.bot/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
+
+  // Mint cert pair — both certs signed by CA, both carry the same identity + scopes
+  let result;
+  try {
+    result = await authority.mintBridgeCertPair({
+      subject: claims.sub,
+      identity,
+      mtlsPublicKeyPem: body.public_keys.mtls,
+      signingPublicKeyPem: body.public_keys.signing,
+      scopes: ["bridgeCert"],
+      authMethod: "gha-oidc",
+      ttlMs: cfg.ghaCertTtlMs,
     });
   } catch (e: any) {
-    return jsonErr(`invalid DPoP proof: ${e.message}`, 401);
+    return jsonErr(e.message || "cert minting failed", 500);
   }
 
-  const accessToken = await authority.mintDPoPToken({
-    sub: claims.sub,
-    scope: "bridgeCert",
-    audience: cfg.ghaCertAudience,
-    jkt: dpopResult.thumbprint,
-  });
-
-  const state = await authority.getAuthorityState();
-
   return Response.json({
-    token: accessToken,
-    token_type: "DPoP",
-    expires_in: 300,
-    jkt: dpopResult.thumbprint,
-    subject: claims.sub,
-    authority: { epoch: state.epoch, key_id: state.keyId },
+    certificates: result.certificates,
+    identity: result.identity,
+    scopes: result.scopes,
+    expires_at: result.expires_at,
+    binding: result.binding,
+    authority: result.authority,
     claims: {
       repository: claims.repository,
       ref: claims.ref,

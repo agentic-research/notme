@@ -11,6 +11,10 @@ import { ED25519 } from "./platform";
 
 const OID_SUBJECT = "1.3.6.1.4.1.99999.1.1"; // Subject identity
 const OID_ISSUANCE_TIME = "1.3.6.1.4.1.99999.1.2"; // Issuance time (RFC3339)
+const OID_SCOPES = "1.3.6.1.4.1.99999.1.3"; // Granted scopes
+const OID_EPOCH = "1.3.6.1.4.1.99999.1.4"; // CA epoch at issuance
+const OID_AUTH_METHOD = "1.3.6.1.4.1.99999.1.5"; // Authentication method
+const OID_PEER_BINDING = "1.3.6.1.4.1.99999.1.6"; // SHA-256(P-256 SPKI || Ed25519 SPKI)
 
 // Encode a string as ASN.1 UTF8String DER (tag 0x0C + length + value)
 function derUtf8String(s: string): Uint8Array {
@@ -52,7 +56,7 @@ async function importMasterKey(pem: string): Promise<CryptoKey> {
   );
 }
 
-async function importPublicKey(pem: string): Promise<CryptoKey> {
+export async function importPublicKey(pem: string): Promise<CryptoKey> {
   const b64 = pem
     .replace("-----BEGIN PUBLIC KEY-----", "")
     .replace("-----END PUBLIC KEY-----", "")
@@ -82,6 +86,18 @@ export interface BridgeCertResult {
   certificate: string; // PEM — signed by master Ed25519 key
   expires_at: number; // Unix timestamp
   subject: string; // CN embedded in cert
+}
+
+export interface BridgeCertPairResult {
+  certificates: {
+    mtls: string; // P-256 cert PEM
+    signing: string; // Ed25519 cert PEM
+  };
+  identity: string; // wimse:// URI
+  scopes: string[];
+  expires_at: number;
+  subject: string;
+  binding: string; // SHA-256(P-256 SPKI || Ed25519 SPKI) hex
 }
 
 // Mint a bridge cert binding the provided public key to the given subject.
@@ -127,5 +143,132 @@ export async function mintGHABridgeCert(
     certificate: cert.toString("pem"),
     expires_at: Math.floor(expires.getTime() / 1000),
     subject,
+  };
+}
+
+// ── Cert pair minting (008) ─────────────────────────────────────────────────
+
+// Encode ASN.1 SEQUENCE OF UTF8String for scope list
+function derScopeSequence(scopes: string[]): Uint8Array {
+  const encoded = scopes.map(s => derUtf8String(s));
+  const totalLen = encoded.reduce((sum, e) => sum + e.length, 0);
+  // SEQUENCE tag = 0x30
+  const header = totalLen < 128
+    ? new Uint8Array([0x30, totalLen])
+    : new Uint8Array([0x30, 0x81, totalLen]);
+  const buf = new Uint8Array(header.length + totalLen);
+  buf.set(header, 0);
+  let offset = header.length;
+  for (const e of encoded) {
+    buf.set(e, offset);
+    offset += e.length;
+  }
+  return buf;
+}
+
+// Encode a 4-byte big-endian integer as ASN.1 INTEGER
+function derInteger(n: number): Uint8Array {
+  const buf = new Uint8Array([0x02, 0x04, (n >> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]);
+  return buf;
+}
+
+export async function mintBridgeCertPair(
+  subject: string,
+  identity: string,
+  mtlsPublicKeyPem: string,
+  signingPublicKeyPem: string,
+  signingKey: CryptoKey,
+  opts: {
+    scopes: string[];
+    epoch: number;
+    authMethod: string;
+    ttlMs?: number;
+  },
+): Promise<BridgeCertPairResult> {
+  const ttlMs = opts.ttlMs ?? 5 * 60 * 1000;
+  const now = new Date();
+  const expires = new Date(now.getTime() + ttlMs);
+
+  // Import both public keys
+  const mtlsPubKey = await importPublicKey(mtlsPublicKeyPem);
+  const signingPubKey = await importPublicKey(signingPublicKeyPem);
+
+  // Compute binding: SHA-256(P-256 SPKI DER || Ed25519 SPKI DER)
+  const mtlsSpki = (await crypto.subtle.exportKey("spki", mtlsPubKey)) as ArrayBuffer;
+  const signingSpki = (await crypto.subtle.exportKey("spki", signingPubKey)) as ArrayBuffer;
+  const bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
+  bindingInput.set(new Uint8Array(mtlsSpki), 0);
+  bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
+  const bindingHash = await crypto.subtle.digest("SHA-256", bindingInput);
+  const bindingHex = Array.from(new Uint8Array(bindingHash))
+    .map(b => b.toString(16).padStart(2, "0")).join("");
+
+  // Shared extensions for both certs
+  const sharedExtensions = [
+    new Extension(OID_SUBJECT, false, derUtf8String(subject)),
+    new Extension(OID_ISSUANCE_TIME, false, derUtf8String(now.toISOString())),
+    new Extension(OID_SCOPES, false, derScopeSequence(opts.scopes)),
+    new Extension(OID_EPOCH, false, derInteger(opts.epoch)),
+    new Extension(OID_AUTH_METHOD, false, derUtf8String(opts.authMethod)),
+    new Extension(OID_PEER_BINDING, false, new Uint8Array(bindingHash)),
+  ];
+
+  // SAN URI extension (WIMSE identity)
+  // SubjectAltName with URI is handled by @peculiar/x509 via the extensions param
+  // We encode it as a custom extension with the URI as a DER-encoded IA5String
+  const sanUri = new TextEncoder().encode(identity);
+  const sanDer = new Uint8Array(2 + 2 + sanUri.length); // SEQUENCE { [6] URI }
+  sanDer[0] = 0x30; // SEQUENCE
+  sanDer[1] = 2 + sanUri.length;
+  sanDer[2] = 0x86; // context [6] = URI (implicit IA5String)
+  sanDer[3] = sanUri.length;
+  sanDer.set(sanUri, 4);
+  const sanExtension = new Extension("2.5.29.17", true, sanDer); // SubjectAltName OID, critical
+
+  const serial1 = crypto.getRandomValues(new Uint8Array(16));
+  // Ensure positive (RFC 5280: serial must be positive integer)
+  serial1[0] &= 0x7f;
+  const serialHex1 = Array.from(serial1).map(b => b.toString(16).padStart(2, "0")).join("");
+
+  const serial2 = crypto.getRandomValues(new Uint8Array(16));
+  serial2[0] &= 0x7f;
+  const serialHex2 = Array.from(serial2).map(b => b.toString(16).padStart(2, "0")).join("");
+
+  // Mint P-256 mTLS cert
+  const mtlsCert = await X509CertificateGenerator.create({
+    subject: `CN=${subject},O=notme`,
+    issuer: `CN=signet-authority,O=notme`,
+    notBefore: now,
+    notAfter: expires,
+    signingAlgorithm: ED25519,
+    publicKey: mtlsPubKey,
+    signingKey,
+    serialNumber: serialHex1,
+    extensions: [...sharedExtensions, sanExtension],
+  });
+
+  // Mint Ed25519 signing cert
+  const signingCert = await X509CertificateGenerator.create({
+    subject: `CN=${subject},O=notme`,
+    issuer: `CN=signet-authority,O=notme`,
+    notBefore: now,
+    notAfter: expires,
+    signingAlgorithm: ED25519,
+    publicKey: signingPubKey,
+    signingKey,
+    serialNumber: serialHex2,
+    extensions: [...sharedExtensions, sanExtension],
+  });
+
+  return {
+    certificates: {
+      mtls: mtlsCert.toString("pem"),
+      signing: signingCert.toString("pem"),
+    },
+    identity,
+    scopes: opts.scopes,
+    expires_at: Math.floor(expires.getTime() / 1000),
+    subject,
+    binding: bindingHex,
   };
 }
