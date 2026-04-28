@@ -286,3 +286,53 @@ export const HandoffPredicateSchema: z.ZodType<HandoffPredicate> = z.object({
   certPair: BridgeCertPairSchema,
 }) as any;
 
+export interface SignRequest {
+  digest: Uint8Array; // The bytes to sign (typically a TLS CertificateVerify hash)
+  algorithm: string; // "Ed25519" or "ECDSA-P256"
+  purpose: string; // "tls-client-auth", "git-commit", "dsse-attestation" — for audit
+}
+
+export const SignRequestSchema: z.ZodType<SignRequest> = z.object({
+  digest: z.instanceof(Uint8Array),
+  algorithm: z.string(),
+  purpose: z.string(),
+}) as any;
+
+export interface SignResponse {
+  signature: Uint8Array; // Raw signature bytes
+  identity: string; // wimse:// URI of the signer (for audit correlation)
+}
+
+export const SignResponseSchema: z.ZodType<SignResponse> = z.object({
+  signature: z.instanceof(Uint8Array),
+  identity: z.string(),
+}) as any;
+
+export interface OraclePublicKey {
+  key: Uint8Array; // Raw public key bytes (32B Ed25519 or 65B P-256 uncompressed)
+  algorithm: string; // "Ed25519" or "ECDSA-P256"
+  certPem: string; // Bridge cert PEM (public data — the cert that binds this key to an identity)
+  identity: string; // wimse:// URI
+  expiresAt: number; // Cert expiry (unix seconds)
+}
+
+export const OraclePublicKeySchema: z.ZodType<OraclePublicKey> = z.object({
+  key: z.instanceof(Uint8Array),
+  algorithm: z.string(),
+  certPem: z.string(),
+  identity: z.string(),
+  expiresAt: z.number().int(),
+}) as any;
+
+export interface OracleInfo {
+  keys: OraclePublicKey[]; // Available signing keys (typically 2: P-256 + Ed25519)
+  scopes: string[]; // Granted capabilities
+  epoch: number; // CA epoch
+}
+
+export const OracleInfoSchema: z.ZodType<OracleInfo> = z.object({
+  keys: z.array(OraclePublicKeySchema),
+  scopes: z.array(z.string()),
+  epoch: z.number().int().nonnegative(),
+}) as any;
+

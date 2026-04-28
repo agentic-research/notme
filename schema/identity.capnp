@@ -174,3 +174,38 @@ struct HandoffPredicate {
   signingCert       @7 :BridgeCertResult;
   certPair          @8 :BridgeCertPair;  # 008: full cert pair
 }
+
+# ── Signing Oracle (ssh-agent pattern) ──
+#
+# Protocol between agent and key holder. The agent does its own TLS handshake
+# but delegates the private key operation (CertificateVerify signature) to the
+# oracle. The key never enters the agent's process.
+#
+# Transport: UDS, service binding, or HTTP — the protocol is the same.
+# Wrapper: Go crypto.Signer, Rust rustls::sign::SigningKey, etc.
+
+struct SignRequest {
+  digest    @0 :Data;    # The bytes to sign (typically a TLS CertificateVerify hash)
+  algorithm @1 :Text;    # "Ed25519" or "ECDSA-P256"
+  purpose   @2 :Text;    # "tls-client-auth", "git-commit", "dsse-attestation" — for audit
+}
+
+struct SignResponse {
+  signature @0 :Data;    # Raw signature bytes
+  identity  @1 :Text;    # wimse:// URI of the signer (for audit correlation)
+}
+
+struct OraclePublicKey {
+  key       @0 :Data;    # Raw public key bytes (32B Ed25519 or 65B P-256 uncompressed)
+  algorithm @1 :Text;    # "Ed25519" or "ECDSA-P256"
+  certPem   @2 :Text;    # Bridge cert PEM (public data — the cert that binds this key to an identity)
+  identity  @3 :Text;    # wimse:// URI
+  expiresAt @4 :Int64;   # Cert expiry (unix seconds)
+}
+
+# Oracle capabilities — what signing operations are available
+struct OracleInfo {
+  keys      @0 :List(OraclePublicKey);  # Available signing keys (typically 2: P-256 + Ed25519)
+  scopes    @1 :List(Text);             # Granted capabilities
+  epoch     @2 :UInt64;                 # CA epoch
+}
