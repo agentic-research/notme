@@ -39,6 +39,11 @@
 !wasm/
 !wasm/**
 
+# Rust mTLS forward proxy
+!proxy/
+!proxy/**
+proxy/target/
+
 # GHA TypeScript action — identity exchange (zero env vars)
 !action/
 !action/**

@@ -1,0 +1,18 @@
+[package]
+name = "notme-proxy"
+version = "0.1.0"
+edition = "2024"
+description = "mTLS forward proxy — adds bridge cert to outbound TLS"
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy"] }
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+hyper-rustls = { version = "0.27", features = ["http1", "ring", "native-tokio"] }
+webpki-roots = "0.26"
+bytes = "1"
