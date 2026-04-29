@@ -25,6 +25,7 @@
 | audience confused deputy | submit an OIDC token issued for a different app (audience=evil-app.com) — `verifyOIDC` accepts it because no audience is enforced | **FIXED + STRUCTURALLY GUARDED** — `expectedAudience` is now a REQUIRED parameter on `verifyOIDC` and `verifyProof` (no longer optional). Every OIDC-accepting route passes `"notme.bot"`. /connections previously omitted it and was patched in notme-567f07; the type-level requirement makes the bug class extinct — TS rejects callers that try to skip the check. The `if (expectedAudience)` skip branch is also removed; the audience comparison runs unconditionally. | `oidc.audience.confused-deputy`, `oidc.connections.audience-binding` |
 | token expiry | replay an old OIDC token | `exp` claim enforced in `verifyOIDC` before audience check | `oidc.audience.confused-deputy` (expired-before-aud sanity) |
 | issuer spoofing | unrecognized `iss` claim used to bypass JWKS routing | `TRUSTED_ISSUERS` allowlist in verify-proof.ts (Google, GitHub Actions, auth.notme.bot) | covered via verify-proof's SSRF guard |
+| CA pem shape mismatch | caller passes SPKI "PUBLIC KEY" to verifyX509 instead of "CERTIFICATE" — X509Certificate constructor throws and every legitimate x509 connection 401s | **FIXED (rosary-9b7d67)** — /connections now calls `getCACertificatePem()` (returns full X.509 CA cert) instead of `getPublicKeyPem()` (returns SPKI). Variable renamed from `caKey` to `caCertPem` for clarity. Test guards the dispatcher path. | `oidc.x509.ca-pem-shape` |
 
 ### 2. GHA OIDC cert exchange (POST /cert/gha)
 

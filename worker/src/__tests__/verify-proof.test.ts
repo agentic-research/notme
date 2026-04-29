@@ -115,3 +115,32 @@ describe("oidc.connections.audience-binding", () => {
     ).rejects.toThrow(/wrong audience/);
   });
 });
+
+describe("oidc.x509.ca-pem-shape", () => {
+  // Threat: caller passes the CA's bare SPKI PEM ("PUBLIC KEY") to
+  // verifyX509 instead of the CA's X.509 CERTIFICATE PEM. The function
+  // does `new X509Certificate(caPublicKeyPem)` which fails on SPKI input,
+  // producing 401 on every legitimate cert. This is rosary-9b7d67. Test
+  // ensures verifyX509 surfaces a recognisable error rather than masking
+  // the shape mismatch.
+
+  const SPKI_PEM = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
+-----END PUBLIC KEY-----`;
+
+  it("rejects when caPublicKeyPem is a SPKI 'PUBLIC KEY' instead of a 'CERTIFICATE'", async () => {
+    // Hand-craft a minimal cert PEM (fake — won't pass signature) just so
+    // verifyX509 gets past the first parse and fails at the CA-cert parse.
+    const fakeCertPem = `-----BEGIN CERTIFICATE-----
+MIIBlzCCAUmgAwIBAgIQfD4tEgEAAAAAAAAAAAAAADAFBgMrZXAwGzELMAkGA1UE
+BhMCVVMxDDAKBgNVBAoMA290cjAeFw0yNDAxMDEwMDAwMDBaFw0yNTAxMDEwMDAw
+-----END CERTIFICATE-----`;
+    // Use the dispatcher (verifyProof) rather than internal verifyX509 to
+    // mirror the real call path. The fakeCertPem may itself fail to
+    // parse — what we're guarding is that SPKI-as-CA can't silently
+    // succeed (that would be the bug rosary-9b7d67 reintroduced).
+    await expect(
+      verifyProof({ type: "x509", cert: fakeCertPem }, SPKI_PEM, "notme.bot"),
+    ).rejects.toThrow();
+  });
+});

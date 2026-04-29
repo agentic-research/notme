@@ -1292,12 +1292,19 @@ export default {
 
         let identity;
         try {
-          const caKey = await authority.getPublicKeyPem();
+          // verifyX509 (in the typedProof.type === "x509" branch) parses
+          // this argument as an X.509 CERTIFICATE PEM and reads its public
+          // key. The earlier code passed `getPublicKeyPem()` which returns
+          // the bare SPKI ("PUBLIC KEY" PEM) — that throws inside
+          // `new X509Certificate(...)`, so every X.509 connection attempt
+          // returned 401 "proof verification failed". Use the actual CA
+          // CERTIFICATE PEM (rosary-9b7d67).
+          const caCertPem = await authority.getCACertificatePem();
           // Audience pin matches /auth/oidc/login + /join: prevents linking a
           // stolen OIDC token issued for a different app, which would silently
           // re-route the victim's later notme.bot OIDC login into the
           // attacker's principal. X.509 path ignores the audience arg.
-          identity = await verifyProof(typedProof, caKey, "notme.bot");
+          identity = await verifyProof(typedProof, caCertPem, "notme.bot");
         } catch (e: any) {
           return jsonErr("proof verification failed: " + e.message, 401);
         }
