@@ -224,12 +224,19 @@ export async function handleCertExchange(
   }
 
   // ── Legacy: token for browser/passkey flows (no public_keys provided) ──
+  // Audience uses the outgoing-token convention (https://<host>) so the
+  // resource-server SDK in gen/ts/dpop.ts validates against the same form
+  // /token and /authorize/token use. Earlier, this minted aud="notme.bot"
+  // (the INCOMING-OIDC convention), producing tokens no resource server
+  // would accept — see notme-612016. Two conventions still live in this
+  // codebase: bare hostname for tokens TO notme, https-form for tokens
+  // FROM notme.
   let accessToken: string;
   try {
     accessToken = await authority.mintRedirectToken({
       sub: principalId,
       scope: effectiveScopes.join(" "),
-      audience: "notme.bot",
+      audience: "https://notme.bot",
     });
   } catch (e: any) {
     return Response.json({ error: "token minting failed: " + e.message }, { status: 500 });
