@@ -16,7 +16,9 @@ import {
   ensurePasskeySchema,
   registrationOptions,
   authenticationOptions,
+  verifyAuthentication,
 } from "../auth/passkey";
+import { timingSafeEqual } from "../auth/timing-safe";
 
 // Minimal SQL mock matching the DO SQLite interface.
 // Uses sql.exec() — this is SQLite's method name, not child_process.
@@ -174,6 +176,155 @@ describe("passkey.challenge.single-use", () => {
     const challenges = sql._tables["passkey_challenges"] ?? [];
     expect(challenges.length).toBe(1);
     expect(challenges[0]._params[0]).toBe(options.challenge);
+  });
+});
+
+describe("passkey.challenge.session-binding", () => {
+  // Threat: two concurrent authentication flows. Without per-flow binding,
+  // a "most recent" lookup picks up the wrong challenge and breaks the
+  // legitimate flow (or, with stale challenges, could enable replay).
+  // Fix: look up the issued challenge by exact value submitted in
+  // clientDataJSON. These tests exercise that lookup path.
+
+  function makeClientDataJSON(challenge: string): string {
+    const json = JSON.stringify({
+      type: "webauthn.get",
+      challenge,
+      origin: "https://auth.notme.bot",
+      crossOrigin: false,
+    });
+    // base64url-encode (no padding)
+    return btoa(json).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function makeAuthResponse(challenge: string, credId = "cred-1") {
+    return {
+      id: credId,
+      rawId: credId,
+      type: "public-key" as const,
+      clientExtensionResults: {},
+      authenticatorAttachment: "platform" as const,
+      response: {
+        authenticatorData: "AAAA",
+        clientDataJSON: makeClientDataJSON(challenge),
+        signature: "AAAA",
+        userHandle: "dXNlci0x",
+      },
+    };
+  }
+
+  it("rejects assertions whose challenge was never issued", async () => {
+    const sql = createMockSql();
+    // No challenges stored. Submitted challenge has no DB match.
+    const result = await verifyAuthentication(
+      makeAuthResponse("never-issued-challenge") as any,
+      "auth.notme.bot",
+      "https://auth.notme.bot",
+      sql,
+    );
+    expect(result.verified).toBe(false);
+    expect(result.userId).toBeNull();
+  });
+
+  it("rejects assertions with malformed clientDataJSON", async () => {
+    const sql = createMockSql();
+    const response = {
+      id: "cred-1",
+      rawId: "cred-1",
+      type: "public-key" as const,
+      clientExtensionResults: {},
+      response: {
+        authenticatorData: "AAAA",
+        // Not valid base64url JSON.
+        clientDataJSON: "!!!not-base64!!!",
+        signature: "AAAA",
+      },
+    };
+    const result = await verifyAuthentication(
+      response as any,
+      "auth.notme.bot",
+      "https://auth.notme.bot",
+      sql,
+    );
+    expect(result.verified).toBe(false);
+  });
+
+  it("rejects assertions whose clientDataJSON has no challenge field", async () => {
+    const sql = createMockSql();
+    // base64url of '{"type":"webauthn.get"}' — no challenge field.
+    const noChallengeJSON = btoa('{"type":"webauthn.get"}')
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    const response = {
+      id: "cred-1",
+      rawId: "cred-1",
+      type: "public-key" as const,
+      clientExtensionResults: {},
+      response: {
+        authenticatorData: "AAAA",
+        clientDataJSON: noChallengeJSON,
+        signature: "AAAA",
+      },
+    };
+    const result = await verifyAuthentication(
+      response as any,
+      "auth.notme.bot",
+      "https://auth.notme.bot",
+      sql,
+    );
+    expect(result.verified).toBe(false);
+  });
+
+  it("authentication options query no longer uses ORDER BY DESC LIMIT 1", async () => {
+    // Regression guard: the old lookup was ORDER BY created_at DESC LIMIT 1,
+    // which let two concurrent flows stomp each other. The fix looks up by
+    // the exact challenge value from clientDataJSON. We can't easily diff
+    // the SQL string from outside, but we can confirm via behavior: with
+    // ZERO authentication challenges stored AND a valid clientDataJSON
+    // submitted, the old code threw "no pending authentication challenge"
+    // because LIMIT 1 returned nothing. The new code returns
+    // {verified: false} cleanly without throwing.
+    const sql = createMockSql();
+    let threw = false;
+    try {
+      await verifyAuthentication(
+        makeAuthResponse("anything") as any,
+        "auth.notme.bot",
+        "https://auth.notme.bot",
+        sql,
+      );
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+  });
+});
+
+describe("passkey.bootstrap.timing-safe", () => {
+  // Threat: byte-by-byte inference of bootstrap code via response-time
+  // side-channel. Defense: timingSafeEqual digests both inputs through
+  // HMAC-SHA256 and XOR-compares fixed-length outputs.
+
+  it("returns true for equal strings", async () => {
+    expect(await timingSafeEqual("abc12345", "abc12345")).toBe(true);
+  });
+
+  it("returns false for different strings of same length", async () => {
+    expect(await timingSafeEqual("abc12345", "abc12346")).toBe(false);
+  });
+
+  it("returns false for different-length strings", async () => {
+    expect(await timingSafeEqual("abc", "abc12345")).toBe(false);
+  });
+
+  it("returns false when comparing prefix to full string", async () => {
+    // Naive `startsWith` would short-circuit; HMAC digests differ entirely.
+    expect(await timingSafeEqual("abc", "abcdef")).toBe(false);
+  });
+
+  it("returns true for empty == empty (boundary)", async () => {
+    expect(await timingSafeEqual("", "")).toBe(true);
   });
 });
 

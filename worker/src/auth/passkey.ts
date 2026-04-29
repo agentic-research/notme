@@ -181,6 +181,23 @@ export async function verifyRegistration(
 
 // ── Authentication ──
 
+// Decode the challenge value from the assertion's clientDataJSON. WebAuthn
+// embeds the original challenge there (base64url-encoded JSON); we use it as
+// a per-flow session identifier to look up the issued challenge by exact
+// value rather than relying on "most recent insert" ordering.
+function decodeChallengeFromClientData(
+  clientDataJSONb64: string,
+): string | null {
+  try {
+    let b64 = clientDataJSONb64.replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    const parsed = JSON.parse(atob(b64)) as { challenge?: unknown };
+    return typeof parsed.challenge === "string" ? parsed.challenge : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function authenticationOptions(
   rpId: string,
   sql: any,
@@ -213,15 +230,28 @@ export async function verifyAuthentication(
 }> {
   ensurePasskeySchema(sql);
 
-  // Get stored challenge
+  // Look up the issued challenge by the value the client submitted in
+  // clientDataJSON. Challenges are unique random nonces, so this binds the
+  // verification to THIS auth flow instead of picking "most recent". Without
+  // this, two concurrent flows stomp each other's challenge (DoS) and the
+  // server has no proof it actually issued the challenge it's verifying.
+  // The 5-minute TTL filter enforces freshness.
+  const submittedChallenge = decodeChallengeFromClientData(
+    response.response.clientDataJSON,
+  );
+  if (!submittedChallenge) {
+    return { verified: false, userId: null, isAdmin: false };
+  }
+
   const challenges = sql
     .exec(
-      "SELECT challenge FROM passkey_challenges WHERE type = 'authentication' ORDER BY created_at DESC LIMIT 1",
+      "SELECT challenge FROM passkey_challenges WHERE challenge = ? AND type = 'authentication' AND created_at > datetime('now', '-5 minutes')",
+      submittedChallenge,
     )
     .toArray() as Array<{ challenge: string }>;
 
   if (challenges.length === 0) {
-    throw new Error("no pending authentication challenge");
+    return { verified: false, userId: null, isAdmin: false };
   }
 
   const expectedChallenge = challenges[0]!.challenge;

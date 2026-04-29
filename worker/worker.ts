@@ -1465,20 +1465,25 @@ export default {
         );
       }
 
-      // Passkey reset — temporary, for fixing corrupted credential data
-      // Requires the bootstrap code (proves deployer ownership)
+      // Passkey reset — temporary, for fixing corrupted credential data.
+      // Requires the bootstrap code (proves deployer ownership).
+      //
+      // consumeBootstrapCode atomically validates and marks the code used —
+      // gives us constant-time compare (timing-safe.ts HMAC equality) AND
+      // single-use semantics in one call. A second /reset with the same code
+      // returns false and we 403, so a leaked code can't be used to repeatedly
+      // wipe credentials.
       if (pathname === "/auth/passkey/reset" && request.method === "POST") {
         try {
           const body = (await request.json()) as { bootstrapCode?: string };
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          // Generate a fresh bootstrap code for reset auth
-          const code = await authority.getOrCreateBootstrapCode();
-          if (!code) {
-            return jsonErr("bootstrap code already consumed — reset not available", 403);
-          }
-          if (!body.bootstrapCode || body.bootstrapCode !== code) {
-            return jsonErr(`wrong code — check wrangler tail for the bootstrap code`, 403);
+          if (
+            !body.bootstrapCode ||
+            !(await authority.consumeBootstrapCode(body.bootstrapCode))
+          ) {
+            // Generic error — don't leak whether code was wrong vs already consumed.
+            return jsonErr("invalid or expired bootstrap code", 403);
           }
           const result = await authority.resetPasskeyData();
           return Response.json({ ok: true, ...result });
