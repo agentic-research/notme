@@ -62,7 +62,7 @@
 | thumbprint collision | craft a key with same JWK thumbprint | SHA-256 thumbprint (RFC 7638) — collision infeasible | `dpop.thumbprint.collision` |
 | nonce bypass | skip server nonce | **NOT YET IMPLEMENTED** — defense-in-depth, tracked as known limitation | — |
 
-### 5. DPoP authorize redirect (GET /authorize)
+### 5. DPoP authorize redirect (GET /authorize, POST /authorize/token)
 
 | threat | attack | defense | test |
 |--------|--------|---------|------|
@@ -71,6 +71,7 @@
 | token in URL logs | access token visible in redirect URL query params | token is DPoP-bound (useless without ephemeral key), 5-min expiry, JTI unique | `authorize.token.url-exposure` |
 | session fixation | attacker sets up session then redirects victim | session cookie is SameSite=Strict, HMAC-signed with user-specific claims | `authorize.session.fixation` |
 | return_to injection | craft /login?return_to=//evil.com | return_to must start with / and not start with // | `authorize.return-to.validation` |
+| audience drift | request /authorize/token with arbitrary audience to mint a token notme didn't intend to commit to | **FIXED (notme-5aa0a1)** — module-scope `ALLOWED_AUDIENCES` enforced at every minting endpoint (/token, /authorize/token); previously /authorize/token only checked `!audience` | `dpop.audience.allowlist` (covers /token; /authorize/token verified via the shared constant) |
 
 ### 6. CORS
 

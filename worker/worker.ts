@@ -36,6 +36,18 @@ const DENIED_HOSTS = new Set([
   "100.100.100.200",        // Alibaba metadata
 ]);
 
+// Audience allowlist — every endpoint that mints an access token must check
+// the requested audience against this set. Hoisted to module scope so /token
+// and /authorize/token (and any future minting route) share one source of
+// truth — drift here is how confused-deputy bugs slip in.
+const ALLOWED_AUDIENCES = new Set([
+  "https://rosary.bot",
+  "https://mcp.rosary.bot",
+  "https://auth.notme.bot",
+  "https://notme.bot",
+  "https://mache.rosary.bot",
+]);
+
 function isDeniedDestination(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -1636,6 +1648,12 @@ export default {
           if (!audience) {
             return Response.json({ error: "audience_required" }, { status: 400 });
           }
+          if (!ALLOWED_AUDIENCES.has(audience)) {
+            return Response.json(
+              { error: "invalid_audience", allowed: [...ALLOWED_AUDIENCES] },
+              { status: 400 },
+            );
+          }
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
@@ -1672,27 +1690,21 @@ export default {
             return Response.json({ error: "dpop_proof_required" }, { status: 400 });
           }
 
-          // Parse body for audience — validated against allowlist
+          // Parse body for audience — validated against module-scope ALLOWED_AUDIENCES
           let audience = "";
           try {
             const body = await request.json() as { audience?: string };
             audience = body.audience || "";
           } catch { /* empty body */ }
 
-          // Audience allowlist — only issue tokens for known resource servers
-          const ALLOWED_AUDIENCES = new Set([
-            "https://rosary.bot",
-            "https://mcp.rosary.bot",
-            "https://auth.notme.bot",
-            "https://notme.bot",
-            "https://mache.rosary.bot",
-            // Empty audience no longer allowed — tokens must be scoped
-          ]);
           if (!audience) {
             return Response.json({ error: "audience_required" }, { status: 400 });
           }
           if (!ALLOWED_AUDIENCES.has(audience)) {
-            return Response.json({ error: "invalid_audience", allowed: [...ALLOWED_AUDIENCES].filter(Boolean) }, { status: 400 });
+            return Response.json(
+              { error: "invalid_audience", allowed: [...ALLOWED_AUDIENCES] },
+              { status: 400 },
+            );
           }
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
