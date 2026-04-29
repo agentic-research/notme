@@ -65,6 +65,7 @@ export async function registrationOptions(
   sql: any,
 ): Promise<any> {
   ensurePasskeySchema(sql);
+  sweepExpiredChallenges(sql);
 
   // Check if any users exist (first user = admin, no auth needed)
   const users = sql
@@ -198,11 +199,27 @@ function decodeChallengeFromClientData(
   }
 }
 
+// Sweep expired challenge rows so the table doesn't grow unbounded.
+// Lookup at verify time already filters with `created_at > datetime('now',
+// '-5 minutes')`, so anything past that window is dead weight. We delete
+// rows older than 1 hour — defense in depth: clients have well past the
+// 5-minute window to complete, abandoned flows still get cleaned up, and
+// the absolute cap doesn't depend on a separate scheduled job. Called from
+// every options/verify entry point so the cleanup amortizes against real
+// auth traffic. (notme-ae81c9 / M2 from session code review.)
+const SWEEP_EXPIRED_CHALLENGES_SQL =
+  "DELETE FROM passkey_challenges WHERE created_at < datetime('now', '-1 hour')";
+
+function sweepExpiredChallenges(sql: any): void {
+  sql.exec(SWEEP_EXPIRED_CHALLENGES_SQL);
+}
+
 export async function authenticationOptions(
   rpId: string,
   sql: any,
 ): Promise<any> {
   ensurePasskeySchema(sql);
+  sweepExpiredChallenges(sql);
 
   const options = await generateAuthenticationOptions({
     rpID: rpId,

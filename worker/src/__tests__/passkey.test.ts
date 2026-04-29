@@ -179,6 +179,72 @@ describe("passkey.challenge.single-use", () => {
   });
 });
 
+describe("passkey.challenge.sweeper (notme-ae81c9, M2)", () => {
+  // The lookup at verify time filters by `created_at > datetime('now',
+  // '-5 minutes')`, but never DELETES expired rows. Abandoned flows
+  // (user closes browser, network failure) leave dead rows forever.
+  // The sweeper runs on every options call and DELETEs rows older than
+  // 1 hour. This test asserts the DELETE statement is issued, with the
+  // right age threshold.
+
+  function makeRecordingMock(
+    calls: { query: string; params: unknown[] }[],
+  ) {
+    return {
+      _tables: { passkey_users: [] as any[], passkey_credentials: [] as any[] },
+      exec(query: string, ...params: unknown[]) {
+        calls.push({ query, params });
+        const q = query.trim().toUpperCase();
+        if (q.startsWith("CREATE TABLE")) return { toArray: () => [] };
+        if (q.startsWith("SELECT COUNT")) {
+          return { toArray: () => [{ count: 0 }] };
+        }
+        if (q.startsWith("SELECT")) return { toArray: () => [] };
+        return { toArray: () => [] };
+      },
+    };
+  }
+
+  it("authenticationOptions sweeps challenges older than 1 hour", async () => {
+    const calls: { query: string; params: unknown[] }[] = [];
+    const sql = makeRecordingMock(calls);
+    await authenticationOptions("auth.notme.bot", sql);
+
+    const sweep = calls.find(
+      (c) =>
+        c.query.toUpperCase().startsWith("DELETE") &&
+        c.query.includes("passkey_challenges") &&
+        c.query.includes("created_at <"),
+    );
+    expect(sweep, "expected a DELETE-old-challenges sweep").toBeTruthy();
+    // 1-hour cutoff (the policy chosen in passkey.ts)
+    expect(sweep!.query).toMatch(/datetime\('now',\s*'-1 hour'\)/);
+    // Sweep must run BEFORE the INSERT — otherwise the row we're about
+    // to add could be caught by the broom (degenerate case: clock skew).
+    const sweepIdx = calls.indexOf(sweep!);
+    const insertIdx = calls.findIndex((c) =>
+      c.query.toUpperCase().startsWith("INSERT") &&
+      c.query.includes("passkey_challenges"),
+    );
+    expect(insertIdx).toBeGreaterThan(sweepIdx);
+  });
+
+  it("registrationOptions also sweeps challenges older than 1 hour", async () => {
+    const calls: { query: string; params: unknown[] }[] = [];
+    const sql = makeRecordingMock(calls);
+    await registrationOptions("user-1", "Admin", "auth.notme.bot", sql);
+
+    const sweep = calls.find(
+      (c) =>
+        c.query.toUpperCase().startsWith("DELETE") &&
+        c.query.includes("passkey_challenges") &&
+        c.query.includes("created_at <"),
+    );
+    expect(sweep).toBeTruthy();
+    expect(sweep!.query).toMatch(/datetime\('now',\s*'-1 hour'\)/);
+  });
+});
+
 describe("passkey.challenge.session-binding", () => {
   // Threat: two concurrent authentication flows. Without per-flow binding,
   // a "most recent" lookup picks up the wrong challenge and breaks the
