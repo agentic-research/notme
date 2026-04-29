@@ -49,6 +49,14 @@ tasks:
       - npx tsc --noEmit
       - npx vitest run
 
+  proxy:check:
+    desc: Build + test the Rust mTLS proxy crate
+    dir: proxy
+    cmds:
+      - cargo build --locked
+      - cargo test --locked
+      - cargo clippy --locked --tests -- -D warnings
+
   worker:deploy-preview:
     desc: Upload new version without routing traffic to it
     dir: worker
