@@ -18,6 +18,14 @@
 | session fixation | reuse someone else's session cookie | session cookie is HMAC-signed with DO-generated secret, includes user_id | `session.hmac.integrity` |
 | session replay | replay a valid session cookie | session has expiry (24h), HMAC includes timestamp | `session.expiry` |
 
+### 1b. OIDC connection / sign-in (POST /connections, POST /auth/oidc/login, POST /join)
+
+| threat | attack | defense | test |
+|--------|--------|---------|------|
+| audience confused deputy | submit an OIDC token issued for a different app (audience=evil-app.com) — `verifyOIDC` accepts it because no audience is enforced | **FIXED** — every OIDC-accepting route passes `expectedAudience: "notme.bot"` to `verifyProof`/`verifyOIDC`. /connections previously omitted this and was patched in notme-567f07; without the fix, a stolen OIDC token issued for a different app could link `(issuer, victim_subject) → attacker's principal`, silently routing the victim's first notme OIDC sign-in into the attacker's account. | `oidc.audience.confused-deputy`, `oidc.connections.audience-binding` |
+| token expiry | replay an old OIDC token | `exp` claim enforced in `verifyOIDC` before audience check | `oidc.audience.confused-deputy` (expired-before-aud sanity) |
+| issuer spoofing | unrecognized `iss` claim used to bypass JWKS routing | `TRUSTED_ISSUERS` allowlist in verify-proof.ts (Google, GitHub Actions, auth.notme.bot) | covered via verify-proof's SSRF guard |
+
 ### 2. GHA OIDC cert exchange (POST /cert/gha)
 
 | threat | attack | defense | test |

@@ -1266,7 +1266,11 @@ export default {
         let identity;
         try {
           const caKey = await authority.getPublicKeyPem();
-          identity = await verifyProof(body.proof as any, caKey);
+          // Audience pin matches /auth/oidc/login + /join: prevents linking a
+          // stolen OIDC token issued for a different app, which would silently
+          // re-route the victim's later notme.bot OIDC login into the
+          // attacker's principal. X.509 path ignores the audience arg.
+          identity = await verifyProof(body.proof as any, caKey, "notme.bot");
         } catch (e: any) {
           return jsonErr("proof verification failed: " + e.message, 401);
         }
