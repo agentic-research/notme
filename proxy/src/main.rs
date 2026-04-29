@@ -14,6 +14,7 @@ use std::env;
 use std::fs;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use http_body_util::{BodyExt, Full};
@@ -23,7 +24,56 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener};
+
+#[derive(Debug, PartialEq, Eq)]
+enum ListenAddr {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+fn parse_listen_addr(s: &str) -> Result<ListenAddr, String> {
+    if let Some(path) = s.strip_prefix("unix:") {
+        if path.is_empty() {
+            return Err("unix: prefix requires a socket path".to_string());
+        }
+        Ok(ListenAddr::Unix(PathBuf::from(path)))
+    } else {
+        s.parse::<SocketAddr>()
+            .map(ListenAddr::Tcp)
+            .map_err(|e| format!("invalid listen address {s:?}: {e}"))
+    }
+}
+
+/// Remove a stale socket file at `path`. Refuses to remove non-socket files so
+/// an operator typo (e.g. `unix:./bridge-cert.pem`) can't clobber unrelated
+/// data. Uses `symlink_metadata` so a symlink at the path is treated as
+/// "not a socket" rather than being followed.
+fn try_remove_socket_file(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => fs::remove_file(path)
+            .map_err(|e| format!("remove stale socket {}: {e}", path.display())),
+        Ok(_) => Err(format!(
+            "refusing to remove non-socket at {}",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
+    }
+}
+
+/// Bind a UDS listener with owner-only (0600) permissions on the socket file.
+/// The bridge cert means anyone who can `connect()` to this socket can fetch
+/// as the bridge identity, so we tighten perms immediately after bind.
+fn bind_unix_listener(path: &std::path::Path) -> Result<UnixListener, String> {
+    use std::os::unix::fs::PermissionsExt;
+    try_remove_socket_file(path)?;
+    let listener = UnixListener::bind(path).map_err(|e| format!("bind {}: {e}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    Ok(listener)
+}
 
 /// Load cert chain + private key from PEM files.
 fn load_certs_and_key(
@@ -181,24 +231,157 @@ async fn main() {
     let tls_config = build_mtls_config(certs, key);
     eprintln!("notme-proxy: mTLS config ready");
 
-    let addr: SocketAddr = listen_addr.parse().expect("invalid listen address");
-    let listener = TcpListener::bind(addr).await.expect("bind failed");
-    eprintln!("notme-proxy: listening on {addr}");
-
-    loop {
-        let (stream, _peer) = listener.accept().await.expect("accept failed");
-        let tls_config = tls_config.clone();
-
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req| {
-                let tls_config = tls_config.clone();
-                handle_proxy(tls_config, req)
-            });
-
-            if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
-                eprintln!("notme-proxy: connection error: {e}");
+    let listen = parse_listen_addr(listen_addr).expect("invalid listen address");
+    match listen {
+        ListenAddr::Tcp(addr) => {
+            let listener = TcpListener::bind(addr).await.expect("bind failed");
+            eprintln!("notme-proxy: listening on tcp {addr}");
+            loop {
+                let (stream, _peer) = listener.accept().await.expect("accept failed");
+                spawn_conn(stream, tls_config.clone());
             }
+        }
+        ListenAddr::Unix(path) => {
+            let listener = bind_unix_listener(&path).expect("bind unix listener");
+            eprintln!("notme-proxy: listening on unix {} (mode 0600)", path.display());
+            loop {
+                let (stream, _peer) = listener.accept().await.expect("accept failed");
+                spawn_conn(stream, tls_config.clone());
+            }
+        }
+    }
+}
+
+fn spawn_conn<S>(stream: S, tls_config: Arc<rustls::ClientConfig>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let io = TokioIo::new(stream);
+        let service = service_fn(move |req| {
+            let tls_config = tls_config.clone();
+            handle_proxy(tls_config, req)
         });
+        if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+            eprintln!("notme-proxy: connection error: {e}");
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_test_path(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "notme-proxy-test-{}-{}-{}.sock",
+            std::process::id(),
+            label,
+            n
+        ))
+    }
+
+    #[test]
+    fn parses_tcp_listen_addr() {
+        let addr = parse_listen_addr("127.0.0.1:1080").expect("parses");
+        assert_eq!(addr, ListenAddr::Tcp("127.0.0.1:1080".parse().unwrap()));
+    }
+
+    #[test]
+    fn parses_unix_listen_addr() {
+        let addr = parse_listen_addr("unix:/run/notme/mtls.sock").expect("parses");
+        assert_eq!(addr, ListenAddr::Unix(PathBuf::from("/run/notme/mtls.sock")));
+    }
+
+    #[test]
+    fn parses_unix_relative_path() {
+        let addr = parse_listen_addr("unix:./mtls.sock").expect("parses");
+        assert_eq!(addr, ListenAddr::Unix(PathBuf::from("./mtls.sock")));
+    }
+
+    #[test]
+    fn rejects_empty_unix_path() {
+        let err = parse_listen_addr("unix:").expect_err("should reject");
+        assert!(err.contains("requires a socket path"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_tcp_addr() {
+        assert!(parse_listen_addr("not-a-real-addr").is_err());
+    }
+
+    #[test]
+    fn try_remove_socket_file_is_noop_when_absent() {
+        let path = unique_test_path("absent");
+        try_remove_socket_file(&path).expect("absent path is ok");
+    }
+
+    #[test]
+    fn try_remove_socket_file_refuses_regular_file() {
+        let path = unique_test_path("regular");
+        std::fs::write(&path, b"important-data").unwrap();
+        let err = try_remove_socket_file(&path).expect_err("must refuse");
+        assert!(err.contains("non-socket"), "got: {err}");
+        assert!(path.exists(), "regular file must not be deleted");
+        assert_eq!(std::fs::read(&path).unwrap(), b"important-data");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn try_remove_socket_file_refuses_symlink_to_regular_file() {
+        let target = unique_test_path("symlink-target");
+        let link = unique_test_path("symlink-link");
+        std::fs::write(&target, b"do-not-delete").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = try_remove_socket_file(&link).expect_err("must refuse");
+        assert!(err.contains("non-socket"), "got: {err}");
+        assert!(target.exists(), "symlink target must remain intact");
+        assert_eq!(std::fs::read(&target).unwrap(), b"do-not-delete");
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
+    }
+
+    #[tokio::test]
+    async fn bind_unix_listener_sets_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let sock = unique_test_path("perms");
+        let _listener = bind_unix_listener(&sock).expect("bind");
+        let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket must be owner-only — bridge cert is sensitive");
+        fs::remove_file(&sock).ok();
+    }
+
+    #[tokio::test]
+    async fn bind_unix_listener_replaces_stale_socket() {
+        let sock = unique_test_path("stale");
+        // Create a real socket file via a transient bind+drop.
+        {
+            let _ = UnixListener::bind(&sock).expect("first bind");
+        }
+        assert!(sock.exists(), "stale socket file should remain after drop");
+        let _listener = bind_unix_listener(&sock).expect("rebind over stale");
+        assert!(sock.exists());
+        fs::remove_file(&sock).ok();
+    }
+
+    #[tokio::test]
+    async fn bind_unix_listener_round_trip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let sock = unique_test_path("round-trip");
+        let listener = bind_unix_listener(&sock).expect("bind");
+        let (client, accepted) = tokio::join!(
+            tokio::net::UnixStream::connect(&sock),
+            listener.accept(),
+        );
+        let mut client = client.expect("connect");
+        let (mut server, _peer) = accepted.expect("accept");
+        client.write_all(b"x").await.unwrap();
+        let mut buf = [0u8; 1];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"x");
+        fs::remove_file(&sock).ok();
     }
 }
