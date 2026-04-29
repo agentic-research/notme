@@ -14,6 +14,7 @@
     "worker.ts",
     "src/**/*.ts",
     "../gen/ts/**/*.ts",
+    "../vault/src/**/*.ts",
   ],
   "exclude": [
     "node_modules",

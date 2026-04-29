@@ -7,9 +7,37 @@
 
 import { handleRequest } from "./handler";
 import { verifyAccessToken, verifyDPoPToken } from "../../gen/ts/dpop";
+import type { SealedCredential as _SealedCredential } from "./crypto";
+
+/**
+ * Public RPC surface of the CredentialVault Durable Object.
+ *
+ * Extracted as a separate interface so `DurableObjectNamespace<T>` doesn't
+ * recurse through the class's full type (which references Env, which
+ * references VAULT, …). The class implements this interface; the binding
+ * uses it as the type parameter.
+ *
+ * `Rpc.DurableObjectBranded` is the marker CF requires on the parameter
+ * — it tags this as a DO RPC type, not a plain interface.
+ */
+export interface CredentialVaultRpc extends Rpc.DurableObjectBranded {
+  getCredential(service: string): Promise<{
+    upstream: string;
+    headers: Record<string, string>;
+    allowedSubs: string[];
+  } | null>;
+  putCredential(
+    service: string,
+    cred: { upstream: string; headers: Record<string, string>; allowedSubs: string[] },
+  ): Promise<void>;
+  deleteCredential(service: string): Promise<boolean>;
+  listServices(): Promise<string[]>;
+  checkAndStoreJti(jti: string): Promise<boolean>;
+  proxyRequest(service: string, incomingRequest: Request): Promise<Response>;
+}
 
 export interface Env {
-  VAULT: DurableObjectNamespace;
+  VAULT: DurableObjectNamespace<CredentialVaultRpc>;
   ADMIN_SUB: string;
   /** Secret string used to derive the KEK for credential encryption. */
   VAULT_KEK_SECRET: string;
@@ -106,6 +134,15 @@ interface StoredRow {
 // DurableObject base class provides this.ctx and this.env automatically.
 // Using the type annotation for documentation — actual base class import
 // requires cloudflare:workers which is only available at runtime.
+//
+// We deliberately do NOT add `implements CredentialVaultRpc` here. The
+// interface extends `Rpc.DurableObjectBranded`, whose private brand
+// (`[__DURABLE_OBJECT_BRAND]`) is only assigned by the runtime DurableObject
+// base class. Without importing `cloudflare:workers` (which we avoid here
+// so vault tests don't load the workerd-only module), the brand can't be
+// declared — `implements` would force a class shape we can't satisfy at
+// the type level. The binding `DurableObjectNamespace<CredentialVaultRpc>`
+// still picks up method types correctly via structural matching.
 export class CredentialVault {
   private sql: any;
   private kekPromise: Promise<CryptoKey> | null = null;
