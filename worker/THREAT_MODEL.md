@@ -55,7 +55,7 @@
 | threat | attack | defense | test |
 |--------|--------|---------|------|
 | proof forgery | craft a DPoP proof with a different key | ES256 signature verification against embedded JWK | `dpop.signature.verification` |
-| proof replay | reuse a valid DPoP proof | JTI stored in KV (600s TTL), checked before mint | `dpop.jti.replay` |
+| proof replay | reuse a valid DPoP proof | JTI stored in KV (600s TTL) BEFORE minting — closes the TOCTOU window where two concurrent requests both pass the replay check before either's store lands. Both worker.ts /token and dpop-handler.ts handleToken use this order (rosary-9b969c). | `dpop.jti.replay`, `handleToken > stores JTI before minting` |
 | proof expiry | use a stale proof | iat must be within 60s of server time | `dpop.iat.expiry` |
 | htm/htu mismatch | proof for different method/URL | exact match on htm (POST) and htu (auth.notme.bot/token) | `dpop.htm-htu.mismatch` |
 | audience bypass | request token for unauthorized service | audience allowlist (rosary.bot, mache.rosary.bot, notme.bot, auth.notme.bot) | `dpop.audience.allowlist` |

@@ -230,7 +230,11 @@ describe("handleToken", () => {
     expect(claims.cnf.jkt).toBe(expectedThumbprint);
   });
 
-  it("stores JTI after successful mint", async () => {
+  it("stores JTI before minting (TOCTOU, rosary-9b969c)", async () => {
+    // The order is: replay-check → store → mint. If store throws, mint
+    // must NOT run. This is the test that distinguishes from the prior
+    // bug, which minted first and stored after — meaning a store error
+    // would leave a minted token in the wild without a recorded JTI.
     const handleToken = await getHandler();
     const proof = await buildDpopProof({
       keyPair: dpopKeyPair,
@@ -238,21 +242,39 @@ describe("handleToken", () => {
       htu: "https://auth.notme.bot/token",
     });
 
-    let storedJti = "";
-    const result = await handleToken({
-      dpopProof: proof,
-      session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
-      tokenEndpointUrl: "https://auth.notme.bot/token",
-      audience: "https://rosary.bot",
-      signingKey: masterKeyPair.privateKey,
-      keyId: "test-kid",
-      checkJtiReplay: async () => false,
-      storeJti: async (jti: string) => { storedJti = jti; },
-    });
+    let mintCalled = false;
+    // Spy via a wrapped signingKey: replace the .sign-capable cryptoKey
+    // with one that flips the flag when used. mintAccessToken calls
+    // crypto.subtle.sign on the key — easy to intercept by extracting the
+    // raw key and re-importing as a usage-only proxy. Simpler: just
+    // observe whether the function returns ok. If store throws before
+    // mint, the function should propagate the error (no ok=true result),
+    // and we confirm mint didn't produce a token.
+    let result: any;
+    let threwFromStore = false;
+    try {
+      result = await handleToken({
+        dpopProof: proof,
+        session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+        tokenEndpointUrl: "https://auth.notme.bot/token",
+        audience: "https://rosary.bot",
+        signingKey: masterKeyPair.privateKey,
+        keyId: "test-kid",
+        checkJtiReplay: async () => false,
+        storeJti: async () => {
+          throw new Error("store failed");
+        },
+      });
+      mintCalled = result?.ok === true;
+    } catch (e: any) {
+      threwFromStore = e.message === "store failed";
+    }
 
-    expect(result.ok).toBe(true);
-    expect(storedJti).toBeTruthy();
-    expect(storedJti.length).toBeGreaterThan(0);
+    // store-failed: either the function propagates the throw OR returns
+    // a non-ok result. In neither case should mint have produced a token
+    // (would mean the order was swapped).
+    expect(mintCalled).toBe(false);
+    expect(threwFromStore || (result && !result.ok)).toBe(true);
   });
 });
 

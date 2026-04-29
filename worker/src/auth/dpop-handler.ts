@@ -65,7 +65,15 @@ export async function handleToken(input: HandleTokenInput): Promise<HandleTokenR
     return { ok: false, status: 401, error: "proof_reused" };
   }
 
-  // 6. Mint access token bound to DPoP key
+  // 6. Store JTI BEFORE minting — prevents TOCTOU race across concurrent
+  // requests (KV is eventually consistent, so two edge nodes can both
+  // pass the replay check at step 5 before either's store lands).
+  // Matches worker.ts /token order. If mint fails after this, the JTI
+  // is burned — acceptable, client retries with a new proof.
+  // (rosary-9b969c)
+  await input.storeJti(proofResult.jti);
+
+  // 7. Mint access token bound to DPoP key
   const scope = input.session.scopes.join(" ");
   const accessToken = await mintAccessToken({
     sub: input.session.principalId,
@@ -75,9 +83,6 @@ export async function handleToken(input: HandleTokenInput): Promise<HandleTokenR
     signingKey: input.signingKey,
     keyId: input.keyId,
   });
-
-  // 7. Store JTI to prevent replay
-  await input.storeJti(proofResult.jti);
 
   return {
     ok: true,
