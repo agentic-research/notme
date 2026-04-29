@@ -1586,37 +1586,13 @@ export default {
         const audience = url.searchParams.get("audience") || "https://rosary.bot";
         const state = url.searchParams.get("state") || "";
 
-        // Validate redirect_uri
-        if (!redirectUri) {
-          return jsonErr("redirect_uri required", 400);
-        }
-        let parsed: URL;
-        try {
-          parsed = new URL(redirectUri);
-        } catch {
-          return jsonErr("invalid redirect_uri", 400);
-        }
-        // Enforce https for all non-localhost
-        const isLocalhost = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
-        if (!isLocalhost && parsed.protocol !== "https:") {
-          return jsonErr("redirect_uri must be https", 400);
-        }
-        if (isLocalhost && parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          return jsonErr("redirect_uri must be http or https", 400);
-        }
-        // Strict allowlist — exact domains only (no wildcard subdomains)
-        const redirectHost = parsed.hostname;
-        const ALLOWED_REDIRECT_HOSTS = new Set([
-          "localhost",
-          "127.0.0.1",
-          "rosary.bot",
-          "auth.rosary.bot",
-          "notme.bot",
-          "auth.notme.bot",
-        ]);
-        if (!ALLOWED_REDIRECT_HOSTS.has(redirectHost)) {
-          return jsonErr("redirect_uri not on allowed domain", 403);
-        }
+        // Validate redirect_uri via the shared helper — keeps the matrix
+        // (required / parsable / https-or-localhost / allowlist) under
+        // unit tests in worker/src/auth/redirect-uri.ts rather than
+        // re-implementing the rules in every consumer.
+        const { validateRedirectUri } = await import("./src/auth/redirect-uri");
+        const v = validateRedirectUri(redirectUri);
+        if (!v.ok) return jsonErr(v.reason, v.status);
 
         // Check session
         const cookie = parseCookie(

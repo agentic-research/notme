@@ -69,7 +69,7 @@
 
 | threat | attack | defense | test |
 |--------|--------|---------|------|
-| open redirect | redirect_uri to attacker-controlled domain | allowlist: *.rosary.bot, *.notme.bot, localhost only | `authorize.redirect.allowlist` |
+| open redirect | redirect_uri to attacker-controlled domain | exact-host allowlist (no wildcards) — rosary.bot, auth.rosary.bot, notme.bot, auth.notme.bot, localhost, 127.0.0.1; https-required on the public internet (localhost gets http for dev); rejects file:/javascript:/data: schemes; rejects userinfo abuse like `https://rosary.bot@attacker.example`. Validation lives in `worker/src/auth/redirect-uri.ts`. | `authorize.redirect.allowlist` |
 | state CSRF | forge the state parameter | state is opaque UUID, validated by consuming app (rig checks KV) | `authorize.state.csrf` |
 | token in URL logs | access token visible in redirect URL query params | token is DPoP-bound (useless without ephemeral key), 5-min expiry, JTI unique | `authorize.token.url-exposure` |
 | session fixation | attacker sets up session then redirects victim | session cookie is SameSite=Strict, HMAC-signed with user-specific claims | `authorize.session.fixation` |
