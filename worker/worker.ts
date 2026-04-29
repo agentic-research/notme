@@ -1359,9 +1359,13 @@ export default {
 
         const body = (await request.json()) as { scopes?: string[]; ttl?: number };
         const scopes = body.scopes ?? ["bridgeCert"];
-        // Can't grant scopes you don't have
+        // Delegated authorization — granter must hold authorityManage AND
+        // the specific scope being granted. canGrant() is the single source
+        // of truth for the predicate (was duplicated inline pre-rosary-8119d0).
+        const { canGrant } = await import("./src/auth/principals");
+        const granterScopes = session.scopes ?? [];
         for (const s of scopes) {
-          if (!(session.scopes ?? []).includes(s)) {
+          if (!canGrant(granterScopes, s)) {
             return jsonErr(`cannot grant scope you don't have: ${s}`, 403);
           }
         }

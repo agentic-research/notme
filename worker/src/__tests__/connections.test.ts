@@ -127,6 +127,42 @@ describe("connections.storage", () => {
   });
 });
 
+describe("principals.canGrant", () => {
+  // Delegated authorization predicate. Granter must hold BOTH
+  // authorityManage AND the specific scope being granted.
+  // rosary-8119d0: function existed but was never called (the check
+  // was duplicated inline in /invites). Now it's the single source of
+  // truth and consumers can rely on the named predicate.
+
+  it("returns true when granter has authorityManage AND the scope", async () => {
+    const { canGrant } = await import("../auth/principals");
+    expect(canGrant(["authorityManage", "bridgeCert"], "bridgeCert")).toBe(true);
+  });
+
+  it("returns false when granter lacks authorityManage", async () => {
+    const { canGrant } = await import("../auth/principals");
+    expect(canGrant(["bridgeCert"], "bridgeCert")).toBe(false);
+  });
+
+  it("returns false when granter has authorityManage but not the scope", async () => {
+    const { canGrant } = await import("../auth/principals");
+    expect(canGrant(["authorityManage"], "certMint")).toBe(false);
+  });
+
+  it("returns false for empty granter scopes", async () => {
+    const { canGrant } = await import("../auth/principals");
+    expect(canGrant([], "bridgeCert")).toBe(false);
+  });
+
+  it("authorityManage cannot self-grant without holding it explicitly", async () => {
+    // Edge: an admin granting `authorityManage` must already have it.
+    // canGrant requires both — implicit gate against accidental admin chaining.
+    const { canGrant } = await import("../auth/principals");
+    expect(canGrant(["authorityManage"], "authorityManage")).toBe(true);
+    expect(canGrant(["bridgeCert"], "authorityManage")).toBe(false);
+  });
+});
+
 describe("connections.lookup", () => {
   it("finds credential by provider subject", async () => {
     const { createConnection, findByProvider } = await import(
