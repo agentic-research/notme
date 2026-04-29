@@ -10,11 +10,20 @@
  * gave ~65k, which an attacker who can influence rotation timing could
  * grind through. See rosary-808b0e for the analysis.
  *
- * Existing 8-hex-char keyIds persisted in deployed DOs are not rewritten
- * — the function is only called when generating a new keypair (or
- * migrating an unset `key_id` column on an old row). 5-minute cert TTL
- * means old certs naturally drain on rotation; the wire-format change is
- * invisible to in-flight callers.
+ * **Migration policy** (no separate sweeper):
+ *
+ *   - Existing 8-hex-char keyIds persisted in deployed DOs are NOT
+ *     rewritten. This function only runs when generating a new keypair
+ *     or backfilling an unset `key_id` column.
+ *   - 5-minute cert TTL means certs minted with an old 8-hex keyId
+ *     drain naturally — every cert in the wild expires within 5 minutes.
+ *   - Bundle keyId / prevKeyId fields accept either width (string
+ *     comparison, no fixed-length parser).
+ *
+ * If you need to actively re-id existing keys, generate a new keypair
+ * via key rotation (epoch bump) — the new keypair gets a 16-hex id, and
+ * the old 8-hex id moves to `prevKeyId` for the rotation grace window.
+ * No code change needed in this function.
  *
  * In its own file (no DO dependencies) so unit tests can import directly.
  */
