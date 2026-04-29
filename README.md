@@ -108,6 +108,8 @@ worker/             identity authority — auth.notme.bot (CF Worker + Durable O
   src/                auth modules (passkey, DPoP, session, OIDC, principals)
   src/platform.ts     runtime abstraction (CF edge vs local workerd)
   e2e/                Playwright contract tests (virtual authenticator)
+proxy/              Rust mTLS forward proxy — bridge cert lives in process memory,
+                    workerd Workers fetch() through it. TCP or UDS listen.
 action/             GHA action — OIDC → access token (zero secrets, zero files)
 gen/ts/             shared SDK — base64url, validateClaims, computeJwkThumbprint
 schema/             cap'n proto type definitions (CABundle, GHAClaims, etc.)
@@ -172,9 +174,10 @@ CA key is generated on first request. In ephemeral mode (local/container), the p
 
 ```bash
 cd worker
-npx vitest run         # 116 unit tests
+npx vitest run         # 131 tests (unit + adversarial)
 bash test-local.sh     # workerd smoke test
 bash test-e2e.sh       # Playwright e2e (virtual authenticator)
+cd ../proxy && cargo test  # 11 Rust tests (parser, UDS bind, perms)
 ```
 
 ## related

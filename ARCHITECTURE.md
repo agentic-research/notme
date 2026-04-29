@@ -41,6 +41,11 @@ gen/go/                       Go bindings from capnp
 vault/                        Separate Worker — credential vault (HKDF + AES-GCM envelope encryption)
 action/src/index.ts           GHA action — OIDC → access token (zero secrets)
 packages/                     Container image pipeline (melange + apko, 40MB OCI)
+proxy/src/main.rs             Rust mTLS forward proxy — workerd → bridge cert → upstream.
+                              The bridge cert private key lives only in this process's
+                              memory; workerd Workers call fetch() normally and the proxy
+                              attaches the client cert during the TLS handshake. Listens
+                              on TCP or unix:/path (UDS, owner-only 0600 perms).
 ```
 
 ## Data flow
@@ -112,22 +117,26 @@ Detection is automatic via `NOTME_KEY_STORAGE` env var and `detectKeyStorage()`.
 
 | File | Lines | What |
 |------|-------|------|
-| `worker/worker.ts` | ~1800 | HTTP fetch handler (monolith — split planned via notme-9f51fa) |
-| `worker/src/signing-authority.ts` | ~720 | SigningAuthority DO — the security kernel |
-| `worker/src/platform.ts` | ~180 | Platform abstraction + MemoryCache |
-| `gen/ts/dpop.ts` | ~550 | Shared JWT/crypto SDK |
-| `vault/src/vault.ts` | ~200 | Credential vault DO |
-| `action/src/index.ts` | ~90 | GHA action |
+| `worker/worker.ts` | ~2100 | HTTP fetch handler (monolith — split planned via notme-9f51fa) |
+| `worker/src/signing-authority.ts` | ~780 | SigningAuthority DO — the security kernel |
+| `worker/src/platform.ts` | ~200 | Platform abstraction + MemoryCache + ED25519 typing constant |
+| `gen/ts/dpop.ts` | ~580 | Shared JWT/crypto SDK |
+| `vault/src/vault.ts` | ~270 | Credential vault DO |
+| `action/src/index.ts` | ~180 | GHA action |
+| `proxy/src/main.rs` | ~390 | mTLS forward proxy (TCP + UDS listen) |
 
 ## Testing
 
 ```bash
-npx vitest run             # 116 unit tests
-bash test-local.sh         # workerd smoke test (endpoints + invariant #1)
-bash test-e2e.sh           # Playwright e2e with virtual authenticator (11 contract tests)
+cd worker && npx vitest run    # 131 tests (unit + adversarial)
+bash test-local.sh             # workerd smoke test (endpoints + invariant #1)
+bash test-e2e.sh               # Playwright e2e with virtual authenticator (11 contract tests)
+cd ../proxy && cargo test      # 11 Rust tests (listen-addr parser, UDS bind, perms, round-trip)
 ```
 
-Test categories:
-- **Adversarial** (29 tests): key extraction, token forgery, confused deputy, DPoP injection, JTI replay, scope escalation, error message leaks, mode downgrade
-- **Contract** (11 tests): discovery shape, JWKS fields, CA cert PEM, error response codes, passkey registration + authenticated access
-- **Unit** (87 tests): signing, token mint/verify, DPoP, sessions, connections, passkeys, routes, platform detection
+Test categories (worker):
+- **Adversarial** (35 tests): key extraction, token forgery, confused deputy, DPoP injection, JTI replay, scope escalation, error message leaks, mode downgrade
+- **Contract** (11 tests, e2e): discovery shape, JWKS fields, CA cert PEM, error response codes, passkey registration + authenticated access
+- **Unit** (96 tests): signing, token mint/verify, DPoP, sessions, connections, passkeys (incl. challenge session-binding + bootstrap timing-safe), routes, platform detection
+
+Threat-model coverage is enumerated in `worker/THREAT_MODEL.md` — each row links to the test that defends it.
