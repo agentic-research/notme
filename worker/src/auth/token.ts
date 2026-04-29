@@ -11,6 +11,7 @@ import {
   base64urlDecode,
   validateClaims,
 } from "../../../gen/ts/dpop";
+import { ED25519 } from "../platform";
 
 const ISSUER = "https://auth.notme.bot";
 const TOKEN_LIFETIME_SECONDS = 300; // 5 minutes
@@ -75,7 +76,7 @@ export async function mintAccessToken(
   const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
 
   const signature = new Uint8Array(
-    await crypto.subtle.sign("Ed25519" as any, signingKey, signingInput),
+    await crypto.subtle.sign(ED25519, signingKey, signingInput),
   );
   const signatureB64 = base64urlEncode(signature);
 
@@ -110,7 +111,7 @@ export async function verifyAccessToken(
   const signature = base64urlDecode(signatureB64);
 
   const valid = await crypto.subtle.verify(
-    "Ed25519" as any,
+    ED25519,
     publicKey,
     signature,
     signingInput,

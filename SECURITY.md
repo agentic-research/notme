@@ -51,3 +51,24 @@ Set via `NOTME_KEY_STORAGE` env var. Default: `cf-managed`. Local workerd config
 - DPoP token endpoint does not yet implement nonce mechanism (defense-in-depth)
 - `encrypted` key storage mode is designed but not yet implemented (startup error if configured)
 - Threat model is documented in `docs/design/007-secretless-local-proxy.md` (adversarial test tables)
+
+## Ed25519 typing workaround
+
+The TypeScript DOM lib does not yet enumerate Ed25519 as a valid `SubtleCrypto`
+algorithm identifier, and `@cloudflare/workers-types` does not extend the
+algorithm union for it. CF Workers' WebCrypto runtime nevertheless implements
+Ed25519 fully (BoringSSL).
+
+All production Ed25519 sign/verify call sites import the single constant
+`ED25519` from `worker/src/platform.ts`, which carries the `as any` cast and
+documents the gap. This means:
+
+- Reviewers see exactly one cast in production code rather than chasing a
+  string literal across the codebase.
+- When the lib types catch up, removing the workaround is a one-line change
+  in `platform.ts`.
+- Tests retain their own inline casts because they construct distinct
+  algorithm objects per call (e.g. `importKey` requires the object form,
+  `sign` accepts the string form).
+
+Tracked in bead `notme-ae1030`.

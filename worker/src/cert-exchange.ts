@@ -9,6 +9,8 @@
 //
 // Schema-driven: input/output types from gen/ts/identity.ts (generated from identity.capnp).
 
+import { ED25519 } from "./platform";
+
 // Types from the schema (would import from gen/ts/identity.ts, but
 // we keep it simple and define the wire format inline to avoid
 // build-time dependency on the generated code for now)
@@ -185,7 +187,7 @@ export async function handleCertExchange(
     try {
       const proofBytes = Uint8Array.from(atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
       const valid = await crypto.subtle.verify(
-        "Ed25519" as any, signingPubKey, proofBytes, bindingPayload,
+        ED25519, signingPubKey, proofBytes, bindingPayload,
       );
       if (!valid) return Response.json({ error: "Ed25519 proof-of-possession failed" }, { status: 401 });
     } catch (e: any) {

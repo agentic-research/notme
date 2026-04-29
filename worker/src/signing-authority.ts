@@ -312,7 +312,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Sign arbitrary data with the authority key.
   async sign(data: ArrayBuffer): Promise<ArrayBuffer> {
     const { signingKey } = await this.getOrCreateSigningKey();
-    return crypto.subtle.sign("Ed25519" as any, signingKey, data);
+    return crypto.subtle.sign(ED25519, signingKey, data);
   }
 
   // Mint a DPoP-bound access token inside the DO — CryptoKey never crosses RPC.
@@ -453,11 +453,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const canonical = new TextEncoder().encode(JSON.stringify(sorted));
 
     // Sign
-    const sig = await crypto.subtle.sign(
-      "Ed25519" as any,
-      signingKey,
-      canonical,
-    );
+    const sig = await crypto.subtle.sign(ED25519, signingKey, canonical);
     const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
 
     return { ...bundle, signature: sigB64 } as CABundle;

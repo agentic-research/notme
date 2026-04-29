@@ -5,7 +5,7 @@ export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
-import type { Platform } from "./src/platform";
+import { ED25519, type Platform } from "./src/platform";
 
 // ── Private RPC surface — only callable via service binding ──
 // Consuming Workers bind to this entrypoint:
@@ -198,7 +198,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     }
 
     const signature = await crypto.subtle.sign(
-      "Ed25519" as any,
+      ED25519,
       heldCerts.signingKey,
       payload,
     );
@@ -414,7 +414,7 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
   try {
     const proofBytes = Uint8Array.from(atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
     const valid = await crypto.subtle.verify(
-      "Ed25519" as any,
+      ED25519,
       signingPubKey,
       proofBytes,
       bindingPayload,

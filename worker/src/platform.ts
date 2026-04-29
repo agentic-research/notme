@@ -7,8 +7,24 @@
 
 export type KeyStorageMode = "ephemeral" | "encrypted" | "cf-managed";
 
-// Ed25519 is not in the WebCrypto TypeScript types (@cloudflare/workers-types).
-// Single declaration avoids scattered `as any` casts in security-critical code.
+// Ed25519 algorithm identifier — single declaration so security-critical
+// crypto call sites stay type-clean.
+//
+// CF Workers' WebCrypto runtime fully implements Ed25519 (BoringSSL); the
+// TypeScript DOM lib's `SubtleCrypto.sign`/`verify` overloads, however, do
+// not yet enumerate it as a valid AlgorithmIdentifier, and
+// `@cloudflare/workers-types` doesn't extend the algorithm union for it.
+// The `as any` here is a typing workaround, not a security bypass — the
+// algorithm string is forwarded to the runtime verbatim.
+//
+// All production sign/verify call sites import this constant rather than
+// inlining their own cast. When the lib types catch up (or workers-types
+// adds the entry), drop the `as any` here and every call site gets fixed
+// for free. Tests inline their own `"Ed25519" as any` casts because they
+// often need to construct distinct algorithm objects (importKey vs sign);
+// keeping this constant production-only avoids changing test plumbing.
+//
+// See SECURITY.md "Ed25519 typing workaround" for the audit note.
 export const ED25519 = { name: "Ed25519" } as any;
 
 export interface CacheStore {
