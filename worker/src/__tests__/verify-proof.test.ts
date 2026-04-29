@@ -96,20 +96,22 @@ describe("oidc.connections.audience-binding", () => {
     ).rejects.toThrow(/wrong audience/);
   });
 
-  it("verifyProof without expected audience is permissive (legacy path)", async () => {
-    // Without an expectedAudience, the check at verify-proof.ts:108 is
-    // skipped — verification proceeds to JWKS fetch. We assert it gets
-    // PAST the audience check (i.e. throws something other than "wrong
-    // audience"); the failure mode here is the JWKS fetch hitting an
-    // untrusted-issuer or network error, not an audience mismatch.
+  it("verifyProof requires expectedAudience at the type level (regression)", async () => {
+    // Earlier this argument was optional, which let /connections (and any
+    // future caller that omitted it) skip the audience check entirely.
+    // Now the parameter is required by the type signature; the test below
+    // simply exercises the value-pin contract — TypeScript would reject a
+    // call site that omits the audience at compile time.
     const token = makeJwt({
-      iss: "https://untrusted-issuer.example",
-      sub: "anyone",
+      iss: "https://accounts.google.com",
+      sub: "victim@gmail.com",
       aud: "evil-app.com",
       exp: FUTURE_EXP,
     });
+    // X.509 path also accepts the parameter for signature-uniformity even
+    // though certs don't carry an aud claim — the value is ignored.
     await expect(
-      verifyProof({ type: "oidc", token }),
-    ).rejects.toThrow(/untrusted issuer/);
+      verifyProof({ type: "oidc", token }, undefined, "notme.bot"),
+    ).rejects.toThrow(/wrong audience/);
   });
 });

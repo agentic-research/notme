@@ -22,7 +22,7 @@
 
 | threat | attack | defense | test |
 |--------|--------|---------|------|
-| audience confused deputy | submit an OIDC token issued for a different app (audience=evil-app.com) — `verifyOIDC` accepts it because no audience is enforced | **FIXED** — every OIDC-accepting route passes `expectedAudience: "notme.bot"` to `verifyProof`/`verifyOIDC`. /connections previously omitted this and was patched in notme-567f07; without the fix, a stolen OIDC token issued for a different app could link `(issuer, victim_subject) → attacker's principal`, silently routing the victim's first notme OIDC sign-in into the attacker's account. | `oidc.audience.confused-deputy`, `oidc.connections.audience-binding` |
+| audience confused deputy | submit an OIDC token issued for a different app (audience=evil-app.com) — `verifyOIDC` accepts it because no audience is enforced | **FIXED + STRUCTURALLY GUARDED** — `expectedAudience` is now a REQUIRED parameter on `verifyOIDC` and `verifyProof` (no longer optional). Every OIDC-accepting route passes `"notme.bot"`. /connections previously omitted it and was patched in notme-567f07; the type-level requirement makes the bug class extinct — TS rejects callers that try to skip the check. The `if (expectedAudience)` skip branch is also removed; the audience comparison runs unconditionally. | `oidc.audience.confused-deputy`, `oidc.connections.audience-binding` |
 | token expiry | replay an old OIDC token | `exp` claim enforced in `verifyOIDC` before audience check | `oidc.audience.confused-deputy` (expired-before-aud sanity) |
 | issuer spoofing | unrecognized `iss` claim used to bypass JWKS routing | `TRUSTED_ISSUERS` allowlist in verify-proof.ts (Google, GitHub Actions, auth.notme.bot) | covered via verify-proof's SSRF guard |
 

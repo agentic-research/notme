@@ -77,13 +77,16 @@ async function fetchJWKS(issuer: string): Promise<JWK[]> {
 /**
  * Verify an OIDC token with mandatory audience validation.
  *
- * expectedAudience prevents confused deputy attacks: a token issued for
- * evil-app.com (same Google issuer, same user sub) must be rejected
- * because its aud doesn't match notme's client ID.
+ * `expectedAudience` is REQUIRED. It prevents confused deputy attacks: a
+ * token issued for evil-app.com (same Google issuer, same user sub) must
+ * be rejected because its aud doesn't match notme's client ID. Earlier
+ * the parameter was optional and `/connections` forgot to pass it (see
+ * notme-567f07); making it required at the type level kills the bug
+ * class — TS rejects callers that try to skip the check.
  */
 export async function verifyOIDC(
   token: string,
-  expectedAudience?: string | string[],
+  expectedAudience: string | string[],
 ): Promise<VerifiedIdentity> {
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("malformed JWT");
@@ -104,18 +107,16 @@ export async function verifyOIDC(
   if (typeof exp !== "number") throw new Error("missing exp claim");
   if (exp < Math.floor(Date.now() / 1000)) throw new Error("token expired");
 
-  // Audience validation — prevents confused deputy (cross-application token replay)
-  if (expectedAudience) {
-    const tokenAud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-    const expectedArr = Array.isArray(expectedAudience) ? expectedAudience : [expectedAudience];
-    const valid = tokenAud.some((a: unknown) =>
-      typeof a === "string" && expectedArr.includes(a),
+  // Audience validation — always runs. Confused-deputy defense.
+  const tokenAud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  const expectedArr = Array.isArray(expectedAudience) ? expectedAudience : [expectedAudience];
+  const audienceOk = tokenAud.some((a: unknown) =>
+    typeof a === "string" && expectedArr.includes(a),
+  );
+  if (!audienceOk) {
+    throw new Error(
+      `wrong audience: expected ${expectedArr.join(",")}, got ${tokenAud.join(",")}`,
     );
-    if (!valid) {
-      throw new Error(
-        `wrong audience: expected ${expectedArr.join(",")}, got ${tokenAud.join(",")}`,
-      );
-    }
   }
 
   // Fetch JWKS and verify signature
@@ -202,14 +203,17 @@ export async function verifyX509(
 
 export async function verifyProof(
   proof: Proof,
-  caPublicKeyPem?: string,
-  expectedAudience?: string | string[],
+  caPublicKeyPem: string | undefined,
+  expectedAudience: string | string[],
 ): Promise<VerifiedIdentity> {
   if (proof.type === "oidc") {
     return verifyOIDC(proof.token, expectedAudience);
   }
   if (proof.type === "x509") {
     if (!caPublicKeyPem) throw new Error("CA public key required for x509 verification");
+    // expectedAudience is unused here — certs don't carry an aud claim. We
+    // still take it as a required argument so callers can't accidentally
+    // route a token-issuing flow through this function without one.
     return verifyX509(proof.cert, caPublicKeyPem);
   }
   // Exhaustiveness: if Proof gains a new variant, the line below fails to
