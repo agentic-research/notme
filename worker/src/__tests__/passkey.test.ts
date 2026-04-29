@@ -197,6 +197,44 @@ describe("passkey.challenge.session-binding", () => {
     return btoa(json).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
+  /**
+   * SQL mock that records every call AND returns matching rows for
+   * the SELECT-WHERE-challenge pattern. Pre-seeds two challenge rows so
+   * the M3 test can assert lookup hits the right one.
+   */
+  function makeRecordingSqlForChallenges(
+    calls: { query: string; params: unknown[] }[],
+  ) {
+    const tables: Record<string, any[]> = {
+      passkey_challenges: [
+        { challenge: "alice-challenge", type: "authentication", created_at: "2026-04-29 12:00:00" },
+        { challenge: "bob-challenge", type: "authentication", created_at: "2026-04-29 12:00:01" },
+      ],
+      passkey_credentials: [],
+      passkey_users: [],
+    };
+    return {
+      _tables: tables,
+      exec(query: string, ...params: unknown[]) {
+        calls.push({ query, params });
+        const q = query.trim().toUpperCase();
+        if (q.startsWith("CREATE TABLE")) return { toArray: () => [] };
+        if (q.startsWith("SELECT")) {
+          const m = query.match(/FROM (\w+)/i);
+          const table = m ? tables[m[1]] ?? [] : [];
+          if (query.includes("WHERE") && params.length > 0) {
+            const filtered = table.filter((row) =>
+              Object.values(row).some((v) => v === params[0]),
+            );
+            return { toArray: () => filtered };
+          }
+          return { toArray: () => table };
+        }
+        return { toArray: () => [] };
+      },
+    };
+  }
+
   function makeAuthResponse(challenge: string, credId = "cred-1") {
     return {
       id: credId,
@@ -274,6 +312,53 @@ describe("passkey.challenge.session-binding", () => {
       sql,
     );
     expect(result.verified).toBe(false);
+  });
+
+  it("two concurrent flows do not stomp each other (rosary-9b969c, M3)", async () => {
+    // The structural fix at passkey.ts:248 changed the lookup from
+    //   ORDER BY created_at DESC LIMIT 1
+    // to
+    //   WHERE challenge = ? AND type = 'authentication' AND created_at > ...
+    //
+    // The earlier "regression guard" test only proved the function
+    // doesn't throw on an empty table — it never exercised two
+    // concurrent flows. Sub-agent (notme-ae9c1b / aa0878f69907df240)
+    // flagged this as M3.
+    //
+    // Strategy: enhance the mock to record every SQL statement
+    // run, pre-seed two challenges (alice + bob), submit alice's
+    // assertion, and assert that the lookup query was
+    // parameterized with alice-challenge — NOT the most-recent
+    // bob-challenge. The query's text is also asserted to include
+    // `challenge = ?` (the fix) and to NOT include
+    // `ORDER BY created_at DESC` (the bug).
+    const calls: { query: string; params: unknown[] }[] = [];
+    const sql = makeRecordingSqlForChallenges(calls);
+
+    await verifyAuthentication(
+      makeAuthResponse("alice-challenge") as any,
+      "auth.notme.bot",
+      "https://auth.notme.bot",
+      sql,
+    );
+
+    // Find the SELECT against passkey_challenges that filters by type=authentication.
+    const lookupQuery = calls.find(
+      (c) =>
+        c.query.includes("FROM passkey_challenges") &&
+        c.query.includes("type = 'authentication'") &&
+        c.query.toUpperCase().startsWith("SELECT"),
+    );
+    expect(lookupQuery, "expected a SELECT against passkey_challenges").toBeTruthy();
+
+    // The fix asserts: lookup is parameterized by challenge value,
+    // not by ORDER BY DESC LIMIT 1.
+    expect(lookupQuery!.query).toMatch(/challenge\s*=\s*\?/);
+    expect(lookupQuery!.query).not.toMatch(/ORDER\s+BY\s+created_at\s+DESC/i);
+
+    // The submitted challenge value must be the param — meaning the
+    // lookup filters to alice's row, not bob's row that came later.
+    expect(lookupQuery!.params[0]).toBe("alice-challenge");
   });
 
   it("authentication options query no longer uses ORDER BY DESC LIMIT 1", async () => {
