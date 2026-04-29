@@ -78,6 +78,82 @@ describe("oidc.audience.confused-deputy", () => {
   });
 });
 
+describe("oidc.issuer.allowlist (notme-ae65a0, M1)", () => {
+  // Google is intentionally absent from TRUSTED_ISSUERS — Google ID tokens
+  // carry aud=<client-id>.apps.googleusercontent.com so they can never match
+  // the "notme.bot" audience pin used by /connections, /auth/oidc/login,
+  // /join. Including Google would be misleading. A proper fix needs a
+  // per-issuer audience map (filed elsewhere); until then, failing fast at
+  // the issuer-trust check gives a clearer error than "wrong audience" on
+  // every legitimate Google token.
+
+  it("rejects Google as untrusted issuer when audience would otherwise pass", async () => {
+    // Audience matches what /connections expects — would pass the audience
+    // check. The trust check at fetchJWKS fires next and surfaces the
+    // architectural gap clearly.
+    const token = makeJwt({
+      iss: "https://accounts.google.com",
+      sub: "alice@gmail.com",
+      aud: "notme.bot",
+      exp: FUTURE_EXP,
+    });
+    await expect(verifyOIDC(token, "notme.bot")).rejects.toThrow(
+      /untrusted issuer/,
+    );
+  });
+
+  it("accepts auth.notme.bot as trusted issuer (still 'untrusted' would fail later)", async () => {
+    // Self-issued tokens get past trust + audience and proceed to JWKS
+    // fetch + signature verify. We can't run those without a network or
+    // mocked JWKS — but reaching that step (different error: JWKS fetch
+    // failure rather than "untrusted issuer") proves the issuer was
+    // accepted. Test asserts the failure message is NOT the trust error.
+    const token = makeJwt({
+      iss: "https://auth.notme.bot",
+      sub: "principal-test",
+      aud: "notme.bot",
+      exp: FUTURE_EXP,
+    });
+    let err: Error | null = null;
+    try {
+      await verifyOIDC(token, "notme.bot");
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeTruthy();
+    expect(err!.message).not.toMatch(/untrusted issuer/);
+  });
+
+  it("accepts GHA token issuer as trusted (workflow can request aud=notme.bot)", async () => {
+    const token = makeJwt({
+      iss: "https://token.actions.githubusercontent.com",
+      sub: "repo:agentic-research/notme:ref:refs/heads/main",
+      aud: "notme.bot",
+      exp: FUTURE_EXP,
+    });
+    let err: Error | null = null;
+    try {
+      await verifyOIDC(token, "notme.bot");
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeTruthy();
+    expect(err!.message).not.toMatch(/untrusted issuer/);
+  });
+
+  it("rejects an attacker-controlled iss that's not in the allowlist", async () => {
+    const token = makeJwt({
+      iss: "https://attacker.example",
+      sub: "anyone",
+      aud: "notme.bot",
+      exp: FUTURE_EXP,
+    });
+    await expect(verifyOIDC(token, "notme.bot")).rejects.toThrow(
+      /untrusted issuer/,
+    );
+  });
+});
+
 describe("oidc.connections.audience-binding", () => {
   // Threat: /connections (POST) used to call verifyProof with no expected
   // audience, letting an attacker who held a Google OIDC token issued for a
