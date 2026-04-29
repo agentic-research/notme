@@ -41,6 +41,13 @@ export interface Env {
   ADMIN_SUB: string;
   /** Secret string used to derive the KEK for credential encryption. */
   VAULT_KEK_SECRET: string;
+  /**
+   * Vault's own URL — used as the expected `aud` claim on incoming
+   * access tokens. Resource servers MUST validate audience to prevent
+   * confused-deputy: a token minted for rosary.bot would otherwise be
+   * accepted by vault since both share notme's signing key.
+   */
+  VAULT_AUDIENCE: string;
 }
 
 export default {
@@ -96,6 +103,10 @@ export default {
             const claims = await verifyAccessToken({
               token: accessToken,
               jwksUrl: "https://auth.notme.bot/.well-known/jwks.json",
+              // Audience pin — rejects tokens minted for a different
+              // resource server (rosary.bot, mache.rosary.bot, etc.) so
+              // a stolen-from-elsewhere token can't be replayed at vault.
+              audience: env.VAULT_AUDIENCE,
             });
             return claims.sub;
           } catch {

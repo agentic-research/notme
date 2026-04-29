@@ -9,7 +9,7 @@
  * mismatched audience throws synchronously on the audience branch.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeAll } from "vitest";
 import { verifyOIDC, verifyProof } from "../auth/verify-proof";
 
 // Build a minimal JWT (header.payload.sig) with the given audience claim.
@@ -120,27 +120,88 @@ describe("oidc.x509.ca-pem-shape", () => {
   // Threat: caller passes the CA's bare SPKI PEM ("PUBLIC KEY") to
   // verifyX509 instead of the CA's X.509 CERTIFICATE PEM. The function
   // does `new X509Certificate(caPublicKeyPem)` which fails on SPKI input,
-  // producing 401 on every legitimate cert. This is rosary-9b7d67. Test
-  // ensures verifyX509 surfaces a recognisable error rather than masking
-  // the shape mismatch.
+  // producing 401 on every legitimate cert. This is rosary-9b7d67.
+  //
+  // The test below uses a well-formed leaf cert (minted in beforeAll
+  // from a real CA keypair) as the user-cert input — so verifyX509
+  // gets PAST the leaf-cert parse and fails specifically at the
+  // CA-cert parse step, which is the path the bug actually affected.
 
-  const SPKI_PEM = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=
------END PUBLIC KEY-----`;
+  let leafCertPem: string;
+  let caCertPem: string;
+  let caSpkiPem: string;
 
-  it("rejects when caPublicKeyPem is a SPKI 'PUBLIC KEY' instead of a 'CERTIFICATE'", async () => {
-    // Hand-craft a minimal cert PEM (fake — won't pass signature) just so
-    // verifyX509 gets past the first parse and fails at the CA-cert parse.
-    const fakeCertPem = `-----BEGIN CERTIFICATE-----
-MIIBlzCCAUmgAwIBAgIQfD4tEgEAAAAAAAAAAAAAADAFBgMrZXAwGzELMAkGA1UE
-BhMCVVMxDDAKBgNVBAoMA290cjAeFw0yNDAxMDEwMDAwMDBaFw0yNTAxMDEwMDAw
------END CERTIFICATE-----`;
-    // Use the dispatcher (verifyProof) rather than internal verifyX509 to
-    // mirror the real call path. The fakeCertPem may itself fail to
-    // parse — what we're guarding is that SPKI-as-CA can't silently
-    // succeed (that would be the bug rosary-9b7d67 reintroduced).
+  beforeAll(async () => {
+    const { X509CertificateGenerator } = await import("@peculiar/x509");
+    const ED25519 = "Ed25519" as any;
+
+    const ca = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+
+    const leaf = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+
+    const now = new Date();
+    const expires = new Date(now.getTime() + 5 * 60 * 1000);
+
+    const caCert = await X509CertificateGenerator.create({
+      subject: "CN=test-ca",
+      issuer: "CN=test-ca",
+      notBefore: now,
+      notAfter: expires,
+      signingAlgorithm: ED25519,
+      publicKey: ca.publicKey,
+      signingKey: ca.privateKey,
+      serialNumber: "01",
+    });
+    caCertPem = caCert.toString("pem");
+
+    const leafCert = await X509CertificateGenerator.create({
+      subject: "CN=test-principal",
+      issuer: "CN=test-ca",
+      notBefore: now,
+      notAfter: expires,
+      signingAlgorithm: ED25519,
+      publicKey: leaf.publicKey,
+      signingKey: ca.privateKey,
+      serialNumber: "02",
+    });
+    leafCertPem = leafCert.toString("pem");
+
+    // Build a SPKI "PUBLIC KEY" PEM from the CA's public key — the
+    // wrong shape that the bug fed to verifyX509 as caPublicKeyPem.
+    const spki = (await crypto.subtle.exportKey(
+      "spki",
+      ca.publicKey,
+    )) as ArrayBuffer;
+    const spkiB64 = btoa(String.fromCharCode(...new Uint8Array(spki)));
+    const spkiLines = spkiB64.match(/.{1,64}/g)!.join("\n");
+    caSpkiPem = `-----BEGIN PUBLIC KEY-----\n${spkiLines}\n-----END PUBLIC KEY-----`;
+  });
+
+  it("succeeds when caPublicKeyPem is the CA CERTIFICATE PEM (control)", async () => {
+    // Sanity: the well-formed leaf cert + correctly-shaped CA cert PEM
+    // should validate. Without this control, a "rejects" assertion in
+    // the next case might be passing for the wrong reason.
+    const identity = await verifyProof(
+      { type: "x509", cert: leafCertPem },
+      caCertPem,
+      "notme.bot",
+    );
+    expect(identity.type).toBe("x509");
+    expect(identity.subject).toBe("test-principal");
+  });
+
+  it("rejects when caPublicKeyPem is SPKI 'PUBLIC KEY' instead of CERTIFICATE", async () => {
+    // The leaf cert IS valid, so verifyX509 reaches the CA-parse step.
+    // Passing SPKI there throws inside `new X509Certificate(...)` with
+    // a recognisable parse error — the bug class rosary-9b7d67 fixed.
     await expect(
-      verifyProof({ type: "x509", cert: fakeCertPem }, SPKI_PEM, "notme.bot"),
+      verifyProof({ type: "x509", cert: leafCertPem }, caSpkiPem, "notme.bot"),
     ).rejects.toThrow();
   });
 });

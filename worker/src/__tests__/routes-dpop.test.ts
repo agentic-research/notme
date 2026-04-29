@@ -231,10 +231,16 @@ describe("handleToken", () => {
   });
 
   it("stores JTI before minting (TOCTOU, rosary-9b969c)", async () => {
-    // The order is: replay-check → store → mint. If store throws, mint
-    // must NOT run. This is the test that distinguishes from the prior
-    // bug, which minted first and stored after — meaning a store error
-    // would leave a minted token in the wild without a recorded JTI.
+    // True ordering test: instrument BOTH callbacks so we observe the
+    // call sequence. The earlier "throw from storeJti and check no token
+    // returned" test couldn't distinguish bug from fix — under either
+    // order the throw propagates and result.ok is false. Code-reviewer
+    // sub-agent caught this (HIGH).
+    //
+    // Strategy: wrap the signingKey with a Proxy that intercepts the
+    // .sign() that mintAccessToken eventually calls (via crypto.subtle.
+    // sign). When that fires, we record "mint-sign". storeJti records
+    // "store". Asserting events[0] === "store" means store ran first.
     const handleToken = await getHandler();
     const proof = await buildDpopProof({
       keyPair: dpopKeyPair,
@@ -242,18 +248,20 @@ describe("handleToken", () => {
       htu: "https://auth.notme.bot/token",
     });
 
-    let mintCalled = false;
-    // Spy via a wrapped signingKey: replace the .sign-capable cryptoKey
-    // with one that flips the flag when used. mintAccessToken calls
-    // crypto.subtle.sign on the key — easy to intercept by extracting the
-    // raw key and re-importing as a usage-only proxy. Simpler: just
-    // observe whether the function returns ok. If store throws before
-    // mint, the function should propagate the error (no ok=true result),
-    // and we confirm mint didn't produce a token.
-    let result: any;
-    let threwFromStore = false;
+    const events: string[] = [];
+
+    // crypto.subtle.sign is global; monkey-patch for the duration of
+    // this test, restore after. We only want to record the sign call
+    // that mintAccessToken makes — DPoP proof verification uses
+    // crypto.subtle.verify, not sign, so no false hit.
+    const origSign = crypto.subtle.sign.bind(crypto.subtle);
+    (crypto.subtle as any).sign = (...args: unknown[]) => {
+      events.push("mint-sign");
+      return origSign(...(args as Parameters<typeof origSign>));
+    };
+
     try {
-      result = await handleToken({
+      const result = await handleToken({
         dpopProof: proof,
         session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
         tokenEndpointUrl: "https://auth.notme.bot/token",
@@ -262,19 +270,21 @@ describe("handleToken", () => {
         keyId: "test-kid",
         checkJtiReplay: async () => false,
         storeJti: async () => {
-          throw new Error("store failed");
+          events.push("store");
         },
       });
-      mintCalled = result?.ok === true;
-    } catch (e: any) {
-      threwFromStore = e.message === "store failed";
+      expect(result.ok).toBe(true);
+    } finally {
+      (crypto.subtle as any).sign = origSign;
     }
 
-    // store-failed: either the function propagates the throw OR returns
-    // a non-ok result. In neither case should mint have produced a token
-    // (would mean the order was swapped).
-    expect(mintCalled).toBe(false);
-    expect(threwFromStore || (result && !result.ok)).toBe(true);
+    // The fix order: replay-check, store, mint. The buggy order was
+    // store after mint. If "mint-sign" appears before "store", the bug
+    // is back.
+    const storeIdx = events.indexOf("store");
+    const mintIdx = events.indexOf("mint-sign");
+    expect(storeIdx).toBeGreaterThanOrEqual(0);
+    expect(mintIdx).toBeGreaterThan(storeIdx);
   });
 });
 

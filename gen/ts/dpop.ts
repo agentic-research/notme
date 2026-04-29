@@ -31,17 +31,23 @@ export interface VerifyAccessTokenOptions {
   /** Provide the Ed25519 public key directly — skips JWKS fetch entirely. */
   publicKey?: CryptoKey;
   /**
-   * Expected audience — string or array. When set, rejects tokens whose
-   * `aud` claim doesn't match. Resource servers SHOULD set this to their
-   * own URL to prevent confused-deputy: a token minted for a different
-   * resource server (same notme issuer, same public key) would otherwise
-   * pass this verifier (rosary-81353c).
+   * Expected audience — string or array. REQUIRED. Resource servers MUST
+   * set this to their own URL to prevent confused-deputy: a token minted
+   * for a different resource server (same notme issuer, same public key)
+   * would otherwise pass this verifier.
+   *
+   * The worker side made `expectedAudience` required at the type level
+   * for verifyOIDC/verifyProof; the SDK now mirrors that for symmetry.
+   * If a caller genuinely doesn't want audience pinning (test fixtures,
+   * a future federated-issuer setup), pass an empty array `[]` and the
+   * caller takes ownership of any failure mode that creates.
    */
-  audience?: string | string[];
+  audience: string | string[];
   /**
    * Expected issuer — when set, rejects tokens whose `iss` claim doesn't
-   * match. Defaults to no check at the SDK level so tests / non-notme
-   * issuers work; notme-internal callers should pass `"https://auth.notme.bot"`.
+   * match. Defaults to no check so the SDK works with self-hosted notme
+   * deployments under different domains; notme-internal callers should
+   * pass `"https://auth.notme.bot"`.
    */
   issuer?: string;
 }

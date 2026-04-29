@@ -689,6 +689,7 @@ describe("verifyAccessToken", () => {
       token,
       jwksUrl: JWKS_URL,
       publicKey: edKp.publicKey,
+      audience: "https://rosary.bot",
     });
 
     expect(claims.sub).toBe("principal:alice");
@@ -707,7 +708,12 @@ describe("verifyAccessToken", () => {
     });
 
     await expect(
-      verifyAccessToken({ token, jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
+      verifyAccessToken({
+        token,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+        audience: "https://rosary.bot",
+      }),
     ).rejects.toThrow(/expired/i);
   });
 
@@ -719,13 +725,23 @@ describe("verifyAccessToken", () => {
     });
 
     await expect(
-      verifyAccessToken({ token, jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
+      verifyAccessToken({
+        token,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+        audience: "https://rosary.bot",
+      }),
     ).rejects.toThrow(/signature/i);
   });
 
   it("rejects malformed token", async () => {
     await expect(
-      verifyAccessToken({ token: "bad", jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
+      verifyAccessToken({
+        token: "bad",
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+        audience: "https://rosary.bot",
+      }),
     ).rejects.toThrow(/malformed|parts/i);
   });
 
@@ -787,6 +803,7 @@ describe("verifyAccessToken", () => {
         token,
         jwksUrl: JWKS_URL,
         publicKey: edKp.publicKey,
+        audience: "https://victim.example",
         issuer: "https://different-issuer.example",
       }),
     ).rejects.toThrow(/iss.*claim.*mismatch/i);
@@ -797,7 +814,12 @@ describe("verifyAccessToken", () => {
     // since mintUnboundToken always sets sub.
     const header = { alg: "EdDSA", typ: "at+jwt", kid: "test" };
     const now = Math.floor(Date.now() / 1000);
-    const payload = { exp: now + 300, iat: now, iss: "https://auth.notme.bot" };
+    const payload = {
+      exp: now + 300,
+      iat: now,
+      iss: "https://auth.notme.bot",
+      aud: "https://rosary.bot", // matches the test's audience option below
+    };
     const enc = (o: unknown) =>
       btoa(JSON.stringify(o))
         .replace(/\+/g, "-")
@@ -822,6 +844,7 @@ describe("verifyAccessToken", () => {
         token: noSubToken,
         jwksUrl: JWKS_URL,
         publicKey: edKp.publicKey,
+        audience: "https://rosary.bot",
       }),
     ).rejects.toThrow(/sub.*claim.*missing/i);
   });
@@ -837,9 +860,17 @@ describe("verifyAccessToken", () => {
       scope: "read",
     });
 
-    // verifyAccessToken (Bearer path) must reject tokens with cnf claim
+    // verifyAccessToken (Bearer path) must reject tokens with cnf claim.
+    // Audience pinned to mintToken's default so the cnf-rejection fires
+    // before the audience check (the order doesn't matter for security
+    // here, but the test wants to assert the cnf path specifically).
     await expect(
-      verifyAccessToken({ token, jwksUrl: JWKS_URL, publicKey: edKp.publicKey }),
+      verifyAccessToken({
+        token,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+        audience: "https://example.com",
+      }),
     ).rejects.toThrow(/dpop.bound|cnf|bearer/i);
   });
 });
