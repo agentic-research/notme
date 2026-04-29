@@ -41,11 +41,11 @@ The action stops outputting `bridge_key`. It starts the local workerd (or connec
 graph TD
     A["Agent<br/>(Claude Code, MCP, CLI)"]
 
-    subgraph LOCAL["LOCAL PLANE (workerd)"]
-        L1["Holds bridge cert + key in memory"]
-        L2["Enforces scope before requests leave"]
-        L3["Generates ephemeral keypairs (CSR pattern)"]
-        L4["Signs/proxies on behalf of agent (phase C)"]
+    subgraph LOCAL["LOCAL PLANE (workerd + notme-proxy)"]
+        L1["workerd: enforces scope before requests leave"]
+        L2["workerd: generates ephemeral keypairs (CSR pattern)"]
+        L3["notme-proxy: holds bridge cert + key in memory"]
+        L4["notme-proxy: attaches mTLS bridge cert on outbound TLS"]
     end
 
     subgraph EDGE["EDGE PLANE (CF WAF / auth.notme.bot)"]
@@ -77,7 +77,10 @@ interface Platform {
   readonly keyStorage: KeyStorageMode;
   readonly cache: CacheStore;
   rateLimit?(key: string): Promise<boolean>;
-  // Phase C: proxy?(req, identity), holdCredential?(cert)
+  // Phase C: holdCredential?(cert).  Note: outbound mTLS is no longer a
+  // Platform method — it lives in a separate Rust process (notme-proxy)
+  // because the bridge cert needs a process boundary workerd can't
+  // introspect.  See "Phase C — partial: notme-proxy crate landed" below.
 }
 
 interface CacheStore {
@@ -317,14 +320,17 @@ Every endpoint gets a "try to hack it" test alongside the happy path. Tests are 
 7. Adversarial tests for key extraction, replay, scope escalation
 8. Container image builds and pushes to ghcr.io
 
-### Phase C (future spec, designed for in A)
+### Phase C — partial: notme-proxy crate landed
 
-1. `Platform.proxy()` — mTLS outbound on behalf of agents
-2. `Platform.holdCredential()` — in-memory credential store
-3. Action starts workerd, outputs `NOTME_URL` instead of `bridge_key`
-4. Agent auth for headless consumers (API key seeded at startup or TOFU)
-5. Destination allowlist / routing table for proxy mode
-6. TLS socket in `config.capnp` for non-localhost deployments
+1. ~~`Platform.proxy()` — mTLS outbound on behalf of agents~~ → **implemented as a separate Rust crate** at `proxy/src/main.rs` rather than a JS abstraction inside the Worker. Rationale: the bridge cert private key needs to live in a process workerd can't introspect; a sibling Rust process gives a hard isolation boundary that a Worker function cannot. workerd Workers call `fetch()` against the proxy and the proxy attaches the bridge cert during the upstream TLS handshake.
+   - Listen modes: `--listen 127.0.0.1:1080` (TCP) or `--listen unix:/path/to/sock` (UDS, owner-only 0600 perms)
+   - Stale-socket refusal: refuses to remove non-socket files at the configured path; uses `symlink_metadata` so a typo like `unix:./bridge-cert.pem` won't clobber the cert
+   - Tested in `proxy/src/main.rs` — 11 cargo tests covering listen-addr parsing, UDS bind, perms, round-trip accept
+2. `Platform.holdCredential()` — in-memory credential store *(not started)*
+3. Action starts workerd, outputs `NOTME_URL` instead of `bridge_key` *(done — see action/action.yml)*
+4. Agent auth for headless consumers (API key seeded at startup or TOFU) *(not started)*
+5. Destination allowlist / routing table for proxy mode *(not started — proxy currently forwards to any HTTPS upstream the caller names)*
+6. TLS socket in `config.capnp` for non-localhost deployments *(not started)*
 
 ## Files changed
 
