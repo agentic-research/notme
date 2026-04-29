@@ -47,6 +47,7 @@
 | epoch bypass | use cert from old epoch after rotation | epoch check in revocation verifier | `revocation.epoch.mismatch` |
 | bundle forgery | publish unsigned/tampered bundle | bundle Ed25519-signed by DO key | `bundle.signature.verification` |
 | stale bundle | serve expired bundle | BUNDLE_MAX_AGE_MS (5 min) staleness check | `bundle.staleness` |
+| leaf cert misuse | use mTLS cert as a CA, or use signing cert in TLS | leaf certs declare BasicConstraints CA=false (critical), KeyUsage scoped per cert (mTLS: digitalSignature+keyAgreement; signing: digitalSignature only), ExtendedKeyUsage clientAuth on mTLS cert. Strict X.509 validators (rustls/boringssl) enforce. | `cert-authority.leaf-extensions` |
 
 ### 4. DPoP token endpoint (POST /token)
 

@@ -6,8 +6,43 @@
 //
 // OIDs match the Go authority (cmd/signet/authority.go) for cert format parity.
 
-import { X509CertificateGenerator, Extension } from "@peculiar/x509";
+import {
+  X509CertificateGenerator,
+  Extension,
+  BasicConstraintsExtension,
+  KeyUsagesExtension,
+  KeyUsageFlags,
+  ExtendedKeyUsageExtension,
+} from "@peculiar/x509";
 import { ED25519 } from "./platform";
+
+// Leaf-cert extensions — declare what each cert is for so strict X.509
+// validators (rustls, boringssl, openssl 3) can enforce. Without these, the
+// signing cert can't be used by validators that require explicit
+// digitalSignature KeyUsage (e.g. ley-line manifest receivers).
+//
+// BasicConstraints CA=false marks both certs as end-entity (not CAs).
+// Marked critical per RFC 5280 §4.2.1.9.
+const BASIC_CONSTRAINTS_LEAF = new BasicConstraintsExtension(false, undefined, true);
+
+// mTLS cert: digitalSignature (TLS handshake signing) + keyAgreement
+// (ECDHE in TLS 1.2+); ExtendedKeyUsage clientAuth so validators that
+// enforce EKU on TLS clients accept it.
+const MTLS_KEY_USAGE = new KeyUsagesExtension(
+  KeyUsageFlags.digitalSignature | KeyUsageFlags.keyAgreement,
+  true,
+);
+const CLIENT_AUTH_EKU = new ExtendedKeyUsageExtension(
+  ["1.3.6.1.5.5.7.3.2"], // id-kp-clientAuth
+  false,
+);
+
+// Signing cert: digitalSignature is sufficient for arbitrary payload
+// signatures (ley-line manifests, git commits, attestations, DSSE).
+const SIGNING_KEY_USAGE = new KeyUsagesExtension(
+  KeyUsageFlags.digitalSignature,
+  true,
+);
 
 const OID_SUBJECT = "1.3.6.1.4.1.99999.1.1"; // Subject identity
 const OID_ISSUANCE_TIME = "1.3.6.1.4.1.99999.1.2"; // Issuance time (RFC3339)
@@ -124,6 +159,13 @@ export async function mintGHABridgeCert(
     .getRandomValues(new Uint8Array(16))
     .reduce((s, b) => s + b.toString(16).padStart(2, "0"), "");
 
+  // GHA legacy single cert is used as a TLS client cert AND for arbitrary
+  // signing — set both digitalSignature and keyAgreement, plus clientAuth EKU.
+  const ghaKeyUsage = new KeyUsagesExtension(
+    KeyUsageFlags.digitalSignature | KeyUsageFlags.keyAgreement,
+    true,
+  );
+
   const cert = await X509CertificateGenerator.create({
     subject: `CN=${subject},O=notme`,
     issuer: `CN=signet-authority,O=notme`,
@@ -134,6 +176,9 @@ export async function mintGHABridgeCert(
     signingKey: signingKey,
     serialNumber: serial,
     extensions: [
+      BASIC_CONSTRAINTS_LEAF,
+      ghaKeyUsage,
+      CLIENT_AUTH_EKU,
       new Extension(OID_SUBJECT, false, derUtf8String(subject)),
       new Extension(OID_ISSUANCE_TIME, false, derUtf8String(now.toISOString())),
     ],
@@ -244,7 +289,13 @@ export async function mintBridgeCertPair(
     publicKey: mtlsPubKey,
     signingKey,
     serialNumber: serialHex1,
-    extensions: [...sharedExtensions, sanExtension],
+    extensions: [
+      BASIC_CONSTRAINTS_LEAF,
+      MTLS_KEY_USAGE,
+      CLIENT_AUTH_EKU,
+      ...sharedExtensions,
+      sanExtension,
+    ],
   });
 
   // Mint Ed25519 signing cert
@@ -257,7 +308,12 @@ export async function mintBridgeCertPair(
     publicKey: signingPubKey,
     signingKey,
     serialNumber: serialHex2,
-    extensions: [...sharedExtensions, sanExtension],
+    extensions: [
+      BASIC_CONSTRAINTS_LEAF,
+      SIGNING_KEY_USAGE,
+      ...sharedExtensions,
+      sanExtension,
+    ],
   });
 
   return {
