@@ -23,12 +23,10 @@ describe("cert-gha.rate-limit", () => {
   it("rate limit state tracks count and window", () => {
     const now = Date.now();
     const WINDOW = 3600_000;
+    type RL = { count: number; windowStart: number };
 
-    // Fresh window
-    let rl: { count: number; windowStart: number } | null = null;
-    if (!rl || now - (rl?.windowStart ?? 0) > WINDOW) {
-      rl = { count: 1, windowStart: now };
-    }
+    // Fresh window: no prior state, so initialize.
+    let rl: RL = { count: 1, windowStart: now };
     expect(rl.count).toBe(1);
 
     // Same window, increment
@@ -40,8 +38,8 @@ describe("cert-gha.rate-limit", () => {
     expect(rl.count > 10).toBe(true);
 
     // Expired window resets
-    const oldWindow = { count: 5, windowStart: now - WINDOW - 1 };
-    if (now - oldWindow.windowStart > WINDOW) {
+    const expired: RL = { count: 5, windowStart: now - WINDOW - 1 };
+    if (now - expired.windowStart > WINDOW) {
       rl = { count: 1, windowStart: now };
     }
     expect(rl.count).toBe(1);

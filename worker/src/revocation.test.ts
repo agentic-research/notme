@@ -1,9 +1,20 @@
-/**
- * revocation.test.ts — Unit tests for the APAS edge revocation module.
- *
- * Runs in the Workerd runtime via @cloudflare/vitest-pool-workers, which
- * provides real WebCrypto (Ed25519) and Durable Object support.
- */
+//
+// revocation.test.ts — Unit tests for the APAS edge revocation module.
+//
+// Runs in the Workerd runtime via @cloudflare/vitest-pool-workers, which
+// provides real WebCrypto (Ed25519) and Durable Object support.
+//
+// DORMANT — this file is NOT currently run or typechecked. It is excluded
+// from tsconfig.json because:
+//   1. vitest.config.ts only globs src/__tests__/**/*.test.ts, so it never
+//      runs.
+//   2. It imports from cloudflare:test (vitest-pool-workers) and references
+//      DO bindings (env.REVOCATION) that aren't declared in the project's
+//      Env type — typechecking fails without configuring the pool.
+//
+// To revive: move into src/__tests__/, add pool config + ProvidedEnv module
+// augmentation declaring REVOCATION, drop the tsconfig exclude. Tracked as
+// a follow-up bead.
 
 import { describe, expect, it, beforeAll } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
