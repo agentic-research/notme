@@ -26,6 +26,8 @@ interface SigningAuthorityEnv {
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 
+import { keyIdFromSpki } from "./key-id";
+
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
   private signingKey: CryptoKey | null = null;
@@ -76,16 +78,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.initialized = true;
   }
 
-  // Generate a key ID from SHA-256 of the public key (first 8 hex chars).
-  // Previous djb2 hash had 32-bit collision space — SHA-256 is cryptographically strong.
   private static async keyIdFromSpki(spkiB64: string): Promise<string> {
-    const raw = atob(spkiB64);
-    const keyBytes = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) keyBytes[i] = raw.charCodeAt(i);
-    const hashBuf = await crypto.subtle.digest("SHA-256", keyBytes);
-    return Array.from(new Uint8Array(hashBuf).slice(0, 4))
-      .map(b => b.toString(16).padStart(2, "0"))
-      .join("");
+    return keyIdFromSpki(spkiB64);
   }
 
   // Load or generate the authority keypair. Cached in memory for the DO lifetime.

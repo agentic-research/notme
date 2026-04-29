@@ -12,29 +12,33 @@ import { describe, expect, it } from "vitest";
 // the static helper and verify the schema/state logic.
 
 describe("signing.key.id", () => {
-  it("generates deterministic key ID from SPKI base64", () => {
-    // The keyIdFromSpki function hashes the last 32 bytes of SPKI
-    // and returns 8 hex chars. Same input = same output.
+  // Tests now exercise the production algorithm via the exported
+  // keyIdFromSpki helper, not a parallel reimplementation. Earlier the
+  // test reimplemented djb2 (the old 32-bit hash) and asserted on that —
+  // it was checking the test-only stub, not the production code. After
+  // rosary-808b0e the production function is SHA-256 truncated to 8
+  // bytes (64-bit collision space).
+
+  it("is deterministic — same input produces same output", async () => {
+    const { keyIdFromSpki } = await import("../key-id");
     const spki1 = btoa("aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddddddddddd");
     const spki2 = btoa("aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddddddddddd");
+    expect(await keyIdFromSpki(spki1)).toBe(await keyIdFromSpki(spki2));
+  });
+
+  it("differs for different inputs", async () => {
+    const { keyIdFromSpki } = await import("../key-id");
+    const spki1 = btoa("aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddddddddddd");
     const spki3 = btoa("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    expect(await keyIdFromSpki(spki1)).not.toBe(await keyIdFromSpki(spki3));
+  });
 
-    // Can't call the static method directly (class not importable without DO runtime)
-    // but we can test the algorithm:
-    function keyIdFromSpki(spkiB64: string): string {
-      const raw = atob(spkiB64);
-      const keyBytes = raw.slice(-32);
-      let hash = 0;
-      for (let i = 0; i < keyBytes.length; i++) {
-        hash = ((hash << 5) - hash + keyBytes.charCodeAt(i)) | 0;
-      }
-      return Math.abs(hash).toString(16).padStart(8, "0");
-    }
-
-    expect(keyIdFromSpki(spki1)).toBe(keyIdFromSpki(spki2));
-    expect(keyIdFromSpki(spki1)).not.toBe(keyIdFromSpki(spki3));
-    expect(keyIdFromSpki(spki1)).toHaveLength(8);
-    expect(keyIdFromSpki(spki1)).toMatch(/^[0-9a-f]{8}$/);
+  it("returns 16 hex chars (8 bytes / 64-bit truncation)", async () => {
+    const { keyIdFromSpki } = await import("../key-id");
+    const spki = btoa("aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddddddddddd");
+    const id = await keyIdFromSpki(spki);
+    expect(id).toHaveLength(16);
+    expect(id).toMatch(/^[0-9a-f]{16}$/);
   });
 });
 
