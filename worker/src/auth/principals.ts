@@ -103,12 +103,21 @@ export function getPrincipal(sql: any, principalId: string): Principal | null {
   const rows = sql.exec(
     "SELECT principal_id, display_name, created_at, created_by, status FROM principals WHERE principal_id = ?",
     principalId,
-  ).toArray() as any[];
+  ).toArray() as Array<{
+    principal_id: string;
+    display_name: string | null;
+    created_at: string;
+    created_by: string | null;
+    status: string;
+  }>;
   if (rows.length === 0) return null;
-  const r = rows[0];
+  const r = rows[0]!;
   return {
-    principalId: r.principal_id, displayName: r.display_name ?? undefined,
-    createdAt: r.created_at, createdBy: r.created_by ?? undefined, status: r.status,
+    principalId: r.principal_id,
+    displayName: r.display_name ?? undefined,
+    createdAt: r.created_at,
+    createdBy: r.created_by ?? undefined,
+    status: r.status,
   };
 }
 
@@ -173,10 +182,17 @@ export function getFederatedIdentities(sql: any, principalId: string): Federated
   const rows = sql.exec(
     "SELECT provider, provider_sub, provider_email, connected_at FROM federated_identities WHERE principal_id = ?",
     principalId,
-  ).toArray() as any[];
-  return rows.map((r: any) => ({
-    provider: r.provider, providerSub: r.provider_sub,
-    providerEmail: r.provider_email ?? undefined, connectedAt: r.connected_at,
+  ).toArray() as Array<{
+    provider: string;
+    provider_sub: string;
+    provider_email: string | null;
+    connected_at: string;
+  }>;
+  return rows.map((r) => ({
+    provider: r.provider,
+    providerSub: r.provider_sub,
+    providerEmail: r.provider_email ?? undefined,
+    connectedAt: r.connected_at,
   }));
 }
 

@@ -127,8 +127,13 @@ export async function handleCertExchange(
     grantedScopes = ["bridgeCert", "authorityManage", "certMint"];
     authMethod = "bootstrap";
   } else {
+    // Exhaustiveness: CertExchangeRequest.proof is a discriminated union.
+    // If a new variant is added without a branch, the assignment below
+    // fails to typecheck (body.proof is no longer `never` here).
+    const _exhaustive: never = body.proof;
+    const seen = (_exhaustive as { type?: unknown }).type;
     return Response.json(
-      { error: "unknown proof type: " + (body.proof as any).type },
+      { error: "unknown proof type: " + String(seen) },
       { status: 400 },
     );
   }

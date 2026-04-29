@@ -1274,7 +1274,22 @@ export default {
         };
         if (!body.proof?.type) return jsonErr("proof.type required", 400);
 
+        // Narrow the request body to the Proof discriminated union before
+        // handing off to verifyProof — keeps the unsafe cast at the trust
+        // boundary (request input) rather than scattered through the call.
         const { verifyProof } = await import("./src/auth/verify-proof");
+        type Proof =
+          | { type: "oidc"; token: string }
+          | { type: "x509"; cert: string };
+        let typedProof: Proof;
+        if (body.proof.type === "oidc" && typeof body.proof.token === "string") {
+          typedProof = { type: "oidc", token: body.proof.token };
+        } else if (body.proof.type === "x509" && typeof body.proof.cert === "string") {
+          typedProof = { type: "x509", cert: body.proof.cert };
+        } else {
+          return jsonErr(`unsupported proof.type: ${body.proof.type}`, 400);
+        }
+
         let identity;
         try {
           const caKey = await authority.getPublicKeyPem();
@@ -1282,7 +1297,7 @@ export default {
           // stolen OIDC token issued for a different app, which would silently
           // re-route the victim's later notme.bot OIDC login into the
           // attacker's principal. X.509 path ignores the audience arg.
-          identity = await verifyProof(body.proof as any, caKey, "notme.bot");
+          identity = await verifyProof(typedProof, caKey, "notme.bot");
         } catch (e: any) {
           return jsonErr("proof verification failed: " + e.message, 401);
         }

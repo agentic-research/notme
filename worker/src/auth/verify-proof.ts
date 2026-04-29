@@ -212,5 +212,10 @@ export async function verifyProof(
     if (!caPublicKeyPem) throw new Error("CA public key required for x509 verification");
     return verifyX509(proof.cert, caPublicKeyPem);
   }
-  throw new Error(`unknown proof type: ${(proof as any).type}`);
+  // Exhaustiveness: if Proof gains a new variant, the line below fails to
+  // typecheck (proof would no longer be `never` here). Runtime read covers
+  // a malformed object cast through.
+  const _exhaustive: never = proof;
+  const seen = (_exhaustive as { type?: unknown }).type;
+  throw new Error(`unknown proof type: ${String(seen)}`);
 }
