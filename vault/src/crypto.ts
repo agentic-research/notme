@@ -61,12 +61,15 @@ export async function encrypt(
   headers: Record<string, string>,
   kek: CryptoKey,
 ): Promise<SealedCredential> {
-  // Generate random DEK
-  const dek = await crypto.subtle.generateKey(
+  // Generate random DEK. The cast is needed because subtle.generateKey's
+  // return type is `CryptoKey | CryptoKeyPair` (depends on the algorithm
+  // name, which TS can't narrow on); for symmetric AES-GCM it's always
+  // CryptoKey.
+  const dek = (await crypto.subtle.generateKey(
     { name: "AES-GCM", length: 256 },
     true, // extractable — we need to wrap it
     ["encrypt"],
-  );
+  )) as CryptoKey;
 
   // Encrypt plaintext with DEK
   const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV
