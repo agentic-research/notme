@@ -35,11 +35,26 @@ interface JWK {
   y?: string;
 }
 
-// Trusted OIDC issuers — prevents SSRF via attacker-controlled iss claim
+// Trusted OIDC issuers — prevents SSRF via attacker-controlled iss claim.
+//
+// The audience pin on /connections /auth/oidc/login /join is "notme.bot",
+// which works for:
+//   - https://auth.notme.bot — self-issued, always carries aud=notme.bot
+//   - https://token.actions.githubusercontent.com — GHA workflows can
+//     request any audience via core.getIDToken(audience) so they can mint
+//     tokens with aud=notme.bot
+//
+// Google ID tokens carry aud=<google-client-id>.apps.googleusercontent.com
+// so they CANNOT match audience="notme.bot". Including Google here would
+// be misleading: the issuer would pass the trust check but every legitimate
+// token would fail the audience check. notme-ae65a0 / M1 from session
+// review tracks the proper fix (per-issuer audience map keyed by env config
+// for the Google client ID); until then, Google is intentionally absent so
+// callers who try it get a clear "untrusted issuer" failure rather than a
+// confusing "wrong audience" failure on every request.
 const TRUSTED_ISSUERS = new Set([
   "https://token.actions.githubusercontent.com",
   "https://auth.notme.bot",
-  "https://accounts.google.com",
 ]);
 
 // Simple JWKS cache — per-issuer, 1 hour TTL
