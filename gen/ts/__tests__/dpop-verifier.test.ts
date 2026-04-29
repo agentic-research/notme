@@ -727,6 +727,103 @@ describe("verifyAccessToken", () => {
     ).rejects.toThrow(/malformed|parts/i);
   });
 
+  it("rejects token whose aud doesn't match expected audience (string)", async () => {
+    const token = await mintUnboundToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      audience: "https://attacker.example",
+    });
+    await expect(
+      verifyAccessToken({
+        token,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+        audience: "https://victim.example",
+      }),
+    ).rejects.toThrow(/aud.*claim.*mismatch/i);
+  });
+
+  it("rejects token whose aud doesn't include expected (array form)", async () => {
+    const token = await mintUnboundToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      audience: "https://attacker.example",
+    });
+    await expect(
+      verifyAccessToken({
+        token,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+        audience: ["https://victim1.example", "https://victim2.example"],
+      }),
+    ).rejects.toThrow(/aud.*claim.*mismatch/i);
+  });
+
+  it("accepts token whose aud matches expected (defense-in-depth)", async () => {
+    const token = await mintUnboundToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      audience: "https://victim.example",
+    });
+    const claims = await verifyAccessToken({
+      token,
+      jwksUrl: JWKS_URL,
+      publicKey: edKp.publicKey,
+      audience: "https://victim.example",
+    });
+    expect(claims.aud).toBe("https://victim.example");
+  });
+
+  it("rejects token whose iss doesn't match expected issuer", async () => {
+    const token = await mintUnboundToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      audience: "https://victim.example",
+    });
+    await expect(
+      verifyAccessToken({
+        token,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+        issuer: "https://different-issuer.example",
+      }),
+    ).rejects.toThrow(/iss.*claim.*mismatch/i);
+  });
+
+  it("rejects token without sub claim (requireSub via SDK)", async () => {
+    // Forge a token whose payload lacks `sub` — direct payload manipulation
+    // since mintUnboundToken always sets sub.
+    const header = { alg: "EdDSA", typ: "at+jwt", kid: "test" };
+    const now = Math.floor(Date.now() / 1000);
+    const payload = { exp: now + 300, iat: now, iss: "https://auth.notme.bot" };
+    const enc = (o: unknown) =>
+      btoa(JSON.stringify(o))
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+    const headerB64 = enc(header);
+    const payloadB64 = enc(payload);
+    const sigInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+    const sig = (await crypto.subtle.sign(
+      { name: "Ed25519" } as any,
+      edKp.privateKey,
+      sigInput,
+    )) as ArrayBuffer;
+    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    const noSubToken = `${headerB64}.${payloadB64}.${sigB64}`;
+
+    await expect(
+      verifyAccessToken({
+        token: noSubToken,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow(/sub.*claim.*missing/i);
+  });
+
   it("CRITICAL: rejects DPoP-bound token used as Bearer (downgrade attack)", async () => {
     // RFC 9449 Section 3: a DPoP-bound token (has cnf.jkt) MUST NOT be accepted
     // as a plain Bearer token. An attacker who steals the token from logs can

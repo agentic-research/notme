@@ -63,6 +63,7 @@
 | session theft | use stolen session cookie to mint tokens | DPoP binding — token is useless without the client's private key. session cookie is HttpOnly/Secure/SameSite=Strict | `dpop.session.binding` |
 | thumbprint collision | craft a key with same JWK thumbprint | SHA-256 thumbprint (RFC 7638) — collision infeasible | `dpop.thumbprint.collision` |
 | nonce bypass | skip server nonce | **NOT YET IMPLEMENTED** — defense-in-depth, tracked as known limitation | — |
+| sdk verifier missing claims | resource server using `verifyAccessToken` SDK accepts a token with no `iss`/`aud`/`nbf` validation; cross-resource confused-deputy possible (rosary-81353c) | **FIXED** — `VerifyAccessTokenOptions` now accepts `audience` and `issuer`; SDK delegates to shared `validateClaims` (covers exp, nbf, iat, iss, aud, sub uniformly) instead of the partial inline checks. Resource servers SHOULD set `audience` to their own URL. | gen/ts SDK tests `verifyAccessToken > rejects/accepts...audience/issuer` |
 
 ### 5. DPoP authorize redirect (GET /authorize, POST /authorize/token)
 

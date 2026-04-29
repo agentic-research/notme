@@ -30,6 +30,20 @@ export interface VerifyAccessTokenOptions {
   kv?: KVLike;
   /** Provide the Ed25519 public key directly — skips JWKS fetch entirely. */
   publicKey?: CryptoKey;
+  /**
+   * Expected audience — string or array. When set, rejects tokens whose
+   * `aud` claim doesn't match. Resource servers SHOULD set this to their
+   * own URL to prevent confused-deputy: a token minted for a different
+   * resource server (same notme issuer, same public key) would otherwise
+   * pass this verifier (rosary-81353c).
+   */
+  audience?: string | string[];
+  /**
+   * Expected issuer — when set, rejects tokens whose `iss` claim doesn't
+   * match. Defaults to no check at the SDK level so tests / non-notme
+   * issuers work; notme-internal callers should pass `"https://auth.notme.bot"`.
+   */
+  issuer?: string;
 }
 
 /** Options for verifyDPoPToken(). */
@@ -271,7 +285,7 @@ export async function verifyDPoPToken(
 export async function verifyAccessToken(
   opts: VerifyAccessTokenOptions,
 ): Promise<VerifiedTokenClaims> {
-  const { token, jwksUrl, kv, publicKey } = opts;
+  const { token, jwksUrl, kv, publicKey, audience, issuer } = opts;
 
   const parts = token.split(".");
   if (parts.length !== 3) {
@@ -295,19 +309,22 @@ export async function verifyAccessToken(
     throw new Error("Invalid access token signature");
   }
 
-  // Parse and validate claims
+  // Parse and validate claims via the shared validator — covers exp, nbf,
+  // iat, iss, aud, sub uniformly so the resource-server path uses the same
+  // claim-check logic as the issuer path. Earlier this function inlined a
+  // partial check that omitted nbf, iss, and aud (rosary-81353c).
   const payload = jsonParse(base64urlDecodeStr(payloadB64), "access token payload");
-  const now = Math.floor(Date.now() / 1000);
-
-  if (typeof payload.exp !== "number" || payload.exp <= now) {
-    throw new Error("Access token expired");
+  // exp is a hard requirement here — `validateClaims` only checks it when
+  // present, but accepting a token without exp would break the short-lived
+  // contract (5-min TTL). Pre-check before delegating.
+  if (typeof payload.exp !== "number") {
+    throw new Error("Access token missing exp claim");
   }
-  if (typeof payload.iat === "number" && payload.iat > now + 60) {
-    throw new Error("Access token iat is in the future");
-  }
-  if (!payload.sub || typeof payload.sub !== "string") {
-    throw new Error("Access token missing sub claim");
-  }
+  validateClaims(payload, {
+    issuer,
+    audience,
+    requireSub: true,
+  });
 
   // RFC 9449 Section 3: a DPoP-bound token (has cnf.jkt) MUST NOT be
   // accepted as a plain Bearer token. Rejecting here prevents downgrade
@@ -319,11 +336,11 @@ export async function verifyAccessToken(
   }
 
   return {
-    sub: payload.sub,
-    scope: payload.scope ?? "",
-    aud: payload.aud ?? "",
-    exp: payload.exp,
-    jti: payload.jti ?? "",
+    sub: payload.sub as string,
+    scope: (payload.scope as string | undefined) ?? "",
+    aud: (payload.aud as string | undefined) ?? "",
+    exp: payload.exp as number,
+    jti: (payload.jti as string | undefined) ?? "",
   };
 }
 
