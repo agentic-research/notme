@@ -11,6 +11,64 @@ import { describe, expect, it } from "vitest";
 // We can't instantiate the real DO outside Workerd, but we can test
 // the static helper and verify the schema/state logic.
 
+describe("revocation.bundle.staleness", () => {
+  // rosary-9bb26b: a bundle without a valid `issuedAt` would previously
+  // skip the staleness check entirely. The fix makes the check fail
+  // closed — these tests lock that contract.
+
+  type Bundle = {
+    epoch: number;
+    seqno: number;
+    keys: Record<string, string>;
+    keyId: string;
+    issuedAt: number;
+    signature: string;
+  };
+
+  const fresh: Bundle = {
+    epoch: 1,
+    seqno: 1,
+    keys: { kid1: "AAAA" },
+    keyId: "kid1",
+    issuedAt: Math.floor(Date.now() / 1000),
+    signature: "AAAA",
+  };
+
+  it("accepts a fresh bundle (issuedAt within window)", async () => {
+    const { isBundleStale } = await import("../revocation");
+    expect(isBundleStale(fresh)).toBe(false);
+  });
+
+  it("rejects a bundle older than BUNDLE_MAX_AGE_MS (5 minutes)", async () => {
+    const { isBundleStale, BUNDLE_MAX_AGE_MS } = await import("../revocation");
+    const stale = { ...fresh, issuedAt: Math.floor((Date.now() - BUNDLE_MAX_AGE_MS - 1000) / 1000) };
+    expect(isBundleStale(stale)).toBe(true);
+  });
+
+  it("rejects a bundle with no issuedAt (missing field, fail closed)", async () => {
+    const { isBundleStale } = await import("../revocation");
+    const noIssuedAt = { ...fresh } as Partial<Bundle>;
+    delete noIssuedAt.issuedAt;
+    expect(isBundleStale(noIssuedAt as any)).toBe(true);
+  });
+
+  it("rejects a bundle with NaN issuedAt", async () => {
+    const { isBundleStale } = await import("../revocation");
+    expect(isBundleStale({ ...fresh, issuedAt: NaN })).toBe(true);
+  });
+
+  it("rejects a bundle with non-numeric issuedAt", async () => {
+    const { isBundleStale } = await import("../revocation");
+    expect(isBundleStale({ ...fresh, issuedAt: "1234" } as any)).toBe(true);
+  });
+
+  it("rejects a bundle with zero or negative issuedAt", async () => {
+    const { isBundleStale } = await import("../revocation");
+    expect(isBundleStale({ ...fresh, issuedAt: 0 })).toBe(true);
+    expect(isBundleStale({ ...fresh, issuedAt: -100 })).toBe(true);
+  });
+});
+
 describe("signing.key.id", () => {
   // Tests now exercise the production algorithm via the exported
   // keyIdFromSpki helper, not a parallel reimplementation. Earlier the

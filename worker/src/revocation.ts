@@ -32,7 +32,12 @@ export interface CABundle {
   keys: Record<string, string>;
   keyId: string;
   prevKeyId?: string;
-  issuedAt?: number;
+  /**
+   * Unix-seconds at which the bundle was issued. REQUIRED — staleness check
+   * is fail-closed. A bundle without `issuedAt` is treated as stale at
+   * runtime even if its signature is otherwise valid (rosary-9bb26b).
+   */
+  issuedAt: number;
   /** Ed25519 signature over bundleCanonical(bundle), base64-standard */
   signature: string;
 }
@@ -125,6 +130,32 @@ function b64Decode(s: string): Uint8Array<ArrayBuffer> {
  * Excludes the `signature` field; sorts remaining keys alphabetically.
  * Must stay in sync with signet's signing implementation.
  */
+/**
+ * Staleness gate — fail closed.
+ *
+ * A bundle without a valid `issuedAt` (missing, NaN, non-positive) is
+ * treated as stale even if its signature is otherwise valid. This is
+ * defense-in-depth — the type signature also requires `issuedAt`, but
+ * malformed JSON could slip through KV deserialization with the wrong
+ * shape, and a producer that omitted the field would otherwise yield
+ * a bundle accepted forever (rosary-9bb26b).
+ *
+ * Bundles older than BUNDLE_MAX_AGE_MS are also stale — that's the
+ * normal clock-skew window enforced against legitimate-but-old bundles.
+ *
+ * `nowMs` is injectable for tests; defaults to `Date.now()`.
+ */
+export function isBundleStale(bundle: CABundle, nowMs: number = Date.now()): boolean {
+  if (
+    typeof bundle.issuedAt !== "number" ||
+    !Number.isFinite(bundle.issuedAt) ||
+    bundle.issuedAt <= 0
+  ) {
+    return true;
+  }
+  return nowMs - bundle.issuedAt * 1000 > BUNDLE_MAX_AGE_MS;
+}
+
 export function bundleCanonical(bundle: CABundle): Uint8Array {
   const { signature: _sig, ...rest } = bundle;
   const sorted: Record<string, unknown> = {};
@@ -208,12 +239,9 @@ export async function checkRevocation(
     return { revoked: false };
   }
 
-  // 2. Staleness check
-  if (bundle.issuedAt !== undefined) {
-    const ageMs = Date.now() - bundle.issuedAt * 1000;
-    if (ageMs > BUNDLE_MAX_AGE_MS) {
-      return { revoked: true, reason: "bundle_stale" };
-    }
+  // 2. Staleness check — fail closed.
+  if (isBundleStale(bundle)) {
+    return { revoked: true, reason: "bundle_stale" };
   }
 
   // 3. Verify bundle signature

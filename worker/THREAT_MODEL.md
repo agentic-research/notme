@@ -47,7 +47,7 @@
 | rollback | serve old CA bundle to un-revoke certs | monotonic seqno in RevocationAuthority DO | `revocation.seqno.monotonic` |
 | epoch bypass | use cert from old epoch after rotation | epoch check in revocation verifier | `revocation.epoch.mismatch` |
 | bundle forgery | publish unsigned/tampered bundle | bundle Ed25519-signed by DO key | `bundle.signature.verification` |
-| stale bundle | serve expired bundle | BUNDLE_MAX_AGE_MS (5 min) staleness check | `bundle.staleness` |
+| stale bundle | serve expired bundle | BUNDLE_MAX_AGE_MS (5 min) staleness check, **fail-closed** if `issuedAt` is missing/NaN/non-positive (rosary-9bb26b). Type signature also requires `issuedAt`; the runtime guard is defense-in-depth against malformed JSON in KV. | `revocation.bundle.staleness` |
 | leaf cert misuse | use mTLS cert as a CA, or use signing cert in TLS | leaf certs declare BasicConstraints CA=false (critical), KeyUsage scoped per cert (mTLS: digitalSignature+keyAgreement; signing: digitalSignature only), ExtendedKeyUsage clientAuth on mTLS cert. Strict X.509 validators (rustls/boringssl) enforce. | `cert-authority.leaf-extensions` |
 
 ### 4. DPoP token endpoint (POST /token)
