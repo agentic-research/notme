@@ -10,7 +10,11 @@
     "noEmit": true,
     "isolatedModules": true
   },
-  "include": ["worker.ts", "src/**/*.ts"],
+  "include": [
+    "worker.ts",
+    "src/**/*.ts",
+    "../gen/ts/**/*.ts",
+  ],
   "exclude": [
     "node_modules",
     "src/revocation.test.ts"

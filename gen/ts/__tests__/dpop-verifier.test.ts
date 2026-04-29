@@ -47,7 +47,9 @@ async function generateP256(): Promise<{
     true,
     ["sign", "verify"],
   )) as CryptoKeyPair;
-  const jwk = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+  // exportKey's return type is JsonWebKey | ArrayBuffer (depends on format).
+  // For "jwk" it's always JsonWebKey, but TS can't narrow on the format arg.
+  const jwk = (await crypto.subtle.exportKey("jwk", keyPair.publicKey)) as JsonWebKey;
   return { keyPair, jwk };
 }
 
