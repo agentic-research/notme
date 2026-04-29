@@ -44,12 +44,23 @@ const SIGNING_KEY_USAGE = new KeyUsagesExtension(
   true,
 );
 
-const OID_SUBJECT = "1.3.6.1.4.1.99999.1.1"; // Subject identity
-const OID_ISSUANCE_TIME = "1.3.6.1.4.1.99999.1.2"; // Issuance time (RFC3339)
-const OID_SCOPES = "1.3.6.1.4.1.99999.1.3"; // Granted scopes
-const OID_EPOCH = "1.3.6.1.4.1.99999.1.4"; // CA epoch at issuance
-const OID_AUTH_METHOD = "1.3.6.1.4.1.99999.1.5"; // Authentication method
-const OID_PEER_BINDING = "1.3.6.1.4.1.99999.1.6"; // SHA-256(P-256 SPKI || Ed25519 SPKI)
+// Custom-extension OID arc.
+//
+// 1.3.6.1.4.1.99999 is the IANA "example/private-experiment" arc used while a
+// real Private Enterprise Number (PEN) is pending — see notme-229dc3. When the
+// PEN arrives, change OID_PEN below; all extension OIDs derive from it, so the
+// rest of the file (and the Go authority's cert format) update automatically.
+//
+// IANA PEN application: https://pen.iana.org/pen/PenApplication.page (free,
+// few business days). Until then, ANY third-party verifier that pins our OID
+// arc will be pinning the placeholder.
+const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigned PEN
+const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
+const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
+const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
+const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
+const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
+const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
 
 // Encode a string as ASN.1 UTF8String DER (tag 0x0C + length + value)
 function derUtf8String(s: string): Uint8Array {
