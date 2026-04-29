@@ -229,6 +229,7 @@ export async function verifyProof(
     // expectedAudience is unused here — certs don't carry an aud claim. We
     // still take it as a required argument so callers can't accidentally
     // route a token-issuing flow through this function without one.
+    void expectedAudience; // intent in IR, not just prose
     return verifyX509(proof.cert, caPublicKeyPem);
   }
   // Exhaustiveness: if Proof gains a new variant, the line below fails to

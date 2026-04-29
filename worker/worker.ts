@@ -40,13 +40,9 @@ const DENIED_HOSTS = new Set([
 // the requested audience against this set. Hoisted to module scope so /token
 // and /authorize/token (and any future minting route) share one source of
 // truth — drift here is how confused-deputy bugs slip in.
-const ALLOWED_AUDIENCES = new Set([
-  "https://rosary.bot",
-  "https://mcp.rosary.bot",
-  "https://auth.notme.bot",
-  "https://notme.bot",
-  "https://mache.rosary.bot",
-]);
+// Implementation in src/allowed-audiences.ts so unit tests can import it
+// without pulling in cloudflare:workers via worker.ts.
+import { getAllowedAudiences } from "./src/allowed-audiences";
 
 function isDeniedDestination(url: string): boolean {
   try {
@@ -1650,9 +1646,10 @@ export default {
           if (!audience) {
             return Response.json({ error: "audience_required" }, { status: 400 });
           }
-          if (!ALLOWED_AUDIENCES.has(audience)) {
+          const allowedAudiences = getAllowedAudiences(env);
+          if (!allowedAudiences.has(audience)) {
             return Response.json(
-              { error: "invalid_audience", allowed: [...ALLOWED_AUDIENCES] },
+              { error: "invalid_audience", allowed: [...allowedAudiences] },
               { status: 400 },
             );
           }
@@ -1702,9 +1699,10 @@ export default {
           if (!audience) {
             return Response.json({ error: "audience_required" }, { status: 400 });
           }
-          if (!ALLOWED_AUDIENCES.has(audience)) {
+          const allowedAudiences = getAllowedAudiences(env);
+          if (!allowedAudiences.has(audience)) {
             return Response.json(
-              { error: "invalid_audience", allowed: [...ALLOWED_AUDIENCES] },
+              { error: "invalid_audience", allowed: [...allowedAudiences] },
               { status: 400 },
             );
           }
