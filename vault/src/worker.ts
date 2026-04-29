@@ -43,6 +43,53 @@ export interface Env {
   VAULT_KEK_SECRET: string;
 }
 
+/**
+ * Compile-time structural assertion that the runtime class
+ * `CredentialVault` matches the RPC surface declared in
+ * `CredentialVaultRpc`. We can't use `class … implements
+ * CredentialVaultRpc` because the interface extends
+ * `Rpc.DurableObjectBranded` whose private brand symbol is only
+ * assigned by the runtime DurableObject base class. So this assertion
+ * picks ONLY the named methods (no brand) on both sides and checks
+ * structural equality both ways: one direction catches "RPC has a
+ * method the class missed" (would break callers); the reverse catches
+ * "class has a method whose signature is wider/narrower than the RPC"
+ * (would let drift compile silently). If either direction fails, tsc
+ * fails.
+ *
+ * Closes notme-aed3a0 (M4 from session code review).
+ */
+type _RpcMethodNames =
+  | "getCredential"
+  | "putCredential"
+  | "deleteCredential"
+  | "listServices"
+  | "checkAndStoreJti"
+  | "proxyRequest";
+
+type _AssertSameKeys<A, B> = keyof A extends keyof B
+  ? keyof B extends keyof A
+    ? true
+    : never
+  : never;
+
+// Each direction: the class's method types must match the RPC's
+// method types. `Pick` strips the brand from the RPC side. Two
+// assignment-checks together catch both narrowing and widening.
+const _classMatchesRpc: Pick<CredentialVaultRpc, _RpcMethodNames> =
+  null as unknown as Pick<CredentialVault, _RpcMethodNames>;
+const _rpcMatchesClass: Pick<CredentialVault, _RpcMethodNames> =
+  null as unknown as Pick<CredentialVaultRpc, _RpcMethodNames>;
+const _keysAssertion: _AssertSameKeys<
+  Pick<CredentialVaultRpc, _RpcMethodNames>,
+  Pick<CredentialVault, _RpcMethodNames>
+> = true;
+// References to silence "declared but never read" (these are
+// type-only assertions; tsc errors come from the assignments above).
+void _classMatchesRpc;
+void _rpcMatchesClass;
+void _keysAssertion;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const vaultId = env.VAULT.idFromName("default");
