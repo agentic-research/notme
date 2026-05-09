@@ -24,6 +24,7 @@
     "@oslojs/encoding": "^1.1.0",
     "@peculiar/x509": "^1.14.3",
     "@simplewebauthn/server": "^13.3.0",
+    "cbor-x": "^1.6.4",
     "oslo": "^1.2.1",
     "zod": "^3.25.0"
   }

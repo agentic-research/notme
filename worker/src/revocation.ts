@@ -17,6 +17,8 @@
  * Spec: https://notme.bot/apas
  */
 
+import { Encoder } from "cbor-x";
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -156,13 +158,90 @@ export function isBundleStale(bundle: CABundle, nowMs: number = Date.now()): boo
   return nowMs - bundle.issuedAt * 1000 > BUNDLE_MAX_AGE_MS;
 }
 
+// CBOR canonical encoder for CABundle signing input.
+//
+// Per ADR-010 + signet ADR-002 §2.3, the canonical bytes that get
+// Ed25519-signed are produced via RFC 8949 §4.2 deterministic CBOR
+// encoding. This must byte-equal signet's Go-side production of the
+// same bundle (`signet/pkg/revocation/checker.go:168-188`).
+//
+// Wire format split:
+//   - Transport / KV / API: JSON (unchanged; matches signet's
+//     pkg/revocation/cabundle/https_fetcher.go).
+//   - Signing canonical: CBOR canonical (this function).
+//
+// CABundle is NOT serialized as CBOR on the wire. The struct is
+// transported and stored as JSON. CBOR is used only as the byte
+// representation that goes into crypto.subtle.sign / verify.
+const cborEncoder = new Encoder({
+  mapsAsObjects: false, // preserve Map→CBOR map; needed for integer keys
+  useRecords: false, // no cbor-x record extension; plain CBOR
+  tagUint8Array: false, // RFC 8949 plain bytes (major type 2), not RFC 8746 typed-array tag.
+  // signet's fxamacker/cbor encodes []byte as plain CBOR bytes; we MUST match.
+});
+
+/**
+ * Sort string-keyed entries by RFC 8949 §4.2 canonical order:
+ * "bytewise lexicographic order of deterministic encodings." For
+ * UTF-8 text strings, equivalent to: shorter first; equal-length
+ * compared bytewise.
+ */
+function sortStringKeysCanonical(
+  entries: Array<[string, Uint8Array]>,
+): Array<[string, Uint8Array]> {
+  const enc = new TextEncoder();
+  return [...entries].sort((a, b) => {
+    const ab = enc.encode(a[0]);
+    const bb = enc.encode(b[0]);
+    if (ab.length !== bb.length) return ab.length - bb.length;
+    for (let i = 0; i < ab.length; i++) {
+      if (ab[i] !== bb[i]) return ab[i] - bb[i];
+    }
+    return 0;
+  });
+}
+
 export function bundleCanonical(bundle: CABundle): Uint8Array {
-  const { signature: _sig, ...rest } = bundle;
-  const sorted: Record<string, unknown> = {};
-  for (const k of Object.keys(rest).sort()) {
-    sorted[k] = rest[k as keyof typeof rest];
-  }
-  return new TextEncoder().encode(JSON.stringify(sorted));
+  // Match signet/pkg/revocation/checker.go:168-188 byte-for-byte:
+  //   message := map[int]interface{}{
+  //     1: bundle.Epoch,     // uint64
+  //     2: bundle.Seqno,     // uint64
+  //     3: bundle.Keys,      // map[string][]byte
+  //     4: bundle.KeyID,     // string
+  //     5: bundle.PrevKeyID, // string
+  //     6: bundle.IssuedAt,  // int64
+  //   }
+  //   encMode := cbor.CanonicalEncOptions().EncMode()
+  //   canonical := encMode.Marshal(message)
+  //
+  // Integer keys 1-6 are already in canonical bytewise order, so
+  // insertion order is correct. The inner `keys` map needs explicit
+  // RFC 8949 §4.2 ordering on its string keys.
+  //
+  // CABundle.keys is a Record<string, base64-string>; signet's
+  // Go-side has map[string][]byte. To match the Go bytes, we
+  // base64-decode here so CBOR encodes the values as bytes
+  // (major type 2), not as text strings (major type 3).
+  const keysEntries: Array<[string, Uint8Array]> = sortStringKeysCanonical(
+    Object.entries(bundle.keys).map(([kid, b64]) => [kid, b64Decode(b64)]),
+  );
+  const keysMap = new Map<string, Uint8Array>(keysEntries);
+
+  const message = new Map<number, unknown>([
+    [1, bundle.epoch],
+    [2, bundle.seqno],
+    [3, keysMap],
+    [4, bundle.keyId],
+    [5, bundle.prevKeyId ?? ""],
+    [6, bundle.issuedAt],
+  ]);
+
+  // cbor-x returns Buffer in Node, Uint8Array on Workers/V8. Normalize so
+  // callers (crypto.subtle.sign + tests) see a stable type cross-platform.
+  const out = cborEncoder.encode(message);
+  return out instanceof Uint8Array && out.constructor === Uint8Array
+    ? out
+    : new Uint8Array(out);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
