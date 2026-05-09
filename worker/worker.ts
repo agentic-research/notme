@@ -481,6 +481,14 @@ async function handlePasskey(
     return jsonErr("method not allowed", 405);
   }
 
+  if (env.PASSKEY_LIMITER) {
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    const { success } = await env.PASSKEY_LIMITER.limit({ key: `passkey:${ip}` });
+    if (!success) {
+      return jsonErr("rate_limited", 429);
+    }
+  }
+
   const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
   const authority = env.SIGNING_AUTHORITY.get(authorityId);
   // Derive origin from SITE_URL (env), not from attacker-controlled Host header.
@@ -1814,9 +1822,8 @@ export default {
         const resp = Response.json(
           {
             issuer: authorityUrl,
-            exchange_token_endpoint: `${authorityUrl}/exchange-token`,
+            cert_endpoint: `${authorityUrl}/cert`,
             cert_gha_endpoint: `${authorityUrl}/cert/gha`,
-            registration_endpoint: `${authorityUrl}/api/cert/register`,
             ca_bundle_endpoint: `${authorityUrl}/.well-known/ca-bundle.pem`,
             algorithms_supported: ["Ed25519"],
             grant_types_supported: [
@@ -1873,11 +1880,10 @@ export default {
               authority_url: authorityUrl,
               status: "operational",
               endpoints: {
-                exchange_token: "/exchange-token",
+                cert: "/cert",
                 cert_gha: "/cert/gha",
-                register: "/api/cert/register",
+                token: "/token",
                 login: "/login",
-                healthz: "/healthz",
                 ca_bundle: "/.well-known/ca-bundle.pem",
               },
               algorithms: ["Ed25519"],
