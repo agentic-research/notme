@@ -6,11 +6,20 @@ $Go.import("github.com/agentic-research/notme/gen/go/identity");
 # identity.capnp — Cross-language type definitions for the signet identity stack.
 #
 # Every type here is code-generated for TypeScript (types + Zod), Go, and Rust.
-# This is the SINGLE source of truth. Do not manually define these types
-# in any language — import the generated code instead.
+# This is the SINGLE source of truth for TYPE DEFINITIONS — do not manually
+# define these types in any language; import the generated code instead.
 #
-# CRITICAL: CABundle canonical encoding must produce identical bytes across
-# all languages. Cap'n Proto's deterministic binary format guarantees this.
+# Wire formats are NOT defined here. This file is type sync only.
+# See signet ADR-002 §2.3 + notme ADR-010 for the wire-format split:
+#
+#   - Transport / storage / HTTP API: JSON
+#   - Cryptographic canonical bytes (Ed25519 sign/verify input): canonical
+#     CBOR per RFC 8949 §4.2, integer-keyed map matching
+#     signet/pkg/revocation/checker.go:168-188.
+#
+# Capnp is the schema language for cross-language type sync; the wire format
+# of any given message is governed by the protocol implementation
+# (signet for revocation/policy bundles, RFC 5652 DER for CMS, etc.).
 
 # ── Revocation ──
 
