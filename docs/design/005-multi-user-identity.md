@@ -1,7 +1,8 @@
 # 005: Multi-User Identity Architecture
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-03-28
+**Status updated:** 2026-05-09 — principal model + capability_grants shipped (`worker/src/auth/principals.ts`, `worker/src/auth/connections.ts`)
 **Bead:** notme-7c7f83
 **Relates to:** ADR-004 (bridge certs), ADR-0002 (identity & secrets architecture)
 

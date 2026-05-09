@@ -180,6 +180,21 @@ bash test-e2e.sh       # Playwright e2e (virtual authenticator)
 cd ../proxy && cargo test  # 11 Rust tests (parser, UDS bind, perms)
 ```
 
+## repo layout
+
+| Subdir | What | README |
+|---|---|---|
+| `worker/` | Cloudflare Worker — edge plane (TS). Same code runs at CF prod and local workerd. | [worker/README.md](worker/README.md) |
+| `proxy/` | Local plane (Rust). Holds the bridge-cert private key in process memory. | [proxy/README.md](proxy/README.md) |
+| `action/` | GitHub Action — `notme/action@<sha>`. CI-side identity exchange. | [action/README.md](action/README.md) |
+| `schema/` | Cap'n Proto schemas — declared single source of truth for cross-language types. | [schema/README.md](schema/README.md) |
+| `gen/` | Generated TS + Go from `schema/`. Don't edit manually. | [gen/README.md](gen/README.md) |
+| `wasm/` | Empty slot for `leyline-sign` wasm32 artifact (gated on `ley-line-c764c6`). | [wasm/README.md](wasm/README.md) |
+| `scripts/` | Standalone tooling (`doc-check.ts` etc.). | [scripts/README.md](scripts/README.md) |
+| `packages/` | melange + apko — signed container bundles for self-hosted deployments. | [packages/README.md](packages/README.md) |
+| `docs/design/` | ADRs 005-009. | [docs/README.md](docs/README.md) |
+| `vault/` | *(moving to cloister — do not extend)* | — |
+
 ## related
 
 - [signet](https://github.com/agentic-research/signet) — Go identity server, APAS spec, bridge cert protocol

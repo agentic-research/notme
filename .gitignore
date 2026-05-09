@@ -79,3 +79,15 @@ worker/wrangler.toml
 node_modules/
 dist/
 _agent_log/
+
+# packages/ build outputs (melange + apko produce these locally; CI publishes via secrets)
+packages/out/
+packages/*.tar
+packages/sbom-*.spdx.json
+packages/melange.rsa
+packages/melange.rsa.pub
+
+# Test outputs
+worker/test-results/
+worker/playwright-report/
+coverage/
