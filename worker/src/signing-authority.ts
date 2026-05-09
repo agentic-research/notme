@@ -14,7 +14,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
 import { encodeBase64urlNoPadding } from "@oslojs/encoding";
-import type { CABundle } from "./revocation";
+import { bundleCanonical, type CABundle } from "./revocation";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 
 interface SigningAuthorityEnv {
@@ -439,12 +439,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       issuedAt: Math.floor(Date.now() / 1000),
     };
 
-    // Canonical JSON for signing (same as revocation.ts bundleCanonical)
-    const sorted: Record<string, unknown> = {};
-    for (const k of Object.keys(bundle).sort()) {
-      sorted[k] = bundle[k as keyof typeof bundle];
-    }
-    const canonical = new TextEncoder().encode(JSON.stringify(sorted));
+    // Canonical bytes for signing — single source of truth in revocation.ts.
+    // Per ADR-010: canonical CBOR (RFC 8949 §4.2), matching signet protocol.
+    const canonical = bundleCanonical(bundle as CABundle);
 
     // Sign
     const sig = await crypto.subtle.sign(ED25519, signingKey, canonical);
