@@ -1,30 +1,40 @@
 # schema
 
-Cap'n Proto schemas — declared single source of truth for cross-language types in the notme identity stack.
+Cap'n Proto schemas — declared single source of truth for **type definitions** across TypeScript, Go, and Rust in the notme identity stack. **Wire formats are NOT defined here.**
 
-## ⚠️ open issue: TS path doesn't use real capnp wire format
+## the layering (read this first)
 
-**Status (2026-05-09):** see bead `notme-803923` (P0, security-relevant).
+| Layer | What it owns | Where |
+|---|---|---|
+| **Protocol** | wire formats, cryptographic operations, canonical-bytes-for-signing | [signet/](https://github.com/agentic-research/signet) (Go, the spec + reference implementation) |
+| **Implementation** | secure deployed reference impl of the signet protocol on CF Workers | `notme/` (this repo) |
+| **Type sync** | cross-language type definitions in lockstep | this directory — `schema/*.capnp` |
 
-`identity.capnp` claims at the top of the file:
+Capnp is the schema language for type sync. The wire format of any given message is determined by the protocol implementation (signet ADR-002 §2.3 for CABundle, RFC 5652 DER for CMS, RFC 9449 for DPoP, etc.).
 
-> "Cap'n Proto's deterministic binary format guarantees this [cross-language byte equality]."
+## wire format split (per ADR-010)
 
-In practice this is **false on the TS side**:
+| Surface | Format |
+|---|---|
+| HTTP API (request bodies, response bodies) | JSON |
+| KV storage (`CA_BUNDLE_CACHE`) | JSON |
+| DO SQLite blob columns | JSON |
+| DPoP / JWT tokens | JSON-in-base64 (RFC 7515 / 9449) |
+| **Cryptographic canonical bytes (Ed25519 sign/verify input)** | **canonical CBOR (RFC 8949 §4.2)** |
 
-- **Go side** (`../gen/go/identity.capnp.go`) — real `capnpc-go` output. Real capnp segments, pointers, canonical form.
-- **TS side** (`../gen/ts/identity.ts`) — output of `codegen/capnp-to-ts.ts` (~280 LOC hand-rolled regex parser). Emits TS interfaces + Zod schemas. Does **not** produce capnp wire bytes — there is no segment table, no pointer layout, no canonical encoder.
-- **`../worker/src/revocation.ts::bundleCanonical()`** (line 159) — computes `JSON.stringify` over sorted keys. Not capnp canonical bytes. The CABundle signature is therefore being verified against a hash of JSON, not against a hash of the capnp message Go signed.
+This matches signet exactly. signet's CABundle struct has `json:"..."` tags and is transported as JSON over HTTPS (`pkg/revocation/cabundle/https_fetcher.go`); the canonical CBOR form is computed in-memory via `cbor.CanonicalEncOptions().EncMode()` only at the moment a signature is produced or verified (`pkg/revocation/checker.go:168-188`).
 
-If you are touching CABundle signature verification, oracle responses, attestation predicates, or anything that assumes "the bytes Go signs are the bytes TS verifies" — **read bead `notme-803923` first.**
+## TS-side canonical-bytes encoder — alignment shipped
 
-Three fix paths in the bead, decision pending:
+**Status (2026-05-10): aligned.** `worker/src/revocation.ts::bundleCanonical()` produces canonical CBOR with integer-keyed map (`{1:Epoch, 2:Seqno, 3:Keys, 4:KeyID, 5:PrevKeyID, 6:IssuedAt}`) per RFC 8949 §4.2 — byte-for-byte matching signet's `pkg/revocation/checker.go:168-188`. Hand-computed fixtures at `worker/src/__tests__/bundle-canonical.test.ts` lock the byte shape.
 
-1. **TS-real-capnp** — replace `capnp-to-ts.ts` with the upstream `capnpc-ts` runtime. Heaviest lift, fully fixes the lie.
-2. **Schema-honest-about-JSON** — strike the docstring claim, declare JSON canonicalization as the wire format, document the JSON canonicalization rules (key order, number repr, byte encoding) as load-bearing. Cheapest. Closes the lie but locks us into JSON.
-3. **wasm bridge** — compile real capnp into a WASM module, call it from TS for canonical encode/decode only. Middle ground.
+The previous JSON-of-sorted-keys path was a closed-loop-but-incompatible alternative; bundles now interoperate across signet implementations. Implemented per ADR-010 (`docs/design/010-cross-language-canonical-encoding.md`).
 
-Tier 2 fix in the same bead: **pin the toolchain** (`capnpc`, `capnpc-go`, runtime versions) and add a cross-runtime fixture suite that asserts byte-for-byte equality.
+**If you are touching CABundle signature verification, oracle responses, or anything that assumes byte-equality of canonical bytes across languages — read ADR-010 first.**
+
+## still open: schema sync drift (separate concern)
+
+**(P1) capnp-to-ts.ts silent degradation** — the hand-rolled TS generator silently drops fields it doesn't recognize. Independent of the wire-format question (this is type-sync correctness, not signature canonicalization). Tracked in its own bead.
 
 ## flow
 
@@ -54,11 +64,11 @@ flowchart LR
     gen_ts --> worker_ts
     gen_ts --> action_ts
 
-    signet_pkg -. "signs canonical capnp bytes" .-> worker_ts
-    worker_ts -. "verifies JSON-of-sorted-keys" .-> signet_pkg
+    signet_pkg -. "signs canonical CBOR (RFC 8949 §4.2)" .-> worker_ts
+    worker_ts -. "verifies canonical CBOR (matches byte-for-byte)" .-> signet_pkg
 
     classDef warn fill:#fee,stroke:#c00,stroke-width:2px
-    class capnp_to_ts,gen_ts warn
+    class capnp_to_ts warn
 
     divergence["⚠ different toolchains, different wire forms<br/>see notme-803923"]
     capnpc_go -.-> divergence
