@@ -136,12 +136,18 @@ This catches the kind of drift that produced the original bug — silent JSON-ca
 
 ## See also
 
-- [signet ADR-002 §2.3 — Canonical Encoding](../../../signet/docs/design/002-protocol-spec.md) — the upstream protocol spec mandating CBOR canonical.
-- [signet ADR-011 — Policy Bundles](../../../signet/docs/design/011-policy-bundles-scim.md) — same canonical-CBOR pattern for policy distribution; sibling architecture.
-- [signet pkg/revocation/checker.go](../../../signet/pkg/revocation/checker.go) — production code; the byte-for-byte target.
-- [signet pkg/revocation/cabundle/https_fetcher.go](../../../signet/pkg/revocation/cabundle/https_fetcher.go) — confirms JSON is the transport, CBOR is signing-only.
-- [ADR-008](008-bridge-cert-csr-wimse.md) — cert pair format; same principle of signet-protocol-conformance.
-- [ley-line-open RTFM dossier](../../../ley-line-open/docs/decades/T8/capnp-rtfm-findings.md) — capnp canonical encoding research; useful background, but capnp wire format is not adopted here.
-- `worker/src/revocation.ts::bundleCanonical` — the function to be replaced.
-- `worker/src/signing-authority.ts:443-447` — the inline duplicate to be removed.
-- `schema/fixtures/cabundle-*.bin` — cross-runtime fixture suite to be created.
+External (cross-repo) references — absolute GitHub URLs since these resolve to repos outside notme:
+
+- [signet ADR-002 §2.3 — Canonical Encoding](https://github.com/agentic-research/signet/blob/main/docs/design/002-protocol-spec.md) — the upstream protocol spec mandating CBOR canonical.
+- [signet ADR-011 — Policy Bundles](https://github.com/agentic-research/signet/blob/main/docs/design/011-policy-bundles-scim.md) — same canonical-CBOR pattern for policy distribution; sibling architecture.
+- [signet pkg/revocation/checker.go](https://github.com/agentic-research/signet/blob/main/pkg/revocation/checker.go) — production code; the byte-for-byte target.
+- [signet pkg/revocation/cabundle/https_fetcher.go](https://github.com/agentic-research/signet/blob/main/pkg/revocation/cabundle/https_fetcher.go) — confirms JSON is the transport, CBOR is signing-only.
+- [ley-line-open RTFM dossier](https://github.com/agentic-research/ley-line-open/blob/main/docs/decades/T8/capnp-rtfm-findings.md) — capnp canonical encoding research; useful background, but capnp wire format is not adopted here.
+
+In-repo references — relative paths since these resolve within notme:
+
+- [`ADR-008` — bridge cert + CSR + WIMSE](008-bridge-cert-csr-wimse.md) — cert pair format; same principle of signet-protocol-conformance.
+- [`worker/src/revocation.ts::bundleCanonical`](../../worker/src/revocation.ts) — the canonical-CBOR encoder (shipped in this PR).
+- [`worker/src/signing-authority.ts::generateBundle`](../../worker/src/signing-authority.ts) — the signing-side caller (now imports `bundleCanonical` from `revocation.ts`; the previous inline duplicate was removed).
+- [`worker/src/__tests__/bundle-canonical.test.ts`](../../worker/src/__tests__/bundle-canonical.test.ts) — hand-computed CBOR fixtures (single-key + multi-key) locking the byte shape (shipped in this PR).
+- `schema/fixtures/cabundle-*.bin` — cross-runtime fixture suite **still to be created** (Go-side test produces the same fixture bytes; gates byte-for-byte interop with signet). Tracked as follow-up to this ADR.
