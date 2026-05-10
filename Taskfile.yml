@@ -140,3 +140,46 @@ tasks:
     deps: [worker:build-local]
     cmds:
       - npx workerd serve config.capnp --experimental
+
+  image:keygen:
+    desc: Generate the melange signing key (one-time setup)
+    dir: packages
+    cmds:
+      - melange keygen melange.rsa
+    status:
+      - test -f packages/melange.rsa
+      - test -f packages/melange.rsa.pub
+
+  image:apk:
+    desc: Build the notme-app + workerd apks via melange (release-style, signed)
+    deps: [worker:build-local, image:keygen]
+    vars:
+      ARCH:
+        sh: uname -m | sed 's/arm64/aarch64/'
+    cmds:
+      - mkdir -p packages/out
+      - |
+        melange build packages/melange-notme-app.yaml \
+          --arch {{.ARCH}} \
+          --signing-key packages/melange.rsa \
+          --out-dir packages/out \
+          --source-dir worker/
+      - |
+        melange build packages/melange-workerd.yaml \
+          --arch {{.ARCH}} \
+          --signing-key packages/melange.rsa \
+          --out-dir packages/out
+
+  image:
+    desc: Build the notme OCI image via apko (loads to docker via `docker load < packages/notme.tar`)
+    deps: [image:apk]
+    vars:
+      TAG: '{{.TAG | default "0.1.0"}}'
+      ARCH:
+        sh: uname -m | sed 's/arm64/aarch64/'
+    cmds:
+      - |
+        cd packages && apko build apko-notme.yaml notme:{{.TAG}} notme.tar \
+          --keyring-append melange.rsa.pub \
+          --arch {{.ARCH}}
+      - 'echo "Built packages/notme.tar — load with: docker load < packages/notme.tar"'

@@ -1168,6 +1168,21 @@ export default {
     const isLocal = envSiteUrl.startsWith("http://localhost");
     if (isLocal) cacheEnabled = false; // Cache API unavailable in local workerd
 
+    // ── /health liveness probe ──
+    // Host-agnostic, no auth, no DO access. Cloister + container orchestrators
+    // (cluster.capnp notme-identity bundle) poll this on :8788/health.
+    // Must respond before any host-canonicalization redirect so probes from
+    // bare-IP / pod-IP / docker bridge hosts get a 200 instead of a 301.
+    if (pathname === "/health" || pathname === "/healthz") {
+      return new Response("ok", {
+        status: 200,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+
     const { createPlatform } = await import("./src/platform");
     const platform = createPlatform(env);
 

@@ -151,14 +151,17 @@ npx workerd serve config.capnp --experimental
 
 **container (melange + apko)**
 ```bash
-cd packages
-melange build melange-notme-app.yaml --arch aarch64 \
-  --signing-key melange.rsa --out-dir ./out --source-dir ../worker/
-apko build apko-notme.yaml notme:latest notme.tar \
-  --keyring-append melange.rsa.pub --arch aarch64
-docker load < notme.tar
-docker run -p 8788:8788 notme:latest-arm64
+task image              # bundles worker, signs apks, builds notme:0.1.0 OCI tar
+docker load < packages/notme.tar
+docker run -p 8788:8788 notme:0.1.0
+curl localhost:8788/health    # → 200 ok
 ```
+
+The `task image` target wraps the full pipeline (`worker:build-local`
+→ melange apks → apko OCI tarball). Override the tag with
+`task image TAG=mytag`. Cloister's `cluster.capnp` consumes
+`notme:0.1.0`, so leave the default for cluster deployment. Requires
+`apko`, `melange`, and a running Docker daemon.
 
 **cloudflare workers**
 ```bash
