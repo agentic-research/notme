@@ -828,24 +828,59 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   override async alarm(): Promise<void> {
     const now = Date.now();
-    const health = this.readAlarmHealthRow();
+    this.ensureAlarmHealthSchema();
+
+    // Read pre-fire state for the breaker decision.
+    // Note: counters are written via atomic SQL increments below
+    // (`field = field + 1`), not via TS-computed read-modify-write — so
+    // concurrent fires (per the comments below on workerd-local quirks)
+    // can't lose counter increments.
+    const preRows = this.ctx.storage.sql
+      .exec(
+        "SELECT failure_count, last_outcome, first_fire_at FROM alarm_health WHERE id = 'authority'",
+      )
+      .toArray() as Array<{
+      failure_count: number;
+      last_outcome: string;
+      first_fire_at: number;
+    }>;
+    const pre = preRows[0] ?? {
+      failure_count: 0,
+      last_outcome: "",
+      first_fire_at: 0,
+    };
 
     // Circuit breaker — stop re-arming if too many consecutive failures.
     // Operator must call resetAlarmHealth() to recover.
-    if (health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES) {
+    //
+    // Even though we early-return without doing the bundle work, we DO
+    // record the fire in alarm_health (atomic increment). Otherwise total_fires
+    // would undercount the actual alarm fires that occurred — important for
+    // post-mortem ("how many fires did we eat after the breaker tripped").
+    if (pre.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES) {
       console.error(
-        `[signing-authority] CIRCUIT BREAKER OPEN: ${health.failure_count} consecutive ` +
-          `alarm failures. Last outcome: "${health.last_outcome}". ` +
+        `[signing-authority] CIRCUIT BREAKER OPEN: ${pre.failure_count} consecutive ` +
+          `alarm failures. Last outcome: "${pre.last_outcome}". ` +
           `Not re-arming. Manual recovery via resetAlarmHealth() RPC.`,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE alarm_health SET total_fires = total_fires + 1, last_fire_at = ?, last_outcome = 'skipped: circuit breaker open' WHERE id = 'authority'",
+        now,
       );
       return; // do NOT re-arm
     }
 
-    // Track this fire
-    const firstFire = health.first_fire_at === 0 ? now : health.first_fire_at;
+    // Set first_fire_at on the very first fire (idempotent: only updates
+    // when first_fire_at is still 0).
+    if (pre.first_fire_at === 0) {
+      this.ctx.storage.sql.exec(
+        "UPDATE alarm_health SET first_fire_at = ? WHERE id = 'authority' AND first_fire_at = 0",
+        now,
+      );
+    }
 
-    let nextFailureCount: number;
-    let nextOutcome: string;
+    let success = false;
+    let outcome: string;
     try {
       const bundle = await this.generateBundle();
       if (this.env.CA_BUNDLE_CACHE) {
@@ -854,23 +889,50 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           JSON.stringify(bundle),
         );
       }
-      nextFailureCount = 0;
-      nextOutcome = "success";
+      success = true;
+      outcome = "success";
     } catch (e) {
       console.error("[signing-authority] bundle refresh failed:", e);
-      nextFailureCount = health.failure_count + 1;
       const msg = (e as Error)?.message ?? "unknown";
-      nextOutcome = `error: ${msg.slice(0, 200)}`;
+      outcome = `error: ${msg.slice(0, 200)}`;
     }
 
-    this.ctx.storage.sql.exec(
-      "UPDATE alarm_health SET failure_count = ?, total_fires = ?, last_fire_at = ?, last_outcome = ?, first_fire_at = ? WHERE id = 'authority'",
-      nextFailureCount,
-      health.total_fires + 1,
-      now,
-      nextOutcome,
-      firstFire,
-    );
+    // Atomic update — `total_fires = total_fires + 1` and (on failure)
+    // `failure_count = failure_count + 1` happen in SQL, so concurrent fires
+    // can't drop increments. failure_count resets to 0 on success.
+    if (success) {
+      this.ctx.storage.sql.exec(
+        "UPDATE alarm_health SET failure_count = 0, total_fires = total_fires + 1, last_fire_at = ?, last_outcome = ? WHERE id = 'authority'",
+        now,
+        outcome,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        "UPDATE alarm_health SET failure_count = failure_count + 1, total_fires = total_fires + 1, last_fire_at = ?, last_outcome = ? WHERE id = 'authority'",
+        now,
+        outcome,
+      );
+    }
+
+    // Re-read failure_count after the atomic update so we can detect
+    // a just-tripped breaker on THIS fire (off-by-one fix). If the
+    // increment from THIS fire pushed us to >= threshold, do not re-arm.
+    // Without this re-check, the breaker would only trip on the NEXT fire,
+    // leaking one extra alarm cycle past the policy threshold.
+    const postRows = this.ctx.storage.sql
+      .exec(
+        "SELECT failure_count FROM alarm_health WHERE id = 'authority'",
+      )
+      .toArray() as Array<{ failure_count: number }>;
+    const postFailureCount = postRows[0]?.failure_count ?? 0;
+    if (postFailureCount >= MAX_CONSECUTIVE_ALARM_FAILURES) {
+      console.error(
+        `[signing-authority] CIRCUIT BREAKER TRIPPED on this fire: ` +
+          `${postFailureCount} consecutive failures. ` +
+          `Not re-arming. Manual recovery via resetAlarmHealth() RPC.`,
+      );
+      return; // do NOT re-arm — breaker tripped on this fire
+    }
 
     // Re-arm with defense-in-depth getAlarm() check.
     // CF's contract says alarm() consumed the prior alarm so getAlarm() returns
