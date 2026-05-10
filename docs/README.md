@@ -6,14 +6,14 @@ architecture decision records for notme.
 
 | # | title | status | one-line decision | code / files |
 |---|---|---|---|---|
-| **005** | [multi-user identity](design/005-multi-user-identity.md) | proposed | replace single-admin model with `principals` + `capability_grants` + invite flow; `is_admin` boolean retired in favor of capability scopes | `worker/src/auth/principals.ts`, `worker/src/auth/connections.ts` |
+| **005** | [multi-user identity](design/005-multi-user-identity.md) | accepted | replace single-admin model with `principals` + `capability_grants` + invite flow; `is_admin` boolean retired in favor of capability scopes | `worker/src/auth/principals.ts`, `worker/src/auth/connections.ts` |
 | **006** | [DPoP tokens](design/006-dpop-tokens.md) | accepted | sender-constrained JWT access tokens (RFC 9449); same Ed25519 master key signs certs and tokens | `worker/src/auth/dpop.ts`, `worker/src/auth/dpop-handler.ts`, `worker/src/auth/token.ts` |
 | **007** | [secretless local proxy](design/007-secretless-local-proxy.md) | accepted (phase A done; phase C partial) | two-plane model — workerd holds non-extractable keys locally, edge validates independently; `extractable: false` invariant enforced everywhere | `worker/src/platform.ts`, `worker/src/signing-authority.ts`, `proxy/src/main.rs` |
 | **007** | [secretless plan](design/007-secretless-plan.md) | implementation plan (sibling of design 007) | task-by-task TDD checklist for executing 007 | — (drives changes across `worker/`, `Taskfile.yml`) |
 | **008** | [bridge cert + CSR + WIMSE](design/008-bridge-cert-csr-wimse.md) | accepted | proof-of-possession exchange producing a P-256 mTLS cert + Ed25519 signing cert with a shared binding extension; WIMSE identity URIs in SAN | `worker/src/cert-authority.ts`, `worker/src/cert-exchange.ts` |
 | **009** | [identity-gated runtime](design/009-identity-gated-runtime.md) | accepted | workerd config pattern: agent Worker has no `globalOutbound`, talks to notme Worker via service binding only; agent cannot `fetch()` | `worker/config.capnp`, `worker/worker.ts` (`AuthService`) |
 
-statuses come from each ADR's own header. 005 is "proposed" in-file even though the principal model has shipped (`worker/src/auth/principals.ts`); the file hasn't been promoted yet. 007 and 009 don't carry an explicit status field — labelled "accepted" here based on shipped code.
+statuses come from each ADR's own header. 007 and 009 don't carry an explicit status field — labelled "accepted" here based on shipped code. 005 was promoted from "proposed" to "accepted" in this PR (the principal model has shipped at `worker/src/auth/principals.ts`).
 
 ## adr dependency graph
 
@@ -24,7 +24,7 @@ graph TD
     classDef plan fill:#e3f2fd,stroke:#1565c0,stroke-width:1px,color:#000
     classDef external fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px,color:#000
 
-    A005["005 multi-user identity<br/>(principal model, capability_grants)"]:::proposed
+    A005["005 multi-user identity<br/>(principal model, capability_grants)"]:::accepted
     A006["006 DPoP tokens<br/>(RFC 9449, browser PoP)"]:::accepted
     A007D["007 secretless local proxy<br/>(two-plane, extractable:false)"]:::accepted
     A007P["007 secretless plan<br/>(implementation tasks)"]:::plan

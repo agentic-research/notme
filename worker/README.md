@@ -143,7 +143,7 @@ served on `auth.notme.bot` (and `localhost:8788` locally). main domain `notme.bo
 
 worker.ts also exposes a private RPC surface via the `AuthService` `WorkerEntrypoint` — service-binding-only, no HTTP. methods: `mintBridgeCert`, `mintDPoPToken`, `getPublicKeyPem`, `getCACertificatePem`, `getAuthorityState`, `verifySession`, plus the 009 identity-gated triple `authenticate` / `proxy` / `sign` / `identity`. consumed by colocated agent workers (see `examples/agent-worker.js`).
 
-note: `/.well-known/signet-authority.json` advertises `/exchange-token` and `/api/cert/register` — these are **not currently routed** in worker.ts. discovery drift; either remove from the doc or wire the routes.
+note: discovery (`/.well-known/signet-authority.json`) and the JSON landing page were trimmed in this PR (commit `4a51a6d`) to advertise only routes that are actually wired — `/exchange-token` and `/api/cert/register` are no longer claimed. If those endpoints are eventually wired, re-add them to discovery alongside the implementation. Re-drift would be caught by `notme-803923`-class tests if a future iteration adds a "discovery vs route table" CI assertion (separate bead).
 
 ## bindings
 
