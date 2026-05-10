@@ -955,9 +955,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     previousFailureCount: number;
   }> {
     const before = this.readAlarmHealthRow();
+    // Reset failure_count + outcome but DO NOT update last_fire_at — a reset
+    // is not an alarm fire, and observability/audit consumers reading
+    // last_fire_at expect "when did alarm() last fire," not "when was the
+    // last administrative action." If a "last reset at" timestamp is wanted
+    // later, add it as a separate column.
     this.ctx.storage.sql.exec(
-      "UPDATE alarm_health SET failure_count = 0, last_outcome = 'manually_reset', last_fire_at = ? WHERE id = 'authority'",
-      Date.now(),
+      "UPDATE alarm_health SET failure_count = 0, last_outcome = 'manually_reset' WHERE id = 'authority'",
     );
     let rearmed = false;
     if (!(await this.ctx.storage.getAlarm())) {
@@ -972,10 +976,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   /**
+   * Minimum total_fires for `driftRatio` to be considered meaningful.
+   * Below this, the average is too noisy (single fire over short elapsed
+   * time → arbitrarily large rate). At 3 fires the average is anchored
+   * by ~12 minutes of cadence-paced data, enough for sustained drift to
+   * surface above startup noise.
+   */
+  static readonly DRIFT_RATIO_WARMUP_FIRES = 3;
+
+  /**
    * DO-internal alarm-loop observability.
-   * Returns the current health row plus derived rates for runaway detection.
-   * driftRatio > 1 indicates the alarm is firing more often than the
-   * BUNDLE_REFRESH_MS cadence prescribes — runaway-alarm smoking gun.
+   *
+   * Returns the current alarm_health row plus derived rates for
+   * runaway-alarm detection. The driftRatio is the runaway smoking gun —
+   * BUT only after warmup. During startup (first ~12 minutes / 3 fires)
+   * the average over a small denominator produces noisy values; consumers
+   * MUST gate runaway alerts on `warmupComplete === true` before treating
+   * `driftRatio > 1` as an anomaly. After warmup, sustained driftRatio
+   * above ~1.2 indicates the alarm is firing faster than the
+   * BUNDLE_REFRESH_MS cadence prescribes.
    */
   async getAlarmHealth(): Promise<{
     totalFires: number;
@@ -986,6 +1005,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     firesPerHour: number;
     expectedFiresPerHour: number;
     driftRatio: number;
+    warmupComplete: boolean;
     circuitBreakerOpen: boolean;
   }> {
     const health = this.readAlarmHealthRow();
@@ -1008,6 +1028,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       firesPerHour,
       expectedFiresPerHour,
       driftRatio,
+      warmupComplete:
+        health.total_fires >= SigningAuthority.DRIFT_RATIO_WARMUP_FIRES,
       circuitBreakerOpen:
         health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES,
     };
