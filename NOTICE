@@ -1,0 +1,10 @@
+notme
+Copyright 2026 Agentic Research
+
+This product includes software developed by Agentic Research
+(https://github.com/agentic-research/notme).
+
+This product includes patterns derived from jose
+(https://github.com/panva/jose), Copyright (c) 2018 Filip Skokan,
+licensed under the MIT License. See gen/ts/dpop.ts and
+gen/ts/__tests__/jwt-primitives.test.ts for in-source attribution.

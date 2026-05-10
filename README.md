@@ -193,7 +193,7 @@ cd ../proxy && cargo test  # 11 Rust tests (parser, UDS bind, perms)
 | `scripts/` | Standalone tooling (`doc-check.ts` etc.). | [scripts/README.md](scripts/README.md) |
 | `packages/` | melange + apko — signed container bundles for self-hosted deployments. | [packages/README.md](packages/README.md) |
 | `docs/design/` | ADRs 005-009. | [docs/README.md](docs/README.md) |
-| `vault/` | *(moving to cloister — do not extend)* | — |
+| `vault/` | Credential vault Worker — *moving to cloister; will become AGPL-3.0 there* | [vault/README.md](vault/README.md) |
 
 ## related
 
