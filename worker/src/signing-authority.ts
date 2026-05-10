@@ -441,7 +441,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     // Canonical bytes for signing — single source of truth in revocation.ts.
     // Per ADR-010: canonical CBOR (RFC 8949 §4.2), matching signet protocol.
-    const canonical = bundleCanonical(bundle as CABundle);
+    // bundleCanonical takes Omit<CABundle, "signature">; pre-signature bundle
+    // is assignable directly (no cast).
+    const canonical = bundleCanonical(bundle);
 
     // Sign
     const sig = await crypto.subtle.sign(ED25519, signingKey, canonical);

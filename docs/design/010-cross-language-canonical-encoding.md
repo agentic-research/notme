@@ -90,14 +90,15 @@ This is signet's choice (`checker.go:168-175`). notme TS adopts it verbatim. Fie
 
 ### Migration path
 
-The closed loop currently works (JSON ↔ JSON within notme), so a sudden swap risks orphaning every existing signature in KV. Plan:
+The closed loop currently works (JSON ↔ JSON within notme), so a sudden swap risks orphaning every existing signature in KV. Two strategies were considered:
 
-1. **Land the new CBOR-canonical encoder** alongside the existing JSON-canonical encoder.
-2. **Dual-encode for one rotation cycle**: writer signs with both, stores both signatures. Verifier accepts either. Metric: count which path succeeds.
-3. **Drop JSON path** after one full epoch rotation has occurred under dual-encode and metrics show no JSON-only fallbacks.
-4. **CABundle schema gains an explicit `signatureFormat` discriminant** (or relies on epoch-bound migration — TBD in implementation).
+**(A) Dual-encode for one rotation cycle.** Writer signs with both JSON-canonical and CBOR-canonical, stores both signatures. Verifier accepts either. After one full epoch rotation under dual-encode with no JSON-only fallbacks observed in metrics, drop the JSON path. Adds a `signatureFormat` discriminant to CABundle (or relies on epoch-bound migration). Conservative; appropriate for production deployments with persistent signed bundles to preserve.
 
-Defer the dual-encode mechanism to the implementation bead; this ADR commits to the destination, not the precise migration choreography.
+**(B) Hard-cutover with bounded staleness window.** Drop JSON-canonical, ship CBOR-canonical only. Existing JSON-signed bundles in KV become unverifiable until the SigningAuthority `alarm()` (every 4 minutes, per `BUNDLE_REFRESH_MS`) regenerates a fresh CBOR-signed bundle. Worst-case window: 4 minutes of revocation-check failures during deploy. Acceptable when there are no production-tier persistent signed bundles to preserve.
+
+**Decision (2026-05-10):** **(B) hard-cutover.** notme is currently pre-production; no persistent JSON-canonical signed bundles in any production KV need preserving. The 4-minute alarm cycle bounds the unverifiable-bundle window during deploy; revocation checks fail closed during that window (per `revocation.ts::isBundleStale`), which is the same fail-closed behavior they'd take on any bundle staleness anyway.
+
+If/when notme has production deployments with persistent signed bundles that pre-date this migration, switch to strategy (A) before bumping CBOR alignment further. The CABundle `signatureFormat` discriminant remains a future option (deferred to a follow-on ADR or a re-revisited (A) path); not implemented in this landing.
 
 ### Cross-runtime fixture suite
 
@@ -117,8 +118,7 @@ This catches the kind of drift that produced the original bug — silent JSON-ca
 **Negative / costs:**
 
 - **One npm dep added** (`cbor-x`). Bundle-size impact measured at integration time; if material, switch to `cbor2` or a hand-rolled minimal RFC 8949 §4.2 encoder.
-- **Migration complexity:** dual-encode for one epoch cycle is operational toil. Worth it to avoid orphaning existing signatures.
-- **Two competing canonical encoders** during the migration window (JSON-canonical for legacy, CBOR-canonical for new). Code complexity peaks during this window.
+- **Bounded staleness window during deploy:** with strategy (B), existing JSON-signed bundles in KV become unverifiable until the next 4-minute alarm cycle regenerates them. Revocation checks fail closed during that window — same fail-closed behavior as any other bundle-stale condition. Acceptable for notme's pre-production stage; documented as a re-evaluation trigger if notme has persistent production signed bundles in the future.
 
 **Out of scope:**
 

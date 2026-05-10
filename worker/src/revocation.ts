@@ -127,12 +127,6 @@ function b64Decode(s: string): Uint8Array<ArrayBuffer> {
 }
 
 /**
- * Canonical JSON for bundle signature verification.
- *
- * Excludes the `signature` field; sorts remaining keys alphabetically.
- * Must stay in sync with signet's signing implementation.
- */
-/**
  * Staleness gate — fail closed.
  *
  * A bundle without a valid `issuedAt` (missing, NaN, non-positive) is
@@ -201,7 +195,27 @@ function sortStringKeysCanonical(
   });
 }
 
-export function bundleCanonical(bundle: CABundle): Uint8Array {
+/**
+ * Canonical bytes for CABundle Ed25519 signing input.
+ *
+ * Per ADR-010 + signet ADR-002 §2.3: produces RFC 8949 §4.2
+ * canonical CBOR with integer-keyed map matching
+ * `signet/pkg/revocation/checker.go:168-188` byte-for-byte. The
+ * output is the input to `crypto.subtle.sign(ED25519, ...)` (or
+ * `verify`); it is NOT the wire format. Wire format stays JSON
+ * for transport/storage; CBOR is signing-only.
+ *
+ * Parameter type: takes `Omit<CABundle, "signature">` because the
+ * signature field is excluded from the signing input by definition.
+ * A full `CABundle` is structurally compatible (the extra
+ * `signature` field is just ignored), so callers can pass either a
+ * pre-signature bundle (during `generateBundle`) or a
+ * fully-signed bundle (during verify).
+ *
+ * @param bundle - the unsigned bundle (signature field, if present, is ignored)
+ * @returns canonical CBOR bytes; safe to feed directly to crypto.subtle.sign / verify
+ */
+export function bundleCanonical(bundle: Omit<CABundle, "signature">): Uint8Array {
   // Match signet/pkg/revocation/checker.go:168-188 byte-for-byte:
   //   message := map[int]interface{}{
   //     1: bundle.Epoch,     // uint64

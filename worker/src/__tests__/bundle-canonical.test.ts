@@ -10,8 +10,8 @@
 // These tests live under src/__tests__/ so they actually run in CI
 // (vitest.config.ts only includes src/__tests__/**). The legacy tests
 // at src/revocation.test.ts use cloudflare:test (DO bindings) and have
-// not been wired into vitest's pool — see notme-XXX (revocation tests
-// dead since vitest config carved them out).
+// not been wired into vitest's pool — see notme-c38bb6 (P1, "revocation
+// tests dead since vitest config carved them out").
 
 import { describe, expect, it } from "vitest";
 import { type CABundle, bundleCanonical } from "../revocation";
@@ -99,6 +99,46 @@ describe("bundleCanonical (CBOR canonical, RFC 8949 §4.2)", () => {
       0x04, 0x63, 0x6b, 0x69, 0x64,
       0x05, 0x60,
       0x06, 0x19, 0x04, 0xd2,
+    ]);
+    expect(bundleCanonical(bundle)).toEqual(expected);
+  });
+
+  it("sorts multi-key keys map per RFC 8949 §4.2 (length-then-bytewise, NOT alphabetical)", () => {
+    // Keys map with two entries chosen specifically to expose the
+    // canonical ordering rule: "b" (length 1) and "ab" (length 2).
+    //
+    // RFC 8949 §4.2 says map keys MUST be sorted "in the bytewise
+    // lexicographic order of their deterministic encodings." For text
+    // strings, the encoding is length-prefixed, so the rule reduces to:
+    // shorter strings first; equal-length strings compared bytewise.
+    //
+    // Naive alphabetical sort would put "ab" before "b" (a < b).
+    // Canonical sort puts "b" before "ab" (length 1 < length 2).
+    //
+    // If sortStringKeysCanonical regresses to plain alphabetical or
+    // skips sorting, this fixture catches it.
+    const bundle: CABundle = {
+      epoch: 1,
+      seqno: 1,
+      keys: { ab: btoa("\x02"), b: btoa("\x01") }, // intentional reverse insertion order
+      keyId: "b",
+      prevKeyId: "",
+      issuedAt: 1234,
+      signature: "",
+    };
+    const expected = new Uint8Array([
+      0xa6,                        // map(6)
+      0x01, 0x01,                  // 1 → 1
+      0x02, 0x01,                  // 2 → 1
+      0x03,                        // 3 → ...
+      0xa2,                        //   map(2)
+      0x61, 0x62,                  //     "b" (length 1, comes FIRST per §4.2)
+      0x41, 0x01,                  //     h'01'
+      0x62, 0x61, 0x62,            //     "ab" (length 2, comes SECOND)
+      0x41, 0x02,                  //     h'02'
+      0x04, 0x61, 0x62,            // 4 → "b"
+      0x05, 0x60,                  // 5 → ""
+      0x06, 0x19, 0x04, 0xd2,      // 6 → 1234
     ]);
     expect(bundleCanonical(bundle)).toEqual(expected);
   });

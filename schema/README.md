@@ -24,17 +24,15 @@ Capnp is the schema language for type sync. The wire format of any given message
 
 This matches signet exactly. signet's CABundle struct has `json:"..."` tags and is transported as JSON over HTTPS (`pkg/revocation/cabundle/https_fetcher.go`); the canonical CBOR form is computed in-memory via `cbor.CanonicalEncOptions().EncMode()` only at the moment a signature is produced or verified (`pkg/revocation/checker.go:168-188`).
 
-## open: TS-side canonical-bytes encoder is wrong
+## TS-side canonical-bytes encoder — alignment shipped
 
-**Status (2026-05-09):** tracked in the **(P0) protocol drift** bead — see `docs/design/010-cross-language-canonical-encoding.md`.
+**Status (2026-05-10): aligned.** `worker/src/revocation.ts::bundleCanonical()` produces canonical CBOR with integer-keyed map (`{1:Epoch, 2:Seqno, 3:Keys, 4:KeyID, 5:PrevKeyID, 6:IssuedAt}`) per RFC 8949 §4.2 — byte-for-byte matching signet's `pkg/revocation/checker.go:168-188`. Hand-computed fixtures at `worker/src/__tests__/bundle-canonical.test.ts` lock the byte shape.
 
-`worker/src/revocation.ts::bundleCanonical()` and the inline duplicate at `worker/src/signing-authority.ts:443-447` currently emit **JSON-of-sorted-keys** as the canonical signing input. signet's protocol prescribes **canonical CBOR with integer-keyed map** (`{1:Epoch, 2:Seqno, 3:Keys, 4:KeyID, 5:PrevKeyID, 6:IssuedAt}`) per RFC 8949 §4.2.
-
-notme's closed loop works in isolation (it writes JSON-canonical, verifies JSON-canonical) but bundles cannot interoperate across signet impls. ADR-010 commits to the alignment.
+The previous JSON-of-sorted-keys path was a closed-loop-but-incompatible alternative; bundles now interoperate across signet implementations. Implemented per ADR-010 (`docs/design/010-cross-language-canonical-encoding.md`).
 
 **If you are touching CABundle signature verification, oracle responses, or anything that assumes byte-equality of canonical bytes across languages — read ADR-010 first.**
 
-## also open: schema sync drift (separate concern)
+## still open: schema sync drift (separate concern)
 
 **(P1) capnp-to-ts.ts silent degradation** — the hand-rolled TS generator silently drops fields it doesn't recognize. Independent of the wire-format question (this is type-sync correctness, not signature canonicalization). Tracked in its own bead.
 
@@ -66,11 +64,11 @@ flowchart LR
     gen_ts --> worker_ts
     gen_ts --> action_ts
 
-    signet_pkg -. "signs canonical capnp bytes" .-> worker_ts
-    worker_ts -. "verifies JSON-of-sorted-keys" .-> signet_pkg
+    signet_pkg -. "signs canonical CBOR (RFC 8949 §4.2)" .-> worker_ts
+    worker_ts -. "verifies canonical CBOR (matches byte-for-byte)" .-> signet_pkg
 
     classDef warn fill:#fee,stroke:#c00,stroke-width:2px
-    class capnp_to_ts,gen_ts warn
+    class capnp_to_ts warn
 
     divergence["⚠ different toolchains, different wire forms<br/>see notme-803923"]
     capnpc_go -.-> divergence
