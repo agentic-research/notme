@@ -26,6 +26,17 @@ interface SigningAuthorityEnv {
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 
+// Circuit-breaker threshold for the alarm() loop. After this many consecutive
+// generateBundle() failures, alarm() stops re-arming itself. Manual recovery
+// via resetAlarmHealth() RPC. Defends against the runaway-alarm-bills failure
+// mode (per notme-5c2511 EPIC and the reddit cautionary tale that motivated it):
+// if generateBundle starts throwing — DO storage corruption, key import failure,
+// KV unavailable, signing-key state desync — without this, we'd fire every 4
+// minutes forever, each time doing real DO storage reads/writes.
+//
+// 5 strikes ≈ 20 minutes of failure before kill switch fires. Tunable.
+const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
+
 import { keyIdFromSpki } from "./key-id";
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
@@ -750,6 +761,63 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // ── Alarm: periodic bundle publish ──────────────────────────────────
   // Ensures CA bundle in KV stays fresh (< BUNDLE_MAX_AGE_MS).
   // Scheduled on first getOrCreateSigningKey() and re-arms after each fire.
+  //
+  // Hardening (notme-5c2511 EPIC, post 2026-05-10 cautionary-tale review):
+  //   - alarm_health table tracks failure_count, total_fires, last_fire_at,
+  //     last_outcome, first_fire_at.
+  //   - Circuit breaker: after MAX_CONSECUTIVE_ALARM_FAILURES consecutive
+  //     failures, alarm() stops re-arming. Manual recovery via
+  //     resetAlarmHealth() RPC.
+  //   - Defense-in-depth: re-arm goes through getAlarm() check first
+  //     (mirrors scheduleNextRefresh's pattern).
+
+  private alarmHealthInitialized = false;
+
+  private ensureAlarmHealthSchema(): void {
+    if (this.alarmHealthInitialized) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS alarm_health (
+        id              TEXT PRIMARY KEY DEFAULT 'authority',
+        failure_count   INTEGER NOT NULL DEFAULT 0,
+        total_fires     INTEGER NOT NULL DEFAULT 0,
+        last_fire_at    INTEGER NOT NULL DEFAULT 0,
+        last_outcome    TEXT    NOT NULL DEFAULT '',
+        first_fire_at   INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO alarm_health (id) VALUES ('authority')",
+    );
+    this.alarmHealthInitialized = true;
+  }
+
+  private readAlarmHealthRow(): {
+    failure_count: number;
+    total_fires: number;
+    last_fire_at: number;
+    last_outcome: string;
+    first_fire_at: number;
+  } {
+    this.ensureAlarmHealthSchema();
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT failure_count, total_fires, last_fire_at, last_outcome, first_fire_at FROM alarm_health WHERE id = 'authority'",
+      )
+      .toArray() as Array<{
+      failure_count: number;
+      total_fires: number;
+      last_fire_at: number;
+      last_outcome: string;
+      first_fire_at: number;
+    }>;
+    return rows[0] ?? {
+      failure_count: 0,
+      total_fires: 0,
+      last_fire_at: 0,
+      last_outcome: "",
+      first_fire_at: 0,
+    };
+  }
 
   async scheduleNextRefresh(): Promise<void> {
     const current = await this.ctx.storage.getAlarm();
@@ -759,6 +827,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   override async alarm(): Promise<void> {
+    const now = Date.now();
+    const health = this.readAlarmHealthRow();
+
+    // Circuit breaker — stop re-arming if too many consecutive failures.
+    // Operator must call resetAlarmHealth() to recover.
+    if (health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES) {
+      console.error(
+        `[signing-authority] CIRCUIT BREAKER OPEN: ${health.failure_count} consecutive ` +
+          `alarm failures. Last outcome: "${health.last_outcome}". ` +
+          `Not re-arming. Manual recovery via resetAlarmHealth() RPC.`,
+      );
+      return; // do NOT re-arm
+    }
+
+    // Track this fire
+    const firstFire = health.first_fire_at === 0 ? now : health.first_fire_at;
+
+    let nextFailureCount: number;
+    let nextOutcome: string;
     try {
       const bundle = await this.generateBundle();
       if (this.env.CA_BUNDLE_CACHE) {
@@ -767,10 +854,100 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           JSON.stringify(bundle),
         );
       }
+      nextFailureCount = 0;
+      nextOutcome = "success";
     } catch (e) {
       console.error("[signing-authority] bundle refresh failed:", e);
+      nextFailureCount = health.failure_count + 1;
+      const msg = (e as Error)?.message ?? "unknown";
+      nextOutcome = `error: ${msg.slice(0, 200)}`;
     }
-    // Re-arm
-    await this.ctx.storage.setAlarm(Date.now() + BUNDLE_REFRESH_MS);
+
+    this.ctx.storage.sql.exec(
+      "UPDATE alarm_health SET failure_count = ?, total_fires = ?, last_fire_at = ?, last_outcome = ?, first_fire_at = ? WHERE id = 'authority'",
+      nextFailureCount,
+      health.total_fires + 1,
+      now,
+      nextOutcome,
+      firstFire,
+    );
+
+    // Re-arm with defense-in-depth getAlarm() check.
+    // CF's contract says alarm() consumed the prior alarm so getAlarm() returns
+    // null here — but checking first costs nothing and protects against
+    // unforeseen runtime quirks (manual alarm() calls in tests, future CF
+    // runtime changes, parallel-execution edge cases in workerd-local mode).
+    if (!(await this.ctx.storage.getAlarm())) {
+      await this.ctx.storage.setAlarm(Date.now() + BUNDLE_REFRESH_MS);
+    }
+  }
+
+  /**
+   * Manual recovery from the circuit-breaker tripped state.
+   * Resets failure_count to 0 and re-arms one cycle.
+   * Total fires + first_fire_at are preserved for audit history.
+   */
+  async resetAlarmHealth(): Promise<{
+    reset: true;
+    rearmed: boolean;
+    previousFailureCount: number;
+  }> {
+    const before = this.readAlarmHealthRow();
+    this.ctx.storage.sql.exec(
+      "UPDATE alarm_health SET failure_count = 0, last_outcome = 'manually_reset', last_fire_at = ? WHERE id = 'authority'",
+      Date.now(),
+    );
+    let rearmed = false;
+    if (!(await this.ctx.storage.getAlarm())) {
+      await this.ctx.storage.setAlarm(Date.now() + BUNDLE_REFRESH_MS);
+      rearmed = true;
+    }
+    return {
+      reset: true,
+      rearmed,
+      previousFailureCount: before.failure_count,
+    };
+  }
+
+  /**
+   * DO-internal alarm-loop observability.
+   * Returns the current health row plus derived rates for runaway detection.
+   * driftRatio > 1 indicates the alarm is firing more often than the
+   * BUNDLE_REFRESH_MS cadence prescribes — runaway-alarm smoking gun.
+   */
+  async getAlarmHealth(): Promise<{
+    totalFires: number;
+    failureCount: number;
+    lastFireAt: number;
+    lastOutcome: string;
+    firstFireAt: number;
+    firesPerHour: number;
+    expectedFiresPerHour: number;
+    driftRatio: number;
+    circuitBreakerOpen: boolean;
+  }> {
+    const health = this.readAlarmHealthRow();
+    const now = Date.now();
+    const elapsedHours =
+      health.first_fire_at > 0
+        ? Math.max((now - health.first_fire_at) / 3_600_000, 1 / 3600)
+        : 0;
+    const firesPerHour =
+      elapsedHours > 0 ? health.total_fires / elapsedHours : 0;
+    const expectedFiresPerHour = 3_600_000 / BUNDLE_REFRESH_MS;
+    const driftRatio =
+      expectedFiresPerHour > 0 ? firesPerHour / expectedFiresPerHour : 0;
+    return {
+      totalFires: health.total_fires,
+      failureCount: health.failure_count,
+      lastFireAt: health.last_fire_at,
+      lastOutcome: health.last_outcome,
+      firstFireAt: health.first_fire_at,
+      firesPerHour,
+      expectedFiresPerHour,
+      driftRatio,
+      circuitBreakerOpen:
+        health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES,
+    };
   }
 }
