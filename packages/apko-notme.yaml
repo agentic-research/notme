@@ -50,6 +50,17 @@ paths:
     uid: 1000
     gid: 1000
     permissions: 0o755
+  # Mount point for cluster-internal UDS sockets. The container runtime
+  # (cluster.compose.yaml) mounts a shared volume here at deploy time; the
+  # apko build only needs to ensure the directory exists and is reachable
+  # by the notme user (uid 1000). Sibling bundles (mache, rosary, etc.)
+  # bind their `<bundle>.sock` files in this dir. notme-proxy dials them
+  # when it receives `X-Cloister-Transport: uds`.
+  - path: /run/cloister-uds
+    type: directory
+    uid: 1000
+    gid: 1000
+    permissions: 0o755
 
 entrypoint:
   command: /usr/bin/workerd serve /app/config.capnp --experimental
