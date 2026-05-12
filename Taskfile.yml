@@ -1,8 +1,21 @@
 version: "3"
 
 tasks:
+  # Root pnpm install — used by any root-scope task that runs `pnpm exec`.
+  # --ignore-scripts: never run install hooks (defense-in-depth, matches
+  # worker:install + .npmrc posture). --frozen-lockfile: fail on lockfile
+  # drift. `sources:` makes Task skip re-running when nothing changed.
+  deps:install:
+    desc: Install root deps (tsx, yaml, zod) via pnpm
+    sources:
+      - package.json
+      - pnpm-lock.yaml
+    cmds:
+      - pnpm install --frozen-lockfile --ignore-scripts
+
   schema:ts:
     desc: Generate TypeScript types + Zod schemas from Cap'n Proto
+    deps: [deps:install]
     cmds:
       - pnpm exec tsx schema/codegen/capnp-to-ts.ts schema/identity.capnp > gen/ts/identity.ts
       - echo "Generated gen/ts/identity.ts"
@@ -42,10 +55,9 @@ tasks:
       - pnpm audit --prod
 
   worker:check:
-    desc: Audit + type-check + test
+    desc: Type-check + test (audit is its own task — `worker:audit`)
     dir: worker
     cmds:
-      - pnpm audit --prod
       - pnpm exec tsc --noEmit
       - pnpm exec vitest run
 
@@ -103,15 +115,14 @@ tasks:
 
   docs:check:
     desc: Verify doc claims against code
+    deps: [deps:install]
     cmds:
       - pnpm exec tsx scripts/doc-check.ts --skip-external
 
   pin:check:
     desc: Verify every external `uses:` in .github/workflows is SHA-pinned
+    deps: [deps:install]
     cmds:
-      # --ignore-scripts: never run install hooks (matches worker:install).
-      # --frozen-lockfile: fail if pnpm-lock.yaml is out of sync.
-      - pnpm install --frozen-lockfile --ignore-scripts
       - pnpm exec tsx scripts/check-sha-pins.ts
 
   ship:

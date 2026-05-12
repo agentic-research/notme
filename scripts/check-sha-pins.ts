@@ -1,6 +1,10 @@
-#!/usr/bin/env npx tsx
 // check-sha-pins.ts — verify every external `uses:` in any workflow
 // is pinned to a 40-char commit SHA.
+//
+// Invoke via `task pin:check` (or `pnpm exec tsx scripts/check-sha-pins.ts`).
+// No shebang: this script is always run via the explicit interpreter so
+// the lockfile-pinned `tsx` + `yaml` versions are used. Bare-shebang
+// invocation would bypass that.
 //
 // Companion to the doc-check.ts pattern: small TS scripts run from
 // Taskfile against the local tree. No external GHA action dependency.
@@ -11,17 +15,11 @@
 // check existed to prevent). YAML parsing via the `yaml` npm package
 // is the correct primitive; the AST walks the structure honestly.
 //
-// Trust surface: the `yaml` npm package (universally vetted, transitive
-// dep of many things in this tree) + ~50 LOC of our own logic, audited
-// here.
-//
-// Usage:
-//   npx tsx scripts/check-sha-pins.ts [path-to-workflows-dir]
-//   task pin:check
-//
 // Exit codes:
 //   0 — all external uses: lines are SHA-pinned
-//   1 — one or more violations found (printed with file:line)
+//   1 — one or more violations found (printed with file path + the
+//       structural context inside that file, e.g.
+//       `jobs.<name>.steps[i].uses` — see findings format below)
 //   2 — malformed input (workflow file unreadable, YAML parse error)
 
 import { readFileSync, readdirSync, statSync } from "fs";
