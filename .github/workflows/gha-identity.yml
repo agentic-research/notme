@@ -90,7 +90,14 @@ jobs:
       - name: Exchange OIDC → notme access token
         id: signet
         if: '!inputs.skip_bridge_cert'
-        uses: agentic-research/notme/action@feat/jwt-sdk-primitives
+        # SHA-pin the self-reference per the action's own README. Previous
+        # ref (@feat/jwt-sdk-primitives) was a temporary test branch that has
+        # since been deleted on origin — workflow was both unpinned AND
+        # broken (404 on ref resolve). Pinned to e57c9ad: most recent commit
+        # touching action/ on main (PR #9 squash, 2026-05-10), which is the
+        # current shipping state. action/dist/index.js at that point is from
+        # f171e8d ("action outputs cert pair, not tokens — 008 end-to-end").
+        uses: agentic-research/notme/action@e57c9ad9bb798b7f6e3336f1c60ae489ac8907cf # PR #9 squash, 2026-05-10
         with:
           audience: ${{ inputs.bridge_audience }}
           authority_url: https://auth.notme.bot
