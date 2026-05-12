@@ -31,8 +31,14 @@ jobs:
           #   - local references (`uses: ./...`)
           #   - SHA-pinned (40 hex chars after `@`)
           # Anything else fails the build with a clear message.
+          #
+          # POSIX character classes ([[:space:]]) instead of \s — \s is a GNU
+          # extension and not part of standard ERE; using it would silently
+          # match-nothing under POSIX-strict or BSD grep, turning the check
+          # into a false-positive "all pass" (which is exactly the kind of
+          # silent failure this job exists to prevent).
           bad=$(
-            grep -rnE '^\s*-?\s*uses:\s*[^./[:space:]]' .github/workflows/ \
+            grep -rnE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^./[:space:]]' .github/workflows/ \
               | grep -vE '@[a-f0-9]{40}([[:space:]]|$|#)' \
               || true
           )
@@ -42,7 +48,8 @@ jobs:
             echo
             echo "Every external action ref MUST be pinned to a 40-char commit SHA."
             echo "Branch refs and tag refs are forbidden (Trivy/Aqua precedent)."
-            echo "Get the SHA: gh api repos/<org>/<repo>/git/refs/tags/<tag> --jq '.object.sha'"
+            echo "Resolve a tag to its commit SHA (handles both annotated and lightweight tags):"
+            echo "  gh api repos/<org>/<repo>/commits/<tag> --jq '.sha'"
             exit 1
           fi
           echo "All uses: lines are SHA-pinned."
