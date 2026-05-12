@@ -7,6 +7,46 @@ on:
 permissions: {}
 
 jobs:
+  # Structural guard: every external `uses:` in any workflow MUST be pinned to
+  # a full 40-char commit SHA (with optional `# vX.Y.Z` comment). Branch refs
+  # and tag refs are forbidden — both are mutable, and the Trivy/Aqua incident
+  # (March 2026) is the load-bearing reason. This job fails any PR that
+  # reintroduces a non-SHA-pinned `uses:` line. Local references (`./...`)
+  # are exempt.
+  #
+  # Companion to the immediate fix in PR #13 (gha-identity.yml line 93 had
+  # drifted to a branch ref pointing at a since-deleted branch). The check
+  # below makes that bug class structurally impossible going forward.
+  sha-pin-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Enforce SHA pins on every external `uses:` line
+        run: |
+          set -euo pipefail
+          # Match `uses: <owner>/<repo>@<ref>` lines that are NOT either:
+          #   - local references (`uses: ./...`)
+          #   - SHA-pinned (40 hex chars after `@`)
+          # Anything else fails the build with a clear message.
+          bad=$(
+            grep -rnE '^\s*-?\s*uses:\s*[^./[:space:]]' .github/workflows/ \
+              | grep -vE '@[a-f0-9]{40}([[:space:]]|$|#)' \
+              || true
+          )
+          if [ -n "$bad" ]; then
+            echo "::error::Non-SHA-pinned uses: line(s) found:"
+            echo "$bad"
+            echo
+            echo "Every external action ref MUST be pinned to a 40-char commit SHA."
+            echo "Branch refs and tag refs are forbidden (Trivy/Aqua precedent)."
+            echo "Get the SHA: gh api repos/<org>/<repo>/git/refs/tags/<tag> --jq '.object.sha'"
+            exit 1
+          fi
+          echo "All uses: lines are SHA-pinned."
+
   check:
     runs-on: ubuntu-latest
     permissions:
