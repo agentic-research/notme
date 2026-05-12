@@ -4,7 +4,7 @@ tasks:
   schema:ts:
     desc: Generate TypeScript types + Zod schemas from Cap'n Proto
     cmds:
-      - npx tsx schema/codegen/capnp-to-ts.ts schema/identity.capnp > gen/ts/identity.ts
+      - pnpm exec tsx schema/codegen/capnp-to-ts.ts schema/identity.capnp > gen/ts/identity.ts
       - echo "Generated gen/ts/identity.ts"
 
   schema:go:
@@ -21,33 +21,33 @@ tasks:
     desc: Type-check generated code
     deps: [schema:ts]
     cmds:
-      - npx tsc --noEmit --strict --moduleResolution bundler --module ES2022 --target ES2022 --skipLibCheck gen/ts/identity.ts
+      - pnpm exec tsc --noEmit --strict --moduleResolution bundler --module ES2022 --target ES2022 --skipLibCheck gen/ts/identity.ts
 
   worker:dev:
     desc: Start local dev server
     dir: worker
     cmds:
-      - npx wrangler dev
+      - pnpm exec wrangler dev
 
   worker:install:
     desc: Clean install from lockfile (no scripts)
     dir: worker
     cmds:
-      - npm ci --ignore-scripts
+      - pnpm install --frozen-lockfile --ignore-scripts
 
   worker:audit:
     desc: Check for known vulnerabilities
     dir: worker
     cmds:
-      - npm audit --omit=dev
+      - pnpm audit --prod
 
   worker:check:
     desc: Audit + type-check + test
     dir: worker
     cmds:
-      - npm audit --omit=dev
-      - npx tsc --noEmit
-      - npx vitest run
+      - pnpm audit --prod
+      - pnpm exec tsc --noEmit
+      - pnpm exec vitest run
 
   proxy:check:
     desc: Build + test the Rust mTLS proxy crate
@@ -61,19 +61,19 @@ tasks:
     desc: Upload new version without routing traffic to it
     dir: worker
     cmds:
-      - npx wrangler versions upload
+      - pnpm exec wrangler versions upload
 
   worker:deploy:
     desc: Deploy to production (use ship for the safe path)
     dir: worker
     cmds:
-      - npx wrangler deploy
+      - pnpm exec wrangler deploy
 
   worker:rollback:
     desc: Roll back to previous version
     dir: worker
     cmds:
-      - npx wrangler rollback
+      - pnpm exec wrangler rollback
 
   worker:verify:
     desc: Smoke test live endpoints
@@ -104,7 +104,15 @@ tasks:
   docs:check:
     desc: Verify doc claims against code
     cmds:
-      - npx tsx scripts/doc-check.ts --skip-external
+      - pnpm exec tsx scripts/doc-check.ts --skip-external
+
+  pin:check:
+    desc: Verify every external `uses:` in .github/workflows is SHA-pinned
+    cmds:
+      # --ignore-scripts: never run install hooks (matches worker:install).
+      # --frozen-lockfile: fail if pnpm-lock.yaml is out of sync.
+      - pnpm install --frozen-lockfile --ignore-scripts
+      - pnpm exec tsx scripts/check-sha-pins.ts
 
   ship:
     desc: "Safe path: install → check → docs → preview → verify instructions"
@@ -132,14 +140,14 @@ tasks:
     desc: Bundle worker for local workerd
     dir: worker
     cmds:
-      - npx esbuild worker.ts --bundle --format=esm --outfile=dist/worker.js --conditions=workerd --external:cloudflare:workers --external:@cloudflare/vitest-pool-workers
+      - pnpm exec esbuild worker.ts --bundle --format=esm --outfile=dist/worker.js --conditions=workerd --external:cloudflare:workers --external:@cloudflare/vitest-pool-workers
 
   worker:serve:
     desc: Run local identity authority via workerd
     dir: worker
     deps: [worker:build-local]
     cmds:
-      - npx workerd serve config.capnp --experimental
+      - pnpm exec workerd serve config.capnp --experimental
 
   image:keygen:
     desc: Generate the melange signing key (one-time setup)

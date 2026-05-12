@@ -18,6 +18,9 @@
   ],
   "exclude": [
     "node_modules",
-    "src/revocation.test.ts"
+    "**/*.test.ts",
+    "**/__tests__/**",
+    "../gen/ts/__tests__/**",
+    "../vault/src/__tests__/**"
   ]
 }
