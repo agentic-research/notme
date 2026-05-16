@@ -45,12 +45,17 @@ notme is an identity authority that issues ephemeral bridge certificates. Securi
 
 Set via `NOTME_KEY_STORAGE` env var. Default: `cf-managed`. Local workerd config sets `ephemeral`.
 
+## Threat Model & Tests
+
+- Server-side threat model: [`worker/THREAT_MODEL.md`](worker/THREAT_MODEL.md). Each row's `test` column maps to a named test in `worker/src/__tests__/`.
+- Executable threat-model + cross-repo contract assertions: [`worker/src/__tests__/threat-model.test.ts`](worker/src/__tests__/threat-model.test.ts). Encodes the 11 consumer↔server contract assumptions surfaced by the 2026-05-16 security review (OIDC audience, trusted issuers, CABundle CBOR canonical bytes, revocation seqno monotonicity, DPoP proof shape, scope vocabulary, AuthService RPC surface, redirect-URI normalization, GHA fork-PR boundary, and AuthService per-session credential isolation). Cross-repo invariants needing server-produced fixtures are marked `it.todo` and name the fixture.
+
 ## Known Limitations
 
 - WebAuthn implementation has not been independently audited
 - DPoP token endpoint does not yet implement nonce mechanism (defense-in-depth)
 - `encrypted` key storage mode is designed but not yet implemented (startup error if configured)
-- Threat model is documented in `docs/design/007-secretless-local-proxy.md` (adversarial test tables)
+- Older design-time threat tables live in `docs/design/007-secretless-local-proxy.md`; canonical threat model is `worker/THREAT_MODEL.md`.
 
 ## Ed25519 typing workaround
 
