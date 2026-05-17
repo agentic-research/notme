@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 notme contributors
+// Origin: hardened in cloister (AGPL-3.0) by sole author, re-incorporated under Apache-2.0 on 2026-05-17; see NOTICE.
+
 // AES-GCM envelope encryption for credential header values.
 //
 // Architecture:
@@ -142,6 +146,29 @@ export async function decrypt(
   return JSON.parse(new TextDecoder().decode(plainBuf));
 }
 
-// ── Helpers — delegated to shared SDK ────────────────────────────────────────
+// ── Helpers — base64url no-padding ───────────────────────────────────────────
+//
+// Inlined here on 2026-05-09 during the cloister-side lift (cloister-9ad9eb).
+// Originally imported from notme's gen/ts/dpop module; cloister doesn't
+// have a DPoP layer of its own yet (ADR-0010 phases 3+ wire the vault into
+// the manifest, at which point identity flows through the lease layer per
+// ADR-0007). Until then, vault library functions speak base64url directly
+// and don't depend on any identity-shaped notme code.
+//
+// Equivalent to RFC 4648 §5 (base64url alphabet) without padding (§3.2).
+// Pure browser/workerd primitives — no third-party dep.
 
-import { base64urlEncode as b64url, base64urlDecode as b64decode } from "../../gen/ts/dpop";
+function b64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function b64decode(s: string): Uint8Array {
+  const padded = s.replace(/-/g, "+").replace(/_/g, "/")
+    + "===".slice((s.length + 3) % 4);
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
