@@ -60,7 +60,7 @@ export const TRUSTED_ISSUERS = [
   "https://token.actions.githubusercontent.com",
 ] as const;
 
-// ── GHA event allowlist for cert exchange ────────────────────────────────
+// ── GHA event reject-list for cert exchange ──────────────────────────────
 // GitHub-signed `event_name` claim is server-trustable. Tokens minted from
 // these events MUST NOT receive a notme bridge cert: pull_request_target
 // runs in the UPSTREAM context (upstream secrets, upstream owner) while
