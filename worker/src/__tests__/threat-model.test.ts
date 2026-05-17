@@ -45,6 +45,7 @@ vi.mock("cloudflare:workers", () => ({
   },
 }));
 
+import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
 import { AuthService } from "../../worker";
 import { validateRedirectUri } from "../auth/redirect-uri";
 import { verifyOIDC } from "../auth/verify-proof";
@@ -288,12 +289,17 @@ describe("contract.oidc.trusted-issuers", () => {
     ).rejects.not.toThrow(/untrusted issuer/);
   });
 
-  // Cross-repo: notme.bot's authoritative TRUSTED_ISSUERS list must equal
-  // what consumers reasonably expect. The list is not exported today; the
-  // fixture below would be a JSON snapshot produced by notme.bot CI.
-  it.todo(
-    "cross-repo: TRUSTED_ISSUERS snapshot matches consumer expectations (needs fixture: fixtures/trusted-issuers.snapshot.json)",
-  );
+  // Cross-repo: @notme/contract is the single source of truth — both the
+  // server's allowlist and verify-proof.ts's enforcement Set derive from
+  // it. This assertion pins the contract's shape and order so a drift
+  // (rename, reorder, accidental Google inclusion) fails CI here in the
+  // consumer instead of producing a confused-deputy gap at runtime.
+  it("cross-repo: TRUSTED_ISSUERS snapshot matches consumer expectations", () => {
+    expect([...CONTRACT_TRUSTED_ISSUERS]).toEqual([
+      "https://auth.notme.bot",
+      "https://token.actions.githubusercontent.com",
+    ]);
+  });
 });
 
 // ── 3. CABundle CBOR canonical round-trip + mutation rejection ──────────────

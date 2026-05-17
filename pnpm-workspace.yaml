@@ -1,0 +1,4 @@
+packages:
+  - "action"
+  - "worker"
+  - "packages/*"

@@ -6,14 +6,13 @@
  * future refactor that renames or drops a member surfaces here in CI.
  *
  * The package itself has no test runner wired; we co-locate the tests in
- * worker/ where vitest already runs. Imports are by relative path because
- * worker/ does not yet declare a workspace dep on @notme/contract (that's
- * a separate adoption PR that swaps the inline hardcoded constants for
- * imports from this package).
+ * worker/ where vitest already runs. Imports go through the workspace
+ * alias now that worker/ declares a workspace dep on @notme/contract — the
+ * same path the production code resolves through.
  */
 
 import { describe, expect, it } from "vitest";
-import * as contract from "../../../packages/contract/src/index";
+import * as contract from "@notme/contract";
 
 describe("@notme/contract — exported shape", () => {
   it("CONTRACT_VERSION is a positive integer", () => {

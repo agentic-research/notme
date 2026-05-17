@@ -14,11 +14,13 @@
 !go.work
 
 # Root pnpm workspace (for repo-level scripts: scripts/check-sha-pins.ts,
-# scripts/doc-check.ts, schema/codegen/capnp-to-ts.ts). Worker + action
-# subdirs still have their own npm package-lock.json — broader pnpm
-# migration tracked separately.
+# scripts/doc-check.ts, schema/codegen/capnp-to-ts.ts). The workspace also
+# wires action/, worker/, and packages/* together so workspace deps like
+# @notme/contract resolve through pnpm's symlink graph instead of relative
+# imports.
 !package.json
 !pnpm-lock.yaml
+!pnpm-workspace.yaml
 
 # Cap'n Proto schemas (source of truth for all cross-language types)
 !schema/
