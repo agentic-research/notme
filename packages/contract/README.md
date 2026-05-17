@@ -9,6 +9,8 @@ Single source of truth for invariants the **consumer** (this repo, `notme`) and 
 | `CONTRACT_VERSION` | Bumped on any breaking shape change. Consumer's pinned version gates the upgrade. |
 | `SCOPES` / `ALL_SCOPES` | Every scope token that may appear in a session cookie or invite. Case- and spelling-pinned. |
 | `OIDC_ALLOWED_ALGS` | JWT algorithms the server's `verifyOIDC` accepts. Adding here ≠ adding to the server; **both** must move. |
+| `TRUSTED_ISSUERS` | Canonical baseline OIDC issuer list both sides accept by default. Deployers MAY extend on the server via env (`OIDC_ALLOWED_ISSUERS`); consumer rejects anything outside the baseline. |
+| `GHA_REJECTED_EVENTS` | GHA `event_name` values the cert-mint endpoint refuses (`pull_request_target` confused-deputy lane + `pull_request` for defense-in-depth). |
 | `ERROR_STATUS` | HTTP status codes the server returns for specific failure classes. Consumer retry/branch logic depends on these. |
 
 ## Who consumes this
