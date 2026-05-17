@@ -95,6 +95,8 @@
 | unauthorized RPC | external caller invokes AuthService methods | service bindings are capability-based — only Workers with the binding can call. No public URL, no HTTP surface | `rpc.capability.isolation` |
 | capability leak | consuming Worker exposes AuthService to its clients | AuthService methods return structured data (not CryptoKeys). Consuming Worker must add its own auth layer | `rpc.data.boundary` |
 | CryptoKey extraction | extract signing key via RPC | CryptoKey is not Structured Cloneable — cannot cross RPC boundary. All signing happens inside the DO | `rpc.cryptokey.isolation` |
+| cross-session credential leak | `heldCerts` stored at module scope; two RPC sessions (or two concurrent `authenticate`→`sign` flows) share state, so `identity()`/`proxy()`/`sign()` return whichever creds were last written — silent identity confusion (2026-05-16 security review, Finding 1) | **FIXED** — credentials moved onto `this.heldCerts` (`worker.ts:67`); `WorkerEntrypoint` gives each RPC session its own `this`, so callers no longer share principal state. Regression-guarded by `auth-service.state.session-isolation > regression guard` + a sanity mirror that pins the buggy pattern's failure mode. | `auth-service.state.session-isolation` |
+| consumer↔server contract drift | a server hardening (OIDC audience, issuer allowlist, CBOR canonical bundle bytes, DPoP shape, scope vocabulary, redirect-URI normalization, GHA fork-PR boundary) lands here but a consumer Worker/Action still talks the old protocol — silent breakage in prod, not in CI | **GUARDED** — `worker/src/__tests__/threat-model.test.ts` encodes the 11 cross-repo contract assumptions surfaced by the 2026-05-16 review. Local invariants run today; cross-repo ones are `it.todo` pending fixtures from `notme.bot`/`signet` CI (`fixtures/trusted-issuers.snapshot.json`, `fixtures/cabundle.canonical.bin`, `fixtures/server-errors.json`). | `contract.*` (multiple — see file) |
 
 ### 8. static content / routing
 
@@ -150,6 +152,12 @@ worker/src/__tests__/
   routes-dpop.test.ts    — /token endpoint integration (handler, JWKS)
   session.test.ts        — session cookie creation, verification, expiry
   connections.test.ts    — identity linking (OIDC/x509 proofs)
+  threat-model.test.ts   — AuthService session isolation (regression guard)
+                          + cross-repo contract assertions (OIDC audience,
+                          trusted issuers, CABundle CBOR, revocation seqno,
+                          DPoP shape, scope vocabulary, AuthService RPC
+                          surface, redirect-URI, GHA fork-PR boundary).
+                          Pairs row-by-row with this doc.
 
 gen/ts/__tests__/
   dpop-verifier.test.ts  — shared SDK: verifyDPoPToken + verifyAccessToken
