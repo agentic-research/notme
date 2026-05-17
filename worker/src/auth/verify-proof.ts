@@ -1,6 +1,9 @@
 // Generic proof verification — OIDC JWTs and X.509 certs.
 // No provider-specific code. If it has a JWKS, we can verify it.
 
+import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
+import { base64urlDecode } from "../../../gen/ts/dpop";
+
 export interface VerifiedIdentity {
   type: "oidc" | "x509";
   issuer: string; // OIDC issuer URL or cert issuer CN
@@ -20,8 +23,6 @@ export interface X509Proof {
 
 export type Proof = OIDCProof | X509Proof;
 
-import { base64urlDecode } from "../../../gen/ts/dpop";
-
 // ── OIDC verification (any issuer with a JWKS endpoint) ──
 
 interface JWK {
@@ -36,6 +37,8 @@ interface JWK {
 }
 
 // Trusted OIDC issuers — prevents SSRF via attacker-controlled iss claim.
+// Source of truth lives in @notme/contract so notme.bot's server-side
+// allowlist and this consumer's enforcement set can't drift.
 //
 // The audience pin on /connections /auth/oidc/login /join is "notme.bot",
 // which works for:
@@ -52,10 +55,7 @@ interface JWK {
 // for the Google client ID); until then, Google is intentionally absent so
 // callers who try it get a clear "untrusted issuer" failure rather than a
 // confusing "wrong audience" failure on every request.
-const TRUSTED_ISSUERS = new Set([
-  "https://token.actions.githubusercontent.com",
-  "https://auth.notme.bot",
-]);
+const TRUSTED_ISSUERS = new Set<string>(CONTRACT_TRUSTED_ISSUERS);
 
 // Simple JWKS cache — per-issuer, 1 hour TTL
 const jwksCache = new Map<string, { keys: JWK[]; at: number }>();
