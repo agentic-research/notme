@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 notme contributors
+// Origin: hardened in cloister (AGPL-3.0) by sole author, re-incorporated under Apache-2.0 on 2026-05-17; see NOTICE.
+
 /**
  * vault-security.test.ts — Security hardening tests for the credential vault.
  *
