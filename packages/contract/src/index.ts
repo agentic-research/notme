@@ -1,13 +1,19 @@
 // @notme/contract — cross-repo contract for the notme ecosystem.
 //
-// Single source of truth for invariants shared between this repo (consumer)
-// and notme.bot (server). Drift here is how confused-deputy bugs and silent
-// breakage between the two halves slip in.
+// Single source of truth for invariants shared between the two repos that
+// implement the notme protocol:
+//   - `notme`     (this package's home) — the CONSUMER side: GHA action,
+//                  worker that holds the bridge cert + AuthService, proxy.
+//   - `notme.bot` (separate repo) — the SERVER side: the signing authority,
+//                  passkey/OIDC login, /cert/* mint endpoints.
 //
-// Consumed locally as @notme/contract via the workspace.
-// notme.bot keeps a byte-identical mirror at src/contract.ts; its
-// src/auth/contract.test.ts byte-diffs against this file in CI when both
-// repos are checked out side-by-side.
+// Drift between the two is how confused-deputy bugs and silent breakage
+// slip in.
+//
+// Consumed by notme components via the workspace alias `@notme/contract`.
+// notme.bot keeps a byte-identical mirror at src/contract.ts because it is
+// a separate git repo; its src/auth/contract.test.ts byte-diffs against
+// this file in CI when both repos are checked out side-by-side.
 //
 // Bump CONTRACT_VERSION on any breaking shape change; the consumer's pinned
 // version gates the upgrade. See ./README.md for the rules of the road.
@@ -40,11 +46,15 @@ export const ALL_SCOPES: readonly ScopeName[] = Object.values(SCOPES);
 export const OIDC_ALLOWED_ALGS = ["RS256", "ES256"] as const;
 export type OIDCAllowedAlg = (typeof OIDC_ALLOWED_ALGS)[number];
 
-// ── Trusted OIDC issuers (default baseline) ──────────────────────────────
-// The canonical issuer set both sides accept by default. Deployers MAY
-// extend this on the server via env config (e.g. OIDC_ALLOWED_ISSUERS),
-// but anything OUTSIDE this baseline is opt-in and the consumer will
-// reject by default.
+// ── Trusted OIDC issuers (recommended baseline) ──────────────────────────
+// The canonical issuer set the protocol is designed around. This is a
+// recommendation, NOT a runtime default — the SERVER fails closed: its
+// OIDC_ALLOWED_ISSUERS env var defaults to empty, which denies all OIDC
+// paths until the deployer explicitly configures the allowlist. The list
+// here documents what a sane production deployment should configure.
+//
+// The CONSUMER side hardcodes its own enforcement Set and SHOULD use this
+// list as its source of truth once it migrates off the inlined constant.
 //
 // Why these specific issuers:
 //   - auth.notme.bot       — self-issued, always carries aud=notme.bot.
