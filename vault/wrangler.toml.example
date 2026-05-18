@@ -19,18 +19,16 @@ invocation_logs = true
 ADMIN_SUB = ""
 
 # KEK (key-encryption-key) source URL. The DO resolves this to the raw
-# secret used to derive the AES-GCM KEK. Supported schemes:
+# secret used to derive the AES-GCM KEK. Schemes accepted by the current
+# dispatcher (`buildKekSource()` in vault/src/kek-source.ts):
 #   env://NAME              — read the named env binding (plaintext)
 #   file:///path/to/file    — read via a workerd disk-service binding (KEK_DISK)
 #   keychain://service-name — macOS Keychain via the kek-helper sidecar (KEK_HELPER)
-#   secret-tool://attr/val  — Linux libsecret via the kek-helper sidecar
-#   op://VAULT/ITEM         — 1Password via the kek-helper sidecar
-#   apple-password://NAME   — macOS Passwords app via the kek-helper sidecar
-#   keyring://NAME          — generic cross-platform keyring via the helper
 #   http(s)://helper/...    — generic HTTP backend via KEK_HELPER
-# See vault/src/kek-source.ts for the dispatcher and cloister's ADR-0019
-# for the kek-helper sidecar (the only thing that can shell out to
-# /usr/bin/security or libsecret — workerd is a sandboxed V8 isolate).
+# Additional helper-backed schemes (`secret-tool://`, `op://`,
+# `apple-password://`, `keyring://`) need the `leyline-sign-helper`
+# sidecar wired into `buildKekSource()` — deferred, tracked separately
+# (see follow-up bead referenced in PR #22).
 VAULT_KEK_SOURCE = "env://VAULT_KEK"
 
 # Legacy plaintext KEK secret. DEPRECATED — set VAULT_KEK_SOURCE instead

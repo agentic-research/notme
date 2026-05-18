@@ -8,6 +8,7 @@
 import { handleRequest } from "./handler";
 import { verifyAccessToken, verifyDPoPToken } from "../../gen/ts/dpop";
 import type { SealedCredential as _SealedCredential } from "./crypto";
+import { validateServiceName } from "./vault";
 
 /**
  * Public RPC surface of the CredentialVault Durable Object.
@@ -129,11 +130,24 @@ export default {
     const vaultId = env.VAULT.idFromName("default");
     const vault = env.VAULT.get(vaultId);
 
-    // Resolve identity ONCE here so we can charge the rate bucket
-    // before handleRequest does any work, then hand the cached value
-    // to the handler. Anonymous (null) requests get a 401 via the
-    // handler without consuming budget — pre-auth DoS is CF's job.
+    // Step 1: cheap sync validation BEFORE any crypto work.
+    // Rejects obviously-invalid paths (bad service names, unknown routes)
+    // without forcing JWT verification + DPoP replay RPC on garbage
+    // traffic. Mirrors what handleRequest validates synchronously today
+    // — handleRequest's own checks still run, this is just an early gate
+    // so a flood of /../../etc/passwd or /garbage doesn't force sig work.
+    const earlyReject = preValidateRoute(request);
+    if (earlyReject) return earlyReject;
+
+    // Step 2: identity resolution (expensive — JWT verify + DPoP replay
+    // RPC). Resolved ONCE here so we can charge the rate bucket and
+    // hand the cached value to the handler. Anonymous (null) requests
+    // get a 401 via the handler without consuming budget — pre-auth
+    // DoS is CF's job.
     const sub = await resolveIdentity(request, env, vault);
+
+    // Step 3: rate-bucket charge (DO RPC). Only authenticated callers
+    // are budgeted — anonymous traffic short-circuits to handler's 401.
     if (sub) {
       const gate = await vault.consumeBudget(sub, costClassFor(request));
       if (!gate.ok) {
@@ -150,6 +164,8 @@ export default {
       }
     }
 
+    // Step 4: delegate to handler (which can now trust the route +
+    // identity + budget).
     return handleRequest({
       request,
       storage: {
@@ -244,6 +260,35 @@ function costClassFor(req: Request): "read" | "write" | "proxy" {
   return "proxy";
 }
 
+/**
+ * Cheap sync route validation, run BEFORE identity resolution so an
+ * attacker hitting `/../../etc/passwd` or `/garbage-path` can't force
+ * JWT verification + DPoP replay RPC for nothing. Returns an error
+ * Response on reject, or `null` to let the request proceed to identity
+ * resolution.
+ *
+ * The checks mirror what `handleRequest()` validates synchronously
+ * today — keeping them here is just a hoist, not a replacement. The
+ * handler still does its own validation; this gate exists so the
+ * expensive work doesn't happen for obviously-bad requests.
+ *
+ * Allowed shapes:
+ *   - GET /admin/services           (admin route, identity required later)
+ *   - GET|PUT|DELETE|...  /:service (service name passes validateServiceName)
+ *
+ * Exported for direct unit testing — caller is just `worker.fetch`.
+ */
+export function preValidateRoute(req: Request): Response | null {
+  const path = new URL(req.url).pathname;
+  if (path === "/admin/services") return null;
+  // Extract candidate service segment — same split handleRequest uses.
+  const service = path.split("/")[1] || "";
+  if (!service || !validateServiceName(service)) {
+    return Response.json({ error: "invalid service name" }, { status: 400 });
+  }
+  return null;
+}
+
 // ── Durable Object: CredentialVault ─────────────────────────────────────────
 //
 // The DO is the security kernel. It:
@@ -262,6 +307,22 @@ import { deriveKEK, encrypt, decrypt, type SealedCredential } from "./crypto";
 import { buildProxyRequest, sanitizeResponse } from "./vault";
 import { buildKekSource } from "./kek-source";
 import { RATE_LIMITS, refillBucket, tryConsume, type BucketState } from "./rate-bucket";
+
+/**
+ * Hard cap on the per-caller bucket map (LRU eviction). Without a cap,
+ * a stream of unique `sub` values (each one populating a new Map entry)
+ * would grow DO memory without bound — a slow-DoS vector against the
+ * single-writer DO instance. Evicting the oldest entry on overflow is
+ * a safe heuristic because the bucket math is already idempotent in
+ * the loss case: an evicted caller gets a full bucket on their next
+ * request, which is the same outcome a long-idle caller sees naturally.
+ *
+ * 10k is generously large for any plausible legitimate workload — a
+ * vault DO that genuinely sees 10k distinct authenticated callers in
+ * its uptime window is well past the point where per-caller buckets
+ * in DO memory are the right shape.
+ */
+const BUCKET_CAP = 10_000;
 
 interface StoredRow {
   upstream: string;
@@ -381,6 +442,11 @@ export class CredentialVault {
    * get a `retryAfterSec` derived from the bucket's refill rate; the
    * `lastRefillMs` is persisted on reject too so a depleted attacker
    * can't freeze time.
+   *
+   * Map access uses delete-then-set so iteration order ≡ recency
+   * (LRU). When the map exceeds `BUCKET_CAP`, the oldest entry is
+   * evicted — bounds DO memory against a flood of unique `sub` values
+   * (notme-PR#22 / Copilot review).
    */
   async consumeBudget(
     sub: string,
@@ -390,7 +456,15 @@ export class CredentialVault {
     const prev = this.buckets.get(sub) ?? null;
     const refilled = refillBucket(prev, Date.now());
     const result = tryConsume(refilled, cost);
+    // Delete-then-set bumps this `sub` to the tail of Map's insertion
+    // order — that ordering is what makes `.keys().next()` give us
+    // the LRU entry on overflow below.
+    this.buckets.delete(sub);
     this.buckets.set(sub, result.next);
+    if (this.buckets.size > BUCKET_CAP) {
+      const oldest = this.buckets.keys().next().value;
+      if (oldest !== undefined) this.buckets.delete(oldest);
+    }
     if (result.ok) return { ok: true };
     return { ok: false, retryAfterSec: result.retryAfterSec };
   }

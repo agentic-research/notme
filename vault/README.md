@@ -38,20 +38,18 @@ If you're integrating against the vault and want a long-term target, prefer **cl
 
 ## KEK source
 
-The vault DO derives its AES-GCM KEK from a secret resolved via a URL spec in `VAULT_KEK_SOURCE`. Schemes:
+The vault DO derives its AES-GCM KEK from a secret resolved via a URL spec in `VAULT_KEK_SOURCE`. Schemes accepted by the current dispatcher (`buildKekSource()` in `src/kek-source.ts`):
 
 | Scheme | Use when | Needs |
 |---|---|---|
 | `env://NAME` | You're fine with a plaintext workerd binding (CI, dev). | nothing |
 | `file:///path` | The secret lives on disk and you've set up a workerd disk service. | `KEK_DISK` binding |
 | `keychain://name` | macOS Keychain (cloister's local-dev posture). | `KEK_HELPER` sidecar |
-| `secret-tool://attr/val` | Linux libsecret. | `KEK_HELPER` sidecar |
-| `op://VAULT/ITEM` | 1Password. | `KEK_HELPER` sidecar |
-| `apple-password://NAME` | macOS Passwords app. | `KEK_HELPER` sidecar |
-| `keyring://NAME` | Generic cross-platform keyring. | `KEK_HELPER` sidecar |
 | `http(s)://host/...` | Any HTTP backend (use sparingly — secret in transit). | `KEK_HELPER` sidecar |
 
-Workerd is a sandboxed V8 isolate — no `fs`, no `child_process`. The OS-backed schemes (`keychain://`, `secret-tool://`, `op://`, `apple-password://`, `keyring://`) go through a separate Node sidecar (`scripts/kek-helper.mjs` in cloister) bound as `KEK_HELPER`. See **cloister ADR-0019** for the helper-binary design rationale and the supply-chain analysis (why we don't shell out to `/usr/bin/security` from a worker).
+Workerd is a sandboxed V8 isolate — no `fs`, no `child_process`. `keychain://` and `http(s)://` go through a separate Node sidecar (`scripts/kek-helper.mjs` in cloister) bound as `KEK_HELPER`. See **cloister ADR-0019** for the helper-binary design rationale and the supply-chain analysis (why we don't shell out to `/usr/bin/security` from a worker).
+
+> **Deferred — helper-backed schemes not yet wired:** `secret-tool://` (Linux libsecret), `op://` (1Password), `apple-password://` (macOS Passwords app), `keyring://` (generic cross-platform) all need wiring through `buildKekSource()`'s `HelperKekSource` dispatcher. Tracked as a follow-up to `rosary-54ad76` (see the bead linked from PR #22). Until that lands, configuring these schemes throws at runtime.
 
 Legacy `VAULT_KEK_SECRET` is supported but **deprecated** — set `VAULT_KEK_SOURCE=env://VAULT_KEK_SECRET` (or another scheme) instead. The DO emits a one-time `console.warn` on first derive if the legacy path is in use.
 

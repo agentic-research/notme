@@ -7,6 +7,8 @@
 //   - Missing VAULT_KEK_SOURCE falls back to legacy VAULT_KEK_SECRET +
 //     emits a one-shot deprecation warning at first derive
 //   - consumeBudget gates per-caller and isolates one caller from another
+//   - preValidateRoute rejects garbage paths BEFORE identity resolution
+//   - buckets map evicts LRU entries beyond a cap (DO memory bound)
 //
 // We exercise the CredentialVault DO directly with a fake `ctx` shim —
 // no workerd, no HTTP. The DO's SQL surface is the only ctx coupling
@@ -204,6 +206,51 @@ describe("worker.rate-bucket", () => {
     expect(bResult.ok).toBe(true);
   });
 
+  it("buckets map evicts LRU entries beyond the cap (DO memory bound)", async () => {
+    const CredentialVault = await getDO();
+    const env = {
+      VAULT_KEK_SOURCE: "env://VAULT_KEK",
+      VAULT_KEK: "k".repeat(32),
+      ADMIN_SUB: "principal:admin",
+      VAULT_AUDIENCE: "https://vault.example.com",
+    } as unknown as Parameters<typeof CredentialVault>[1];
+
+    const vault = new CredentialVault(makeFakeCtx() as never, env);
+
+    // Drain "victim"'s bucket: 21 proxy calls (cost 5 × 20 = 100 capacity)
+    // is enough to push it well past the reject threshold.
+    let victimRejectedAt = -1;
+    for (let i = 0; i < 30; i++) {
+      const r = await vault.consumeBudget("principal:victim", "proxy");
+      if (!r.ok) {
+        victimRejectedAt = i;
+        break;
+      }
+    }
+    expect(victimRejectedAt).toBeGreaterThan(0);
+
+    // Now hammer the map with > BUCKET_CAP (10_000) unique callers.
+    // The victim's entry — the oldest — must be evicted; every new
+    // caller is fresh, so they all start with a full bucket. We
+    // verify by issuing a single proxy call per unique sub and
+    // asserting each one accepts.
+    const CAP = 10_000;
+    let accepted = 0;
+    for (let i = 0; i < CAP + 50; i++) {
+      const r = await vault.consumeBudget(`flooder-${i}`, "proxy");
+      if (r.ok) accepted++;
+    }
+    expect(accepted).toBe(CAP + 50);
+
+    // After the flood, the victim's entry has been evicted. A fresh
+    // proxy call from "victim" must now be accepted (full bucket) —
+    // proving the eviction happened. If the entry had persisted, the
+    // refill since the test started (microseconds) would have left
+    // it depleted and the call would reject.
+    const victimAgain = await vault.consumeBudget("principal:victim", "proxy");
+    expect(victimAgain.ok).toBe(true);
+  });
+
   it("cost classes scale: read is cheaper than write is cheaper than proxy", async () => {
     const CredentialVault = await getDO();
     const env = {
@@ -232,5 +279,44 @@ describe("worker.rate-bucket", () => {
     const proxies = await drain("proxy");
     expect(reads).toBeGreaterThan(writes);
     expect(writes).toBeGreaterThan(proxies);
+  });
+});
+
+// ── cheap-validation-before-identity ordering ──────────────────────────────
+
+describe("worker.preValidateRoute", () => {
+  async function getPreValidate() {
+    return (await import("../worker")).preValidateRoute;
+  }
+
+  it("accepts /admin/services as a known route", async () => {
+    const preValidateRoute = await getPreValidate();
+    const res = preValidateRoute(new Request("https://vault.example.com/admin/services"));
+    expect(res).toBeNull();
+  });
+
+  it("accepts a path whose first segment is a valid service name", async () => {
+    const preValidateRoute = await getPreValidate();
+    const res = preValidateRoute(new Request("https://vault.example.com/anthropic"));
+    expect(res).toBeNull();
+  });
+
+  it("rejects garbage paths with 400 BEFORE any identity work happens", async () => {
+    // Load-bearing test for the Copilot review nit: an attacker hitting
+    // `/.hidden` or `/` must not be able to force JWT verification.
+    // preValidateRoute is sync, has no DPoP/JWT dependency, and returns
+    // a 400 Response without ever touching `resolveIdentity`. The fact
+    // that this test doesn't need a fake JWKS endpoint is the proof.
+    const preValidateRoute = await getPreValidate();
+    for (const url of [
+      "https://vault.example.com/",
+      "https://vault.example.com/.hidden",
+      "https://vault.example.com/has spaces",
+      "https://vault.example.com/-leading-dash",
+    ]) {
+      const res = preValidateRoute(new Request(url));
+      expect(res, `expected reject for ${url}`).not.toBeNull();
+      expect(res!.status).toBe(400);
+    }
   });
 });
