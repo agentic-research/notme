@@ -1,0 +1,7 @@
+packages/schema-bridge — Apache-2.0
+
+Lifted from cloister/tools/schema-bridge/ (AGPL-3.0) on 2026-05-18 and
+re-licensed under Apache-2.0 by the sole author. No third-party
+contributions existed in the cloister copy (verified via git log).
+
+See vault/NOTICE for the precedent of this round-trip pattern.

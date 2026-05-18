@@ -202,3 +202,80 @@ tasks:
           --keyring-append melange.rsa.pub \
           --arch {{.ARCH}}
       - 'echo "Built packages/notme.tar — load with: docker load < packages/notme.tar"'
+
+  # schema-bridge tasks
+  #
+  # capnp → zod TypeScript codegen via the Rust crate at
+  # packages/schema-bridge/. Replaces the older `schema:ts` TS-based
+  # codegen which silently emitted `z.unknown()` for unrecognised
+  # constructs; schema-bridge fails fast on any unmapped capnp shape.
+  #
+  # NOT wired into `task verify` yet — schema-bridge doesn't yet map
+  # the `$Go.package` / `$Go.import` annotations our identity.capnp
+  # uses for Go codegen. Filing as a follow-on bead. Until that lands,
+  # `task gen:zod` against identity.capnp will fail with a clear
+  # `unmapped capnp construct annotation` diagnostic.
+  schema-bridge:build:
+    desc: Build the capnpc-schema-bridge plugin (release profile)
+    dir: packages/schema-bridge
+    sources:
+      - src/**/*.rs
+      - Cargo.toml
+      - Cargo.lock
+    generates:
+      - target/release/capnpc-schema-bridge
+    cmds:
+      - cargo build --locked --release
+
+  gen:zod:
+    desc: Regenerate gen/ts/*.zod.ts from schema/*.capnp via schema-bridge
+    deps: [schema-bridge:build]
+    cmds:
+      # `capnp compile` exits 0 even when the plugin errors and writes
+      # nothing — its stderr carries the real diagnostic. Generate into
+      # a sibling tmpdir under gen/ts/ (same filesystem as destination)
+      # so the final `mv` is a same-fs rename — atomic on POSIX. A
+      # plain `mktemp -d` lands in $TMPDIR (often /tmp, a separate fs),
+      # which silently degrades the rename to a cross-fs copy+unlink.
+      - |
+        set -eu
+        mkdir -p gen/ts
+        TMPDIR=$(mktemp -d -p gen/ts)
+        trap 'rm -rf "$TMPDIR"' EXIT
+        capnp compile \
+          -o./packages/schema-bridge/target/release/capnpc-schema-bridge:"$TMPDIR" \
+          -I "$HOME/go/pkg/mod/capnproto.org/go/capnp/v3@v3.1.0-alpha.2/std" \
+          --src-prefix=schema schema/identity.capnp
+        if [ ! -f "$TMPDIR/identity.zod.ts" ]; then
+          echo "FAIL — schema-bridge produced no identity.zod.ts; check capnp stderr above" >&2
+          exit 1
+        fi
+        mv "$TMPDIR/identity.zod.ts" gen/ts/identity.zod.ts
+
+  gen:zod:check-drift:
+    desc: Fail if committed gen/ts/*.zod.ts has drifted from a fresh regen
+    deps: [schema-bridge:build]
+    cmds:
+      - |
+        set -eu
+        # Baseline must exist before we can diff against it. Until the
+        # schema-bridge Go-annotation gap (rosary-8d2c78) is closed,
+        # `task gen:zod` against identity.capnp errors out, so no
+        # baseline is committed. Emit a clearer error than the raw
+        # `diff: gen/ts/identity.zod.ts: No such file or directory`.
+        if [ ! -f gen/ts/identity.zod.ts ]; then
+          echo "FAIL — gen/ts/identity.zod.ts baseline missing; run \`task gen:zod\` and commit the output first (blocked on rosary-8d2c78)." >&2
+          exit 1
+        fi
+        mkdir -p gen/ts
+        TMPDIR=$(mktemp -d -p gen/ts)
+        trap 'rm -rf "$TMPDIR"' EXIT
+        capnp compile \
+          -o./packages/schema-bridge/target/release/capnpc-schema-bridge:"$TMPDIR" \
+          -I "$HOME/go/pkg/mod/capnproto.org/go/capnp/v3@v3.1.0-alpha.2/std" \
+          --src-prefix=schema schema/identity.capnp
+        if [ ! -f "$TMPDIR/identity.zod.ts" ]; then
+          echo "FAIL — schema-bridge produced no identity.zod.ts; check capnp stderr above" >&2
+          exit 1
+        fi
+        diff -u gen/ts/identity.zod.ts "$TMPDIR/identity.zod.ts"
