@@ -33,13 +33,13 @@ loud. notme's older `capnp-to-ts.ts` (which this tool replaces in
 spirit) silently emitted `z.unknown()` for unrecognised constructs;
 that's the precise failure mode schema-bridge exists to prevent.
 
-**Today the codegen is opt-in** — `task cluster:zod` regenerates
-`src/generated/cluster.zod.ts` and `task cluster:zod:check-drift`
+**Today the codegen is opt-in** — `task gen:zod` regenerates
+`gen/ts/identity.zod.ts` and `task gen:zod:check-drift`
 verifies the committed copy matches. Neither task is wired into
 `task lint` or `task verify` yet, so an unmapped capnp construct
 won't break CI automatically; it WILL break the moment a developer
 runs the regen or drift-check task locally. The plan is to wire
-`cluster:zod:check-drift` into `task verify` once the schema-bridge
+`gen:zod:check-drift` into `task verify` once the schema-bridge
 mapping coverage stabilises (tracked separately) — at that point
 unmapped constructs become a hard CI failure. No silent fallbacks
 regardless.
@@ -136,7 +136,7 @@ needed in CI).
 ## Layout
 
 ```
-tools/schema-bridge/
+packages/schema-bridge/
 ├── Cargo.toml          standalone workspace; depends only on capnp + thiserror
 ├── README.md           this file
 ├── src/
@@ -169,8 +169,8 @@ Tracked separately from this initial drop. In rough priority order:
 5. End-to-end fixture tests against `manifest/*.capnp` — currently
    verified manually (see README "What's mapped today"); locking that
    in as a golden-output test in CI prevents silent regressions.
-6. License — deferred per the implementation conversation. Default
-   matches cloister (AGPL-3.0-or-later); revisit if extraction to a
+6. License — this crate ships as Apache-2.0 (see `Cargo.toml`,
+   source headers, and `NOTICE`). Revisit if extraction to a
    standalone repo lands.
 
 ## Non-goals (the helm comparison)

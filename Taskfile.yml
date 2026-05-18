@@ -225,7 +225,7 @@ tasks:
     generates:
       - target/release/capnpc-schema-bridge
     cmds:
-      - cargo build --release
+      - cargo build --locked --release
 
   gen:zod:
     desc: Regenerate gen/ts/*.zod.ts from schema/*.capnp via schema-bridge
@@ -233,11 +233,14 @@ tasks:
     cmds:
       # `capnp compile` exits 0 even when the plugin errors and writes
       # nothing — its stderr carries the real diagnostic. Generate into
-      # a tmpdir + existence-check + atomic move. Mirrors the cloister
-      # cluster:zod pattern; same rationale.
+      # a sibling tmpdir under gen/ts/ (same filesystem as destination)
+      # so the final `mv` is a same-fs rename — atomic on POSIX. A
+      # plain `mktemp -d` lands in $TMPDIR (often /tmp, a separate fs),
+      # which silently degrades the rename to a cross-fs copy+unlink.
       - |
         set -eu
-        TMPDIR=$(mktemp -d)
+        mkdir -p gen/ts
+        TMPDIR=$(mktemp -d -p gen/ts)
         trap 'rm -rf "$TMPDIR"' EXIT
         capnp compile \
           -o./packages/schema-bridge/target/release/capnpc-schema-bridge:"$TMPDIR" \
@@ -255,7 +258,17 @@ tasks:
     cmds:
       - |
         set -eu
-        TMPDIR=$(mktemp -d)
+        # Baseline must exist before we can diff against it. Until the
+        # schema-bridge Go-annotation gap (rosary-8d2c78) is closed,
+        # `task gen:zod` against identity.capnp errors out, so no
+        # baseline is committed. Emit a clearer error than the raw
+        # `diff: gen/ts/identity.zod.ts: No such file or directory`.
+        if [ ! -f gen/ts/identity.zod.ts ]; then
+          echo "FAIL — gen/ts/identity.zod.ts baseline missing; run \`task gen:zod\` and commit the output first (blocked on rosary-8d2c78)." >&2
+          exit 1
+        fi
+        mkdir -p gen/ts
+        TMPDIR=$(mktemp -d -p gen/ts)
         trap 'rm -rf "$TMPDIR"' EXIT
         capnp compile \
           -o./packages/schema-bridge/target/release/capnpc-schema-bridge:"$TMPDIR" \
