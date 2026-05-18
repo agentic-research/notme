@@ -57,10 +57,6 @@ proxy/target/
 # GHA TypeScript action — identity exchange (zero env vars)
 !action/
 !action/**
-!action/pnpm-lock.yaml
-
-# Worker lockfile
-!worker/pnpm-lock.yaml
 
 # Scripts (doc-check, etc.)
 !scripts/

@@ -47,6 +47,8 @@ importers:
 
   packages/contract: {}
 
+  vault: {}
+
   worker:
     dependencies:
       '@notme/contract':

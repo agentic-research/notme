@@ -65,7 +65,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: worker/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
 
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2.0.0
         with:
