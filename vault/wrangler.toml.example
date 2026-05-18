@@ -18,6 +18,26 @@ invocation_logs = true
 # Set this to your notme principal ID after first passkey registration.
 ADMIN_SUB = ""
 
+# KEK (key-encryption-key) source URL. The DO resolves this to the raw
+# secret used to derive the AES-GCM KEK. Schemes accepted by the current
+# dispatcher (`buildKekSource()` in vault/src/kek-source.ts):
+#   env://NAME              — read the named env binding (plaintext)
+#   file:///path/to/file    — read via a workerd disk-service binding (KEK_DISK)
+#   keychain://service-name — macOS Keychain via the kek-helper sidecar (KEK_HELPER)
+#   http(s)://helper/...    — generic HTTP backend via KEK_HELPER
+# Additional helper-backed schemes (`secret-tool://`, `op://`,
+# `apple-password://`, `keyring://`) need the `leyline-sign-helper`
+# sidecar wired into `buildKekSource()` — deferred, tracked separately
+# (see follow-up bead referenced in PR #22).
+VAULT_KEK_SOURCE = "env://VAULT_KEK"
+
+# Legacy plaintext KEK secret. DEPRECATED — set VAULT_KEK_SOURCE instead
+# (the env://VAULT_KEK_SECRET shape above is the one-line equivalent).
+# The DO emits a one-time `console.warn` on first derive if this path is
+# used. Left here so existing deployments keep working through the
+# rollout window; remove once VAULT_KEK_SOURCE is set everywhere.
+# VAULT_KEK_SECRET = ""
+
 # ── Durable Object: credential storage ──
 [[durable_objects.bindings]]
 name = "VAULT"

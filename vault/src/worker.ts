@@ -8,6 +8,7 @@
 import { handleRequest } from "./handler";
 import { verifyAccessToken, verifyDPoPToken } from "../../gen/ts/dpop";
 import type { SealedCredential as _SealedCredential } from "./crypto";
+import { validateServiceName } from "./vault";
 
 /**
  * Public RPC surface of the CredentialVault Durable Object.
@@ -34,13 +35,39 @@ export interface CredentialVaultRpc extends Rpc.DurableObjectBranded {
   listServices(): Promise<string[]>;
   checkAndStoreJti(jti: string): Promise<boolean>;
   proxyRequest(service: string, incomingRequest: Request): Promise<Response>;
+  /**
+   * Per-caller token-bucket gate (cloister-211b68 / dos-friend F1).
+   * Returns `{ ok: true }` if the request fits the caller's budget,
+   * else `{ ok: false, retryAfterSec }` with a conservative ceiling
+   * derived from the bucket's refill rate.
+   */
+  consumeBudget(sub: string, costClass: "read" | "write" | "proxy"): Promise<
+    { ok: true } | { ok: false; retryAfterSec: number }
+  >;
 }
 
 export interface Env {
   VAULT: DurableObjectNamespace<CredentialVaultRpc>;
   ADMIN_SUB: string;
-  /** Secret string used to derive the KEK for credential encryption. */
-  VAULT_KEK_SECRET: string;
+  /**
+   * URL spec for the pluggable KEK source.
+   *   env://NAME            — read the named env binding (plaintext)
+   *   file:///path          — read via the KEK_DISK workerd disk service
+   *   keychain://name       — macOS Keychain via the KEK_HELPER sidecar
+   *   http(s)://host/...    — any HTTP backend via KEK_HELPER
+   * See `src/kek-source.ts` for the resolver. If unset, vault falls
+   * back to the legacy `VAULT_KEK_SECRET` env binding with a one-time
+   * deprecation warning at boot — keeps existing deployments working
+   * during the rollout.
+   */
+  VAULT_KEK_SOURCE?: string;
+  /**
+   * Legacy plaintext KEK secret. DEPRECATED — set `VAULT_KEK_SOURCE`
+   * instead (e.g. `env://VAULT_KEK_SECRET` is a one-line equivalent).
+   * Kept so the lift PR (#19) doesn't force every deployment to update
+   * its wrangler config on the same day.
+   */
+  VAULT_KEK_SECRET?: string;
   /**
    * Vault's own URL — used as the expected `aud` claim on incoming
    * access tokens. Resource servers MUST validate audience to prevent
@@ -72,7 +99,8 @@ type _RpcMethodNames =
   | "deleteCredential"
   | "listServices"
   | "checkAndStoreJti"
-  | "proxyRequest";
+  | "proxyRequest"
+  | "consumeBudget";
 
 type _AssertSameKeys<A, B> = keyof A extends keyof B
   ? keyof B extends keyof A
@@ -102,6 +130,42 @@ export default {
     const vaultId = env.VAULT.idFromName("default");
     const vault = env.VAULT.get(vaultId);
 
+    // Step 1: cheap sync validation BEFORE any crypto work.
+    // Rejects obviously-invalid paths (bad service names, unknown routes)
+    // without forcing JWT verification + DPoP replay RPC on garbage
+    // traffic. Mirrors what handleRequest validates synchronously today
+    // — handleRequest's own checks still run, this is just an early gate
+    // so a flood of /../../etc/passwd or /garbage doesn't force sig work.
+    const earlyReject = preValidateRoute(request);
+    if (earlyReject) return earlyReject;
+
+    // Step 2: identity resolution (expensive — JWT verify + DPoP replay
+    // RPC). Resolved ONCE here so we can charge the rate bucket and
+    // hand the cached value to the handler. Anonymous (null) requests
+    // get a 401 via the handler without consuming budget — pre-auth
+    // DoS is CF's job.
+    const sub = await resolveIdentity(request, env, vault);
+
+    // Step 3: rate-bucket charge (DO RPC). Only authenticated callers
+    // are budgeted — anonymous traffic short-circuits to handler's 401.
+    if (sub) {
+      const gate = await vault.consumeBudget(sub, costClassFor(request));
+      if (!gate.ok) {
+        return new Response(
+          JSON.stringify({ error: "rate_limited" }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": String(gate.retryAfterSec),
+            },
+          },
+        );
+      }
+    }
+
+    // Step 4: delegate to handler (which can now trust the route +
+    // identity + budget).
     return handleRequest({
       request,
       storage: {
@@ -119,50 +183,7 @@ export default {
           return vault.listServices();
         },
       },
-      resolveIdentity: async (req) => {
-        // Try DPoP token (Authorization: DPoP <token> + DPoP header)
-        const authHeader = req.headers.get("Authorization");
-        const dpopHeader = req.headers.get("DPoP");
-        const token = authHeader?.startsWith("DPoP ") ? authHeader.slice(5) : null;
-
-        if (token && dpopHeader) {
-          try {
-            const claims = await verifyDPoPToken({
-              token,
-              proof: dpopHeader,
-              method: req.method,
-              url: req.url,
-              jwksUrl: "https://auth.notme.bot/.well-known/jwks.json",
-            });
-            // JTI replay check — DO tracks seen proofs for 120s
-            const replayed = await vault.checkAndStoreJti(claims.jti);
-            if (replayed) return null;
-            return claims.sub;
-          } catch {
-            return null;
-          }
-        }
-
-        // Try access token only (redirect flow or simple bearer)
-        if (token || authHeader?.startsWith("Bearer ")) {
-          const accessToken = token || authHeader!.slice(7);
-          try {
-            const claims = await verifyAccessToken({
-              token: accessToken,
-              jwksUrl: "https://auth.notme.bot/.well-known/jwks.json",
-              // Audience pin — rejects tokens minted for a different
-              // resource server (rosary.bot, mache.rosary.bot, etc.) so
-              // a stolen-from-elsewhere token can't be replayed at vault.
-              audience: env.VAULT_AUDIENCE,
-            });
-            return claims.sub;
-          } catch {
-            return null;
-          }
-        }
-
-        return null;
-      },
+      resolveIdentity: async () => sub,
       adminSub: env.ADMIN_SUB || "",
       // Proxy via DO — credentials decrypted INSIDE the DO, never cross RPC.
       proxyViaVault: async (service, req) => vault.proxyRequest(service, req),
@@ -170,18 +191,138 @@ export default {
   },
 };
 
+// ── Identity resolution ────────────────────────────────────────────────────
+//
+// Extracted from the worker.fetch body so it can run BEFORE handleRequest
+// — the rate bucket needs the caller's sub to charge the right bucket,
+// and the handler needs the same value. We pass it via a no-arg closure
+// to handleRequest so it doesn't re-do JWT verification.
+
+async function resolveIdentity(
+  req: Request,
+  env: Env,
+  vault: CredentialVaultRpc,
+): Promise<string | null> {
+  const authHeader = req.headers.get("Authorization");
+  const dpopHeader = req.headers.get("DPoP");
+  const token = authHeader?.startsWith("DPoP ") ? authHeader.slice(5) : null;
+
+  if (token && dpopHeader) {
+    try {
+      const claims = await verifyDPoPToken({
+        token,
+        proof: dpopHeader,
+        method: req.method,
+        url: req.url,
+        jwksUrl: "https://auth.notme.bot/.well-known/jwks.json",
+      });
+      // JTI replay check — DO tracks seen proofs for 120s
+      const replayed = await vault.checkAndStoreJti(claims.jti);
+      if (replayed) return null;
+      return claims.sub;
+    } catch {
+      return null;
+    }
+  }
+
+  // Try access token only (redirect flow or simple bearer)
+  if (token || authHeader?.startsWith("Bearer ")) {
+    const accessToken = token || authHeader!.slice(7);
+    try {
+      const claims = await verifyAccessToken({
+        token: accessToken,
+        jwksUrl: "https://auth.notme.bot/.well-known/jwks.json",
+        // Audience pin — rejects tokens minted for a different
+        // resource server (rosary.bot, mache.rosary.bot, etc.) so
+        // a stolen-from-elsewhere token can't be replayed at vault.
+        audience: env.VAULT_AUDIENCE,
+      });
+      return claims.sub;
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Map a request to its rate-bucket cost class. PUT pays the `write`
+ * cost (encrypt + SQL write), DELETE and /admin/services are `read`,
+ * and everything else routes to the upstream and pays the `proxy` cost
+ * (encrypt + SQL read + upstream fetch).
+ */
+function costClassFor(req: Request): "read" | "write" | "proxy" {
+  if (req.method === "PUT") return "write";
+  if (req.method === "DELETE") return "read";
+  const path = new URL(req.url).pathname;
+  if (path === "/admin/services") return "read";
+  return "proxy";
+}
+
+/**
+ * Cheap sync route validation, run BEFORE identity resolution so an
+ * attacker hitting `/../../etc/passwd` or `/garbage-path` can't force
+ * JWT verification + DPoP replay RPC for nothing. Returns an error
+ * Response on reject, or `null` to let the request proceed to identity
+ * resolution.
+ *
+ * The checks mirror what `handleRequest()` validates synchronously
+ * today — keeping them here is just a hoist, not a replacement. The
+ * handler still does its own validation; this gate exists so the
+ * expensive work doesn't happen for obviously-bad requests.
+ *
+ * Allowed shapes:
+ *   - GET /admin/services           (admin route, identity required later)
+ *   - GET|PUT|DELETE|...  /:service (service name passes validateServiceName)
+ *
+ * Exported for direct unit testing — caller is just `worker.fetch`.
+ */
+export function preValidateRoute(req: Request): Response | null {
+  const path = new URL(req.url).pathname;
+  if (path === "/admin/services") return null;
+  // Extract candidate service segment — same split handleRequest uses.
+  const service = path.split("/")[1] || "";
+  if (!service || !validateServiceName(service)) {
+    return Response.json({ error: "invalid service name" }, { status: 400 });
+  }
+  return null;
+}
+
 // ── Durable Object: CredentialVault ─────────────────────────────────────────
 //
 // The DO is the security kernel. It:
-//   1. Derives the KEK from this.env.VAULT_KEK_SECRET (non-extractable)
+//   1. Resolves the KEK via the url-driven kek-source (env://, file://,
+//      keychain://, http(s)://) — falls back to legacy VAULT_KEK_SECRET
+//      with a deprecation warning. Non-extractable in Web Crypto.
 //   2. Encrypts credential headers before writing to SQLite
 //   3. Decrypts only when proxying (plaintext never crosses RPC)
 //   4. Performs the upstream fetch itself — plaintext headers stay in DO memory
+//   5. Gates every authenticated request through a per-caller token bucket
+//      (consumeBudget) so a noisy caller can't starve neighbours.
 //
 // The Worker is just a routing/auth shell. It never sees decrypted credentials.
 
 import { deriveKEK, encrypt, decrypt, type SealedCredential } from "./crypto";
 import { buildProxyRequest, sanitizeResponse } from "./vault";
+import { buildKekSource } from "./kek-source";
+import { RATE_LIMITS, refillBucket, tryConsume, type BucketState } from "./rate-bucket";
+
+/**
+ * Hard cap on the per-caller bucket map (LRU eviction). Without a cap,
+ * a stream of unique `sub` values (each one populating a new Map entry)
+ * would grow DO memory without bound — a slow-DoS vector against the
+ * single-writer DO instance. Evicting the oldest entry on overflow is
+ * a safe heuristic because the bucket math is already idempotent in
+ * the loss case: an evicted caller gets a full bucket on their next
+ * request, which is the same outcome a long-idle caller sees naturally.
+ *
+ * 10k is generously large for any plausible legitimate workload — a
+ * vault DO that genuinely sees 10k distinct authenticated callers in
+ * its uptime window is well past the point where per-caller buckets
+ * in DO memory are the right shape.
+ */
+const BUCKET_CAP = 10_000;
 
 interface StoredRow {
   upstream: string;
@@ -204,6 +345,15 @@ interface StoredRow {
 export class CredentialVault {
   private sql: any;
   private kekPromise: Promise<CryptoKey> | null = null;
+  /**
+   * Per-caller token-bucket state, keyed by `sub`. Lives in DO memory
+   * (single-writer per DO instance) — persistence isn't needed because
+   * the bucket auto-refills from a stale `lastRefillMs` on the next
+   * consume attempt. If the DO is evicted, callers get a full bucket
+   * on their next request, which is the same outcome a long-idle
+   * caller would see anyway.
+   */
+  private readonly buckets = new Map<string, BucketState>();
 
   constructor(private ctx: any, private env: Env) {
     this.sql = ctx.storage.sql;
@@ -242,12 +392,81 @@ export class CredentialVault {
     return false;
   }
 
-  /** Lazy KEK derivation — derived once per DO lifetime, cached. */
+  /**
+   * Lazy KEK derivation — resolved once per DO lifetime, cached. The KEK
+   * itself comes from the URL-driven kek-source resolver
+   * (`env://`, `file://`, `keychain://`, `http(s)://`). If
+   * `VAULT_KEK_SOURCE` is unset, falls back to the legacy plaintext
+   * `VAULT_KEK_SECRET` env binding with a one-time deprecation warning.
+   * On resolver failure the cached promise is cleared so the next call
+   * retries instead of permanently poisoning the DO's KEK slot.
+   */
   #getKEK(): Promise<CryptoKey> {
     if (!this.kekPromise) {
-      this.kekPromise = deriveKEK(this.env.VAULT_KEK_SECRET);
+      this.kekPromise = this.#resolveAndDeriveKEK().catch((err) => {
+        this.kekPromise = null;
+        throw err;
+      });
     }
     return this.kekPromise;
+  }
+
+  async #resolveAndDeriveKEK(): Promise<CryptoKey> {
+    const spec = this.env.VAULT_KEK_SOURCE;
+    if (spec && spec.length > 0) {
+      const secret = await buildKekSource(
+        spec,
+        this.env as unknown as Record<string, unknown>,
+      ).resolve();
+      return deriveKEK(secret);
+    }
+    // Legacy path — kept so the lift PR doesn't force every deployment
+    // to update its wrangler config on the same day. Removed once all
+    // deployments set VAULT_KEK_SOURCE.
+    const legacy = this.env.VAULT_KEK_SECRET;
+    if (!legacy) {
+      throw new Error(
+        "vault: no KEK source configured — set VAULT_KEK_SOURCE (preferred) or VAULT_KEK_SECRET",
+      );
+    }
+    console.warn(
+      "vault: VAULT_KEK_SECRET is deprecated; set VAULT_KEK_SOURCE=env://VAULT_KEK_SECRET (or another scheme) instead",
+    );
+    return deriveKEK(legacy);
+  }
+
+  /**
+   * Per-caller token-bucket gate (cloister-211b68 / dos-friend F1).
+   * Looks up the caller's bucket, refills based on wall-clock elapsed,
+   * and attempts to consume the cost for `costClass`. Rejected callers
+   * get a `retryAfterSec` derived from the bucket's refill rate; the
+   * `lastRefillMs` is persisted on reject too so a depleted attacker
+   * can't freeze time.
+   *
+   * Map access uses delete-then-set so iteration order ≡ recency
+   * (LRU). When the map exceeds `BUCKET_CAP`, the oldest entry is
+   * evicted — bounds DO memory against a flood of unique `sub` values
+   * (notme-PR#22 / Copilot review).
+   */
+  async consumeBudget(
+    sub: string,
+    costClass: "read" | "write" | "proxy",
+  ): Promise<{ ok: true } | { ok: false; retryAfterSec: number }> {
+    const cost = RATE_LIMITS.COST[costClass];
+    const prev = this.buckets.get(sub) ?? null;
+    const refilled = refillBucket(prev, Date.now());
+    const result = tryConsume(refilled, cost);
+    // Delete-then-set bumps this `sub` to the tail of Map's insertion
+    // order — that ordering is what makes `.keys().next()` give us
+    // the LRU entry on overflow below.
+    this.buckets.delete(sub);
+    this.buckets.set(sub, result.next);
+    if (this.buckets.size > BUCKET_CAP) {
+      const oldest = this.buckets.keys().next().value;
+      if (oldest !== undefined) this.buckets.delete(oldest);
+    }
+    if (result.ok) return { ok: true };
+    return { ok: false, retryAfterSec: result.retryAfterSec };
   }
 
   /** Get credential metadata (upstream, scopes) WITHOUT decrypting headers. */
