@@ -1,11 +1,17 @@
 {
   "private": true,
   "devDependencies": {
-    "@vitest/coverage-v8": "^4.1.2",
-    "tsx": "^4.21.0"
+    "@vitest/coverage-v8": "^4.1.6",
+    "tsx": "^4.22.2"
   },
   "dependencies": {
     "yaml": "^2.9.0",
-    "zod": "^4.3.6"
+    "zod": "^4.4.3"
+  },
+  "pnpm": {
+    "overrides": {
+      "undici@<6.24.0": "^6.24.0",
+      "ws@<8.20.1": "^8.20.1"
+    }
   }
 }
