@@ -186,14 +186,10 @@ fn validate_uds_path(raw: Option<&str>, prefix: &str) -> Result<PathBuf, UdsPath
     for comp in path.components() {
         match comp {
             std::path::Component::ParentDir => return Err(UdsPathError::Traversal),
-            std::path::Component::Normal(s) => {
-                if s.to_string_lossy().contains("..") {
-                    // Catches encoded variants like `foo..bar` defensively;
-                    // socket names shouldn't contain `..` at all.
-                    if s == ".." {
-                        return Err(UdsPathError::Traversal);
-                    }
-                }
+            // Catches encoded variants like `foo..bar` defensively;
+            // socket names shouldn't contain `..` at all.
+            std::path::Component::Normal(s) if s == ".." => {
+                return Err(UdsPathError::Traversal);
             }
             _ => {}
         }
