@@ -14,13 +14,11 @@
     "worker.ts",
     "src/**/*.ts",
     "../gen/ts/**/*.ts",
-    "../vault/src/**/*.ts",
   ],
   "exclude": [
     "node_modules",
     "**/*.test.ts",
     "**/__tests__/**",
-    "../gen/ts/__tests__/**",
-    "../vault/src/__tests__/**"
+    "../gen/ts/__tests__/**"
   ]
 }
