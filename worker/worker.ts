@@ -5,6 +5,10 @@ export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
+import {
+  ensureCurrentCABundle,
+  handleInternalCABundle,
+} from "./src/internal-ca-bundle";
 import { ED25519, type Platform } from "./src/platform";
 
 // ── Private RPC surface — only callable via service binding ──
@@ -312,19 +316,16 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
 
   const cfg = getConfig(env);
 
-  // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC)
-  const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-  const authority = env.SIGNING_AUTHORITY.get(authorityId);
   try {
     // Ensure CA bundle is published to KV (lazy init — first request bootstraps)
-    const existingBundle = await platform.cache.get("bundle:current");
-    if (!existingBundle) {
-      const bundle = await authority.generateBundle();
-      await platform.cache.put("bundle:current", JSON.stringify(bundle));
-    }
+    await ensureCurrentCABundle(env, platform);
   } catch (e: any) {
     return jsonErr("authority unavailable: " + e.message, 503);
   }
+
+  // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC)
+  const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+  const authority = env.SIGNING_AUTHORITY.get(authorityId);
 
   const authHeader = request.headers.get("authorization") ?? "";
   if (!authHeader.startsWith("Bearer ")) {
@@ -1192,6 +1193,13 @@ export default {
 
     const { createPlatform } = await import("./src/platform");
     const platform = createPlatform(env);
+
+    // Internal service-binding route used by cloister to fetch Signet's signed
+    // JSON CABundle. Host-agnostic by design: service bindings commonly use
+    // synthetic hostnames such as https://notme-bot/.
+    if (pathname === "/internal/ca-bundle") {
+      return handleInternalCABundle(request, env, platform);
+    }
 
     // ── Canonical host enforcement ──
     // Redirect any non-notme.bot host (e.g. workers.dev) to the canonical domain.
