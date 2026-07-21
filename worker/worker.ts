@@ -1878,6 +1878,88 @@ export default {
         return cachePut(request, resp);
       }
 
+      // ── OAuth 2.0 Authorization Server Metadata (RFC 8414) ──────────────
+      //
+      // notme IS an OAuth 2.0 authorization server: it has /authorize,
+      // /token, and /.well-known/jwks.json, and mints DPoP-bound `at+jwt`
+      // access tokens (RFC 9449). What it is NOT is an OpenID Provider —
+      // it issues no `id_token` and honours no `scope=openid`.
+      //
+      // WHY THIS IS SERVED AT TWO PATHS:
+      //   /.well-known/oauth-authorization-server  — the correct, accurate
+      //     path for what this server is (RFC 8414).
+      //   /.well-known/openid-configuration        — served ONLY because
+      //     many client libraries probe exclusively there and would
+      //     otherwise fail to discover us at all.
+      //
+      // WHAT IS DELIBERATELY OMITTED (do not "helpfully" add these):
+      //   - id_token_signing_alg_values_supported  (REQUIRED by OIDC Discovery)
+      //   - subject_types_supported                (REQUIRED by OIDC Discovery)
+      //   - "openid" in scopes_supported
+      //   - "id_token" in response_types_supported
+      // Their absence is load-bearing: a strict OIDC client fails fast and
+      // legibly instead of discovering an "OP", requesting scope=openid, and
+      // silently getting no id_token back. Publishing a capability we do not
+      // have would be worse here than publishing nothing — this is a trust
+      // substrate. If id_token support ever lands, add these fields THEN.
+      //
+      // SECURITY NOTE: this document is unauthenticated by design (RFC 8414
+      // §3) and intentionally public — it is a map, not a key. Reading it
+      // grants nothing. What actually constrains issuance is the closed
+      // audience allowlist (src/allowed-audiences.ts — every mint checks the
+      // requested audience), validateRedirectUri() on /authorize, the
+      // required session cookie, DPoP sender-binding via cnf.jkt, and the
+      // absence of dynamic client registration.
+      if (
+        pathname === "/.well-known/oauth-authorization-server" ||
+        pathname === "/.well-known/openid-configuration"
+      ) {
+        const cached = await cacheMatch(request);
+        if (cached) return cached;
+        const resp = Response.json(
+          {
+            issuer: authorityUrl,
+            authorization_endpoint: `${authorityUrl}/authorize`,
+            token_endpoint: `${authorityUrl}/token`,
+            jwks_uri: `${authorityUrl}/.well-known/jwks.json`,
+            // Mirrors the vocabulary already published in
+            // /.well-known/signet-authority.json — kept identical so the two
+            // discovery documents can never disagree.
+            grant_types_supported: [
+              "oidc_token_exchange",
+              "github_actions_oidc",
+              "github_pat",
+              "dpop",
+            ],
+            response_types_supported: ["code"],
+            scopes_supported: [
+              "sign:git",
+              "sign:attestation",
+              "bundle:current",
+              "cloudflare:workers",
+            ],
+            // The token endpoint authenticates the USER (session cookie) plus
+            // a DPoP proof — there is no client credential, so "none" is the
+            // accurate value rather than client_secret_*.
+            token_endpoint_auth_methods_supported: ["none"],
+            // RFC 9449. The DPoP PROOF is ES256 (client-generated P-256);
+            // the ACCESS TOKEN itself is EdDSA-signed by this authority.
+            // Both are stated because consumers have historically assumed
+            // one algorithm for both and broken interop.
+            dpop_signing_alg_values_supported: ["ES256"],
+            algorithms_supported: ["Ed25519"],
+            service_documentation: `${siteUrl}/architecture`,
+          },
+          {
+            headers: {
+              "Cache-Control": "public, max-age=86400",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+        return cachePut(request, resp);
+      }
+
       // CA certificate — self-signed X.509 from SigningAuthority DO.
       // CF mTLS trust store requires X.509 PEM, not raw public keys.
       if (pathname === "/.well-known/ca-bundle.pem") {
