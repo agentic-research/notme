@@ -5,6 +5,7 @@ export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { ALL_SCOPES } from "@notme/contract";
 import {
   ensureCurrentCABundle,
   handleInternalCABundle,
@@ -1931,13 +1932,20 @@ export default {
               "github_pat",
               "dpop",
             ],
-            response_types_supported: ["code"],
-            scopes_supported: [
-              "sign:git",
-              "sign:attestation",
-              "bundle:current",
-              "cloudflare:workers",
-            ],
+            // Empty ON PURPOSE, and RFC 8414 §2 still satisfied (the field is
+            // REQUIRED to be a JSON array, not to be non-empty). notme
+            // implements NO standard OAuth response type: there is no
+            // authorization-code issuance and no code->token exchange
+            // anywhere. /authorize renders an HTML page; the token is then
+            // obtained by a session-authenticated POST to /authorize/token.
+            // Advertising ["code"] would send clients into an RFC 6749 §4.1
+            // flow that does not exist here.
+            response_types_supported: [],
+            // Sourced from @notme/contract's SCOPES — never hand-listed here.
+            // That package exists precisely so scope drift surfaces at compile
+            // time in both repos; a hardcoded copy in a DISCOVERY document is
+            // the worst place for it to rot, because clients would believe it.
+            scopes_supported: ALL_SCOPES,
             // The token endpoint authenticates the USER (session cookie) plus
             // a DPoP proof — there is no client credential, so "none" is the
             // accurate value rather than client_secret_*.
