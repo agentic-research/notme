@@ -154,6 +154,16 @@ consumers" to "asserts identity to arbitrary RPs." What must be modelled:
    root, and cross-protocol confusion is additionally stopped by claims shape
    (`at+jwt` has no `nonce` and a resource `aud`; RFC 9068 verifiers reject
    non-`at+jwt` `typ` in the other direction).
+   > **DEPENDENCY (2026-07-21):** invariant (v)'s dedicated `kid` is NOT
+   > free to be minted by this design. It MUST conform to the canonical
+   > `kid` scheme being defined by **`signet-248d17`** (the authority: canonical
+   > `kid` + pinned vectors + ADR), which also drives notme's `keyIdFromSpki`
+   > replacement + JWKS epoch-rotation (**`notme-254f03`**) and the 64→128-bit
+   > widening (**`ley-line-open-24bd97`**). Do NOT implement Phase 1's dedicated
+   > `kid` until `signet-248d17` lands — a kid minted outside that scheme is
+   > exactly the drift this whole cross-repo effort exists to stop. This is the
+   > one point where 012 touches that in-flight work; the rest of 012 (`cnf`,
+   > `sub`=thumbprint, presentation profile) is `kid`-independent.
 2. **`sub` correlation / privacy — resolved: no real conflict, because the
    correlator's lifetime is the dispatch's, not the principal's.** The tension
    would be real if `sub` were a stable key for a long-lived principal being
