@@ -1934,7 +1934,14 @@ export default {
         const resp = Response.json(
           {
             issuer: authorityUrl,
-            authorization_endpoint: `${authorityUrl}/authorize`,
+            // authorization_endpoint is DELIBERATELY OMITTED. RFC 8414 §2:
+            // "This is REQUIRED unless no grant types are supported that use
+            // the authorization endpoint." notme supports no such grant type
+            // — there is no authorization-code flow (see
+            // response_types_supported below). /authorize does exist, but it
+            // renders an HTML page and issues no code; advertising it here
+            // would point clients at an RFC 6749 §4.1 flow that isn't
+            // implemented. Omitting is both honest AND spec-conformant.
             token_endpoint: `${authorityUrl}/token`,
             jwks_uri: `${authorityUrl}/.well-known/jwks.json`,
             // Mirrors the vocabulary already published in
