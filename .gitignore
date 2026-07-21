@@ -4,6 +4,14 @@
 # Keep gitignore itself tracked.
 !.gitignore
 
+# Beads: the store binary (beads.db) stays ignored — a committed binary DB has
+# no git 3-way merge (rosary-05fbe0) — but the JSONL export is the tracked,
+# mergeable text mirror that carries beads to clones/agents. Re-include the
+# .beads dir so git descends, then allow only the JSONL (root `*` still ignores
+# beads.db and its WAL sidecars inside).
+!.beads/
+!.beads/beads.jsonl
+
 # Project metadata
 !LICENSE
 !NOTICE
