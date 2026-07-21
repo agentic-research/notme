@@ -34,8 +34,56 @@ export const AUTHORITY_GRANT_TYPES = ["github_actions_oidc", "dpop"] as const;
 /** The DPoP *proof* algorithm (client-generated P-256). RFC 9449. */
 export const DPOP_PROOF_ALGS = ["ES256"] as const;
 
-/** The *access token* signing algorithm (this authority's Ed25519 master). */
-export const ACCESS_TOKEN_ALGS = ["Ed25519"] as const;
+/**
+ * JWS algorithms this authority signs tokens with.
+ *
+ * "EdDSA" is the JWA algorithm name (RFC 8037 §3.1). "Ed25519" is the CURVE
+ * (`crv`), not an algorithm — the authority's own JWK is
+ * `{kty:"OKP", crv:"Ed25519", alg:"EdDSA"}` (src/signing-authority.ts), so
+ * "EdDSA" is the correct identifier to publish.
+ *
+ * WHY THIS IS PUBLISHED AS id_token_signing_alg_values_supported even though
+ * notme issues no id_token: that field is what real client libraries read to
+ * configure their JWS verifier, and omitting it is not neutral — it BREAKS
+ * them. go-oidc's verifyJWT does:
+ *
+ *   // If no algorithms were specified by both the config and discovery,
+ *   // default to the one mandatory algorithm "RS256".
+ *   if len(supportedSigAlgs) == 0 {
+ *       supportedSigAlgs = []jose.SignatureAlgorithm{jose.RS256}
+ *   }
+ *
+ * So with the field absent, a client accepts RS256 ONLY and rejects every
+ * EdDSA token from this issuer as "oidc: malformed jwt". Publishing the
+ * algorithm is therefore a correctness requirement, not an OIDC capability
+ * claim — and it is the same failure mode as the original DPoP interop bug
+ * (a consumer defaulting to the wrong algorithm because discovery was silent).
+ *
+ * notme still advertises NO OpenID Provider capability: `scopes_supported`
+ * contains no "openid" and `response_types_supported` is empty. Those are the
+ * signals that say "not an OP" — not the absence of an algorithm list.
+ */
+export const DEFAULT_SIGNING_ALGS: ReadonlyArray<string> = ["EdDSA"];
+
+/**
+ * Deployer override for the signing algorithms, CSV. Mirrors
+ * getAllowedAudiences(env) so operators configure both the same way.
+ * Empty/missing → DEFAULT_SIGNING_ALGS.
+ */
+export function getSigningAlgs(env: {
+  ID_TOKEN_SIGNING_ALGS?: string;
+}): ReadonlyArray<string> {
+  const raw = (env.ID_TOKEN_SIGNING_ALGS ?? "").trim();
+  if (!raw) return DEFAULT_SIGNING_ALGS;
+  const parsed = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  // Never publish an EMPTY list: that is exactly the state that makes
+  // go-oidc silently fall back to RS256-only. A misconfigured env must not
+  // be able to break every client, so fall back to the default instead.
+  return parsed.length > 0 ? parsed : DEFAULT_SIGNING_ALGS;
+}
 
 export interface AsMetadata {
   issuer: string;
@@ -46,7 +94,7 @@ export interface AsMetadata {
   scopes_supported: readonly string[];
   token_endpoint_auth_methods_supported: readonly string[];
   dpop_signing_alg_values_supported: readonly string[];
-  algorithms_supported: readonly string[];
+  id_token_signing_alg_values_supported: readonly string[];
   service_documentation: string;
 }
 
@@ -63,6 +111,7 @@ export interface AsMetadata {
 export function buildAsMetadata(
   authorityUrl: string,
   siteUrl: string,
+  signingAlgs: ReadonlyArray<string> = DEFAULT_SIGNING_ALGS,
 ): AsMetadata {
   return {
     issuer: authorityUrl,
@@ -92,7 +141,12 @@ export function buildAsMetadata(
     // re-add tls_client_auth here without re-adding that verification.
     token_endpoint_auth_methods_supported: ["none"],
     dpop_signing_alg_values_supported: DPOP_PROOF_ALGS,
-    algorithms_supported: ACCESS_TOKEN_ALGS,
+    // The JWS alg this issuer signs with. MUST be published: absent, go-oidc
+    // (and libraries following the same pattern) fall back to RS256-only and
+    // reject every EdDSA token from us. See DEFAULT_SIGNING_ALGS above.
+    // Replaces the previous non-standard `algorithms_supported: ["Ed25519"]`,
+    // which no library reads AND which named the curve, not the algorithm.
+    id_token_signing_alg_values_supported: signingAlgs,
     service_documentation: `${siteUrl}/architecture`,
   };
 }
@@ -105,8 +159,14 @@ export function buildAsMetadata(
  * Enforced by test so nobody "helpfully" re-adds them.
  */
 export const FORBIDDEN_METADATA_FIELDS = [
-  "id_token_signing_alg_values_supported",
+  // Claims an OP capability we lack; unlike the alg list, omitting it breaks
+  // nothing, so there is no interop argument for publishing it.
   "subject_types_supported",
+  // RFC 8414 §2 permits omission when no grant type uses it — and none does.
   "authorization_endpoint",
+  // PKCE (code_challenge/code_verifier) is unimplemented.
   "code_challenge_methods_supported",
+  // Non-standard, read by nothing, and it named the CURVE (Ed25519) where an
+  // algorithm belongs. Superseded by id_token_signing_alg_values_supported.
+  "algorithms_supported",
 ] as const;

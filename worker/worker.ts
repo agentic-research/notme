@@ -5,7 +5,11 @@ export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { AUTHORITY_GRANT_TYPES, buildAsMetadata } from "./src/as-metadata";
+import {
+  AUTHORITY_GRANT_TYPES,
+  buildAsMetadata,
+  getSigningAlgs,
+} from "./src/as-metadata";
 import {
   ensureCurrentCABundle,
   handleInternalCABundle,
@@ -1919,7 +1923,7 @@ export default {
         // src/__tests__/as-metadata.test.ts pins them. This handler owns only
         // caching + headers.
         const resp = Response.json(
-          buildAsMetadata(authorityUrl, siteUrl),
+          buildAsMetadata(authorityUrl, siteUrl, getSigningAlgs(env)),
           {
             headers: {
               "Cache-Control": "public, max-age=86400",

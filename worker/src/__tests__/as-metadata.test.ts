@@ -23,11 +23,12 @@
 import { describe, expect, it } from "vitest";
 import { ALL_SCOPES } from "@notme/contract";
 import {
-  ACCESS_TOKEN_ALGS,
   AUTHORITY_GRANT_TYPES,
+  DEFAULT_SIGNING_ALGS,
   DPOP_PROOF_ALGS,
   FORBIDDEN_METADATA_FIELDS,
   buildAsMetadata,
+  getSigningAlgs,
 } from "../as-metadata";
 
 const AUTHORITY = "https://auth.notme.bot";
@@ -129,26 +130,73 @@ describe("AS metadata — no hand-listed values (drift guards)", () => {
   });
 });
 
-describe("AS metadata — DPoP algorithms are not transposed", () => {
+describe("AS metadata — signing algorithms", () => {
   it("dpop_signing_alg_values_supported is the client PROOF alg", () => {
-    // ES256 = client-generated P-256 proof. Ed25519 = this authority's
-    // access-token signature. Transposing these is exactly the interop bug
-    // that made cloister's verifier unable to talk to this mint.
+    // ES256 = client-generated P-256 proof. EdDSA = this authority's token
+    // signature. Transposing these is exactly the interop bug that made
+    // cloister's verifier unable to talk to this mint.
     expect(buildAsMetadata(AUTHORITY, SITE).dpop_signing_alg_values_supported)
       .toEqual(DPOP_PROOF_ALGS);
     expect(DPOP_PROOF_ALGS).toContain("ES256");
   });
 
-  it("algorithms_supported is the ACCESS TOKEN alg", () => {
-    expect(buildAsMetadata(AUTHORITY, SITE).algorithms_supported).toEqual(
-      ACCESS_TOKEN_ALGS,
-    );
-    expect(ACCESS_TOKEN_ALGS).toContain("Ed25519");
+  it("publishes the issuer's JWS alg — absence makes go-oidc assume RS256", () => {
+    // go-oidc verifyJWT: "If no algorithms were specified by both the config
+    // and discovery, default to the one mandatory algorithm RS256."
+    //   if len(supportedSigAlgs) == 0 { supportedSigAlgs = {jose.RS256} }
+    // With this field absent, every EdDSA token we issue is rejected as
+    // "oidc: malformed jwt". Publishing it is a correctness requirement.
+    const algs = buildAsMetadata(AUTHORITY, SITE)
+      .id_token_signing_alg_values_supported;
+    expect(algs).toEqual(DEFAULT_SIGNING_ALGS);
+    expect(algs).toContain("EdDSA");
+    expect(algs.length).toBeGreaterThan(0);
   });
 
-  it("the two algorithm lists are disjoint", () => {
+  it('uses the JWA alg name "EdDSA", never the curve name "Ed25519"', () => {
+    // RFC 8037 §3.1: EdDSA is the algorithm; Ed25519 is the crv. The JWK is
+    // {kty:"OKP", crv:"Ed25519", alg:"EdDSA"}.
+    const algs = buildAsMetadata(AUTHORITY, SITE)
+      .id_token_signing_alg_values_supported;
+    expect(algs).not.toContain("Ed25519");
+  });
+
+  it("the proof and token algorithm lists stay disjoint", () => {
     const proof = new Set<string>(DPOP_PROOF_ALGS);
-    for (const alg of ACCESS_TOKEN_ALGS) expect(proof.has(alg)).toBe(false);
+    for (const alg of DEFAULT_SIGNING_ALGS) expect(proof.has(alg)).toBe(false);
+  });
+});
+
+describe("AS metadata — signing algs are deployer-configurable", () => {
+  it("defaults to EdDSA when unset", () => {
+    expect(getSigningAlgs({})).toEqual(DEFAULT_SIGNING_ALGS);
+    expect(getSigningAlgs({ ID_TOKEN_SIGNING_ALGS: "   " })).toEqual(
+      DEFAULT_SIGNING_ALGS,
+    );
+  });
+
+  it("accepts a CSV override and trims it", () => {
+    expect(getSigningAlgs({ ID_TOKEN_SIGNING_ALGS: "EdDSA, ES256" })).toEqual([
+      "EdDSA",
+      "ES256",
+    ]);
+  });
+
+  it("NEVER yields an empty list, even from a malformed override", () => {
+    // An empty list is the precise state that makes go-oidc fall back to
+    // RS256-only. A misconfigured env must not be able to break every client.
+    for (const bad of [",", " , , ", ""]) {
+      expect(getSigningAlgs({ ID_TOKEN_SIGNING_ALGS: bad }).length)
+        .toBeGreaterThan(0);
+    }
+  });
+
+  it("threads the configured algs into the document", () => {
+    const m = buildAsMetadata(AUTHORITY, SITE, ["EdDSA", "ES256"]);
+    expect(m.id_token_signing_alg_values_supported).toEqual([
+      "EdDSA",
+      "ES256",
+    ]);
   });
 });
 
