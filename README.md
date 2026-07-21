@@ -13,6 +13,10 @@ every AI coding tool uses your credentials. your PAT, your SSH key, your OAuth t
 
 notme is the identity layer that fixes this. agents get their own cryptographic identity — scoped, ephemeral, revocable, distinct from the human who deployed them.
 
+under the hood, notme is an identity **normalizer**. bring any auth you already passed — a passkey, a GitHub Actions OIDC token, a PAT, mTLS — and it re-issues that identity as a **standard** credential the rest of your stack already speaks: an X.509 bridge certificate (mTLS today; scoped for git signing and attestation) or a DPoP-bound OAuth access token ([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449)) for HTTP and MCP. one Ed25519 authority signs both; the key never leaves process memory.
+
+mechanically it's a bridge **certificate authority** *and* an OAuth **authorization server** over a single root — and deliberately **not** an OpenID provider. it never vends a third party a bearer claim about who you are; it converts auth you already proved into proof-of-possession you can't hand off by copying.
+
 ## why
 
 ```mermaid
