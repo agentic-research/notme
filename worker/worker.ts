@@ -6,6 +6,25 @@ export { SigningAuthority } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { ALL_SCOPES } from "@notme/contract";
+
+/**
+ * Grant types advertised by BOTH discovery documents
+ * (/.well-known/signet-authority.json and the RFC 8414 metadata).
+ *
+ * Single source of truth on purpose: these were previously hand-listed in
+ * each document and had already drifted from reality — "github_pat" and
+ * "oidc_token_exchange" were advertised publicly but implemented NOWHERE
+ * (the authMethod values the code actually emits are gha-oidc, invite,
+ * oidc:github, passkey, test). Two hand-maintained copies of a public
+ * capability claim is how a discovery document starts lying.
+ *
+ * Only verified token-issuance paths belong here:
+ *   github_actions_oidc — /cert/gha, validateGHAToken (worker.ts ~L277)
+ *   dpop                — mintDPoPToken (worker.ts ~L86)
+ * Session-establishment methods (passkey/invite/oidc:github) are auth
+ * methods, not grants, and are deliberately not conflated with these.
+ */
+const AUTHORITY_GRANT_TYPES = ["github_actions_oidc", "dpop"] as const;
 import {
   ensureCurrentCABundle,
   handleInternalCABundle,
@@ -1857,12 +1876,7 @@ export default {
             cert_gha_endpoint: `${authorityUrl}/cert/gha`,
             ca_bundle_endpoint: `${authorityUrl}/.well-known/ca-bundle.pem`,
             algorithms_supported: ["Ed25519"],
-            grant_types_supported: [
-              "oidc_token_exchange",
-              "github_actions_oidc",
-              "github_pat",
-              "dpop",
-            ],
+            grant_types_supported: AUTHORITY_GRANT_TYPES,
             cert_types_supported: ["bridge_certificate"],
             token_endpoint: `${authorityUrl}/token`,
             jwks_uri: `${authorityUrl}/.well-known/jwks.json`,
@@ -1926,12 +1940,7 @@ export default {
             // Mirrors the vocabulary already published in
             // /.well-known/signet-authority.json — kept identical so the two
             // discovery documents can never disagree.
-            grant_types_supported: [
-              "oidc_token_exchange",
-              "github_actions_oidc",
-              "github_pat",
-              "dpop",
-            ],
+            grant_types_supported: AUTHORITY_GRANT_TYPES,
             // Empty ON PURPOSE, and RFC 8414 §2 still satisfied (the field is
             // REQUIRED to be a JSON array, not to be non-empty). notme
             // implements NO standard OAuth response type: there is no
