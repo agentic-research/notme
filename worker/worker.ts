@@ -5,6 +5,26 @@ export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { ALL_SCOPES } from "@notme/contract";
+
+/**
+ * Grant types advertised by BOTH discovery documents
+ * (/.well-known/signet-authority.json and the RFC 8414 metadata).
+ *
+ * Single source of truth on purpose: these were previously hand-listed in
+ * each document and had already drifted from reality — "github_pat" and
+ * "oidc_token_exchange" were advertised publicly but implemented NOWHERE
+ * (the authMethod values the code actually emits are gha-oidc, invite,
+ * oidc:github, passkey, test). Two hand-maintained copies of a public
+ * capability claim is how a discovery document starts lying.
+ *
+ * Only verified token-issuance paths belong here:
+ *   github_actions_oidc — /cert/gha, validateGHAToken (worker.ts ~L277)
+ *   dpop                — mintDPoPToken (worker.ts ~L86)
+ * Session-establishment methods (passkey/invite/oidc:github) are auth
+ * methods, not grants, and are deliberately not conflated with these.
+ */
+const AUTHORITY_GRANT_TYPES = ["github_actions_oidc", "dpop"] as const;
 import {
   ensureCurrentCABundle,
   handleInternalCABundle,
@@ -1856,17 +1876,103 @@ export default {
             cert_gha_endpoint: `${authorityUrl}/cert/gha`,
             ca_bundle_endpoint: `${authorityUrl}/.well-known/ca-bundle.pem`,
             algorithms_supported: ["Ed25519"],
-            grant_types_supported: [
-              "oidc_token_exchange",
-              "github_actions_oidc",
-              "github_pat",
-              "dpop",
-            ],
+            grant_types_supported: AUTHORITY_GRANT_TYPES,
             cert_types_supported: ["bridge_certificate"],
             token_endpoint: `${authorityUrl}/token`,
             jwks_uri: `${authorityUrl}/.well-known/jwks.json`,
             dpop_signing_alg_values_supported: ["ES256"],
             documentation: `${siteUrl}/architecture`,
+          },
+          {
+            headers: {
+              "Cache-Control": "public, max-age=86400",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+        return cachePut(request, resp);
+      }
+
+      // ── OAuth 2.0 Authorization Server Metadata (RFC 8414) ──────────────
+      //
+      // notme IS an OAuth 2.0 authorization server: it has /authorize,
+      // /token, and /.well-known/jwks.json, and mints DPoP-bound `at+jwt`
+      // access tokens (RFC 9449). What it is NOT is an OpenID Provider —
+      // it issues no `id_token` and honours no `scope=openid`.
+      //
+      // WHY THIS IS SERVED AT TWO PATHS:
+      //   /.well-known/oauth-authorization-server  — the correct, accurate
+      //     path for what this server is (RFC 8414).
+      //   /.well-known/openid-configuration        — served ONLY because
+      //     many client libraries probe exclusively there and would
+      //     otherwise fail to discover us at all.
+      //
+      // WHAT IS DELIBERATELY OMITTED (do not "helpfully" add these):
+      //   - id_token_signing_alg_values_supported  (REQUIRED by OIDC Discovery)
+      //   - subject_types_supported                (REQUIRED by OIDC Discovery)
+      //   - "openid" in scopes_supported
+      //   - "id_token" in response_types_supported
+      // Their absence is load-bearing: a strict OIDC client fails fast and
+      // legibly instead of discovering an "OP", requesting scope=openid, and
+      // silently getting no id_token back. Publishing a capability we do not
+      // have would be worse here than publishing nothing — this is a trust
+      // substrate. If id_token support ever lands, add these fields THEN.
+      //
+      // SECURITY NOTE: this document is unauthenticated by design (RFC 8414
+      // §3) and intentionally public — it is a map, not a key. Reading it
+      // grants nothing. What actually constrains issuance is the closed
+      // audience allowlist (src/allowed-audiences.ts — every mint checks the
+      // requested audience), validateRedirectUri() on /authorize, the
+      // required session cookie, DPoP sender-binding via cnf.jkt, and the
+      // absence of dynamic client registration.
+      if (
+        pathname === "/.well-known/oauth-authorization-server" ||
+        pathname === "/.well-known/openid-configuration"
+      ) {
+        const cached = await cacheMatch(request);
+        if (cached) return cached;
+        const resp = Response.json(
+          {
+            issuer: authorityUrl,
+            // authorization_endpoint is DELIBERATELY OMITTED. RFC 8414 §2:
+            // "This is REQUIRED unless no grant types are supported that use
+            // the authorization endpoint." notme supports no such grant type
+            // — there is no authorization-code flow (see
+            // response_types_supported below). /authorize does exist, but it
+            // renders an HTML page and issues no code; advertising it here
+            // would point clients at an RFC 6749 §4.1 flow that isn't
+            // implemented. Omitting is both honest AND spec-conformant.
+            token_endpoint: `${authorityUrl}/token`,
+            jwks_uri: `${authorityUrl}/.well-known/jwks.json`,
+            // Mirrors the vocabulary already published in
+            // /.well-known/signet-authority.json — kept identical so the two
+            // discovery documents can never disagree.
+            grant_types_supported: AUTHORITY_GRANT_TYPES,
+            // Empty ON PURPOSE, and RFC 8414 §2 still satisfied (the field is
+            // REQUIRED to be a JSON array, not to be non-empty). notme
+            // implements NO standard OAuth response type: there is no
+            // authorization-code issuance and no code->token exchange
+            // anywhere. /authorize renders an HTML page; the token is then
+            // obtained by a session-authenticated POST to /authorize/token.
+            // Advertising ["code"] would send clients into an RFC 6749 §4.1
+            // flow that does not exist here.
+            response_types_supported: [],
+            // Sourced from @notme/contract's SCOPES — never hand-listed here.
+            // That package exists precisely so scope drift surfaces at compile
+            // time in both repos; a hardcoded copy in a DISCOVERY document is
+            // the worst place for it to rot, because clients would believe it.
+            scopes_supported: ALL_SCOPES,
+            // The token endpoint authenticates the USER (session cookie) plus
+            // a DPoP proof — there is no client credential, so "none" is the
+            // accurate value rather than client_secret_*.
+            token_endpoint_auth_methods_supported: ["none"],
+            // RFC 9449. The DPoP PROOF is ES256 (client-generated P-256);
+            // the ACCESS TOKEN itself is EdDSA-signed by this authority.
+            // Both are stated because consumers have historically assumed
+            // one algorithm for both and broken interop.
+            dpop_signing_alg_values_supported: ["ES256"],
+            algorithms_supported: ["Ed25519"],
+            service_documentation: `${siteUrl}/architecture`,
           },
           {
             headers: {
