@@ -59,6 +59,11 @@ tasks:
     dir: worker
     cmds:
       - pnpm exec tsc --noEmit
+      # Type-check the pool tests (*.do.test.ts), which the base tsconfig
+      # excludes (**/*.test.ts) and vitest transpiles via esbuild without
+      # checking. tsconfig.test.json loads the cloudflare:test types + the
+      # ProvidedEnv augmentation so env bindings + DO instances are typed.
+      - pnpm exec tsc -p tsconfig.test.json
       - pnpm exec vitest run
       # Real-Durable-Object tests (*.do.test.ts) via vitest-pool-workers.
       # Hermetic — its config declares DO bindings inline (no wrangler.toml,
