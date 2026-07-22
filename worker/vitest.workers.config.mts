@@ -23,8 +23,11 @@ export default defineConfig({
     cloudflareTest({
       main: "./worker.ts",
       miniflare: {
-        // Match wrangler.toml's compatibility_date so the isolate behaves
-        // identically to production for the code under test.
+        // Keep in sync with wrangler.toml `compatibility_date` (line 4) — the
+        // isolate must behave identically to production for the code under
+        // test. Not imported from wrangler.toml on purpose: this config declares
+        // bindings inline precisely to avoid loading wrangler.toml (see above),
+        // so the date is duplicated here. If you bump it there, bump it here.
         compatibilityDate: "2026-03-01",
         durableObjects: {
           // SQLite-backed per wrangler.toml migration v2 (new_sqlite_classes).
