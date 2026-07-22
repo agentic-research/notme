@@ -1,3 +1,4 @@
+/// <reference types="@cloudflare/vitest-pool-workers/types" />
 // Real-Durable-Object test for the SigningAuthority rotation grace window.
 //
 // Maps to notme-b49020 (this test) guarding the notme-54f84b fix: rotate()
@@ -21,8 +22,11 @@ describe("SigningAuthority rotation grace window (notme-b49020 / notme-54f84b)",
     const stub = env.SIGNING_AUTHORITY.get(id);
 
     // Baseline: a fresh authority publishes exactly one key and no prevKeyId.
-    const before = await runInDurableObject(stub, (auth: SigningAuthority) =>
-      auth.generateBundle(),
+    // `auth as SigningAuthority`: runInDurableObject can't infer the concrete DO
+    // instance type through its stub in workers-types 5 (it widens to the base
+    // DurableObject), so we assert it — the runtime instance IS a SigningAuthority.
+    const before = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).generateBundle(),
     );
     expect(Object.keys(before.keys)).toHaveLength(1);
     expect(before.prevKeyId).toBeUndefined();
@@ -31,14 +35,14 @@ describe("SigningAuthority rotation grace window (notme-b49020 / notme-54f84b)",
     expect(oldPub).toBeTruthy();
 
     // Rotate: mints a new key. Must preserve the OLD public key + kid.
-    const { newKeyId } = await runInDurableObject(stub, (auth: SigningAuthority) =>
-      auth.rotate(),
+    const { newKeyId } = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).rotate(),
     );
     expect(newKeyId).not.toBe(oldKeyId);
 
     // The next signed bundle carries BOTH keys; prevKeyId points at the old one.
-    const after = await runInDurableObject(stub, (auth: SigningAuthority) =>
-      auth.generateBundle(),
+    const after = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).generateBundle(),
     );
     expect(after.keyId).toBe(newKeyId);
     expect(after.prevKeyId).toBe(oldKeyId);

@@ -1,3 +1,4 @@
+/// <reference types="@cloudflare/vitest-pool-workers/types" />
 //
 // revocation.do.test.ts — tests for the APAS edge revocation module.
 //

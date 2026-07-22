@@ -1,0 +1,14 @@
+{
+  // Type-checks the vitest-pool-workers tests (*.do.test.ts), which the base
+  // tsconfig excludes (**/*.test.ts) and which vitest otherwise transpiles via
+  // esbuild without type-checking. Loads the pool's `cloudflare:test` module
+  // types + the ProvidedEnv augmentation (pool-test-env.d.ts). Run in CI via
+  // `task worker:check` (tsc -p tsconfig.test.json).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"],
+    "noEmit": true
+  },
+  "include": ["src/**/*.do.test.ts", "src/pool-test-env.d.ts"],
+  "exclude": ["node_modules"]
+}
