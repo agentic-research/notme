@@ -70,33 +70,57 @@ describe("revocation.bundle.staleness", () => {
 });
 
 describe("signing.key.id", () => {
-  // Tests now exercise the production algorithm via the exported
-  // keyIdFromSpki helper, not a parallel reimplementation. Earlier the
-  // test reimplemented djb2 (the old 32-bit hash) and asserted on that —
-  // it was checking the test-only stub, not the production code. After
-  // rosary-808b0e the production function is SHA-256 truncated to 8
-  // bytes (64-bit collision space).
+  // Exercises the production keyIdFromSpki (signet ADR-012, bead
+  // signet-248d17): kid = hex(SHA-256(canonical SPKI DER)[:16]), 128-bit.
+  // The earlier tests passed non-SPKI garbage (btoa("aaa…")) that the old
+  // byte-hashing accepted; the canonicalizing importKey now correctly rejects
+  // it, so these use real Ed25519 SPKI.
 
-  it("is deterministic — same input produces same output", async () => {
+  // Build a canonical Ed25519 SPKI (RFC 8410: AlgorithmIdentifier = OID only,
+  // parameters ABSENT) from a raw 32-byte public key given as hex.
+  const spkiB64FromKeyHex = (keyHex: string) => {
+    const der = "302a300506032b6570032100" + keyHex;
+    const bytes = der.match(/../g)!.map((h) => parseInt(h, 16));
+    return btoa(String.fromCharCode(...bytes));
+  };
+  const KEY_A =
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+  const KEY_B =
+    "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+
+  it("matches the ADR-012 canonical conformance vector (128-bit)", async () => {
     const { keyIdFromSpki } = await import("../key-id");
-    const spki1 = btoa("aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddddddddddd");
-    const spki2 = btoa("aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddddddddddd");
-    expect(await keyIdFromSpki(spki1)).toBe(await keyIdFromSpki(spki2));
+    // The cross-language pinned vector. notme MUST reproduce it byte-for-byte,
+    // as must signet Go and any LLO consumer.
+    expect(await keyIdFromSpki(spkiB64FromKeyHex(KEY_A))).toBe(
+      "9408457aefd071cec127c1f985399308",
+    );
   });
 
-  it("differs for different inputs", async () => {
+  it("is 128-bit (32 lowercase hex) and deterministic", async () => {
     const { keyIdFromSpki } = await import("../key-id");
-    const spki1 = btoa("aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddddddddddd");
-    const spki3 = btoa("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-    expect(await keyIdFromSpki(spki1)).not.toBe(await keyIdFromSpki(spki3));
+    const id = await keyIdFromSpki(spkiB64FromKeyHex(KEY_A));
+    expect(id).toHaveLength(32);
+    expect(id).toMatch(/^[0-9a-f]{32}$/);
+    expect(await keyIdFromSpki(spkiB64FromKeyHex(KEY_A))).toBe(id);
   });
 
-  it("returns 16 hex chars (8 bytes / 64-bit truncation)", async () => {
+  it("differs for different keys", async () => {
     const { keyIdFromSpki } = await import("../key-id");
-    const spki = btoa("aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddddddddddd");
-    const id = await keyIdFromSpki(spki);
-    expect(id).toHaveLength(16);
-    expect(id).toMatch(/^[0-9a-f]{16}$/);
+    expect(await keyIdFromSpki(spkiB64FromKeyHex(KEY_A))).not.toBe(
+      await keyIdFromSpki(spkiB64FromKeyHex(KEY_B)),
+    );
+  });
+
+  it("canonicalizes: rejects non-canonical NULL-params SPKI (ADR-012 R2)", async () => {
+    const { keyIdFromSpki } = await import("../key-id");
+    // Same key, but the AlgorithmIdentifier carries an explicit NULL parameter
+    // — a valid-but-non-canonical encoding that MUST NOT silently produce a
+    // second, divergent kid. Web Crypto rejects it; the kid stays single-valued.
+    const der = "302c300706032b65700500032100" + KEY_A;
+    const bytes = der.match(/../g)!.map((h) => parseInt(h, 16));
+    const nullParamSpki = btoa(String.fromCharCode(...bytes));
+    await expect(keyIdFromSpki(nullParamSpki)).rejects.toThrow();
   });
 });
 
