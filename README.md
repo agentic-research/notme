@@ -181,10 +181,11 @@ CA key is generated on first request. In ephemeral mode (local/container), the p
 
 ```bash
 cd worker
-npx vitest run         # 131 tests (unit + adversarial)
+npx vitest run         # 329 tests (unit + adversarial)
+npm run test:do        # 18 real-Durable-Object tests (vitest-pool-workers)
 bash test-local.sh     # workerd smoke test
 bash test-e2e.sh       # Playwright e2e (virtual authenticator)
-cd ../proxy && cargo test  # 11 Rust tests (parser, UDS bind, perms)
+cd ../proxy && cargo test  # Rust tests (parser, UDS bind, perms)
 ```
 
 ## repo layout

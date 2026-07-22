@@ -197,13 +197,17 @@ note: discovery (`/.well-known/signet-authority.json`) and the JSON landing page
 ```bash
 cd worker
 npm ci
-npx vitest run                              # unit: src/__tests__/*.test.ts + ../gen/ts/__tests__ + ../vault/src/__tests__
+npx vitest run                              # unit (329): src/__tests__/ + ../gen/ts/__tests__ (vault retired — see docs/design/012-vault-retirement.md)
+npm run test:do                             # real-DO (18): *.do.test.ts via vitest-pool-workers — hermetic (SigningAuthority + RevocationAuthority + checkRevocation)
 npx vitest run src/__tests__/adversarial.test.ts   # focused: adversarial corpus
 npm run build:local                         # esbuild bundle worker.ts → dist/worker.js
 bash test-local.sh                          # workerd smoke: discovery / jwks / ca-bundle + invariant #1 (no private key on disk)
 bash test-e2e.sh                            # playwright contract tests (extracts bootstrap code from workerd stdout)
 npx playwright test e2e/contract.spec.ts    # contract tests directly (workerd must be running)
 ```
+
+The CI gate is `task worker:check`: `tsc --noEmit` + `tsc -p tsconfig.test.json`
+(type-checks the pool `*.do.test.ts` files) + the unit suite + the pool suite.
 
 invariant #1 (`test-local.sh`): `find DO sqlite | strings | grep '"d"'` must return nothing. ephemeral mode never persists the private JWK.
 

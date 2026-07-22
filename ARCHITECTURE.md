@@ -128,15 +128,17 @@ Detection is automatic via `NOTME_KEY_STORAGE` env var and `detectKeyStorage()`.
 ## Testing
 
 ```bash
-cd worker && npx vitest run    # 131 tests (unit + adversarial)
+cd worker && npx vitest run    # 329 tests (unit + adversarial + shared-SDK)
+cd worker && npm run test:do   # 18 real-Durable-Object tests (vitest-pool-workers)
 bash test-local.sh             # workerd smoke test (endpoints + invariant #1)
 bash test-e2e.sh               # Playwright e2e with virtual authenticator (11 contract tests)
-cd ../proxy && cargo test      # 11 Rust tests (listen-addr parser, UDS bind, perms, round-trip)
+cd ../proxy && cargo test      # Rust tests (listen-addr parser, UDS bind, perms, round-trip)
 ```
 
 Test categories (worker):
 - **Adversarial** (35 tests): key extraction, token forgery, confused deputy, DPoP injection, JTI replay, scope escalation, error message leaks, mode downgrade
+- **Real-DO** (18 tests, vitest-pool-workers): SigningAuthority rotation grace window + RevocationAuthority seqno rollback/isolation + checkRevocation — boot real workerd + DO SQLite via `runInDurableObject` (`npm run test:do`)
 - **Contract** (11 tests, e2e): discovery shape, JWKS fields, CA cert PEM, error response codes, passkey registration + authenticated access
-- **Unit** (96 tests): signing, token mint/verify, DPoP, sessions, connections, passkeys (incl. challenge session-binding + bootstrap timing-safe), routes, platform detection
+- **Unit** (237 worker + 57 shared-SDK): signing, token mint/verify, DPoP, sessions, connections, passkeys (incl. challenge session-binding + bootstrap timing-safe), routes, platform detection
 
 Threat-model coverage is enumerated in `worker/THREAT_MODEL.md` — each row links to the test that defends it.
