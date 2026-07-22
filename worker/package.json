@@ -12,13 +12,13 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.18.7",
-    "@cloudflare/workers-types": "^4.20260518.1",
+    "@cloudflare/workers-types": "^5.20260722.1",
     "@playwright/test": "^1.60.0",
     "@types/node": "^25.9.0",
     "esbuild": "^0.28.0",
     "prettier": "^3.8.3",
     "vitest": "^4.1.6",
-    "wrangler": "^4.92.0"
+    "wrangler": "^4.113.0"
   },
   "dependencies": {
     "@notme/contract": "workspace:*",
