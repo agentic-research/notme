@@ -7,7 +7,7 @@
  * Patterns adapted from jose (MIT, Copyright (c) 2018 Filip Skokan).
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 async function getSDK() {
   return import("../dpop");
@@ -69,6 +69,10 @@ describe("base64urlEncode (exported)", () => {
     expect(decoded).toEqual(original);
   });
 
+  // Generous timeout: this is a correctness check (no stack overflow on a
+  // large input), not a perf assertion. It ran fine unloaded (~sub-second) but
+  // timed out at the default 5s under heavy parallel test load — the extra
+  // budget guards against that flake without weakening what it verifies.
   it("handles large payloads without stack overflow", async () => {
     const { base64urlEncode, base64urlDecode } = await getSDK();
     // 100KB payload — would overflow if using String.fromCharCode.apply without chunking
@@ -77,7 +81,7 @@ describe("base64urlEncode (exported)", () => {
     const encoded = base64urlEncode(large);
     const decoded = base64urlDecode(encoded);
     expect(decoded).toEqual(large);
-  });
+  }, 30_000);
 });
 
 // ── JSON parse with label ──────────────────────────────────────────────────
@@ -141,8 +145,19 @@ describe("validateClaims", () => {
 
   it("accepts exp at boundary with tolerance", async () => {
     const { validateClaims } = await getSDK();
-    // Expired 5s ago, but tolerance is 10s — should pass
-    validateClaims({ exp: now - 5 }, { clockTolerance: 10 });
+    // Pin the clock. validateClaims reads Date.now() at execution time while the
+    // token's exp derives from `now` (captured at collection). Under load the
+    // gap between collection and execution exceeded the 5s slack (exp = now-5,
+    // tolerance 10), tripping "token expired". A fixed clock removes the race.
+    vi.useFakeTimers();
+    try {
+      const fixed = 1_700_000_000; // arbitrary fixed epoch seconds
+      vi.setSystemTime(fixed * 1000);
+      // Expired 5s ago, but tolerance is 10s — should pass
+      validateClaims({ exp: fixed - 5 }, { clockTolerance: 10 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ── nbf ──
@@ -157,8 +172,18 @@ describe("validateClaims", () => {
 
   it("accepts nbf at boundary with tolerance", async () => {
     const { validateClaims } = await getSDK();
-    // Not valid for 5 more seconds, but tolerance is 10s — should pass
-    validateClaims({ exp: now + 300, nbf: now + 5 }, { clockTolerance: 10 });
+    // Pin the clock (same rationale as the exp-boundary test). This direction is
+    // safe under forward-moving time, but a fixed clock keeps the tolerance
+    // tests symmetric and independent of wall-clock entirely.
+    vi.useFakeTimers();
+    try {
+      const fixed = 1_700_000_000;
+      vi.setSystemTime(fixed * 1000);
+      // Not valid for 5 more seconds, but tolerance is 10s — should pass
+      validateClaims({ exp: fixed + 300, nbf: fixed + 5 }, { clockTolerance: 10 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects nbf that is not a number", async () => {
