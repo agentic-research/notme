@@ -35,7 +35,15 @@ export default defineConfig({
             className: "SigningAuthority",
             useSQLite: true,
           },
+          // Classic (KV-storage) DO per wrangler.toml migration v1
+          // (new_classes, NOT new_sqlite_classes). Used by revocation.do.test.ts.
+          REVOCATION: {
+            className: "RevocationAuthority",
+            useSQLite: false,
+          },
         },
+        // KV binding the checkRevocation() tests write bundle:current into.
+        kvNamespaces: ["CA_BUNDLE_CACHE"],
       },
     }),
   ],

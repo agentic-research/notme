@@ -1,20 +1,19 @@
 //
-// revocation.test.ts — Unit tests for the APAS edge revocation module.
+// revocation.do.test.ts — tests for the APAS edge revocation module.
 //
 // Runs in the Workerd runtime via @cloudflare/vitest-pool-workers, which
 // provides real WebCrypto (Ed25519) and Durable Object support.
 //
-// DORMANT — this file is NOT currently run or typechecked. It is excluded
-// from tsconfig.json because:
-//   1. vitest.config.ts only globs src/__tests__/**/*.test.ts, so it never
-//      runs.
-//   2. It imports from cloudflare:test (vitest-pool-workers) and references
-//      DO bindings (env.REVOCATION) that aren't declared in the project's
-//      Env type — typechecking fails without configuring the pool.
+// Runs under vitest.workers.config.mts (the vitest-pool-workers pool), NOT the
+// default plain-vitest suite. The `.do.test.ts` suffix is what the pool glob
+// (src/**/*.do.test.ts) matches; the pool config declares the bindings this
+// file needs — REVOCATION (classic DO), CA_BUNDLE_CACHE (KV), and the shared
+// SIGNING_AUTHORITY. Invoke via `pnpm test:do`; gated by `task worker:check`.
+// Not in tsconfig (excluded via **/*.test.ts): the pool transpiles via esbuild
+// and provides cloudflare:test + the bindings at runtime.
 //
-// To revive: move into src/__tests__/, add pool config + ProvidedEnv module
-// augmentation declaring REVOCATION, drop the tsconfig exclude. Tracked as
-// a follow-up bead.
+// History: this file was dormant — no config ran it — until notme-97b3ff wired
+// it into the pool; notme-c38bb6 flagged the dead-test gap.
 
 import { describe, expect, it, beforeAll } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
