@@ -60,6 +60,10 @@ tasks:
     cmds:
       - pnpm exec tsc --noEmit
       - pnpm exec vitest run
+      # Real-Durable-Object tests (*.do.test.ts) via vitest-pool-workers.
+      # Hermetic — its config declares DO bindings inline (no wrangler.toml,
+      # no remote VPC binding), so it needs no CF creds and runs in CI.
+      - pnpm exec vitest run --config vitest.workers.config.mts
 
   proxy:check:
     desc: Build + test the Rust mTLS proxy crate
