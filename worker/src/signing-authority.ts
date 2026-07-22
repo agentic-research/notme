@@ -441,12 +441,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray() as Array<{ epoch: number; seqno: number }>;
     const { epoch, seqno } = rows[0]!;
 
-    // Build the unsigned bundle
+    // Build the unsigned bundle. During a rotation grace window we ALSO publish
+    // the previous key + its keyId, so tokens the old key signed still verify
+    // until they drain (notme-54f84b). rotate() preserves the old kid + its
+    // public key; both must appear in the SIGNED bundle — bundleCanonical covers
+    // `keys` and `prevKeyId`, so consumers can resolve the prev key AND the
+    // revocation check (token.keyId === bundle.prevKeyId) sees it.
+    const keys: Record<string, string> = { [keyId]: pubKeyB64 };
+    const prevKeyId = (await this.ctx.storage.get<string>("prevKeyId")) ?? undefined;
+    const prevPubKey = (await this.ctx.storage.get<string>("prevPubKey")) ?? undefined;
+    const hasPrev = !!prevKeyId && prevKeyId !== keyId && !!prevPubKey;
+    if (hasPrev) keys[prevKeyId] = prevPubKey;
+
     const bundle: Omit<CABundle, "signature"> & { signature?: string } = {
       epoch,
       seqno,
-      keys: { [keyId]: pubKeyB64 },
+      keys,
       keyId,
+      ...(hasPrev ? { prevKeyId } : {}),
       issuedAt: Math.floor(Date.now() / 1000),
     };
 
@@ -468,6 +480,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async rotate(): Promise<{ newKeyId: string; epoch: number }> {
     this.ensureSchema();
     const oldKeyId = this.getKeyId();
+    // Capture the old PUBLIC key BEFORE deleting it. The grace window needs it
+    // published (generateBundle above) so tokens the old key signed still verify
+    // until they expire; storing only the id (prevKeyId) left the pubkey gone
+    // and the grace window broken (notme-54f84b).
+    const oldPubKeyB64 = await this.getPublicKeyRawB64();
 
     // Delete old key
     this.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");
@@ -482,8 +499,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Generate new key (getOrCreateSigningKey will create since we deleted)
     const { keyId: newKeyId } = await this.getOrCreateSigningKey();
 
-    // Store prevKeyId for the transition window
+    // Store prevKeyId + prevPubKey for the transition window (both needed so
+    // generateBundle can republish the previous key for grace-window verify).
     await this.ctx.storage.put("prevKeyId", oldKeyId);
+    await this.ctx.storage.put("prevPubKey", oldPubKeyB64);
 
     const rows = this.ctx.storage.sql
       .exec("SELECT epoch FROM state WHERE id = 'authority'")

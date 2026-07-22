@@ -36,6 +36,30 @@ interface JWK {
   y?: string;
 }
 
+/**
+ * Select the verifying JWK for a token by its `kid`.
+ *
+ * A silent first-key fallback when the header omits `kid` is key-confusion on a
+ * multi-key JWKS: the token gets verified against whichever key happens to be
+ * first, regardless of which key signed it. That is not hypothetical here — a
+ * rotation grace window publishes BOTH the current and previous key, so
+ * "pick keys[0]" can verify a token against the wrong one. The fallback is only
+ * unambiguous for a single-key JWKS; with more than one key an explicit `kid`
+ * is required. Returns undefined when a present `kid` matches no key (caller
+ * surfaces "unknown key id"). notme ADR-012 R1: kid selects the key, never
+ * silently guessed. (notme-692274)
+ */
+export function selectVerifyingKey<K extends { kid: string }>(
+  keys: readonly K[],
+  kid: string | undefined,
+): K | undefined {
+  if (kid) return keys.find((k) => k.kid === kid);
+  if (keys.length === 1) return keys[0];
+  throw new Error(
+    "kid required: JWKS publishes multiple keys, cannot select without a kid",
+  );
+}
+
 // Trusted OIDC issuers — prevents SSRF via attacker-controlled iss claim.
 // Source of truth lives in @notme/contract so notme.bot's server-side
 // allowlist and this consumer's enforcement set can't drift.
@@ -134,12 +158,10 @@ export async function verifyOIDC(
     );
   }
 
-  // Fetch JWKS and verify signature
+  // Fetch JWKS and select the verifying key by kid (see selectVerifyingKey).
   const keys = await fetchJWKS(iss);
-  const jwk = header.kid
-    ? keys.find((k) => k.kid === header.kid)
-    : keys[0];
-  if (!jwk) throw new Error(`unknown key id: ${header.kid}`);
+  const jwk = selectVerifyingKey(keys, header.kid);
+  if (!jwk) throw new Error(`unknown key id: ${header.kid ?? "<omitted>"}`);
 
   let cryptoKey: CryptoKey;
   if (header.alg === "RS256" && jwk.n && jwk.e) {

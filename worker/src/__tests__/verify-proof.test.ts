@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it, beforeAll } from "vitest";
-import { verifyOIDC, verifyProof } from "../auth/verify-proof";
+import { verifyOIDC, verifyProof, selectVerifyingKey } from "../auth/verify-proof";
 
 // Build a minimal JWT (header.payload.sig) with the given audience claim.
 // Signature is junk — we only care that the audience check fires before
@@ -279,5 +279,29 @@ describe("oidc.x509.ca-pem-shape", () => {
     await expect(
       verifyProof({ type: "x509", cert: leafCertPem }, caSpkiPem, "notme.bot"),
     ).rejects.toThrow();
+  });
+});
+
+describe("selectVerifyingKey — kid selection / key-confusion guard (notme-692274)", () => {
+  const k = (kid: string) => ({ kid, kty: "OKP" });
+
+  it("selects the key whose kid matches the header", () => {
+    expect(selectVerifyingKey([k("a"), k("b")], "b")).toEqual(k("b"));
+  });
+
+  it("single-key JWKS: an omitted kid unambiguously uses the one key", () => {
+    expect(selectVerifyingKey([k("only")], undefined)).toEqual(k("only"));
+  });
+
+  it("multi-key JWKS + omitted kid THROWS — no silent keys[0] key-confusion", () => {
+    // The rotation-grace case: current + previous key both published. Picking
+    // keys[0] could verify a token against the wrong key.
+    expect(() => selectVerifyingKey([k("current"), k("prev")], undefined)).toThrow(
+      /kid required/,
+    );
+  });
+
+  it("present kid matching no key returns undefined (caller: unknown key id)", () => {
+    expect(selectVerifyingKey([k("a"), k("b")], "z")).toBeUndefined();
   });
 });
