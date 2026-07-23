@@ -243,6 +243,60 @@ describe("verifyDPoPToken", () => {
     ).rejects.toThrow(/expired/i);
   });
 
+  // ── Clock-skew tolerance (notme-18450e) ─────────────────────────────────
+  //
+  // notme mints `nbf: iat` on every access token, so a resource server whose
+  // clock trails the issuer's rejects a legitimate token at `nbf`. Zero stays
+  // the DEFAULT (fail-closed); `clockTolerance` lets a verifier on separate
+  // infrastructure buy back a bounded window. Both halves are asserted — an
+  // option that silently did nothing would be worse than no option at all.
+
+  it("rejects a not-yet-valid nbf by default (zero tolerance)", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      nbfOverride: now + 30,
+    });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow('"nbf" claim timestamp check failed');
+  });
+
+  it("accepts that same token when clockTolerance covers the skew", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      nbfOverride: now + 30,
+    });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    const claims = await verifyDPoPToken({
+      token,
+      proof,
+      method: METHOD,
+      url: URL,
+      jwksUrl: JWKS_URL,
+      audience: "https://example.com",
+      publicKey: edKp.publicKey,
+      clockTolerance: 60,
+    });
+    expect(claims.sub).toBe("principal:alice");
+  });
+
   // ── Invalid token signature ─────────────────────────────────────────────
 
   it("rejects a token signed by a different key", async () => {
