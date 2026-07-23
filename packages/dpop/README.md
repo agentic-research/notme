@@ -1,4 +1,4 @@
-# `@notme/dpop`
+# `@agentic-research/dpop`
 
 DPoP ([RFC 9449](https://datatracker.ietf.org/doc/html/rfc9449)) utilities and a
 resource-server verifier SDK for notme-issued access tokens.
@@ -23,7 +23,7 @@ of the protocol share one implementation.
 ## Verifying a token
 
 ```ts
-import { verifyDPoPToken } from "@notme/dpop";
+import { verifyDPoPToken } from "@agentic-research/dpop";
 
 const claims = await verifyDPoPToken({
   token, proof,
@@ -56,7 +56,7 @@ window bounds replay — not true single-use.
 In-repo, via the workspace:
 
 ```json
-{ "dependencies": { "@notme/dpop": "workspace:*" } }
+{ "dependencies": { "@agentic-research/dpop": "workspace:*" } }
 ```
 
 Downstream repos currently **vendor a copy** of this file, because until it moved

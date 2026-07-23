@@ -1,0 +1,67 @@
+# Publish @agentic-research/dpop to GitHub Packages.
+#
+# Why this exists: two downstream repos (cloister, canonical-hours) vendored a
+# byte-copy of the DPoP SDK because there was no package to depend on. This is
+# the step that lets those copies be deleted (notme-18450e / cloister-195e47).
+#
+# Registry note: GitHub Packages requires the npm scope to match the org, hence
+# @agentic-research/dpop rather than @notme/dpop. Unlike npmjs.org, it also
+# requires authentication to INSTALL, even for public packages — consumers need
+# GITHUB_TOKEN (same-org Actions) or a read:packages PAT locally. If that
+# barrier ever matters more than the convenience, the move to npmjs.org is a
+# rename plus a registry swap.
+#
+# Trigger: push a tag `dpop-v<version>` matching packages/dpop/package.json.
+# The version check below fails the run on a mismatch rather than publishing
+# something whose tag lies about its contents.
+name: publish-dpop
+
+on:
+  push:
+    tags:
+      - "dpop-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://npm.pkg.github.com
+          scope: "@agentic-research"
+
+      - run: pnpm install --frozen-lockfile
+
+      # The published artifact is the thing under test. Building and testing
+      # before publish keeps a broken tarball from reaching consumers, since an
+      # npm version is immutable once it lands.
+      - run: pnpm vitest run packages/dpop
+      - run: pnpm --filter @agentic-research/dpop build
+
+      - name: Tag must match package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#dpop-v}"
+          PKG_VERSION="$(node -p "require('./packages/dpop/package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME implies $TAG_VERSION but package.json says $PKG_VERSION" >&2
+            exit 1
+          fi
+          echo "version $PKG_VERSION matches tag"
+
+      - name: Publish
+        working-directory: packages/dpop
+        run: pnpm publish --no-git-checks --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

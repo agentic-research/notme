@@ -47,16 +47,20 @@ importers:
 
   packages/contract: {}
 
-  packages/dpop: {}
+  packages/dpop:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
 
   worker:
     dependencies:
+      '@agentic-research/dpop':
+        specifier: workspace:*
+        version: link:../packages/dpop
       '@notme/contract':
         specifier: workspace:*
         version: link:../packages/contract
-      '@notme/dpop':
-        specifier: workspace:*
-        version: link:../packages/dpop
       '@oslojs/crypto':
         specifier: ^1.0.1
         version: 1.0.1

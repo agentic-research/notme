@@ -105,3 +105,6 @@ packages/melange.rsa.pub
 worker/test-results/
 worker/playwright-report/
 coverage/
+
+# built package artifacts (published, not committed)
+packages/*/dist/
