@@ -50,7 +50,17 @@ jobs:
       # The published artifact is the thing under test. Building and testing
       # before publish keeps a broken tarball from reaching consumers, since an
       # npm version is immutable once it lands.
-      - run: pnpm vitest run packages/dpop
+      #
+      # Run from worker/, not the repo root: vitest is a devDependency of the
+      # worker package only, so `pnpm vitest` at the root resolves to nothing in
+      # a clean CI install (it appears to work locally purely through hoisting).
+      # worker's vitest config globs ../packages/dpop/__tests__, so this single
+      # run covers the SDK's own 67 tests AND proves worker still resolves the
+      # package through its bare specifier — a stronger gate than testing the
+      # package alone.
+      - name: Test (worker suite includes packages/dpop)
+        working-directory: worker
+        run: pnpm vitest run
       - run: pnpm --filter @agentic-research/dpop build
 
       - name: Tag must match package version
