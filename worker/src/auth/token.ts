@@ -10,7 +10,7 @@ import {
   base64urlEncode,
   base64urlDecode,
   validateClaims,
-} from "notme-dpop";
+} from "@agentic-research/dpop";
 import { ED25519 } from "../platform";
 
 const ISSUER = "https://auth.notme.bot";

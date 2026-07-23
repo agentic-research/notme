@@ -1,4 +1,4 @@
-# Publish notme-dpop to npmjs.org.
+# Publish @agentic-research/dpop to npmjs.org.
 #
 # Why this exists: two downstream repos (cloister, canonical-hours) vendored a
 # byte-copy of the DPoP SDK because there was no package to depend on. This is
@@ -12,7 +12,7 @@
 # verifier SDK wants the widest possible reach, it moved to npmjs.org, where
 # anonymous install works and no consumer needs an .npmrc at all.
 #
-# Unscoped `notme-dpop` rather than `@notme/dpop` deliberately: an unscoped name
+# Unscoped `@agentic-research/dpop` rather than `@notme/dpop` deliberately: an unscoped name
 # needs no npm org to exist first, removing the last setup step. The GitHub
 # Packages copy is left in place but frozen at 0.1.0.
 #
@@ -38,7 +38,7 @@ jobs:
       # id-token lets npm attach a provenance attestation binding the tarball to
       # this workflow + commit. Consumers can verify the package was built here
       # and not uploaded from someone's laptop.
-      id-token: write
+      packages: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # `version` is required — the repo root has no `packageManager` field, so
@@ -50,7 +50,8 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          registry-url: https://registry.npmjs.org
+          registry-url: https://npm.pkg.github.com
+          scope: "@agentic-research"
 
       - run: pnpm install --frozen-lockfile
 
@@ -68,7 +69,7 @@ jobs:
       - name: Test (worker suite includes packages/dpop)
         working-directory: worker
         run: pnpm vitest run
-      - run: pnpm --filter notme-dpop build
+      - run: pnpm --filter @agentic-research/dpop build
 
       - name: Tag must match package version
         if: startsWith(github.ref, 'refs/tags/')
@@ -83,6 +84,6 @@ jobs:
 
       - name: Publish
         working-directory: packages/dpop
-        run: pnpm publish --no-git-checks --access public --provenance
+        run: pnpm publish --no-git-checks --access public
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

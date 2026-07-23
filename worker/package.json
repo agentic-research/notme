@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "@notme/contract": "workspace:*",
-    "notme-dpop": "workspace:*",
+    "@agentic-research/dpop": "workspace:*",
     "@oslojs/crypto": "^1.0.1",
     "@oslojs/encoding": "^1.1.0",
     "@peculiar/x509": "^1.14.3",
