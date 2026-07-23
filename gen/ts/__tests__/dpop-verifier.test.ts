@@ -65,15 +65,17 @@ async function mintToken(opts: {
   audience?: string;
   expOverride?: number;
   iatOverride?: number;
+  nbfOverride?: number;
+  typOverride?: string;
 }): Promise<string> {
-  const header = { typ: "at+jwt", alg: "EdDSA", kid: "test-kid" };
+  const header = { typ: opts.typOverride ?? "at+jwt", alg: "EdDSA", kid: "test-kid" };
   const iat = opts.iatOverride ?? Math.floor(Date.now() / 1000);
   const payload: Record<string, unknown> = {
     sub: opts.sub,
     iss: "https://auth.notme.bot",
     aud: opts.audience ?? "https://example.com",
     iat,
-    nbf: iat,
+    nbf: opts.nbfOverride ?? iat,
     exp: opts.expOverride ?? iat + 300,
     jti: crypto.randomUUID(),
     scope: opts.scope ?? "read",
@@ -196,6 +198,7 @@ describe("verifyDPoPToken", () => {
       method: METHOD,
       url: URL,
       jwksUrl: JWKS_URL,
+      audience: "https://api.example.com",
       publicKey: edKp.publicKey,
     });
 
@@ -234,6 +237,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/expired/i);
@@ -262,6 +266,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey, // verifying with the "correct" key
       }),
     ).rejects.toThrow(/signature/i);
@@ -293,6 +298,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/binding|mismatch|thumbprint/i);
@@ -320,6 +326,7 @@ describe("verifyDPoPToken", () => {
         method: "GET", // but request is GET
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/htm/i);
@@ -347,6 +354,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/htu/i);
@@ -375,6 +383,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: "https://api.example.com/resource",
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/htu/i);
@@ -397,6 +406,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/malformed|parts/i);
@@ -416,6 +426,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/malformed|parts/i);
@@ -453,6 +464,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/typ/i);
@@ -495,6 +507,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/cnf|jkt/i);
@@ -522,6 +535,7 @@ describe("verifyDPoPToken", () => {
       method: METHOD,
       url: URL,
       jwksUrl: JWKS_URL,
+      audience: "https://example.com",
       publicKey: edKp.publicKey,
     });
 
@@ -566,6 +580,7 @@ describe("verifyDPoPToken", () => {
         method: "DELETE",
         url: URL,
         jwksUrl: JWKS_URL,
+      audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/signature/i);
@@ -591,7 +606,8 @@ describe("verifyDPoPToken", () => {
     await expect(
       verifyDPoPToken({
         token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, publicKey: edKp.publicKey,
+        jwksUrl: JWKS_URL,
+      audience: "https://example.com", publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/iat/i);
   });
@@ -613,7 +629,8 @@ describe("verifyDPoPToken", () => {
     await expect(
       verifyDPoPToken({
         token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, publicKey: edKp.publicKey,
+        jwksUrl: JWKS_URL,
+      audience: "https://example.com", publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/iat|old|expired|future/i);
   });
@@ -635,7 +652,8 @@ describe("verifyDPoPToken", () => {
     await expect(
       verifyDPoPToken({
         token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, publicKey: edKp.publicKey,
+        jwksUrl: JWKS_URL,
+      audience: "https://example.com", publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/iat|old|expired|future/i);
   });
@@ -657,9 +675,135 @@ describe("verifyDPoPToken", () => {
     await expect(
       verifyDPoPToken({
         token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, publicKey: edKp.publicKey,
+        jwksUrl: JWKS_URL,
+      audience: "https://example.com", publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/jti/i);
+  });
+
+  // ── notme-dffc5c: audience, issuer, token typ, nbf, replay ──────────────
+
+  it("rejects a token minted for a different audience — confused-deputy guard", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      audience: "https://other-service.example",
+    });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow(/aud/i);
+  });
+
+  it("accepts a token whose audience matches one entry of an array", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      audience: "https://b.example",
+    });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    const claims = await verifyDPoPToken({
+      token, proof, method: METHOD, url: URL,
+      jwksUrl: JWKS_URL,
+      audience: ["https://a.example", "https://b.example"],
+      publicKey: edKp.publicKey,
+    });
+    expect(claims.sub).toBe("principal:alice");
+  });
+
+  it("rejects a token with the wrong issuer when issuer is pinned", async () => {
+    const token = await mintToken({ signingKey: edKp.privateKey, sub: "principal:alice", jkt });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+        issuer: "https://not-auth.notme.bot",
+      }),
+    ).rejects.toThrow(/iss/i);
+  });
+
+  it("accepts a token with the pinned issuer", async () => {
+    const token = await mintToken({ signingKey: edKp.privateKey, sub: "principal:alice", jkt });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    const claims = await verifyDPoPToken({
+      token, proof, method: METHOD, url: URL,
+      jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+      issuer: "https://auth.notme.bot", // matches mintToken()'s fixed iss
+    });
+    expect(claims.sub).toBe("principal:alice");
+  });
+
+  it("rejects a token not yet valid (nbf in the future)", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      iatOverride: now,
+      expOverride: now + 300,
+      nbfOverride: now + 120,
+    });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow(/nbf|not yet valid/i);
+  });
+
+  it("rejects an access token whose typ is not at+jwt", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      typOverride: "id+jwt",
+    });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+      }),
+    ).rejects.toThrow(/typ/i);
+  });
+
+  it("rejects a replayed proof when seenJti reports it as already seen", async () => {
+    const token = await mintToken({ signingKey: edKp.privateKey, sub: "principal:alice", jkt });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+
+    await expect(
+      verifyDPoPToken({
+        token, proof, method: METHOD, url: URL,
+        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+        seenJti: () => true,
+      }),
+    ).rejects.toThrow(/replay/i);
+  });
+
+  it("accepts a fresh proof when seenJti reports it as not seen", async () => {
+    const token = await mintToken({ signingKey: edKp.privateKey, sub: "principal:alice", jkt });
+    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const seen = new Set<string>();
+
+    const claims = await verifyDPoPToken({
+      token, proof, method: METHOD, url: URL,
+      jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+      seenJti: (jti) => seen.has(jti),
+    });
+    expect(claims.sub).toBe("principal:alice");
   });
 });
 
