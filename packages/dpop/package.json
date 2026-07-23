@@ -1,5 +1,5 @@
 {
-  "name": "@notme/dpop",
+  "name": "@agentic-research/dpop",
   "version": "0.1.0",
   "description": "DPoP (RFC 9449) utilities and resource-server verifier SDK for notme-issued access tokens. Zero dependencies, pure Web Crypto — runs on Cloudflare Workers, Node, Deno, and browsers.",
   "type": "module",
@@ -9,12 +9,22 @@
     "url": "git+https://github.com/agentic-research/notme.git",
     "directory": "packages/dpop"
   },
+  "homepage": "https://github.com/agentic-research/notme/tree/main/packages/dpop",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
   "files": [
-    "src"
+    "dist",
+    "src",
+    "README.md"
   ],
   "keywords": [
     "dpop",
@@ -24,5 +34,17 @@
     "proof-of-possession",
     "webcrypto"
   ],
-  "sideEffects": false
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://npm.pkg.github.com",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
 }

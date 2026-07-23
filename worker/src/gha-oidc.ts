@@ -67,7 +67,7 @@ async function fetchJWKS(): Promise<JWK[]> {
 }
 
 // b64urlDecode imported from SDK — single implementation for all JWT code
-import { base64urlDecode as b64urlDecode } from "@notme/dpop";
+import { base64urlDecode as b64urlDecode } from "@agentic-research/dpop";
 
 // Validate a GHA OIDC JWT and return typed, Zod-parsed claims.
 // Throws on any validation failure — callers treat all errors as 401.

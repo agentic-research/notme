@@ -191,7 +191,7 @@ export async function verifyDPoPToken(
   const tokenValid = await crypto.subtle.verify(
     { name: "Ed25519" } as any,
     signingKey,
-    tSig,
+    tSig as BufferSource,
     tSigInput,
   );
   if (!tokenValid) {
@@ -267,7 +267,7 @@ export async function verifyDPoPToken(
   const proofValid = await crypto.subtle.verify(
     verifyAlg,
     proofKey,
-    pSig,
+    pSig as BufferSource,
     pSigInput,
   );
   if (!proofValid) {
@@ -366,7 +366,7 @@ export async function verifyAccessToken(
   const valid = await crypto.subtle.verify(
     { name: "Ed25519" } as any,
     signingKey,
-    sig,
+    sig as BufferSource,
     sigInput,
   );
   if (!valid) {
