@@ -1,0 +1,28 @@
+# Local bead stores are machine-local runtime state.
+beads.db
+beads.db-*
+*.db
+*.db?*
+*.db-journal
+*.db-wal
+*.db-shm
+db.sqlite
+bd.db
+dolt/
+dolt.bak/
+dolt-access.lock
+
+# Runtime files
+bd.sock
+bd.sock.startlock
+sync-state.json
+last-touched
+.local_version
+redirect
+.sync.lock
+export-state/
+backup/
+.beads-credential-key
+
+# Canonical content artifact shared through git.
+!beads.jsonl
