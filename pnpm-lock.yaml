@@ -55,9 +55,6 @@ importers:
 
   worker:
     dependencies:
-      '@agentic-research/dpop':
-        specifier: workspace:*
-        version: link:../packages/dpop
       '@notme/contract':
         specifier: workspace:*
         version: link:../packages/contract
@@ -76,6 +73,9 @@ importers:
       cbor-x:
         specifier: ^1.6.4
         version: 1.6.4
+      notme-dpop:
+        specifier: workspace:*
+        version: link:../packages/dpop
       zod:
         specifier: ^4.4.3
         version: 4.4.3

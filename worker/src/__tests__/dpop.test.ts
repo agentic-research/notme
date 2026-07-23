@@ -85,7 +85,7 @@ async function buildDpopProof(opts: {
 
 describe("computeJwkThumbprint", () => {
   it("computes correct SHA-256 thumbprint for a known EC key", async () => {
-    const { computeJwkThumbprint } = await import("@agentic-research/dpop");
+    const { computeJwkThumbprint } = await import("notme-dpop");
 
     // RFC 7638 Section 3.1 uses an RSA key, but the algorithm is the same.
     // We use a deterministic EC key (fixed x, y) and verify the computation.
@@ -111,7 +111,7 @@ describe("computeJwkThumbprint", () => {
   });
 
   it("excludes non-required members (alg, kid, use)", async () => {
-    const { computeJwkThumbprint } = await import("@agentic-research/dpop");
+    const { computeJwkThumbprint } = await import("notme-dpop");
 
     const bareJwk: JsonWebKey = {
       kty: "EC",
@@ -137,7 +137,7 @@ describe("computeJwkThumbprint", () => {
   });
 
   it("is deterministic (same key = same thumbprint)", async () => {
-    const { computeJwkThumbprint } = await import("@agentic-research/dpop");
+    const { computeJwkThumbprint } = await import("notme-dpop");
 
     const jwk: JsonWebKey = {
       kty: "EC",
@@ -378,7 +378,7 @@ describe("validateDpopProof", () => {
 
   it("returned thumbprint matches computeJwkThumbprint", async () => {
     const { validateDpopProof } = await import("../auth/dpop");
-    const { computeJwkThumbprint } = await import("@agentic-research/dpop");
+    const { computeJwkThumbprint } = await import("notme-dpop");
     const { keyPair, jwk } = await generateP256();
 
     const proof = await buildDpopProof({ keyPair, jwk });

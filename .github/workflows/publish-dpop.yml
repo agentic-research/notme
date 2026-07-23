@@ -1,15 +1,20 @@
-# Publish @agentic-research/dpop to GitHub Packages.
+# Publish notme-dpop to npmjs.org.
 #
 # Why this exists: two downstream repos (cloister, canonical-hours) vendored a
 # byte-copy of the DPoP SDK because there was no package to depend on. This is
 # the step that lets those copies be deleted (notme-18450e / cloister-195e47).
 #
-# Registry note: GitHub Packages requires the npm scope to match the org, hence
-# @agentic-research/dpop rather than @notme/dpop. Unlike npmjs.org, it also
-# requires authentication to INSTALL, even for public packages — consumers need
-# GITHUB_TOKEN (same-org Actions) or a read:packages PAT locally. If that
-# barrier ever matters more than the convenience, the move to npmjs.org is a
-# rename plus a registry swap.
+# Registry note: this briefly published to GitHub Packages as
+# @agentic-research/dpop (v0.1.0). That registry requires authentication to
+# INSTALL even for public packages — 401 anonymous — which put a token
+# requirement on every consumer, including external resource servers verifying
+# notme tokens and every local dev machine. Since a public identity provider's
+# verifier SDK wants the widest possible reach, it moved to npmjs.org, where
+# anonymous install works and no consumer needs an .npmrc at all.
+#
+# Unscoped `notme-dpop` rather than `@notme/dpop` deliberately: an unscoped name
+# needs no npm org to exist first, removing the last setup step. The GitHub
+# Packages copy is left in place but frozen at 0.1.0.
 #
 # Trigger: push a tag `dpop-v<version>` matching packages/dpop/package.json.
 # The version check below fails the run on a mismatch rather than publishing
@@ -30,7 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      # id-token lets npm attach a provenance attestation binding the tarball to
+      # this workflow + commit. Consumers can verify the package was built here
+      # and not uploaded from someone's laptop.
+      id-token: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # `version` is required — the repo root has no `packageManager` field, so
@@ -42,8 +50,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          registry-url: https://npm.pkg.github.com
-          scope: "@agentic-research"
+          registry-url: https://registry.npmjs.org
 
       - run: pnpm install --frozen-lockfile
 
@@ -61,7 +68,7 @@ jobs:
       - name: Test (worker suite includes packages/dpop)
         working-directory: worker
         run: pnpm vitest run
-      - run: pnpm --filter @agentic-research/dpop build
+      - run: pnpm --filter notme-dpop build
 
       - name: Tag must match package version
         if: startsWith(github.ref, 'refs/tags/')
@@ -76,6 +83,6 @@ jobs:
 
       - name: Publish
         working-directory: packages/dpop
-        run: pnpm publish --no-git-checks --access public
+        run: pnpm publish --no-git-checks --access public --provenance
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

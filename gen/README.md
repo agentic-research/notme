@@ -5,7 +5,7 @@ generated code from `../schema/`. **don't edit anything in here by hand** — ex
 > `ts/dpop.ts` used to be the other exception. It was never generated, and keeping
 > it in `gen/` meant downstream verifiers had no package to depend on and vendored
 > a byte-copy instead — cloister and canonical-hours each carried one. It now lives
-> at [`../packages/dpop`](../packages/dpop) as `@agentic-research/dpop` (`notme-18450e`).
+> at [`../packages/dpop`](../packages/dpop) as `notme-dpop` (`notme-18450e`).
 
 ## ⚠️ open: TS and Go paths use different toolchains
 
@@ -97,7 +97,7 @@ it was never generated — a hand-written DPoP utilities and verifier SDK that s
 
 that reasoning held for consumers *inside* this repo and failed for everyone else: a file in `gen/` is not a package, so downstream verifiers had nothing to depend on and copied it instead. cloister and canonical-hours each carried a byte-identical vendored copy, each with a "re-sync manually" note and nothing enforcing it.
 
-it now lives at [`../packages/dpop`](../packages/dpop) as `@agentic-research/dpop`, consumed in-repo via `workspace:*` exactly like `@notme/contract`. publishing it to a registry — the step that actually lets the two downstream copies be deleted — is a separate decision tracked in `notme-18450e`.
+it now lives at [`../packages/dpop`](../packages/dpop) as `notme-dpop`, consumed in-repo via `workspace:*` exactly like `@notme/contract`. publishing it to a registry — the step that actually lets the two downstream copies be deleted — is a separate decision tracked in `notme-18450e`.
 
 what's in there:
 
