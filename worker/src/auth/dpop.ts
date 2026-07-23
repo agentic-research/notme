@@ -5,7 +5,7 @@
  * Uses Web Crypto for signature verification — no npm crypto dependencies.
  */
 
-import { computeJwkThumbprint, base64urlDecode, jsonParseSafe } from "@agentic-research/dpop";
+import { computeJwkThumbprint, base64urlDecode, jsonParseSafe } from "notme-dpop";
 
 /** Maximum allowed age of a DPoP proof (seconds). */
 const MAX_IAT_AGE_SECONDS = 60;
