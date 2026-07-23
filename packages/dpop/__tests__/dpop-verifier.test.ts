@@ -11,7 +11,7 @@ import {
   verifyDPoPToken,
   verifyAccessToken,
   type KVLike,
-} from "../dpop";
+} from "../src/index";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 

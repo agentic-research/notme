@@ -34,7 +34,7 @@ worker.ts                    HTTP routing + CORS + host enforcement
 ├── src/platform.ts            Platform abstraction (CacheStore, key storage mode, ED25519)
 └── src/revocation.ts          RevocationAuthority DO — epoch-based CA rotation
 
-gen/ts/dpop.ts               Shared SDK — base64url, validateClaims, computeJwkThumbprint
+packages/dpop/src/index.ts               Shared SDK — base64url, validateClaims, computeJwkThumbprint
 schema/identity.capnp         Cap'n Proto type definitions (CABundle, GHAClaims, etc.)
 gen/go/                       Go bindings from capnp
 
@@ -120,7 +120,7 @@ Detection is automatic via `NOTME_KEY_STORAGE` env var and `detectKeyStorage()`.
 | `worker/worker.ts` | ~2100 | HTTP fetch handler (monolith — split planned via notme-9f51fa) |
 | `worker/src/signing-authority.ts` | ~780 | SigningAuthority DO — the security kernel |
 | `worker/src/platform.ts` | ~200 | Platform abstraction + MemoryCache + ED25519 typing constant |
-| `gen/ts/dpop.ts` | ~580 | Shared JWT/crypto SDK |
+| `packages/dpop` | ~580 | Shared JWT/crypto SDK |
 | `vault/src/vault.ts` | ~270 | Credential vault DO |
 | `action/src/index.ts` | ~180 | GHA action |
 | `proxy/src/main.rs` | ~390 | mTLS forward proxy (TCP + UDS listen) |

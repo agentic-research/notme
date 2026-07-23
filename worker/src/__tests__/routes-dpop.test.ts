@@ -224,7 +224,7 @@ describe("handleToken", () => {
     expect(claims.cnf.jkt).toBeTruthy();
 
     // Verify cnf.jkt matches the DPoP key
-    const { computeJwkThumbprint } = await import("../../../gen/ts/dpop");
+    const { computeJwkThumbprint } = await import("@notme/dpop");
     const pubJwk = (await crypto.subtle.exportKey("jwk", dpopKeyPair.publicKey)) as JsonWebKey;
     const expectedThumbprint = await computeJwkThumbprint(pubJwk);
     expect(claims.cnf.jkt).toBe(expectedThumbprint);
