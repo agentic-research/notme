@@ -95,6 +95,23 @@ export interface VerifyDPoPTokenOptions {
    * replay, not true single-use.
    */
   seenJti?: (jti: string) => boolean | Promise<boolean>;
+  /**
+   * Clock-skew tolerance in SECONDS for the access token's time-based claims
+   * (`exp` / `nbf`), forwarded to `validateClaims`. Defaults to 0.
+   *
+   * Why this needs to be settable: notme mints `nbf: iat` on every access
+   * token (`worker/src/auth/token.ts`), so a verifier whose clock trails the
+   * issuer's by even one second rejects a legitimate token at `nbf`. Zero is
+   * the right DEFAULT — fail-closed, and a same-host verifier wants it — but
+   * a resource server on separate infrastructure needs to buy back a bounded
+   * window. cloister carried its own 60s allowance for exactly this reason
+   * and silently lost it when it re-vendored onto the SDK's claim checks
+   * (cloister-ed4460 / notme-18450e), which is what surfaced the gap.
+   *
+   * Applies to `exp` as well as `nbf`, so a non-zero value also widens the
+   * expiry grace — keep it small (tens of seconds, not minutes).
+   */
+  clockTolerance?: number;
 }
 
 /** Claims returned on successful verification. */
@@ -155,7 +172,7 @@ const JWKS_TTL = 3600; // 1 hour
 export async function verifyDPoPToken(
   opts: VerifyDPoPTokenOptions,
 ): Promise<VerifiedTokenClaims> {
-  const { token, proof, method, url, jwksUrl, kv, publicKey, audience, issuer, seenJti } = opts;
+  const { token, proof, method, url, jwksUrl, kv, publicKey, audience, issuer, seenJti, clockTolerance } = opts;
 
   // ── 1. Verify access token ──────────────────────────────────────────────
 
@@ -199,7 +216,7 @@ export async function verifyDPoPToken(
   if (typeof tPayload.exp !== "number") {
     throw new Error("Access token missing exp claim");
   }
-  validateClaims(tPayload, { issuer, audience, requireSub: true });
+  validateClaims(tPayload, { issuer, audience, requireSub: true, clockTolerance });
 
   // ── 2. Verify DPoP proof ───────────────────────────────────────────────
 
