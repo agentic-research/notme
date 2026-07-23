@@ -159,7 +159,7 @@ worker/src/__tests__/
                           surface, redirect-URI, GHA fork-PR boundary).
                           Pairs row-by-row with this doc.
 
-gen/ts/__tests__/
+packages/dpop/__tests__/
   dpop-verifier.test.ts  — shared SDK: verifyDPoPToken + verifyAccessToken
 
 vault/src/__tests__/

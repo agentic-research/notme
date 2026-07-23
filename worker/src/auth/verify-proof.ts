@@ -2,7 +2,7 @@
 // No provider-specific code. If it has a JWKS, we can verify it.
 
 import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
-import { base64urlDecode } from "../../../gen/ts/dpop";
+import { base64urlDecode } from "@notme/dpop";
 
 export interface VerifiedIdentity {
   type: "oidc" | "x509";

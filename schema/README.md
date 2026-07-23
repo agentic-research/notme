@@ -181,6 +181,6 @@ Tracked as a Tier 2 fix in `notme-803923`.
 - **`../worker/src/revocation.ts`** — consumes `gen/ts/identity.ts`. `bundleCanonical()` at line 159 is the JSON-canonicalization site that diverges from real capnp.
 - **`../worker/src/cert-exchange.ts`** — consumes `BridgeCertPair` / `CertPairRequest` / `CertPairPoP` for the 008 PoP exchange.
 - **`../docs/design/008-bridge-cert-csr-wimse.md`** — what `BridgeCertPair` represents.
-- **`../docs/design/006-dpop-tokens.md`** — DPoP wire format (TS-only, separate file at `gen/ts/dpop.ts`).
+- **`../docs/design/006-dpop-tokens.md`** — DPoP wire format (TS-only, separate file at `packages/dpop`).
 - **`signet/pkg/revocation/types.go`** — Go-side mirror that signs `CABundle` for the Worker to verify.
 - **`ley-line-open/docs/decades/T8/capnp-rtfm-findings.md`** — canonical-encoding rules, fileId discipline, version-counter analysis. Read before changing anything in this directory.

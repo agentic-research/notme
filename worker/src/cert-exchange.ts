@@ -230,7 +230,7 @@ export async function handleCertExchange(
 
   // ── Legacy: token for browser/passkey flows (no public_keys provided) ──
   // Audience uses the outgoing-token convention (https://<host>) so the
-  // resource-server SDK in gen/ts/dpop.ts validates against the same form
+  // resource-server SDK in packages/dpop validates against the same form
   // /token and /authorize/token use. Earlier, this minted aud="notme.bot"
   // (the INCOMING-OIDC convention), producing tokens no resource server
   // would accept — see notme-612016. Two conventions still live in this

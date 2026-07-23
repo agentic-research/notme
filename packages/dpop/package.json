@@ -1,0 +1,28 @@
+{
+  "name": "@notme/dpop",
+  "version": "0.1.0",
+  "description": "DPoP (RFC 9449) utilities and resource-server verifier SDK for notme-issued access tokens. Zero dependencies, pure Web Crypto — runs on Cloudflare Workers, Node, Deno, and browsers.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentic-research/notme.git",
+    "directory": "packages/dpop"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "dpop",
+    "rfc9449",
+    "oauth2",
+    "jwt",
+    "proof-of-possession",
+    "webcrypto"
+  ],
+  "sideEffects": false
+}

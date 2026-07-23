@@ -1,7 +1,7 @@
 /**
  * jwt-primitives.test.ts — TDD tests for shared JWT primitives.
  *
- * These primitives live in gen/ts/dpop.ts and are used by ALL JWT code.
+ * These primitives live in packages/dpop/src/index.ts and are used by ALL JWT code.
  * One implementation, one place, one set of tests.
  *
  * Patterns adapted from jose (MIT, Copyright (c) 2018 Filip Skokan).
@@ -10,7 +10,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 async function getSDK() {
-  return import("../dpop");
+  return import("../src/index");
 }
 
 // ── Base64url ──────────────────────────────────────────────────────────────

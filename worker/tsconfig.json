@@ -14,11 +14,12 @@
     "worker.ts",
     "src/**/*.ts",
     "../gen/ts/**/*.ts",
+    "../packages/dpop/src/**/*.ts",
   ],
   "exclude": [
     "node_modules",
     "**/*.test.ts",
     "**/__tests__/**",
-    "../gen/ts/__tests__/**"
+    "../packages/dpop/__tests__/**"
   ]
 }

@@ -197,7 +197,7 @@ note: discovery (`/.well-known/signet-authority.json`) and the JSON landing page
 ```bash
 cd worker
 npm ci
-npx vitest run                              # unit (329): src/__tests__/ + ../gen/ts/__tests__ (vault retired — see docs/design/012-vault-retirement.md)
+npx vitest run                              # unit (329): src/__tests__/ + ../packages/dpop/__tests__ (vault retired — see docs/design/012-vault-retirement.md)
 npm run test:do                             # real-DO (18): *.do.test.ts via vitest-pool-workers — hermetic (SigningAuthority + RevocationAuthority + checkRevocation)
 npx vitest run src/__tests__/adversarial.test.ts   # focused: adversarial corpus
 npm run build:local                         # esbuild bundle worker.ts → dist/worker.js
@@ -252,7 +252,7 @@ see [`THREAT_MODEL.md`](THREAT_MODEL.md) — adversarial scenarios, trust bounda
 
 - **`../proxy/`** — local plane (rust). holds the bridge cert pair in process memory; presents on outgoing requests. paired with the cert pair this worker mints.
 - **`../action/`** — github action wrapping `POST /cert/gha`. zero stored secrets — the OIDC JWT is the credential.
-- **`../schema/identity.capnp`** — wire types: `CABundle`, `BridgeCertPair`, `GHAClaims`, etc. **`../gen/ts/`** is generated from this; `gen/ts/dpop.ts` is the shared `base64urlDecode` / `validateClaims` / `computeJwkThumbprint` SDK consumed here. open audit: hand-rolled TS encoding does not yet match real cap'n proto wire format — bead `notme-803923`.
+- **`../schema/identity.capnp`** — wire types: `CABundle`, `BridgeCertPair`, `GHAClaims`, etc. **`../gen/ts/`** is generated from this; `packages/dpop` is the shared `base64urlDecode` / `validateClaims` / `computeJwkThumbprint` SDK consumed here. open audit: hand-rolled TS encoding does not yet match real cap'n proto wire format — bead `notme-803923`.
 - **`../docs/design/`** — ADRs 005 (multi-user identity), 006 (DPoP tokens), 007 (secretless local proxy), 008 (bridge-cert CSR + WIMSE), 009 (identity-gated runtime).
 - **`../wasm/`** — empty slot for `leyline-sign` wasm32 (gated on `ley-line-c764c6`); will land here when the rust signer is FFI-ready.
 - **signet** (Go, separate repo) — sister identity authority. issues bundles; this worker is the verifier side via `revocation.ts`.

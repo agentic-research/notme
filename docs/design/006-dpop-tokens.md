@@ -161,7 +161,7 @@ On first request without nonce: server returns 401 with `{ "error": "use_dpop_no
 | `worker/src/auth/token.ts` | New — JWT access token minting (EdDSA) |
 | `worker/worker.ts` | Routes: /token, /authorize, /.well-known/jwks.json |
 | `worker/src/signing-authority.ts` | Add `getPublicKeyJwk()`, `mintAccessToken()` |
-| `gen/ts/dpop.ts` | New — shared `computeJwkThumbprint()` |
+| `packages/dpop` | New — shared `computeJwkThumbprint()` |
 | `worker/src/__tests__/dpop.test.ts` | New — TDD tests first |
 | `worker/src/__tests__/token.test.ts` | New — TDD tests first |
 
