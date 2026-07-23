@@ -10,6 +10,8 @@ import {
   computeJwkThumbprint,
   verifyDPoPToken,
   verifyAccessToken,
+  validateClaims,
+  DPoPVerificationError,
   type KVLike,
 } from "../src/index";
 
@@ -1070,5 +1072,83 @@ describe("verifyAccessToken", () => {
         audience: "https://example.com",
       }),
     ).rejects.toThrow(/dpop.bound|cnf|bearer/i);
+  });
+});
+
+// ── Stable error codes (notme-3bc238) ─────────────────────────────────────
+//
+// `code` is the contract; `message` is human-readable and may be reworded.
+// These tests exist because the codes were added specifically so downstream
+// verifiers stop matching on message SUBSTRINGS — cloister's bundle-auth had
+// already built a reason-mapper out of `msg.includes(...)`, which degrades
+// silently the moment a message changes. A contract with no test is just a
+// comment, and this one has two consumers about to depend on it.
+
+describe("DPoPVerificationError codes", () => {
+  // Self-contained: the constants and keys above live inside the
+  // verifyDPoPToken describe block and are not in scope here.
+  let ed: CryptoKeyPair;
+  beforeAll(async () => {
+    ed = await generateEd25519();
+  });
+
+  it("is thrown as a DPoPVerificationError carrying a code, not a bare Error", async () => {
+    const err = await verifyDPoPToken({
+      token: "only.twoparts",
+      proof: "also.not.valid",
+      method: "GET",
+      url: "https://api.example.com/resource",
+      jwksUrl: "https://auth.notme.bot/.well-known/jwks.json",
+      audience: "https://example.com",
+      publicKey: ed.publicKey,
+    }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(DPoPVerificationError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.code).toBe("MALFORMED_TOKEN");
+  });
+
+  it("instanceof survives the prototype chain (down-level extends Error)", () => {
+    const e = new DPoPVerificationError("CLAIM_SUB_MISSING", "x");
+    expect(e instanceof DPoPVerificationError).toBe(true);
+    expect(e.name).toBe("DPoPVerificationError");
+  });
+
+  // validateClaims is the shared path both verifiers delegate to, so pinning
+  // its codes covers the claim checks cloister's mapper cared about most:
+  // audience, issuer and not-yet-valid.
+  it.each([
+    ["CLAIM_AUD_MISMATCH", { aud: "someone-else", sub: "s" }, { audience: "expected" }],
+    ["CLAIM_AUD_MISSING", { sub: "s" }, { audience: "expected" }],
+    ["CLAIM_ISS_MISMATCH", { iss: "https://evil.example", sub: "s" }, { issuer: "https://auth.notme.bot" }],
+    ["CLAIM_ISS_MISSING", { sub: "s" }, { issuer: "https://auth.notme.bot" }],
+    ["CLAIM_SUB_MISSING", {}, { requireSub: true }],
+    ["CLAIM_SUB_INVALID_TYPE", { sub: 42 }, { requireSub: true }],
+    ["CLAIM_EXP_EXPIRED", { exp: 1 }, {}],
+    ["CLAIM_NBF_NOT_YET_VALID", { nbf: Math.floor(Date.now() / 1000) + 3600 }, {}],
+    ["CLAIM_NBF_INVALID_TYPE", { nbf: "soon" }, {}],
+  ])("validateClaims throws %s", (code, payload, opts) => {
+    let err: unknown = null;
+    try {
+      validateClaims(payload as Record<string, unknown>, opts as any);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(DPoPVerificationError);
+    expect((err as DPoPVerificationError).code).toBe(code);
+  });
+
+  it("a clean payload throws nothing", () => {
+    expect(() =>
+      validateClaims(
+        {
+          sub: "principal:alice",
+          iss: "https://auth.notme.bot",
+          aud: "rs",
+          exp: Math.floor(Date.now() / 1000) + 300,
+        },
+        { requireSub: true, issuer: "https://auth.notme.bot", audience: "rs" } as any,
+      ),
+    ).not.toThrow();
   });
 });

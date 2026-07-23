@@ -12,6 +12,72 @@
  * Pure Web Crypto — no npm dependencies.
  */
 
+// ── Stable error codes ──────────────────────────────────────────────────────
+
+/**
+ * Stable, machine-readable error codes for every failure this SDK's
+ * verifiers can throw. `message` is for humans and may be reworded over
+ * time; `code` is the part API consumers should match on — added because
+ * cloister and canonical-hours had each independently started matching on
+ * message *substrings*, which silently breaks if a message is ever
+ * reworded (notme-3bc238).
+ */
+export type VerifyErrorCode =
+  | "MALFORMED_TOKEN"
+  | "TOKEN_SIGNATURE_INVALID"
+  | "TOKEN_TYP_INVALID"
+  | "TOKEN_EXP_MISSING"
+  | "MALFORMED_PROOF"
+  | "PROOF_TYP_INVALID"
+  | "PROOF_JWK_MISSING"
+  | "PROOF_KEY_TYPE_UNSUPPORTED"
+  | "PROOF_SIGNATURE_INVALID"
+  | "PROOF_JTI_MISSING"
+  | "PROOF_REPLAY"
+  | "PROOF_IAT_MISSING"
+  | "PROOF_IAT_STALE"
+  | "PROOF_HTM_MISMATCH"
+  | "PROOF_HTU_MISMATCH"
+  | "CNF_JKT_MISSING"
+  | "CNF_JKT_MISMATCH"
+  | "BEARER_TOKEN_DPOP_BOUND"
+  | "JWKS_FETCH_FAILED"
+  | "JWKS_NO_KEY_FOUND"
+  | "JWK_KEY_TYPE_UNSUPPORTED"
+  | "BASE64URL_DECODE_FAILED"
+  | "JSON_PARSE_FAILED"
+  | "JSON_NOT_OBJECT"
+  | "CLAIM_EXP_INVALID_TYPE"
+  | "CLAIM_EXP_EXPIRED"
+  | "CLAIM_NBF_INVALID_TYPE"
+  | "CLAIM_NBF_NOT_YET_VALID"
+  | "CLAIM_IAT_INVALID_TYPE"
+  | "CLAIM_IAT_FUTURE"
+  | "CLAIM_ISS_MISSING"
+  | "CLAIM_ISS_MISMATCH"
+  | "CLAIM_AUD_MISSING"
+  | "CLAIM_AUD_MISMATCH"
+  | "CLAIM_SUB_MISSING"
+  | "CLAIM_SUB_INVALID_TYPE";
+
+/**
+ * Thrown by every verifier/parser in this module. `code` is the stable
+ * contract; `message` is human-readable and NOT guaranteed to stay
+ * word-for-word identical across versions (though changing it is a
+ * courtesy break, not a contract break — `code` is what's guaranteed).
+ */
+export class DPoPVerificationError extends Error {
+  readonly code: VerifyErrorCode;
+  constructor(code: VerifyErrorCode, message: string) {
+    super(message);
+    this.name = "DPoPVerificationError";
+    this.code = code;
+    // Restore the prototype chain — down-level TS compile targets can lose
+    // it across `extends Error`, breaking `instanceof` checks otherwise.
+    Object.setPrototypeOf(this, DPoPVerificationError.prototype);
+  }
+}
+
 // ── Public types ────────────────────────────────────────────────────────────
 
 /** Minimal KV interface — compatible with CF KV but not coupled to it. */
@@ -178,7 +244,7 @@ export async function verifyDPoPToken(
 
   const tokenParts = token.split(".");
   if (tokenParts.length !== 3) {
-    throw new Error("Malformed access token: expected 3 parts");
+    throw new DPoPVerificationError("MALFORMED_TOKEN", "Malformed access token: expected 3 parts");
   }
   const [tHeaderB64, tPayloadB64, tSigB64] = tokenParts;
 
@@ -195,7 +261,7 @@ export async function verifyDPoPToken(
     tSigInput,
   );
   if (!tokenValid) {
-    throw new Error("Invalid access token signature");
+    throw new DPoPVerificationError("TOKEN_SIGNATURE_INVALID", "Invalid access token signature");
   }
 
   // typ pin — an EdDSA JWT notme signed with the same key for a different
@@ -203,7 +269,7 @@ export async function verifyDPoPToken(
   // as an access token.
   const tHeader = jsonParse(base64urlDecodeStr(tHeaderB64), "access token header");
   if (tHeader.typ !== "at+jwt") {
-    throw new Error(`Access token typ must be "at+jwt", got "${tHeader.typ}"`);
+    throw new DPoPVerificationError("TOKEN_TYP_INVALID", `Access token typ must be "at+jwt", got "${tHeader.typ}"`);
   }
 
   // Parse and validate token claims via the shared validator — covers exp,
@@ -214,7 +280,7 @@ export async function verifyDPoPToken(
   const tPayload = jsonParse(base64urlDecodeStr(tPayloadB64), "access token payload");
   const now = Math.floor(Date.now() / 1000);
   if (typeof tPayload.exp !== "number") {
-    throw new Error("Access token missing exp claim");
+    throw new DPoPVerificationError("TOKEN_EXP_MISSING", "Access token missing exp claim");
   }
   validateClaims(tPayload, { issuer, audience, requireSub: true, clockTolerance });
 
@@ -222,17 +288,17 @@ export async function verifyDPoPToken(
 
   const proofParts = proof.split(".");
   if (proofParts.length !== 3) {
-    throw new Error("Malformed DPoP proof: expected 3 parts");
+    throw new DPoPVerificationError("MALFORMED_PROOF", "Malformed DPoP proof: expected 3 parts");
   }
   const [pHeaderB64, pPayloadB64, pSigB64] = proofParts;
 
   const pHeader = jsonParse(base64urlDecodeStr(pHeaderB64), "DPoP proof header");
 
   if (pHeader.typ !== "dpop+jwt") {
-    throw new Error(`DPoP proof typ must be "dpop+jwt", got "${pHeader.typ}"`);
+    throw new DPoPVerificationError("PROOF_TYP_INVALID", `DPoP proof typ must be "dpop+jwt", got "${pHeader.typ}"`);
   }
   if (!pHeader.jwk || typeof pHeader.jwk !== "object") {
-    throw new Error("DPoP proof header must contain a jwk");
+    throw new DPoPVerificationError("PROOF_JWK_MISSING", "DPoP proof header must contain a jwk");
   }
 
   // Import proof key and verify signature (support ES256 and EdDSA)
@@ -259,7 +325,7 @@ export async function verifyDPoPToken(
     );
     verifyAlg = { name: "Ed25519" } as any;
   } else {
-    throw new Error(`Unsupported DPoP proof key type: ${proofJwk.kty}`);
+    throw new DPoPVerificationError("PROOF_KEY_TYPE_UNSUPPORTED", `Unsupported DPoP proof key type: ${proofJwk.kty}`);
   }
 
   const pSigInput = new TextEncoder().encode(`${pHeaderB64}.${pPayloadB64}`);
@@ -271,7 +337,7 @@ export async function verifyDPoPToken(
     pSigInput,
   );
   if (!proofValid) {
-    throw new Error("Invalid DPoP proof signature");
+    throw new DPoPVerificationError("PROOF_SIGNATURE_INVALID", "Invalid DPoP proof signature");
   }
 
   // Validate proof claims (strict per RFC 9449 Section 4.3)
@@ -279,7 +345,7 @@ export async function verifyDPoPToken(
 
   // jti required — without it, replay detection is impossible
   if (!pPayload.jti || typeof pPayload.jti !== "string") {
-    throw new Error("DPoP proof missing jti claim");
+    throw new DPoPVerificationError("PROOF_JTI_MISSING", "DPoP proof missing jti claim");
   }
 
   // Optional durable single-use check — the SDK is issuer-agnostic about
@@ -287,27 +353,30 @@ export async function verifyDPoPToken(
   // so without this hook only the 60s iat freshness window below bounds
   // replay, not true single-use (notme-dffc5c).
   if (seenJti && (await seenJti(pPayload.jti))) {
-    throw new Error("DPoP proof replay: jti already seen");
+    throw new DPoPVerificationError("PROOF_REPLAY", "DPoP proof replay: jti already seen");
   }
 
   // iat required and must be within 60s — prevents replay of intercepted proofs
   if (typeof pPayload.iat !== "number") {
-    throw new Error("DPoP proof missing iat claim");
+    throw new DPoPVerificationError("PROOF_IAT_MISSING", "DPoP proof missing iat claim");
   }
   const proofAge = now - pPayload.iat;
   if (proofAge > 60 || proofAge < -60) {
-    throw new Error(
+    throw new DPoPVerificationError(
+      "PROOF_IAT_STALE",
       `DPoP proof iat is too old or in the future (age: ${proofAge}s, max: 60s)`,
     );
   }
 
   if (pPayload.htm !== method) {
-    throw new Error(
+    throw new DPoPVerificationError(
+      "PROOF_HTM_MISMATCH",
       `DPoP proof htm mismatch: expected "${method}", got "${pPayload.htm}"`,
     );
   }
   if (pPayload.htu !== url) {
-    throw new Error(
+    throw new DPoPVerificationError(
+      "PROOF_HTU_MISMATCH",
       `DPoP proof htu mismatch: expected "${url}", got "${pPayload.htu}"`,
     );
   }
@@ -315,12 +384,12 @@ export async function verifyDPoPToken(
   // ── 3. Verify cnf.jkt binding ──────────────────────────────────────────
 
   if (!tPayload.cnf || !tPayload.cnf.jkt) {
-    throw new Error("Access token missing cnf.jkt claim");
+    throw new DPoPVerificationError("CNF_JKT_MISSING", "Access token missing cnf.jkt claim");
   }
 
   const thumbprint = await computeJwkThumbprint(proofJwk);
   if (thumbprint !== tPayload.cnf.jkt) {
-    throw new Error("DPoP key binding mismatch: proof key thumbprint does not match cnf.jkt");
+    throw new DPoPVerificationError("CNF_JKT_MISMATCH", "DPoP key binding mismatch: proof key thumbprint does not match cnf.jkt");
   }
 
   // ── 4. Return verified claims ──────────────────────────────────────────
@@ -353,7 +422,7 @@ export async function verifyAccessToken(
 
   const parts = token.split(".");
   if (parts.length !== 3) {
-    throw new Error("Malformed access token: expected 3 parts");
+    throw new DPoPVerificationError("MALFORMED_TOKEN", "Malformed access token: expected 3 parts");
   }
   const [headerB64, payloadB64, sigB64] = parts;
 
@@ -370,7 +439,7 @@ export async function verifyAccessToken(
     sigInput,
   );
   if (!valid) {
-    throw new Error("Invalid access token signature");
+    throw new DPoPVerificationError("TOKEN_SIGNATURE_INVALID", "Invalid access token signature");
   }
 
   // Parse and validate claims via the shared validator — covers exp, nbf,
@@ -382,7 +451,7 @@ export async function verifyAccessToken(
   // present, but accepting a token without exp would break the short-lived
   // contract (5-min TTL). Pre-check before delegating.
   if (typeof payload.exp !== "number") {
-    throw new Error("Access token missing exp claim");
+    throw new DPoPVerificationError("TOKEN_EXP_MISSING", "Access token missing exp claim");
   }
   validateClaims(payload, {
     issuer,
@@ -394,7 +463,8 @@ export async function verifyAccessToken(
   // accepted as a plain Bearer token. Rejecting here prevents downgrade
   // attacks where an attacker strips the DPoP header from a stolen token.
   if (payload.cnf) {
-    throw new Error(
+    throw new DPoPVerificationError(
+      "BEARER_TOKEN_DPOP_BOUND",
       "DPoP-bound token cannot be verified as Bearer — use verifyDPoPToken with a proof",
     );
   }
@@ -429,7 +499,7 @@ async function fetchSigningKey(
   if (!jwksJson) {
     const res = await fetch(jwksUrl);
     if (!res.ok) {
-      throw new Error(`JWKS fetch failed: ${res.status}`);
+      throw new DPoPVerificationError("JWKS_FETCH_FAILED", `JWKS fetch failed: ${res.status}`);
     }
     jwksJson = await res.text();
 
@@ -446,7 +516,7 @@ async function fetchSigningKey(
     (k) => k.kty === "OKP" && k.crv === "Ed25519",
   );
   if (!jwk) {
-    throw new Error("No Ed25519 key found in JWKS");
+    throw new DPoPVerificationError("JWKS_NO_KEY_FOUND", "No Ed25519 key found in JWKS");
   }
 
   return crypto.subtle.importKey(
@@ -495,7 +565,7 @@ function buildCanonicalJson(jwk: JsonWebKey): string {
       return JSON.stringify(obj);
     }
     default:
-      throw new Error(`Unsupported key type: ${jwk.kty}`);
+      throw new DPoPVerificationError("JWK_KEY_TYPE_UNSUPPORTED", `Unsupported key type: ${jwk.kty}`);
   }
 }
 
@@ -530,7 +600,7 @@ export function base64urlDecode(s: string): Uint8Array {
   try {
     binary = atob(padded);
   } catch {
-    throw new Error("Failed to base64url decode: malformed input");
+    throw new DPoPVerificationError("BASE64URL_DECODE_FAILED", "Failed to base64url decode: malformed input");
   }
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -556,10 +626,10 @@ export function jsonParseSafe(s: string, label: string): Record<string, any> {
   try {
     parsed = JSON.parse(s);
   } catch {
-    throw new Error(`${label} is not valid JSON`);
+    throw new DPoPVerificationError("JSON_PARSE_FAILED", `${label} is not valid JSON`);
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${label} must be a JSON object`);
+    throw new DPoPVerificationError("JSON_NOT_OBJECT", `${label} must be a JSON object`);
   }
   return parsed as Record<string, any>;
 }
@@ -597,47 +667,47 @@ export function validateClaims(
   // ── exp: type-check, then compare with tolerance ──
   if (payload.exp !== undefined) {
     if (typeof payload.exp !== "number") {
-      throw new Error('"exp" claim must be a number');
+      throw new DPoPVerificationError("CLAIM_EXP_INVALID_TYPE", '"exp" claim must be a number');
     }
     if (payload.exp <= now - tolerance) {
-      throw new Error('"exp" claim timestamp check failed (token expired)');
+      throw new DPoPVerificationError("CLAIM_EXP_EXPIRED", '"exp" claim timestamp check failed (token expired)');
     }
   }
 
   // ── nbf: validate only if present ──
   if (payload.nbf !== undefined) {
     if (typeof payload.nbf !== "number") {
-      throw new Error('"nbf" claim must be a number');
+      throw new DPoPVerificationError("CLAIM_NBF_INVALID_TYPE", '"nbf" claim must be a number');
     }
     if (payload.nbf > now + tolerance) {
-      throw new Error('"nbf" claim timestamp check failed (token not yet valid)');
+      throw new DPoPVerificationError("CLAIM_NBF_NOT_YET_VALID", '"nbf" claim timestamp check failed (token not yet valid)');
     }
   }
 
   // ── iat: validate only if present ──
   if (payload.iat !== undefined) {
     if (typeof payload.iat !== "number") {
-      throw new Error('"iat" claim must be a number');
+      throw new DPoPVerificationError("CLAIM_IAT_INVALID_TYPE", '"iat" claim must be a number');
     }
     if (payload.iat > now + 60 + tolerance) {
-      throw new Error('"iat" claim is too far in the future');
+      throw new DPoPVerificationError("CLAIM_IAT_FUTURE", '"iat" claim is too far in the future');
     }
   }
 
   // ── iss: required when issuer option is set ──
   if (opts.issuer !== undefined) {
     if (payload.iss === undefined) {
-      throw new Error('"iss" claim missing (required by issuer option)');
+      throw new DPoPVerificationError("CLAIM_ISS_MISSING", '"iss" claim missing (required by issuer option)');
     }
     if (payload.iss !== opts.issuer) {
-      throw new Error(`"iss" claim mismatch: expected "${opts.issuer}", got "${payload.iss}"`);
+      throw new DPoPVerificationError("CLAIM_ISS_MISMATCH", `"iss" claim mismatch: expected "${opts.issuer}", got "${payload.iss}"`);
     }
   }
 
   // ── aud: required when audience option is set (handles string + array) ──
   if (opts.audience !== undefined) {
     if (payload.aud === undefined) {
-      throw new Error('"aud" claim missing (required by audience option)');
+      throw new DPoPVerificationError("CLAIM_AUD_MISSING", '"aud" claim missing (required by audience option)');
     }
     const expected = Array.isArray(opts.audience) ? opts.audience : [opts.audience];
     const actual = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
@@ -645,17 +715,17 @@ export function validateClaims(
       (a: unknown) => typeof a === "string" && expected.includes(a),
     );
     if (!match) {
-      throw new Error(`"aud" claim mismatch: expected ${expected.join(",")}, got ${actual.join(",")}`);
+      throw new DPoPVerificationError("CLAIM_AUD_MISMATCH", `"aud" claim mismatch: expected ${expected.join(",")}, got ${actual.join(",")}`);
     }
   }
 
   // ── sub: required when requireSub option is set ──
   if (opts.requireSub) {
     if (payload.sub === undefined) {
-      throw new Error('"sub" claim missing (required)');
+      throw new DPoPVerificationError("CLAIM_SUB_MISSING", '"sub" claim missing (required)');
     }
     if (typeof payload.sub !== "string") {
-      throw new Error('"sub" claim must be a string');
+      throw new DPoPVerificationError("CLAIM_SUB_INVALID_TYPE", '"sub" claim must be a string');
     }
   }
 }
