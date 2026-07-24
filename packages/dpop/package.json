@@ -29,7 +29,8 @@
   "files": [
     "dist",
     "src",
-    "README.md"
+    "README.md",
+    "docs"
   ],
   "keywords": [
     "dpop",

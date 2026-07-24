@@ -1,0 +1,27 @@
+---
+title: Errors
+description: Handle DPoP verification failures using stable error codes.
+---
+
+All verification and parsing failures use `DPoPVerificationError`. Its
+`VerifyErrorCode` `code` is the stable machine-readable contract; `message` is
+for people and may change. Never match error-message text.
+
+Use `instanceof DPoPVerificationError`, then map code families to your HTTP and
+operational policy. Configuration failures such as `CONFIG_AUDIENCE_REQUIRED`
+are server misconfiguration and normally merit an alert or 500. Malformed,
+signature, key, and claim codes (`MALFORMED_*`, `TOKEN_*`, `PROOF_*`, `JWK_*`,
+`CLAIM_*`, `CNF_*`) generally describe an unauthenticated request and can map to
+401. Binding mismatches and `BEARER_TOKEN_DPOP_BOUND` should not be retried as a
+different authentication mode. `PROOF_REPLAY` merits an authentication failure
+and security telemetry. `JWKS_FETCH_FAILED` can be an upstream operational
+failure; distinguish it from `JWKS_NO_KEY_FOUND` in logs and alerts.
+
+```ts
+if (error instanceof DPoPVerificationError) {
+  log({ code: error.code, message: error.message });
+}
+```
+
+Keep response bodies deliberately generic; preserve the specific code in trusted
+logs and metrics.

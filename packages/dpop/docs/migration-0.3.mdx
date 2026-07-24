@@ -1,0 +1,25 @@
+---
+title: Migrating to 0.3
+description: Update DPoP consumers for stricter verification defaults.
+---
+
+Version 0.3 tightens verification. Rename `seenJti` to `checkAndRecordJti` and
+implement it as an atomic check-and-record operation. DPoP proofs must include
+an `ath` claim bound to the exact access-token string. Every verification call
+must supply a non-empty `audience`.
+
+Access-token clock tolerance now defaults to 60 seconds; pass
+`clockTolerance: 0` when no tolerance is intended. `htu` is normalized before
+comparison (including query/fragment removal), while `htm` remains
+case-sensitive. Proof algorithms and key material are validated strictly:
+unsupported algorithms, private proof JWKs, and invalid public JWKs are
+rejected. Errors are now stable `DPoPVerificationError` codes, so replace
+message-substring matching with `error.code` handling.
+
+Consumer checklist:
+
+- Update proof fixtures with `ath`, a public JWK, normalized `htu`, and exact-case `htm`.
+- Pass the full request URL and the request method unchanged.
+- Configure an explicit non-empty audience and any desired issuer.
+- Deploy durable shared atomic replay storage and retain entries through the proof window.
+- Update error handling to use `DPoPVerificationError` and `VerifyErrorCode`.

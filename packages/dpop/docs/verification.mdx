@@ -1,0 +1,42 @@
+---
+title: Verification
+description: Verify notme access tokens and DPoP proofs safely.
+---
+
+`verifyDPoPToken` verifies a notme access token and its RFC 9449 DPoP proof as
+one operation. Provide the exact compact `token` and `proof`, the request's
+`method` and full `url`, a JWKS URL (or `publicKey`), and a non-empty `audience`.
+`issuer` is optional for self-hosted deployments, and `kv` may cache JWKS data.
+
+The verifier checks the access-token signature, `typ`, required `exp`, and
+`exp`/`nbf`/`iat`/`iss`/`aud`/`sub` claims. Its token clock tolerance defaults
+to 60 seconds; set `clockTolerance: 0` to disable that tolerance. The proof has
+its own fixed freshness window of plus or minus 60 seconds, independent of the
+token window.
+
+The proof must have `typ: "dpop+jwt"`, an allowed public JWK, a valid signature,
+and `jti`, `iat`, `htm`, `htu`, and `ath` claims. `ath` is the SHA-256 hash of
+the exact presented compact access-token string. Do not hash a decoded token or
+provide a separate expected hash.
+
+Pass the full request URL. Both proof `htu` and request URL are parsed as URLs;
+query strings and fragments are removed and percent encoding is normalized
+before comparison. `htm` is compared directly to `method`: HTTP method case is
+significant, so do not uppercase or lowercase it unless that is the actual
+request method.
+
+Successful verification returns `VerifiedTokenClaims`:
+
+```ts
+type VerifiedTokenClaims = {
+  sub: string;
+  scope: string;
+  aud: string | string[];
+  exp: number;
+  jti: string;
+};
+```
+
+For an unbound redirect token, use `verifyAccessToken` with the same audience
+and issuer policy. It rejects DPoP-bound tokens rather than silently accepting
+them as Bearer tokens.

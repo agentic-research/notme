@@ -1,0 +1,29 @@
+---
+title: Replay protection
+description: Make DPoP proof JTI recording atomic and durable.
+---
+
+Pass `checkAndRecordJti` to make each DPoP proof JTI single-use. It must perform
+one atomic operation: return `true` if the JTI is already recorded; otherwise
+record it and return `false`. The verifier calls it only after all stateless
+token, proof, `ath`, and binding checks succeed, so invalid proofs never consume
+replay state.
+
+Use durable storage shared by every request handler. For example, a database
+unique constraint makes concurrent inserts atomic:
+
+```sql
+CREATE TABLE dpop_proof_jtis (
+  jti TEXT PRIMARY KEY,
+  expires_at TIMESTAMPTZ NOT NULL
+);
+```
+
+Attempt an insert for the JTI; treat a uniqueness conflict as `true`, and a
+successful insert as `false`. Retain entries for at least the proof-validity
+window (the verifier accepts proof `iat` values within plus or minus 60 seconds);
+retaining longer is often appropriate for clock skew and cleanup cadence.
+
+Do not implement this as a KV read followed by a write: two requests can both
+observe an absent key. Likewise, per-isolate in-memory sets are not shared,
+evict on restart, and do not provide replay protection across a deployment.
