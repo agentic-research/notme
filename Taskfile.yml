@@ -62,6 +62,7 @@ tasks:
   worker:check:
     desc: Type-check + test (audit is its own task — `worker:audit`)
     dir: worker
+    deps: [dpop:build]
     cmds:
       - pnpm exec tsc --noEmit
       # Type-check the pool tests (*.do.test.ts), which the base tsconfig
