@@ -1,0 +1,35 @@
+version: "3"
+
+includes:
+  release:
+    taskfile: ../../tasks/release-ts.yml
+    vars:
+      TARGET_PKG: package.json
+      TAG_TEMPLATE: dpop-v%s
+      PKG_NAME: "@agentic-research/dpop"
+
+tasks:
+  build:
+    desc: "Build the portable DPoP verifier SDK."
+    cmds:
+      - pnpm run build
+
+  test:package:
+    desc: "Pack DPoP and verify its docs and published ESM entry point."
+    cmds:
+      - task: release:test:package
+
+  publish:
+    desc: "Pack-smoke and publish DPoP to npm."
+    cmds:
+      - task: release:publish
+
+  ci-publish:
+    desc: "Pack-smoke and publish DPoP to npm from CI with provenance."
+    cmds:
+      - task: release:ci-publish
+
+  bump:
+    desc: "Interactively bump and tag DPoP without pushing."
+    cmds:
+      - task: release:bump

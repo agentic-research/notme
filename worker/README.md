@@ -111,35 +111,35 @@ sequenceDiagram
 
 served on `auth.notme.bot` (and `localhost:8788` locally). main domain `notme.bot/*` falls through to ASSETS.
 
-| method | path | handler | auth |
-|---|---|---|---|
-| `POST` | `/cert` | `cert-exchange.ts` `handleCertExchange` | proof in body (session cookie / bootstrap; oidc returns 501) |
-| `POST` | `/cert/gha` | worker.ts `handleCertGHA` | GHA OIDC bearer + jti replay + repo-owner allowlist |
-| `POST` | `/token` | worker.ts inline | session cookie + DPoP proof header |
-| `POST` | `/authorize/token` | worker.ts inline | session cookie (unbound redirect token, no DPoP) |
-| `GET` | `/authorize` | worker.ts `authorizePageHtml` | session cookie (302 → `/login` if missing); validates `redirect_uri` via `auth/redirect-uri.ts` |
-| `GET` | `/me` | worker.ts inline | session cookie; HTML or JSON via `Accept` |
-| `POST` | `/auth/passkey/register/options` | `handlePasskey` → DO `passkeyRegistrationOptions` | open (first user needs bootstrap code) |
-| `POST` | `/auth/passkey/register/verify` | `handlePasskey` → DO `passkeyVerifyRegistration` | depends on first-user / bootstrap |
-| `POST` | `/auth/passkey/login/options` | `handlePasskey` → DO | open |
-| `POST` | `/auth/passkey/login/verify` | `handlePasskey` → DO | open |
-| `POST` | `/auth/passkey/reset` | worker.ts inline | bootstrap code (single-use) |
-| `GET` | `/auth/passkey/status` | worker.ts inline | session w/ `authorityManage` |
-| `POST` | `/auth/oidc/login` | worker.ts inline | OIDC token (`verifyOIDC`, audience pinned to `notme.bot`) |
-| `GET` | `/connections` | worker.ts inline | session cookie |
-| `POST` | `/connections` | worker.ts inline; verifies via `auth/verify-proof.ts` | session cookie + proof (oidc/x509) |
-| `POST` | `/invites` | worker.ts inline; uses `auth/principals.canGrant` | session w/ `authorityManage` |
-| `GET` | `/join` | worker.ts inline (renders login asset) | open |
-| `POST` | `/join` | worker.ts inline | invite token in body |
-| `GET` | `/.well-known/jwks.json` | worker.ts inline → DO `getPublicKeyJwk` | open, edge-cached |
-| `GET` | `/.well-known/signet-authority.json` | worker.ts inline | open, edge-cached |
-| `GET` | `/.well-known/ca-bundle.pem` | worker.ts inline → DO `getCACertificatePem` | open, edge-cached |
-| `GET` | `/.well-known/security.txt` | worker.ts inline | open |
-| `GET` | `/api/docs` | worker.ts → `ASSETS.fetch(/_api-docs)` | open |
-| `GET` | `/login` | worker.ts → `ASSETS.fetch(/_login)` | open |
-| `GET` | `/provenance/dispatch/v1` | worker.ts inline | open; HTML or JSON-Schema by `Accept` |
-| `GET` | `/provenance/handoff/v1` | worker.ts inline | open; HTML or JSON-Schema by `Accept` |
-| `GET` | `/robots.txt`, `/sitemap.xml`, `/favicon.ico` | worker.ts inline | open |
+| method | path                                          | handler                                               | auth                                                                                            |
+| ------ | --------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `POST` | `/cert`                                       | `cert-exchange.ts` `handleCertExchange`               | proof in body (session cookie / bootstrap; oidc returns 501)                                    |
+| `POST` | `/cert/gha`                                   | worker.ts `handleCertGHA`                             | GHA OIDC bearer + jti replay + repo-owner allowlist                                             |
+| `POST` | `/token`                                      | worker.ts inline                                      | session cookie + DPoP proof header                                                              |
+| `POST` | `/authorize/token`                            | worker.ts inline                                      | session cookie (unbound redirect token, no DPoP)                                                |
+| `GET`  | `/authorize`                                  | worker.ts `authorizePageHtml`                         | session cookie (302 → `/login` if missing); validates `redirect_uri` via `auth/redirect-uri.ts` |
+| `GET`  | `/me`                                         | worker.ts inline                                      | session cookie; HTML or JSON via `Accept`                                                       |
+| `POST` | `/auth/passkey/register/options`              | `handlePasskey` → DO `passkeyRegistrationOptions`     | open (first user needs bootstrap code)                                                          |
+| `POST` | `/auth/passkey/register/verify`               | `handlePasskey` → DO `passkeyVerifyRegistration`      | depends on first-user / bootstrap                                                               |
+| `POST` | `/auth/passkey/login/options`                 | `handlePasskey` → DO                                  | open                                                                                            |
+| `POST` | `/auth/passkey/login/verify`                  | `handlePasskey` → DO                                  | open                                                                                            |
+| `POST` | `/auth/passkey/reset`                         | worker.ts inline                                      | bootstrap code (single-use)                                                                     |
+| `GET`  | `/auth/passkey/status`                        | worker.ts inline                                      | session w/ `authorityManage`                                                                    |
+| `POST` | `/auth/oidc/login`                            | worker.ts inline                                      | OIDC token (`verifyOIDC`, audience pinned to `notme.bot`)                                       |
+| `GET`  | `/connections`                                | worker.ts inline                                      | session cookie                                                                                  |
+| `POST` | `/connections`                                | worker.ts inline; verifies via `auth/verify-proof.ts` | session cookie + proof (oidc/x509)                                                              |
+| `POST` | `/invites`                                    | worker.ts inline; uses `auth/principals.canGrant`     | session w/ `authorityManage`                                                                    |
+| `GET`  | `/join`                                       | worker.ts inline (renders login asset)                | open                                                                                            |
+| `POST` | `/join`                                       | worker.ts inline                                      | invite token in body                                                                            |
+| `GET`  | `/.well-known/jwks.json`                      | worker.ts inline → DO `getPublicKeyJwk`               | open, edge-cached                                                                               |
+| `GET`  | `/.well-known/signet-authority.json`          | worker.ts inline                                      | open, edge-cached                                                                               |
+| `GET`  | `/.well-known/ca-bundle.pem`                  | worker.ts inline → DO `getCACertificatePem`           | open, edge-cached                                                                               |
+| `GET`  | `/.well-known/security.txt`                   | worker.ts inline                                      | open                                                                                            |
+| `GET`  | `/api/docs`                                   | worker.ts → `ASSETS.fetch(/_api-docs)`                | open                                                                                            |
+| `GET`  | `/login`                                      | worker.ts → `ASSETS.fetch(/_login)`                   | open                                                                                            |
+| `GET`  | `/provenance/dispatch/v1`                     | worker.ts inline                                      | open; HTML or JSON-Schema by `Accept`                                                           |
+| `GET`  | `/provenance/handoff/v1`                      | worker.ts inline                                      | open; HTML or JSON-Schema by `Accept`                                                           |
+| `GET`  | `/robots.txt`, `/sitemap.xml`, `/favicon.ico` | worker.ts inline                                      | open                                                                                            |
 
 worker.ts also exposes a private RPC surface via the `AuthService` `WorkerEntrypoint` — service-binding-only, no HTTP. methods: `mintBridgeCert`, `mintDPoPToken`, `getPublicKeyPem`, `getCACertificatePem`, `getAuthorityState`, `verifySession`, plus the 009 identity-gated triple `authenticate` / `proxy` / `sign` / `identity`. consumed by colocated agent workers (see `examples/agent-worker.js`).
 
@@ -147,50 +147,50 @@ note: discovery (`/.well-known/signet-authority.json`) and the JSON landing page
 
 ## bindings
 
-| binding | type | purpose | declared |
-|---|---|---|---|
-| `SIGNING_AUTHORITY` | DO namespace | master Ed25519 key + passkeys + principals + invites + bootstrap (SQLite) | wrangler.toml + config.capnp |
-| `REVOCATION` | DO namespace | atomic monotonic seqno (rollback gate on CABundle) | wrangler.toml + config.capnp |
-| `CA_BUNDLE_CACHE` | KV namespace | signed `CABundle` written by the SA alarm, read by edge revocation verifier | wrangler.toml only (KV not in workerd) |
-| `VPC_AUTH` | vpc_service | private tunnel to signet (Go) on Fly — fall-through for unrouted auth paths | wrangler.toml only |
-| `ASSETS` | static assets | `public/` directory; `run_worker_first = true` | wrangler.toml |
-| `TOKEN_LIMITER` | rate limiter | per-principal `/token` (20/min) | wrangler.toml.example only |
-| `CERT_LIMITER` | rate limiter | per-repo `/cert/gha` (10/min) | wrangler.toml.example only |
-| `PASSKEY_LIMITER` | rate limiter | per-IP passkey routes (5/min) — wired in `handlePasskey` | wrangler.toml.example |
-| `SITE_URL` | var | canonical site origin | both |
-| `SIGNET_AUTHORITY_URL` | var | authority origin for self-references | both |
-| `GHA_ALLOWED_OWNERS` | var | CSV of GitHub orgs/users allowed to mint via `/cert/gha` | both |
-| `GHA_CERT_AUDIENCE` | var (optional) | expected `aud` on incoming GHA OIDC; default `notme.bot` | optional |
-| `GHA_CERT_TTL_MS` | var (optional) | cert lifetime; default 5min | optional |
-| `JTI_MIN_TTL_SECONDS` | var (optional) | min jti replay window; default 60 | optional |
-| `RATE_LIMIT_*` | var (optional) | KV-limiter knobs (legacy path; CF rate limiter is preferred) | optional |
-| `ALLOWED_AUDIENCES` | var (optional) | CSV override of token-mint audience allowlist (`allowed-audiences.ts`) | optional |
-| `NOTME_KEY_STORAGE` | var | `ephemeral` / `cf-managed` / `encrypted` (last is unimplemented, fails fast) | config.capnp sets `ephemeral` |
+| binding                | type           | purpose                                                                      | declared                               |
+| ---------------------- | -------------- | ---------------------------------------------------------------------------- | -------------------------------------- |
+| `SIGNING_AUTHORITY`    | DO namespace   | master Ed25519 key + passkeys + principals + invites + bootstrap (SQLite)    | wrangler.toml + config.capnp           |
+| `REVOCATION`           | DO namespace   | atomic monotonic seqno (rollback gate on CABundle)                           | wrangler.toml + config.capnp           |
+| `CA_BUNDLE_CACHE`      | KV namespace   | signed `CABundle` written by the SA alarm, read by edge revocation verifier  | wrangler.toml only (KV not in workerd) |
+| `VPC_AUTH`             | vpc_service    | private tunnel to signet (Go) on Fly — fall-through for unrouted auth paths  | wrangler.toml only                     |
+| `ASSETS`               | static assets  | `public/` directory; `run_worker_first = true`                               | wrangler.toml                          |
+| `TOKEN_LIMITER`        | rate limiter   | per-principal `/token` (20/min)                                              | wrangler.toml.example only             |
+| `CERT_LIMITER`         | rate limiter   | per-repo `/cert/gha` (10/min)                                                | wrangler.toml.example only             |
+| `PASSKEY_LIMITER`      | rate limiter   | per-IP passkey routes (5/min) — wired in `handlePasskey`                     | wrangler.toml.example                  |
+| `SITE_URL`             | var            | canonical site origin                                                        | both                                   |
+| `SIGNET_AUTHORITY_URL` | var            | authority origin for self-references                                         | both                                   |
+| `GHA_ALLOWED_OWNERS`   | var            | CSV of GitHub orgs/users allowed to mint via `/cert/gha`                     | both                                   |
+| `GHA_CERT_AUDIENCE`    | var (optional) | expected `aud` on incoming GHA OIDC; default `notme.bot`                     | optional                               |
+| `GHA_CERT_TTL_MS`      | var (optional) | cert lifetime; default 5min                                                  | optional                               |
+| `JTI_MIN_TTL_SECONDS`  | var (optional) | min jti replay window; default 60                                            | optional                               |
+| `RATE_LIMIT_*`         | var (optional) | KV-limiter knobs (legacy path; CF rate limiter is preferred)                 | optional                               |
+| `ALLOWED_AUDIENCES`    | var (optional) | CSV override of token-mint audience allowlist (`allowed-audiences.ts`)       | optional                               |
+| `NOTME_KEY_STORAGE`    | var            | `ephemeral` / `cf-managed` / `encrypted` (last is unimplemented, fails fast) | config.capnp sets `ephemeral`          |
 
 ## modules
 
 `worker.ts` (root, 2k lines) — fetch handler + `AuthService` RPC entrypoint + APAS predicate schemas + inline route bodies. exports `SigningAuthority` and `RevocationAuthority` for the DO migrations.
 
-| file | role | key exports |
-|---|---|---|
-| `src/cert-authority.ts` | X.509 cert minting (WebCrypto + `@peculiar/x509`) — sets KU/EKU/SAN/custom-OID extensions | `mintGHABridgeCert`, `mintBridgeCertPair`, `importPublicKey`, `BridgeCertResult`, `BridgeCertPairResult` |
-| `src/cert-exchange.ts` | `/cert` proof → cert-pair-or-token. discriminated-union proof type (session / oidc / bootstrap) | `handleCertExchange`, `CertExchangeRequest`, `CertPairExchangeResponse`, `TokenExchangeResponse` |
-| `src/signing-authority.ts` | `SigningAuthority` DO. owns master Ed25519, mints all certs/tokens, stores passkeys + principals + invites + bootstrap, runs the bundle-refresh alarm. Alarm loop hardened against runaway-bill failure modes (notme-5c2511): `getAlarm()`-guarded re-arm, 5-strike circuit breaker, `alarm_health` table + `getAlarmHealth()` RPC for runaway detection (driftRatio metric). | `SigningAuthority` (class), `getAlarmHealth()`, `resetAlarmHealth()` |
-| `src/revocation.ts` | `RevocationAuthority` DO + edge revocation verifier (`checkRevocation`) | `RevocationAuthority`, `CABundle`, `checkRevocation`, `verifyBundleSignature`, `bundleCanonical`, `isBundleStale`, `BUNDLE_MAX_AGE_MS` |
-| `src/gha-oidc.ts` | github actions OIDC JWT validation (RS256, JWKS-cached 1h) | `validateGHAToken`, `GHAClaims`, `GHAClaimsSchema` |
-| `src/platform.ts` | runtime abstraction: `KVCache` / `SQLiteCache` / `MemoryCache`, `detectKeyStorage`, `ED25519` constant | `createPlatform`, `Platform`, `MemoryCache`, `SQLiteCache`, `KVCache`, `ED25519`, `KeyStorageMode` |
-| `src/key-id.ts` | RFC-7638-style truncated SHA-256 over SPKI for stable kid (16 hex / 64 bits) | `keyIdFromSpki` |
-| `src/allowed-audiences.ts` | token-mint audience allowlist (env override) | `getAllowedAudiences`, `DEFAULT_ALLOWED_AUDIENCES` |
-| `src/auth/dpop.ts` | DPoP proof JWT validation (RFC 9449): typ/alg/jwk/sig/jti/htm/htu/iat/nonce/ath | `validateDpopProof` |
-| `src/auth/dpop-handler.ts` | composable token-minting orchestration with injected JTI store (testable without DOs) | `handleToken`, `buildJwksResponse` |
-| `src/auth/token.ts` | EdDSA `at+jwt` mint + verify; `cnf.jkt` when DPoP-bound, omitted for redirect tokens | `mintAccessToken`, `verifyAccessToken` |
-| `src/auth/session.ts` | HMAC-SHA256 session cookie (no server store); v1→v2 migration on read | `createSessionCookie`, `verifySessionCookie`, `clearSessionCookie` |
-| `src/auth/passkey.ts` | WebAuthn register + auth via `@simplewebauthn/server`; SQLite schema + challenge sweep | `registrationOptions`, `verifyRegistration`, `authenticationOptions`, `verifyAuthentication`, `ensurePasskeySchema` |
-| `src/auth/principals.ts` | principal model (UUID stable across credential rotation), capability grants, federated identities, invites | `createPrincipal`, `grantCapability`, `getCapabilities`, `canGrant`, `linkFederatedIdentity`, `findPrincipalByFederated`, `createInvite`, `redeemInvite` |
-| `src/auth/connections.ts` | OIDC/x509 identity connections joined to a passkey credential | `createConnection`, `getConnections`, `findByProvider` |
-| `src/auth/verify-proof.ts` | OIDC + X.509 proof verification with mandatory audience pin (`TRUSTED_ISSUERS` allowlist) | `verifyOIDC`, `verifyX509`, `verifyProof`, `Proof`, `VerifiedIdentity` |
-| `src/auth/redirect-uri.ts` | `/authorize` redirect_uri matrix: required → parsable → https-or-localhost → exact-host allowlist | `validateRedirectUri`, `ALLOWED_REDIRECT_HOSTS` |
-| `src/auth/timing-safe.ts` | constant-time string compare (HMAC-then-XOR) for bootstrap codes etc. | `timingSafeEqual` |
+| file                       | role                                                                                                                                                                                                                                                                                                                                                                                                                                           | key exports                                                                                                                                              |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/cert-authority.ts`    | X.509 cert minting (WebCrypto + `@peculiar/x509`) — sets KU/EKU/SAN/custom-OID extensions                                                                                                                                                                                                                                                                                                                                                      | `mintGHABridgeCert`, `mintBridgeCertPair`, `importPublicKey`, `BridgeCertResult`, `BridgeCertPairResult`                                                 |
+| `src/cert-exchange.ts`     | `/cert` proof → cert-pair-or-token. discriminated-union proof type (session / oidc / bootstrap)                                                                                                                                                                                                                                                                                                                                                | `handleCertExchange`, `CertExchangeRequest`, `CertPairExchangeResponse`, `TokenExchangeResponse`                                                         |
+| `src/signing-authority.ts` | `SigningAuthority` DO. owns master Ed25519, atomically consumes DPoP proof JTIs in SQLite while minting tokens, mints all certs, stores passkeys + principals + invites + bootstrap, and runs the bundle-refresh alarm. Alarm loop hardened against runaway-bill failure modes (notme-5c2511): `getAlarm()`-guarded re-arm, 5-strike circuit breaker, `alarm_health` table + `getAlarmHealth()` RPC for runaway detection (driftRatio metric). | `SigningAuthority` (class), `mintDPoPTokenOnce()`, `getAlarmHealth()`, `resetAlarmHealth()`                                                              |
+| `src/revocation.ts`        | `RevocationAuthority` DO + edge revocation verifier (`checkRevocation`)                                                                                                                                                                                                                                                                                                                                                                        | `RevocationAuthority`, `CABundle`, `checkRevocation`, `verifyBundleSignature`, `bundleCanonical`, `isBundleStale`, `BUNDLE_MAX_AGE_MS`                   |
+| `src/gha-oidc.ts`          | github actions OIDC JWT validation (RS256, JWKS-cached 1h)                                                                                                                                                                                                                                                                                                                                                                                     | `validateGHAToken`, `GHAClaims`, `GHAClaimsSchema`                                                                                                       |
+| `src/platform.ts`          | runtime abstraction: `KVCache` / `SQLiteCache` / `MemoryCache`, `detectKeyStorage`, `ED25519` constant                                                                                                                                                                                                                                                                                                                                         | `createPlatform`, `Platform`, `MemoryCache`, `SQLiteCache`, `KVCache`, `ED25519`, `KeyStorageMode`                                                       |
+| `src/key-id.ts`            | RFC-7638-style truncated SHA-256 over SPKI for stable kid (16 hex / 64 bits)                                                                                                                                                                                                                                                                                                                                                                   | `keyIdFromSpki`                                                                                                                                          |
+| `src/allowed-audiences.ts` | token-mint audience allowlist (env override)                                                                                                                                                                                                                                                                                                                                                                                                   | `getAllowedAudiences`, `DEFAULT_ALLOWED_AUDIENCES`                                                                                                       |
+| `src/auth/dpop.ts`         | DPoP proof JWT validation (RFC 9449): typ/alg/jwk/sig/jti/htm/htu/iat/nonce/ath                                                                                                                                                                                                                                                                                                                                                                | `validateDpopProof`                                                                                                                                      |
+| `src/auth/dpop-handler.ts` | composable token-minting orchestration with injected atomic JTI consumer (testable without DOs)                                                                                                                                                                                                                                                                                                                                                | `handleToken`, `buildJwksResponse`                                                                                                                       |
+| `src/auth/token.ts`        | EdDSA `at+jwt` mint + verify; `cnf.jkt` when DPoP-bound, omitted for redirect tokens                                                                                                                                                                                                                                                                                                                                                           | `mintAccessToken`, `verifyAccessToken`                                                                                                                   |
+| `src/auth/session.ts`      | HMAC-SHA256 session cookie (no server store); v1→v2 migration on read                                                                                                                                                                                                                                                                                                                                                                          | `createSessionCookie`, `verifySessionCookie`, `clearSessionCookie`                                                                                       |
+| `src/auth/passkey.ts`      | WebAuthn register + auth via `@simplewebauthn/server`; SQLite schema + challenge sweep                                                                                                                                                                                                                                                                                                                                                         | `registrationOptions`, `verifyRegistration`, `authenticationOptions`, `verifyAuthentication`, `ensurePasskeySchema`                                      |
+| `src/auth/principals.ts`   | principal model (UUID stable across credential rotation), capability grants, federated identities, invites                                                                                                                                                                                                                                                                                                                                     | `createPrincipal`, `grantCapability`, `getCapabilities`, `canGrant`, `linkFederatedIdentity`, `findPrincipalByFederated`, `createInvite`, `redeemInvite` |
+| `src/auth/connections.ts`  | OIDC/x509 identity connections joined to a passkey credential                                                                                                                                                                                                                                                                                                                                                                                  | `createConnection`, `getConnections`, `findByProvider`                                                                                                   |
+| `src/auth/verify-proof.ts` | OIDC + X.509 proof verification with mandatory audience pin (`TRUSTED_ISSUERS` allowlist)                                                                                                                                                                                                                                                                                                                                                      | `verifyOIDC`, `verifyX509`, `verifyProof`, `Proof`, `VerifiedIdentity`                                                                                   |
+| `src/auth/redirect-uri.ts` | `/authorize` redirect_uri matrix: required → parsable → https-or-localhost → exact-host allowlist                                                                                                                                                                                                                                                                                                                                              | `validateRedirectUri`, `ALLOWED_REDIRECT_HOSTS`                                                                                                          |
+| `src/auth/timing-safe.ts`  | constant-time string compare (HMAC-then-XOR) for bootstrap codes etc.                                                                                                                                                                                                                                                                                                                                                                          | `timingSafeEqual`                                                                                                                                        |
 
 ## tests
 

@@ -32,11 +32,10 @@ function b64urlStr(s: string): string {
 
 /** Generate an Ed25519 keypair for signing access tokens. */
 async function generateEd25519(): Promise<CryptoKeyPair> {
-  return crypto.subtle.generateKey(
-    { name: "Ed25519" } as any,
-    true,
-    ["sign", "verify"],
-  ) as Promise<CryptoKeyPair>;
+  return crypto.subtle.generateKey({ name: "Ed25519" } as any, true, [
+    "sign",
+    "verify",
+  ]) as Promise<CryptoKeyPair>;
 }
 
 /** Generate a P-256 keypair for DPoP proofs. */
@@ -51,7 +50,10 @@ async function generateP256(): Promise<{
   )) as CryptoKeyPair;
   // exportKey's return type is JsonWebKey | ArrayBuffer (depends on format).
   // For "jwk" it's always JsonWebKey, but TS can't narrow on the format arg.
-  const jwk = (await crypto.subtle.exportKey("jwk", keyPair.publicKey)) as JsonWebKey;
+  const jwk = (await crypto.subtle.exportKey(
+    "jwk",
+    keyPair.publicKey,
+  )) as JsonWebKey;
   return { keyPair, jwk };
 }
 
@@ -64,13 +66,17 @@ async function mintToken(opts: {
   sub: string;
   jkt: string;
   scope?: string;
-  audience?: string;
+  audience?: string | string[];
   expOverride?: number;
   iatOverride?: number;
   nbfOverride?: number;
   typOverride?: string;
 }): Promise<string> {
-  const header = { typ: opts.typOverride ?? "at+jwt", alg: "EdDSA", kid: "test-kid" };
+  const header = {
+    typ: opts.typOverride ?? "at+jwt",
+    alg: "EdDSA",
+    kid: "test-kid",
+  };
   const iat = opts.iatOverride ?? Math.floor(Date.now() / 1000);
   const payload: Record<string, unknown> = {
     sub: opts.sub,
@@ -98,7 +104,7 @@ async function mintUnboundToken(opts: {
   signingKey: CryptoKey;
   sub: string;
   scope?: string;
-  audience?: string;
+  audience?: string | string[];
   expOverride?: number;
   iatOverride?: number;
 }): Promise<string> {
@@ -131,18 +137,31 @@ async function buildProof(opts: {
   jwk: JsonWebKey;
   htm: string;
   htu: string;
+  accessToken?: string;
+  headerOverrides?: Record<string, unknown>;
   payloadOverrides?: Record<string, unknown>;
 }): Promise<string> {
   const header = {
     typ: "dpop+jwt",
     alg: "ES256",
     jwk: opts.jwk,
+    ...opts.headerOverrides,
   };
   const payload = {
     jti: crypto.randomUUID(),
     htm: opts.htm,
     htu: opts.htu,
     iat: Math.floor(Date.now() / 1000),
+    ...(opts.accessToken
+      ? {
+          ath: b64url(
+            await crypto.subtle.digest(
+              "SHA-256",
+              new TextEncoder().encode(opts.accessToken),
+            ),
+          ),
+        }
+      : {}),
     ...opts.payloadOverrides,
   };
 
@@ -188,6 +207,7 @@ describe("verifyDPoPToken", () => {
       audience: "https://api.example.com",
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -226,6 +246,7 @@ describe("verifyDPoPToken", () => {
       expOverride: now - 300,
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -239,7 +260,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/expired/i);
@@ -248,12 +269,11 @@ describe("verifyDPoPToken", () => {
   // ── Clock-skew tolerance (notme-18450e) ─────────────────────────────────
   //
   // notme mints `nbf: iat` on every access token, so a resource server whose
-  // clock trails the issuer's rejects a legitimate token at `nbf`. Zero stays
-  // the DEFAULT (fail-closed); `clockTolerance` lets a verifier on separate
-  // infrastructure buy back a bounded window. Both halves are asserted — an
-  // option that silently did nothing would be worse than no option at all.
+  // clock trails the issuer needs a bounded skew allowance. The verifier
+  // defaults that access-token allowance to 60s, independently of the proof's
+  // fixed ±60s freshness window. Callers can explicitly tighten it to zero.
 
-  it("rejects a not-yet-valid nbf by default (zero tolerance)", async () => {
+  it("accepts a not-yet-valid nbf within the default 60s tolerance", async () => {
     const now = Math.floor(Date.now() / 1000);
     const token = await mintToken({
       signingKey: edKp.privateKey,
@@ -261,7 +281,41 @@ describe("verifyDPoPToken", () => {
       jkt,
       nbfOverride: now + 30,
     });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
+
+    const claims = await verifyDPoPToken({
+      token,
+      proof,
+      method: METHOD,
+      url: URL,
+      jwksUrl: JWKS_URL,
+      audience: "https://example.com",
+      publicKey: edKp.publicKey,
+    });
+    expect(claims.sub).toBe("principal:alice");
+  });
+
+  it("allows callers to tighten access-token clock tolerance to zero", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+      nbfOverride: now + 30,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     await expect(
       verifyDPoPToken({
@@ -272,19 +326,25 @@ describe("verifyDPoPToken", () => {
         jwksUrl: JWKS_URL,
         audience: "https://example.com",
         publicKey: edKp.publicKey,
+        clockTolerance: 0,
       }),
     ).rejects.toThrow('"nbf" claim timestamp check failed');
   });
 
-  it("accepts that same token when clockTolerance covers the skew", async () => {
-    const now = Math.floor(Date.now() / 1000);
+  it("returns an array audience without violating the public claims type", async () => {
     const token = await mintToken({
       signingKey: edKp.privateKey,
       sub: "principal:alice",
       jkt,
-      nbfOverride: now + 30,
+      audience: ["https://a.example", "https://b.example"],
     });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     const claims = await verifyDPoPToken({
       token,
@@ -292,11 +352,36 @@ describe("verifyDPoPToken", () => {
       method: METHOD,
       url: URL,
       jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+      audience: "https://b.example",
       publicKey: edKp.publicKey,
-      clockTolerance: 60,
     });
-    expect(claims.sub).toBe("principal:alice");
+    expect(claims.aud).toEqual(["https://a.example", "https://b.example"]);
+  });
+
+  it("rejects a missing runtime audience configuration", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+      } as any),
+    ).rejects.toMatchObject({ code: "CONFIG_AUDIENCE_REQUIRED" });
   });
 
   // ── Invalid token signature ─────────────────────────────────────────────
@@ -309,6 +394,7 @@ describe("verifyDPoPToken", () => {
       jkt,
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -322,7 +408,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey, // verifying with the "correct" key
       }),
     ).rejects.toThrow(/signature/i);
@@ -341,6 +427,7 @@ describe("verifyDPoPToken", () => {
     // But proof is signed by a DIFFERENT EC key
     const otherEc = await generateP256();
     const proof = await buildProof({
+      accessToken: token,
       keyPair: otherEc.keyPair,
       jwk: otherEc.jwk,
       htm: METHOD,
@@ -354,7 +441,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/binding|mismatch|thumbprint/i);
@@ -369,6 +456,7 @@ describe("verifyDPoPToken", () => {
       jkt,
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: "POST", // proof says POST
@@ -382,10 +470,37 @@ describe("verifyDPoPToken", () => {
         method: "GET", // but request is GET
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/htm/i);
+  });
+
+  it("treats HTTP method tokens as case-sensitive", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: "get",
+      htu: URL,
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: "GET",
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).rejects.toMatchObject({ code: "PROOF_HTM_MISMATCH" });
   });
 
   // ── htu mismatch ────────────────────────────────────────────────────────
@@ -397,6 +512,7 @@ describe("verifyDPoPToken", () => {
       jkt,
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -410,7 +526,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/htu/i);
@@ -426,6 +542,7 @@ describe("verifyDPoPToken", () => {
     });
     // Proof htu is a prefix of the actual URL but not exact
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -439,10 +556,129 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: "https://api.example.com/resource",
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/htu/i);
+  });
+
+  it("matches htu after removing the request query and fragment", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: `${URL}?page=2#ignored`,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).resolves.toMatchObject({ sub: "principal:alice" });
+  });
+
+  it("normalizes percent-encoded unreserved characters in htu", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: "https://api.example.com/%7eresource",
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: "https://api.example.com/~resource",
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).resolves.toMatchObject({ sub: "principal:alice" });
+  });
+
+  it("requires ath on protected-resource proofs", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).rejects.toMatchObject({ code: "PROOF_ATH_MISSING" });
+  });
+
+  it("rejects ath computed from a different access token", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const otherToken = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:bob",
+      jkt,
+    });
+    const wrongAth = b64url(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(otherToken),
+      ),
+    );
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+      payloadOverrides: { ath: wrongAth },
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).rejects.toMatchObject({ code: "PROOF_ATH_MISMATCH" });
   });
 
   // ── Malformed inputs ──────────────────────────────────────────────────
@@ -462,7 +698,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/malformed|parts/i);
@@ -482,7 +718,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/malformed|parts/i);
@@ -520,10 +756,96 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/typ/i);
+  });
+
+  it("rejects a proof whose alg header does not match its signature algorithm", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+      headerOverrides: { alg: "none" },
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).rejects.toMatchObject({ code: "PROOF_ALG_UNSUPPORTED" });
+  });
+
+  it("rejects private key material in the proof JWK", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+      headerOverrides: { jwk: { ...ecJwk, d: "private-material" } },
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).rejects.toMatchObject({ code: "PROOF_JWK_PRIVATE" });
+  });
+
+  it("wraps malformed proof JWK imports in a stable error", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+      headerOverrides: {
+        jwk: { kty: "EC", crv: "P-256", x: "invalid", y: "invalid" },
+      },
+    });
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+      }),
+    ).rejects.toMatchObject({ code: "PROOF_JWK_INVALID" });
   });
 
   it("rejects token missing cnf.jkt", async () => {
@@ -550,6 +872,7 @@ describe("verifyDPoPToken", () => {
     const token = `${headerB64}.${payloadB64}.${b64url(sig)}`;
 
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -563,7 +886,7 @@ describe("verifyDPoPToken", () => {
         method: METHOD,
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/cnf|jkt/i);
@@ -578,6 +901,7 @@ describe("verifyDPoPToken", () => {
       jkt,
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -636,7 +960,7 @@ describe("verifyDPoPToken", () => {
         method: "DELETE",
         url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com",
+        audience: "https://example.com",
         publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/signature/i);
@@ -652,6 +976,7 @@ describe("verifyDPoPToken", () => {
     });
     // Proof without iat — enables indefinite replay
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -661,9 +986,13 @@ describe("verifyDPoPToken", () => {
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com", publicKey: edKp.publicKey,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/iat/i);
   });
@@ -675,6 +1004,7 @@ describe("verifyDPoPToken", () => {
       jkt,
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -684,9 +1014,13 @@ describe("verifyDPoPToken", () => {
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com", publicKey: edKp.publicKey,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/iat|old|expired|future/i);
   });
@@ -698,6 +1032,7 @@ describe("verifyDPoPToken", () => {
       jkt,
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -707,9 +1042,13 @@ describe("verifyDPoPToken", () => {
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com", publicKey: edKp.publicKey,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/iat|old|expired|future/i);
   });
@@ -721,6 +1060,7 @@ describe("verifyDPoPToken", () => {
       jkt,
     });
     const proof = await buildProof({
+      accessToken: token,
       keyPair: ecKp,
       jwk: ecJwk,
       htm: METHOD,
@@ -730,9 +1070,13 @@ describe("verifyDPoPToken", () => {
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
         jwksUrl: JWKS_URL,
-      audience: "https://example.com", publicKey: edKp.publicKey,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/jti/i);
   });
@@ -746,12 +1090,23 @@ describe("verifyDPoPToken", () => {
       jkt,
       audience: "https://other-service.example",
     });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/aud/i);
   });
@@ -763,10 +1118,19 @@ describe("verifyDPoPToken", () => {
       jkt,
       audience: "https://b.example",
     });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     const claims = await verifyDPoPToken({
-      token, proof, method: METHOD, url: URL,
+      token,
+      proof,
+      method: METHOD,
+      url: URL,
       jwksUrl: JWKS_URL,
       audience: ["https://a.example", "https://b.example"],
       publicKey: edKp.publicKey,
@@ -775,25 +1139,55 @@ describe("verifyDPoPToken", () => {
   });
 
   it("rejects a token with the wrong issuer when issuer is pinned", async () => {
-    const token = await mintToken({ signingKey: edKp.privateKey, sub: "principal:alice", jkt });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
         issuer: "https://not-auth.notme.bot",
       }),
     ).rejects.toThrow(/iss/i);
   });
 
   it("accepts a token with the pinned issuer", async () => {
-    const token = await mintToken({ signingKey: edKp.privateKey, sub: "principal:alice", jkt });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     const claims = await verifyDPoPToken({
-      token, proof, method: METHOD, url: URL,
-      jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+      token,
+      proof,
+      method: METHOD,
+      url: URL,
+      jwksUrl: JWKS_URL,
+      audience: "https://example.com",
+      publicKey: edKp.publicKey,
       issuer: "https://auth.notme.bot", // matches mintToken()'s fixed iss
     });
     expect(claims.sub).toBe("principal:alice");
@@ -809,12 +1203,23 @@ describe("verifyDPoPToken", () => {
       expOverride: now + 300,
       nbfOverride: now + 120,
     });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/nbf|not yet valid/i);
   });
@@ -826,40 +1231,124 @@ describe("verifyDPoPToken", () => {
       jkt,
       typOverride: "id+jwt",
     });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
       }),
     ).rejects.toThrow(/typ/i);
   });
 
-  it("rejects a replayed proof when seenJti reports it as already seen", async () => {
-    const token = await mintToken({ signingKey: edKp.privateKey, sub: "principal:alice", jkt });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+  it("rejects a replayed proof when checkAndRecordJti reports it as already seen", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
 
     await expect(
       verifyDPoPToken({
-        token, proof, method: METHOD, url: URL,
-        jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
-        seenJti: () => true,
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+        checkAndRecordJti: () => true,
       }),
     ).rejects.toThrow(/replay/i);
   });
 
-  it("accepts a fresh proof when seenJti reports it as not seen", async () => {
-    const token = await mintToken({ signingKey: edKp.privateKey, sub: "principal:alice", jkt });
-    const proof = await buildProof({ keyPair: ecKp, jwk: ecJwk, htm: METHOD, htu: URL });
+  it("records a fresh proof and rejects its second use", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: URL,
+    });
     const seen = new Set<string>();
 
-    const claims = await verifyDPoPToken({
-      token, proof, method: METHOD, url: URL,
-      jwksUrl: JWKS_URL, audience: "https://example.com", publicKey: edKp.publicKey,
-      seenJti: (jti) => seen.has(jti),
-    });
+    const checkAndRecord = (jti: string) => {
+      if (seen.has(jti)) return true;
+      seen.add(jti);
+      return false;
+    };
+    const options = {
+      token,
+      proof,
+      method: METHOD,
+      url: URL,
+      jwksUrl: JWKS_URL,
+      audience: "https://example.com",
+      publicKey: edKp.publicKey,
+      checkAndRecordJti: checkAndRecord,
+    };
+
+    const claims = await verifyDPoPToken(options);
     expect(claims.sub).toBe("principal:alice");
+    await expect(verifyDPoPToken(options)).rejects.toMatchObject({
+      code: "PROOF_REPLAY",
+    });
+  });
+
+  it("does not consume replay state for an invalid proof", async () => {
+    const token = await mintToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+      jkt,
+    });
+    const proof = await buildProof({
+      accessToken: token,
+      keyPair: ecKp,
+      jwk: ecJwk,
+      htm: METHOD,
+      htu: "https://evil.example/resource",
+    });
+    let calls = 0;
+
+    await expect(
+      verifyDPoPToken({
+        token,
+        proof,
+        method: METHOD,
+        url: URL,
+        jwksUrl: JWKS_URL,
+        audience: "https://example.com",
+        publicKey: edKp.publicKey,
+        checkAndRecordJti: () => {
+          calls += 1;
+          return false;
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PROOF_HTU_MISMATCH" });
+    expect(calls).toBe(0);
   });
 });
 
@@ -896,6 +1385,21 @@ describe("verifyAccessToken", () => {
     expect(claims.scope).toBe("bridgeCert authorityManage");
     expect(claims.aud).toBe("https://rosary.bot");
     expect(claims.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  it("rejects a missing runtime audience configuration", async () => {
+    const token = await mintUnboundToken({
+      signingKey: edKp.privateKey,
+      sub: "principal:alice",
+    });
+
+    await expect(
+      verifyAccessToken({
+        token,
+        jwksUrl: JWKS_URL,
+        publicKey: edKp.publicKey,
+      } as any),
+    ).rejects.toMatchObject({ code: "CONFIG_AUDIENCE_REQUIRED" });
   });
 
   it("rejects an expired token", async () => {
@@ -1056,7 +1560,7 @@ describe("verifyAccessToken", () => {
     const token = await mintToken({
       signingKey: edKp.privateKey,
       sub: "principal:alice",
-      jkt,  // <-- this token is DPoP-bound (has cnf.jkt)
+      jkt, // <-- this token is DPoP-bound (has cnf.jkt)
       scope: "read",
     });
 
@@ -1118,15 +1622,32 @@ describe("DPoPVerificationError codes", () => {
   // its codes covers the claim checks cloister's mapper cared about most:
   // audience, issuer and not-yet-valid.
   it.each([
-    ["CLAIM_AUD_MISMATCH", { aud: "someone-else", sub: "s" }, { audience: "expected" }],
+    [
+      "CLAIM_AUD_MISMATCH",
+      { aud: "someone-else", sub: "s" },
+      { audience: "expected" },
+    ],
     ["CLAIM_AUD_MISSING", { sub: "s" }, { audience: "expected" }],
-    ["CLAIM_ISS_MISMATCH", { iss: "https://evil.example", sub: "s" }, { issuer: "https://auth.notme.bot" }],
+    [
+      "CLAIM_ISS_MISMATCH",
+      { iss: "https://evil.example", sub: "s" },
+      { issuer: "https://auth.notme.bot" },
+    ],
     ["CLAIM_ISS_MISSING", { sub: "s" }, { issuer: "https://auth.notme.bot" }],
     ["CLAIM_SUB_MISSING", {}, { requireSub: true }],
     ["CLAIM_SUB_INVALID_TYPE", { sub: 42 }, { requireSub: true }],
     ["CLAIM_EXP_EXPIRED", { exp: 1 }, {}],
-    ["CLAIM_NBF_NOT_YET_VALID", { nbf: Math.floor(Date.now() / 1000) + 3600 }, {}],
+    [
+      "CLAIM_NBF_NOT_YET_VALID",
+      { nbf: Math.floor(Date.now() / 1000) + 3600 },
+      {},
+    ],
     ["CLAIM_NBF_INVALID_TYPE", { nbf: "soon" }, {}],
+    [
+      "CLAIM_AUD_INVALID_TYPE",
+      { aud: ["valid", 42], sub: "s" },
+      { audience: "valid" },
+    ],
   ])("validateClaims throws %s", (code, payload, opts) => {
     let err: unknown = null;
     try {
@@ -1147,8 +1668,22 @@ describe("DPoPVerificationError codes", () => {
           aud: "rs",
           exp: Math.floor(Date.now() / 1000) + 300,
         },
-        { requireSub: true, issuer: "https://auth.notme.bot", audience: "rs" } as any,
+        {
+          requireSub: true,
+          issuer: "https://auth.notme.bot",
+          audience: "rs",
+        } as any,
       ),
     ).not.toThrow();
+  });
+
+  it.each([
+    ["EC", { kty: "EC", crv: "P-256", x: "x" }],
+    ["RSA", { kty: "RSA", e: "AQAB" }],
+    ["OKP", { kty: "OKP", crv: "Ed25519" }],
+  ])("rejects %s JWKs with missing thumbprint members", async (_kty, jwk) => {
+    await expect(computeJwkThumbprint(jwk)).rejects.toMatchObject({
+      code: "JWK_INVALID",
+    });
   });
 });

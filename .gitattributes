@@ -1,0 +1,5 @@
+
+# Bead export merges by RECORD, not by line (rosary-f9516f). The driver
+# itself is defined in git config by `rsry hooks install` — this line only
+# names it, and without it git would line-merge and shred bead records.
+.beads/beads.jsonl merge=beads-jsonl

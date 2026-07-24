@@ -3,6 +3,9 @@
 
 # Keep gitignore itself tracked.
 !.gitignore
+!.gitattributes
+!.githooks/
+!.githooks/**
 
 # Beads: the store binary (beads.db) stays ignored — a committed binary DB has
 # no git 3-way merge (rosary-05fbe0) — but the JSONL export is the tracked,
@@ -20,6 +23,10 @@
 !ARCHITECTURE.md
 !Taskfile.yml
 !go.work
+
+# Shared Taskfile modules used by package-local release wrappers.
+!tasks/
+!tasks/**
 
 # Root pnpm workspace (for repo-level scripts: scripts/check-sha-pins.ts,
 # scripts/doc-check.ts, schema/codegen/capnp-to-ts.ts). The workspace also

@@ -54,3 +54,71 @@ describe("SigningAuthority rotation grace window (notme-b49020 / notme-54f84b)",
     expect(after.keys[newKeyId]).not.toBe(oldPub);
   });
 });
+
+describe("SigningAuthority DPoP replay protection (notme-1bd2dd)", () => {
+  it("atomically consumes a JTI and mints exactly one token", async () => {
+    const id = env.SIGNING_AUTHORITY.idFromName("dpop-replay-test");
+    const stub = env.SIGNING_AUTHORITY.get(id);
+    const params = {
+      sub: "alice",
+      scope: "bridgeCert",
+      audience: "https://rosary.bot",
+      jkt: "test-thumbprint",
+      proofJti: crypto.randomUUID(),
+    };
+
+    const results = await Promise.all([
+      runInDurableObject(stub, (auth) =>
+        (auth as any).mintDPoPTokenOnce(params),
+      ),
+      runInDurableObject(stub, (auth) =>
+        (auth as any).mintDPoPTokenOnce(params),
+      ),
+    ]);
+
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(
+      results.filter((result) => result.reason === "proof_reused"),
+    ).toHaveLength(1);
+
+    const replay = await runInDurableObject(stub, (auth) =>
+      (auth as any).mintDPoPTokenOnce(params),
+    );
+    expect(replay).toEqual({ ok: false, reason: "proof_reused" });
+
+    const distinct = await runInDurableObject(stub, (auth) =>
+      (auth as any).mintDPoPTokenOnce({
+        ...params,
+        proofJti: crypto.randomUUID(),
+      }),
+    );
+    expect(distinct.ok).toBe(true);
+  });
+
+  it("keeps a JTI consumed when token minting fails", async () => {
+    const id = env.SIGNING_AUTHORITY.idFromName("dpop-mint-failure-test");
+    const stub = env.SIGNING_AUTHORITY.get(id);
+    const params = {
+      sub: "alice",
+      scope: "bridgeCert",
+      audience: "https://rosary.bot",
+      jkt: "test-thumbprint",
+      proofJti: crypto.randomUUID(),
+    };
+
+    await expect(
+      runInDurableObject(stub, async (auth) => {
+        const authority = auth as any;
+        authority.mintDPoPToken = async () => {
+          throw new Error("simulated mint failure");
+        };
+        return authority.mintDPoPTokenOnce(params);
+      }),
+    ).rejects.toThrow("simulated mint failure");
+
+    const replay = await runInDurableObject(stub, (auth) =>
+      (auth as any).mintDPoPTokenOnce(params),
+    );
+    expect(replay).toEqual({ ok: false, reason: "proof_reused" });
+  });
+});

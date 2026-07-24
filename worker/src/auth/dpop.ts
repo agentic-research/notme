@@ -5,7 +5,11 @@
  * Uses Web Crypto for signature verification — no npm crypto dependencies.
  */
 
-import { computeJwkThumbprint, base64urlDecode, jsonParseSafe } from "@agentic-research/dpop";
+import {
+  computeJwkThumbprint,
+  base64urlDecode,
+  jsonParseSafe,
+} from "@agentic-research/dpop";
 
 /** Maximum allowed age of a DPoP proof (seconds). */
 const MAX_IAT_AGE_SECONDS = 60;
@@ -13,7 +17,7 @@ const MAX_IAT_AGE_SECONDS = 60;
 export interface DpopValidationOptions {
   /** Expected HTTP method (e.g. "POST"). */
   htm: string;
-  /** Expected HTTP request URL (e.g. "https://auth.notme.bot/token"). */
+  /** Expected HTTP request URL; query and fragment are ignored for `htu`. */
   htu: string;
   /** Server-issued nonce — if provided, proof must contain matching nonce claim. */
   nonce?: string;
@@ -37,7 +41,7 @@ export interface DpopValidationResult {
  * - JWT structure (header.payload.signature, base64url encoded)
  * - Header: typ === "dpop+jwt", alg === "ES256", jwk present (EC P-256)
  * - Signature: verified with the embedded JWK
- * - Claims: jti present/string, htm matches, htu matches, iat within 60s
+ * - Claims: jti present/string, htm matches exactly, normalized htu matches, iat within 60s
  * - Optional: nonce matches if provided
  * - Optional: ath matches accessTokenHash if provided
  *
@@ -54,25 +58,34 @@ export async function validateDpopProof(
   }
   const [headerB64, payloadB64, signatureB64] = parts;
 
-  const header = jsonParseSafe(new TextDecoder().decode(base64urlDecode(headerB64)), "DPoP header");
-  const payload = jsonParseSafe(new TextDecoder().decode(base64urlDecode(payloadB64)), "DPoP payload");
+  const header = jsonParseSafe(
+    new TextDecoder().decode(base64urlDecode(headerB64)),
+    "DPoP header",
+  );
+  const payload = jsonParseSafe(
+    new TextDecoder().decode(base64urlDecode(payloadB64)),
+    "DPoP payload",
+  );
 
   // ── 2. Validate header ─────────────────────────────────────────────────
   if (header.typ !== "dpop+jwt") {
-    throw new Error(
-      `DPoP proof typ must be "dpop+jwt", got "${header.typ}"`,
-    );
+    throw new Error(`DPoP proof typ must be "dpop+jwt", got "${header.typ}"`);
   }
   if (header.alg !== "ES256") {
-    throw new Error(
-      `DPoP proof alg must be "ES256", got "${header.alg}"`,
-    );
+    throw new Error(`DPoP proof alg must be "ES256", got "${header.alg}"`);
   }
   if (!header.jwk || typeof header.jwk !== "object") {
     throw new Error("DPoP proof header must contain a jwk");
   }
   if (header.jwk.kty !== "EC" || header.jwk.crv !== "P-256") {
     throw new Error("DPoP proof jwk must be EC P-256");
+  }
+  if (
+    ["d", "p", "q", "dp", "dq", "qi", "oth"].some(
+      (member) => header.jwk[member] !== undefined,
+    )
+  ) {
+    throw new Error("DPoP proof jwk must not contain private key material");
   }
 
   // ── 3. Verify signature ────────────────────────────────────────────────
@@ -102,15 +115,17 @@ export async function validateDpopProof(
     throw new Error("DPoP proof must contain a jti claim (string)");
   }
 
-  if (payload.htm !== options.htm) {
+  if (typeof payload.htm !== "string" || payload.htm !== options.htm) {
     throw new Error(
       `DPoP proof htm mismatch: expected "${options.htm}", got "${payload.htm}"`,
     );
   }
 
-  if (payload.htu !== options.htu) {
+  const proofHtu = normalizeHtu(payload.htu);
+  const requestHtu = normalizeHtu(options.htu);
+  if (proofHtu === null || requestHtu === null || proofHtu !== requestHtu) {
     throw new Error(
-      `DPoP proof htu mismatch: expected "${options.htu}", got "${payload.htu}"`,
+      `DPoP proof htu mismatch: expected "${requestHtu ?? options.htu}", got "${proofHtu ?? payload.htu}"`,
     );
   }
 
@@ -153,3 +168,24 @@ export async function validateDpopProof(
   };
 }
 
+function normalizeHtu(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = new URL(value);
+    parsed.search = "";
+    parsed.hash = "";
+    return normalizePercentEncoding(parsed.href);
+  } catch {
+    return null;
+  }
+}
+
+function normalizePercentEncoding(value: string): string {
+  return value.replace(/%[0-9a-fA-F]{2}/g, (triplet) => {
+    const codePoint = Number.parseInt(triplet.slice(1), 16);
+    const character = String.fromCharCode(codePoint);
+    return /[A-Za-z0-9\-._~]/.test(character)
+      ? character
+      : triplet.toUpperCase();
+  });
+}

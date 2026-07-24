@@ -20,11 +20,10 @@ async function generateP256Keypair(): Promise<CryptoKeyPair> {
 }
 
 async function generateEd25519Keypair(): Promise<CryptoKeyPair> {
-  return (await crypto.subtle.generateKey(
-    { name: "Ed25519" } as any,
-    true,
-    ["sign", "verify"],
-  )) as CryptoKeyPair;
+  return (await crypto.subtle.generateKey({ name: "Ed25519" } as any, true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
 }
 
 function b64url(buf: ArrayBuffer): string {
@@ -39,7 +38,10 @@ async function buildDpopProof(opts: {
   nonce?: string;
   ath?: string;
 }): Promise<string> {
-  const pubJwk = (await crypto.subtle.exportKey("jwk", opts.keyPair.publicKey)) as JsonWebKey;
+  const pubJwk = (await crypto.subtle.exportKey(
+    "jwk",
+    opts.keyPair.publicKey,
+  )) as JsonWebKey;
 
   const header = {
     typ: "dpop+jwt",
@@ -104,8 +106,7 @@ describe("handleToken", () => {
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
-      checkJtiReplay: async () => false,
-      storeJti: async () => {},
+      consumeJti: async () => true,
     });
 
     expect(result.ok).toBe(false);
@@ -120,13 +121,17 @@ describe("handleToken", () => {
 
     const result = await handleToken({
       dpopProof: null,
-      session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      session: {
+        principalId: "alice",
+        scopes: ["bridgeCert"],
+        authMethod: "passkey",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
       tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
-      checkJtiReplay: async () => false,
-      storeJti: async () => {},
+      consumeJti: async () => true,
     });
 
     expect(result.ok).toBe(false);
@@ -146,13 +151,17 @@ describe("handleToken", () => {
 
     const result = await handleToken({
       dpopProof: proof,
-      session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      session: {
+        principalId: "alice",
+        scopes: ["bridgeCert"],
+        authMethod: "passkey",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
       tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
-      checkJtiReplay: async () => false,
-      storeJti: async () => {},
+      consumeJti: async () => true,
     });
 
     expect(result.ok).toBe(false);
@@ -172,13 +181,17 @@ describe("handleToken", () => {
 
     const result = await handleToken({
       dpopProof: proof,
-      session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      session: {
+        principalId: "alice",
+        scopes: ["bridgeCert"],
+        authMethod: "passkey",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
       tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
-      checkJtiReplay: async () => true, // already seen
-      storeJti: async () => {},
+      consumeJti: async () => false, // already seen
     });
 
     expect(result.ok).toBe(false);
@@ -198,13 +211,17 @@ describe("handleToken", () => {
 
     const result = await handleToken({
       dpopProof: proof,
-      session: { principalId: "alice", scopes: ["bridgeCert", "authorityManage"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+      session: {
+        principalId: "alice",
+        scopes: ["bridgeCert", "authorityManage"],
+        authMethod: "passkey",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
       tokenEndpointUrl: "https://auth.notme.bot/token",
       audience: "https://rosary.bot",
       signingKey: masterKeyPair.privateKey,
       keyId: "test-kid",
-      checkJtiReplay: async () => false,
-      storeJti: async () => {},
+      consumeJti: async () => true,
     });
 
     expect(result.ok).toBe(true);
@@ -216,7 +233,10 @@ describe("handleToken", () => {
 
     // Verify the token is valid
     const { verifyAccessToken } = await import("../auth/token");
-    const claims = await verifyAccessToken(result.accessToken, masterKeyPair.publicKey);
+    const claims = await verifyAccessToken(
+      result.accessToken,
+      masterKeyPair.publicKey,
+    );
 
     expect(claims.sub).toBe("alice");
     expect(claims.aud).toBe("https://rosary.bot");
@@ -225,22 +245,15 @@ describe("handleToken", () => {
 
     // Verify cnf.jkt matches the DPoP key
     const { computeJwkThumbprint } = await import("@agentic-research/dpop");
-    const pubJwk = (await crypto.subtle.exportKey("jwk", dpopKeyPair.publicKey)) as JsonWebKey;
+    const pubJwk = (await crypto.subtle.exportKey(
+      "jwk",
+      dpopKeyPair.publicKey,
+    )) as JsonWebKey;
     const expectedThumbprint = await computeJwkThumbprint(pubJwk);
     expect(claims.cnf.jkt).toBe(expectedThumbprint);
   });
 
-  it("stores JTI before minting (TOCTOU, rosary-9b969c)", async () => {
-    // True ordering test: instrument BOTH callbacks so we observe the
-    // call sequence. The earlier "throw from storeJti and check no token
-    // returned" test couldn't distinguish bug from fix — under either
-    // order the throw propagates and result.ok is false. Code-reviewer
-    // sub-agent caught this (HIGH).
-    //
-    // Strategy: wrap the signingKey with a Proxy that intercepts the
-    // .sign() that mintAccessToken eventually calls (via crypto.subtle.
-    // sign). When that fires, we record "mint-sign". storeJti records
-    // "store". Asserting events[0] === "store" means store ran first.
+  it("atomically consumes JTI before minting", async () => {
     const handleToken = await getHandler();
     const proof = await buildDpopProof({
       keyPair: dpopKeyPair,
@@ -250,10 +263,6 @@ describe("handleToken", () => {
 
     const events: string[] = [];
 
-    // crypto.subtle.sign is global; monkey-patch for the duration of
-    // this test, restore after. We only want to record the sign call
-    // that mintAccessToken makes — DPoP proof verification uses
-    // crypto.subtle.verify, not sign, so no false hit.
     const origSign = crypto.subtle.sign.bind(crypto.subtle);
     (crypto.subtle as any).sign = (...args: unknown[]) => {
       events.push("mint-sign");
@@ -263,14 +272,19 @@ describe("handleToken", () => {
     try {
       const result = await handleToken({
         dpopProof: proof,
-        session: { principalId: "alice", scopes: ["bridgeCert"], authMethod: "passkey", exp: Math.floor(Date.now() / 1000) + 3600 },
+        session: {
+          principalId: "alice",
+          scopes: ["bridgeCert"],
+          authMethod: "passkey",
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        },
         tokenEndpointUrl: "https://auth.notme.bot/token",
         audience: "https://rosary.bot",
         signingKey: masterKeyPair.privateKey,
         keyId: "test-kid",
-        checkJtiReplay: async () => false,
-        storeJti: async () => {
-          events.push("store");
+        consumeJti: async () => {
+          events.push("consume");
+          return true;
         },
       });
       expect(result.ok).toBe(true);
@@ -278,13 +292,76 @@ describe("handleToken", () => {
       (crypto.subtle as any).sign = origSign;
     }
 
-    // The fix order: replay-check, store, mint. The buggy order was
-    // store after mint. If "mint-sign" appears before "store", the bug
-    // is back.
-    const storeIdx = events.indexOf("store");
+    const consumeIdx = events.indexOf("consume");
     const mintIdx = events.indexOf("mint-sign");
-    expect(storeIdx).toBeGreaterThanOrEqual(0);
-    expect(mintIdx).toBeGreaterThan(storeIdx);
+    expect(consumeIdx).toBeGreaterThanOrEqual(0);
+    expect(mintIdx).toBeGreaterThan(consumeIdx);
+  });
+
+  it("allows exactly one of two concurrent requests with the same proof", async () => {
+    const handleToken = await getHandler();
+    const proof = await buildDpopProof({
+      keyPair: dpopKeyPair,
+      htm: "POST",
+      htu: "https://auth.notme.bot/token",
+    });
+    const seen = new Set<string>();
+    const consumeJti = async (jti: string) => {
+      if (seen.has(jti)) return false;
+      seen.add(jti);
+      return true;
+    };
+    const input = {
+      dpopProof: proof,
+      session: {
+        principalId: "alice",
+        scopes: ["bridgeCert"],
+        authMethod: "passkey",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      tokenEndpointUrl: "https://auth.notme.bot/token",
+      audience: "https://rosary.bot",
+      signingKey: masterKeyPair.privateKey,
+      keyId: "test-kid",
+      consumeJti,
+    };
+
+    const results = await Promise.all([handleToken(input), handleToken(input)]);
+
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(
+      results.filter((result) => !result.ok && result.error === "proof_reused"),
+    ).toHaveLength(1);
+  });
+
+  it("does not consume a JTI when proof validation fails", async () => {
+    const handleToken = await getHandler();
+    let consumeCalls = 0;
+
+    const result = await handleToken({
+      dpopProof: "not-a-jwt",
+      session: {
+        principalId: "alice",
+        scopes: ["bridgeCert"],
+        authMethod: "passkey",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      tokenEndpointUrl: "https://auth.notme.bot/token",
+      audience: "https://rosary.bot",
+      signingKey: masterKeyPair.privateKey,
+      keyId: "test-kid",
+      consumeJti: async () => {
+        consumeCalls += 1;
+        return true;
+      },
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      status: 401,
+      error: "invalid_dpop_proof",
+    });
+    expect(consumeCalls).toBe(0);
   });
 });
 
@@ -294,10 +371,20 @@ describe("buildJwksResponse", () => {
   it("returns a valid JWKS with one key", async () => {
     const { buildJwksResponse } = await import("../auth/dpop-handler");
     const kp = await generateEd25519Keypair();
-    const raw = (await crypto.subtle.exportKey("raw", kp.publicKey)) as ArrayBuffer;
+    const raw = (await crypto.subtle.exportKey(
+      "raw",
+      kp.publicKey,
+    )) as ArrayBuffer;
     const x = b64url(raw);
 
-    const jwks = buildJwksResponse({ kty: "OKP", crv: "Ed25519", x, kid: "k1", use: "sig", alg: "EdDSA" });
+    const jwks = buildJwksResponse({
+      kty: "OKP",
+      crv: "Ed25519",
+      x,
+      kid: "k1",
+      use: "sig",
+      alg: "EdDSA",
+    });
 
     expect(jwks.keys).toHaveLength(1);
     expect(jwks.keys[0].kty).toBe("OKP");

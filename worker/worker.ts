@@ -42,9 +42,9 @@ type HeldCerts = {
 
 // Cloud metadata endpoints — hard-denied, not configurable
 const DENIED_HOSTS = new Set([
-  "169.254.169.254",        // AWS/GCP metadata
+  "169.254.169.254", // AWS/GCP metadata
   "metadata.google.internal", // GCP metadata
-  "100.100.100.200",        // Alibaba metadata
+  "100.100.100.200", // Alibaba metadata
 ]);
 
 // Audience allowlist — every endpoint that mints an access token must check
@@ -87,7 +87,12 @@ export class AuthService extends WorkerEntrypoint<any> {
   }
 
   /** Mint a DPoP-bound access token. */
-  async mintDPoPToken(params: { sub: string; scope: string; audience: string; jkt: string }) {
+  async mintDPoPToken(params: {
+    sub: string;
+    scope: string;
+    audience: string;
+    jkt: string;
+  }) {
     const authority = this.getAuthority();
     return authority.mintDPoPToken(params);
   }
@@ -160,7 +165,9 @@ export class AuthService extends WorkerEntrypoint<any> {
 
     // Destination check
     if (isDeniedDestination(request.url)) {
-      throw new Error("destination denied — cloud metadata endpoints are blocked");
+      throw new Error(
+        "destination denied — cloud metadata endpoints are blocked",
+      );
     }
 
     // Scope check
@@ -177,21 +184,25 @@ export class AuthService extends WorkerEntrypoint<any> {
     });
 
     const responseHeaders: Record<string, string> = {};
-    res.headers.forEach((v, k) => { responseHeaders[k] = v; });
+    res.headers.forEach((v, k) => {
+      responseHeaders[k] = v;
+    });
     const body = await res.text();
 
     // Audit log — structured JSON, feeds into APAS attestations
-    console.log(JSON.stringify({
-      ts: new Date().toISOString(),
-      type: "proxy",
-      identity: this.heldCerts.identity,
-      destination: request.url,
-      method: request.method || "GET",
-      scope_checked: "bridgeCert",
-      allowed: true,
-      response_status: res.status,
-      duration_ms: Date.now() - start,
-    }));
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        type: "proxy",
+        identity: this.heldCerts.identity,
+        destination: request.url,
+        method: request.method || "GET",
+        scope_checked: "bridgeCert",
+        allowed: true,
+        response_status: res.status,
+        duration_ms: Date.now() - start,
+      }),
+    );
 
     return { status: res.status, headers: responseHeaders, body };
   }
@@ -214,11 +225,14 @@ export class AuthService extends WorkerEntrypoint<any> {
 
     // Scope check for signing
     const signingScopes = ["sign:git", "sign:attestation"];
-    const hasSignScope = format === "raw"
-      ? true // raw signing doesn't require a specific scope
-      : this.heldCerts.scopes.some(s => signingScopes.includes(s));
+    const hasSignScope =
+      format === "raw"
+        ? true // raw signing doesn't require a specific scope
+        : this.heldCerts.scopes.some((s) => signingScopes.includes(s));
     if (!hasSignScope) {
-      throw new Error(`scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`);
+      throw new Error(
+        `scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`,
+      );
     }
 
     const signature = await crypto.subtle.sign(
@@ -228,18 +242,25 @@ export class AuthService extends WorkerEntrypoint<any> {
     );
 
     // Audit log
-    const payloadHash = Array.from(new Uint8Array(
-      await crypto.subtle.digest("SHA-256", payload),
-    )).map(b => b.toString(16).padStart(2, "0")).join("");
-    console.log(JSON.stringify({
-      ts: new Date().toISOString(),
-      type: "sign",
-      identity: this.heldCerts.identity,
-      format,
-      payload_hash: `sha256:${payloadHash}`,
-      scope_checked: format === "raw" ? "none" : signingScopes.find(s => this.heldCerts!.scopes.includes(s)),
-      allowed: true,
-    }));
+    const payloadHash = Array.from(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", payload)),
+    )
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        type: "sign",
+        identity: this.heldCerts.identity,
+        format,
+        payload_hash: `sha256:${payloadHash}`,
+        scope_checked:
+          format === "raw"
+            ? "none"
+            : signingScopes.find((s) => this.heldCerts!.scopes.includes(s)),
+        allowed: true,
+      }),
+    );
 
     return {
       signature,
@@ -314,7 +335,11 @@ function jsonErr(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
 }
 
-async function handleCertGHA(request: Request, env: any, platform: Platform): Promise<Response> {
+async function handleCertGHA(
+  request: Request,
+  env: any,
+  platform: Platform,
+): Promise<Response> {
   if (request.method !== "POST") {
     return jsonErr("method not allowed", 405);
   }
@@ -362,7 +387,10 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
     if (seen) {
       return jsonErr("token already used", 401);
     }
-    const ttl = Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000));
+    const ttl = Math.max(
+      cfg.jtiMinTtlSeconds,
+      claims.exp - Math.floor(Date.now() / 1000),
+    );
     await platform.cache.put(jtiKey, "1", { expirationTtl: ttl });
   }
 
@@ -389,10 +417,16 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
   }
 
   if (!body.public_keys?.mtls || !body.public_keys?.signing) {
-    return jsonErr("public_keys.mtls and public_keys.signing required (SPKI PEM)", 400);
+    return jsonErr(
+      "public_keys.mtls and public_keys.signing required (SPKI PEM)",
+      400,
+    );
   }
   if (!body.proofs?.mtls || !body.proofs?.signing) {
-    return jsonErr("proofs.mtls and proofs.signing required (signatures over binding payload)", 400);
+    return jsonErr(
+      "proofs.mtls and proofs.signing required (signatures over binding payload)",
+      400,
+    );
   }
 
   // Import public keys to verify PoP proofs
@@ -407,19 +441,36 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
   }
 
   // Compute binding payload: SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
-  const mtlsSpki = (await crypto.subtle.exportKey("spki", mtlsPubKey)) as ArrayBuffer;
-  const signingSpki = (await crypto.subtle.exportKey("spki", signingPubKey)) as ArrayBuffer;
-  const oidcHash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
-  const bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength + 32);
+  const mtlsSpki = (await crypto.subtle.exportKey(
+    "spki",
+    mtlsPubKey,
+  )) as ArrayBuffer;
+  const signingSpki = (await crypto.subtle.exportKey(
+    "spki",
+    signingPubKey,
+  )) as ArrayBuffer;
+  const oidcHash = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(token),
+  );
+  const bindingInput = new Uint8Array(
+    mtlsSpki.byteLength + signingSpki.byteLength + 32,
+  );
   bindingInput.set(new Uint8Array(mtlsSpki), 0);
   bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
-  bindingInput.set(new Uint8Array(oidcHash), mtlsSpki.byteLength + signingSpki.byteLength);
+  bindingInput.set(
+    new Uint8Array(oidcHash),
+    mtlsSpki.byteLength + signingSpki.byteLength,
+  );
   const bindingPayload = await crypto.subtle.digest("SHA-256", bindingInput);
 
   // Verify PoP: caller must have signed the binding payload with both keys
   // P-256 proof (ES256)
   try {
-    const proofBytes = Uint8Array.from(atob(body.proofs.mtls.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+    const proofBytes = Uint8Array.from(
+      atob(body.proofs.mtls.replace(/-/g, "+").replace(/_/g, "/")),
+      (c) => c.charCodeAt(0),
+    );
     const valid = await crypto.subtle.verify(
       { name: "ECDSA", hash: "SHA-256" },
       mtlsPubKey,
@@ -433,7 +484,10 @@ async function handleCertGHA(request: Request, env: any, platform: Platform): Pr
 
   // Ed25519 proof
   try {
-    const proofBytes = Uint8Array.from(atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+    const proofBytes = Uint8Array.from(
+      atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")),
+      (c) => c.charCodeAt(0),
+    );
     const valid = await crypto.subtle.verify(
       ED25519,
       signingPubKey,
@@ -496,7 +550,9 @@ async function handlePasskey(
 
   if (env.PASSKEY_LIMITER) {
     const ip = request.headers.get("cf-connecting-ip") || "unknown";
-    const { success } = await env.PASSKEY_LIMITER.limit({ key: `passkey:${ip}` });
+    const { success } = await env.PASSKEY_LIMITER.limit({
+      key: `passkey:${ip}`,
+    });
     if (!success) {
       return jsonErr("rate_limited", 429);
     }
@@ -506,7 +562,8 @@ async function handlePasskey(
   const authority = env.SIGNING_AUTHORITY.get(authorityId);
   // Derive origin from SITE_URL (env), not from attacker-controlled Host header.
   // Host header can be spoofed in non-CF environments (local dev, proxies).
-  const siteUrl = env.SIGNET_AUTHORITY_URL || env.SITE_URL || "https://auth.notme.bot";
+  const siteUrl =
+    env.SIGNET_AUTHORITY_URL || env.SITE_URL || "https://auth.notme.bot";
   const host = new URL(siteUrl).hostname;
   const origin = siteUrl;
 
@@ -530,9 +587,7 @@ async function handlePasskey(
         );
       }
       if (result.isFirstUser) {
-        const valid = await authority.consumeBootstrapCode(
-          body.bootstrapCode!,
-        );
+        const valid = await authority.consumeBootstrapCode(body.bootstrapCode!);
         if (!valid) {
           return jsonErr("invalid or already-used bootstrap code", 403);
         }
@@ -580,16 +635,13 @@ async function handlePasskey(
         sessionSecret,
       );
 
-      return new Response(
-        JSON.stringify({ verified: true, scopes }),
-        {
-          status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            "Set-Cookie": cookie,
-          },
+      return new Response(JSON.stringify({ verified: true, scopes }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Set-Cookie": cookie,
         },
-      );
+      });
     }
 
     if (pathname === "/auth/passkey/login/options") {
@@ -665,11 +717,18 @@ function parseCookie(cookieHeader: string, name: string): string | null {
 // All params are injected via data attributes on a hidden div — no inline
 // script variables, no eval. The JS reads them via dataset.
 
-function authorizePageHtml(redirectUri: string, audience: string, state: string): string {
+function authorizePageHtml(
+  redirectUri: string,
+  audience: string,
+  state: string,
+): string {
   // HTML-escape to prevent injection via query params
   const esc = (s: string) =>
-    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;")
-     .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    s
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
 
   return `<!doctype html>
 <html lang="en">
@@ -1112,7 +1171,9 @@ function cacheKey(request: Request, vary?: string): Request {
   if (vary === "Accept") {
     const url = new URL(request.url);
     const accept = request.headers.get("Accept") || "";
-    const suffix = accept.includes("application/json") ? "?_accept=json" : "?_accept=html";
+    const suffix = accept.includes("application/json")
+      ? "?_accept=json"
+      : "?_accept=html";
     return new Request(url.origin + url.pathname + suffix, request);
   }
   return request;
@@ -1121,7 +1182,11 @@ function cacheKey(request: Request, vary?: string): Request {
 // Edge cache disabled when cacheApiOutbound is not configured (local workerd).
 let cacheEnabled = true;
 
-async function cachePut(request: Request, response: Response, vary?: string): Promise<Response> {
+async function cachePut(
+  request: Request,
+  response: Response,
+  vary?: string,
+): Promise<Response> {
   if (!cacheEnabled || request.method !== "GET") return response;
   if (!response.ok && response.status !== 301) return response;
   try {
@@ -1134,7 +1199,10 @@ async function cachePut(request: Request, response: Response, vary?: string): Pr
   return response;
 }
 
-async function cacheMatch(request: Request, vary?: string): Promise<Response | undefined> {
+async function cacheMatch(
+  request: Request,
+  vary?: string,
+): Promise<Response | undefined> {
   if (!cacheEnabled || request.method !== "GET") return undefined;
   try {
     const cache = caches.default;
@@ -1158,7 +1226,8 @@ export default {
       "https://mache.rosary.bot",
     ]);
     // Allow localhost for dev
-    const corsAllowed = CORS_ALLOWED_ORIGINS.has(requestOrigin) ||
+    const corsAllowed =
+      CORS_ALLOWED_ORIGINS.has(requestOrigin) ||
       requestOrigin.startsWith("http://localhost:");
 
     if (request.method === "OPTIONS") {
@@ -1280,10 +1349,16 @@ export default {
         const cached = await cacheMatch(request);
         if (cached) return cached;
         const baseUrl = env.SITE_URL || "https://notme.bot";
-        const resp = await env.ASSETS.fetch(new Request(`${baseUrl}/_api-docs`));
+        const resp = await env.ASSETS.fetch(
+          new Request(`${baseUrl}/_api-docs`),
+        );
         const headers = new Headers(resp.headers);
         headers.set("Cache-Control", "public, max-age=3600");
-        const result = new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+        const result = new Response(resp.body, {
+          status: resp.status,
+          statusText: resp.statusText,
+          headers,
+        });
         return cachePut(request, result);
       }
 
@@ -1321,9 +1396,15 @@ export default {
           | { type: "oidc"; token: string }
           | { type: "x509"; cert: string };
         let typedProof: Proof;
-        if (body.proof.type === "oidc" && typeof body.proof.token === "string") {
+        if (
+          body.proof.type === "oidc" &&
+          typeof body.proof.token === "string"
+        ) {
           typedProof = { type: "oidc", token: body.proof.token };
-        } else if (body.proof.type === "x509" && typeof body.proof.cert === "string") {
+        } else if (
+          body.proof.type === "x509" &&
+          typeof body.proof.cert === "string"
+        ) {
           typedProof = { type: "x509", cert: body.proof.cert };
         } else {
           return jsonErr(`unsupported proof.type: ${body.proof.type}`, 400);
@@ -1384,7 +1465,10 @@ export default {
 
       // POST /invites — create an invite (requires authorityManage scope)
       if (pathname === "/invites" && request.method === "POST") {
-        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
@@ -1396,7 +1480,10 @@ export default {
           return jsonErr("authorityManage scope required", 403);
         }
 
-        const body = (await request.json()) as { scopes?: string[]; ttl?: number };
+        const body = (await request.json()) as {
+          scopes?: string[];
+          ttl?: number;
+        };
         const scopes = body.scopes ?? ["bridgeCert"];
         // Delegated authorization — granter must hold authorityManage AND
         // the specific scope being granted. canGrant() is the single source
@@ -1445,7 +1532,10 @@ export default {
 
         // Create principal
         const principalId = crypto.randomUUID();
-        const result = await authority.redeemInviteToken(body.token, principalId);
+        const result = await authority.redeemInviteToken(
+          body.token,
+          principalId,
+        );
         if (!result) return jsonErr("invalid or expired invite", 403);
 
         // Create principal with the invite's scopes
@@ -1578,11 +1668,20 @@ export default {
         const { verifySessionCookie } = await import("./src/auth/session");
         const authId = env.SIGNING_AUTHORITY.idFromName("default");
         const authDO = env.SIGNING_AUTHORITY.get(authId);
-        const statusCookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        const statusCookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
         if (!statusCookie) return jsonErr("unauthorized", 401);
         const statusSecret = await authDO.getSessionSecret();
-        const statusSession = await verifySessionCookie(statusCookie, statusSecret);
-        if (!statusSession || !statusSession.scopes.includes("authorityManage")) {
+        const statusSession = await verifySessionCookie(
+          statusCookie,
+          statusSecret,
+        );
+        if (
+          !statusSession ||
+          !statusSession.scopes.includes("authorityManage")
+        ) {
           return jsonErr("admin required", 403);
         }
         try {
@@ -1592,7 +1691,11 @@ export default {
           // Count users and credentials via a simple RPC (need to add this)
           const passkey = await authority.passkeyStats();
           return Response.json({
-            authority: { epoch: state.epoch, seqno: state.seqno, keyId: state.keyId },
+            authority: {
+              epoch: state.epoch,
+              seqno: state.seqno,
+              keyId: state.keyId,
+            },
             passkey,
             rpId: request.headers.get("host") || "auth.notme.bot",
           });
@@ -1622,7 +1725,8 @@ export default {
       if (pathname === "/authorize" && request.method === "GET") {
         const url = new URL(request.url);
         const redirectUri = url.searchParams.get("redirect_uri") || "";
-        const audience = url.searchParams.get("audience") || "https://rosary.bot";
+        const audience =
+          url.searchParams.get("audience") || "https://rosary.bot";
         const state = url.searchParams.get("state") || "";
 
         // Validate redirect_uri via the shared helper — keeps the matrix
@@ -1677,17 +1781,25 @@ export default {
             "notme_session",
           );
           if (!cookie) {
-            return Response.json({ error: "session_required" }, { status: 401 });
+            return Response.json(
+              { error: "session_required" },
+              { status: 401 },
+            );
           }
 
           let audience = "";
           try {
-            const body = await request.json() as { audience?: string };
+            const body = (await request.json()) as { audience?: string };
             audience = body.audience || "";
-          } catch { /* empty body */ }
+          } catch {
+            /* empty body */
+          }
 
           if (!audience) {
-            return Response.json({ error: "audience_required" }, { status: 400 });
+            return Response.json(
+              { error: "audience_required" },
+              { status: 400 },
+            );
           }
           const allowedAudiences = getAllowedAudiences(env);
           if (!allowedAudiences.has(audience)) {
@@ -1718,7 +1830,10 @@ export default {
             expires_in: 300,
           });
         } catch (e: any) {
-          return Response.json({ error: "authorize token error: " + e.message }, { status: 500 });
+          return Response.json(
+            { error: "authorize token error: " + e.message },
+            { status: 500 },
+          );
         }
       }
 
@@ -1729,18 +1844,26 @@ export default {
 
           // Fast-fail: no DPoP proof = 400
           if (!dpopProof) {
-            return Response.json({ error: "dpop_proof_required" }, { status: 400 });
+            return Response.json(
+              { error: "dpop_proof_required" },
+              { status: 400 },
+            );
           }
 
           // Parse body for audience — validated against module-scope ALLOWED_AUDIENCES
           let audience = "";
           try {
-            const body = await request.json() as { audience?: string };
+            const body = (await request.json()) as { audience?: string };
             audience = body.audience || "";
-          } catch { /* empty body */ }
+          } catch {
+            /* empty body */
+          }
 
           if (!audience) {
-            return Response.json({ error: "audience_required" }, { status: 400 });
+            return Response.json(
+              { error: "audience_required" },
+              { status: 400 },
+            );
           }
           const allowedAudiences = getAllowedAudiences(env);
           if (!allowedAudiences.has(audience)) {
@@ -1777,12 +1900,17 @@ export default {
           // bindings are active and CF injects the cert (not the client).
 
           if (!principalId) {
-            return Response.json({ error: "session_required" }, { status: 401 });
+            return Response.json(
+              { error: "session_required" },
+              { status: 401 },
+            );
           }
 
           // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
           if (env.TOKEN_LIMITER) {
-            const { success } = await env.TOKEN_LIMITER.limit({ key: `token:${principalId}` });
+            const { success } = await env.TOKEN_LIMITER.limit({
+              key: `token:${principalId}`,
+            });
             if (!success) {
               return Response.json({ error: "rate_limited" }, { status: 429 });
             }
@@ -1797,29 +1925,28 @@ export default {
               htu: `${new URL(request.url).origin}/token`,
             });
           } catch {
-            return Response.json({ error: "invalid_dpop_proof" }, { status: 401 });
+            return Response.json(
+              { error: "invalid_dpop_proof" },
+              { status: 401 },
+            );
           }
 
-          // JTI replay check
-          const jtiKey = `dpop:jti:${proofResult.jti}`;
-          if (await platform.cache.get(jtiKey)) {
-            return Response.json({ error: "proof_reused" }, { status: 401 });
-          }
-
-          // Store JTI BEFORE minting — prevents TOCTOU race across edge nodes.
-          // If mint fails after this, the JTI is burned (acceptable — client retries with new proof).
-          await platform.cache.put(jtiKey, "1", { expirationTtl: 600 });
-
-          // Mint token inside DO — CryptoKey never crosses RPC boundary
-          const accessToken = await authority.mintDPoPToken({
+          // Atomically consume the proof JTI and mint inside the singleton DO.
+          // SQLite uniqueness closes the cross-edge read/write race that an
+          // eventually-consistent KV cache cannot.
+          const mintResult = await authority.mintDPoPTokenOnce({
             sub: principalId,
             scope: scopes.join(" "),
             audience,
             jkt: proofResult.thumbprint,
+            proofJti: proofResult.jti,
           });
+          if (!mintResult.ok) {
+            return Response.json({ error: "proof_reused" }, { status: 401 });
+          }
 
           return Response.json({
-            access_token: accessToken,
+            access_token: mintResult.accessToken,
             token_type: "DPoP",
             expires_in: 300,
           });
@@ -1992,7 +2119,11 @@ export default {
         const headers = new Headers(resp.headers);
         headers.set("Cache-Control", "public, max-age=3600");
         headers.set("Vary", "Accept");
-        const result = new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+        const result = new Response(resp.body, {
+          status: resp.status,
+          statusText: resp.statusText,
+          headers,
+        });
         return cachePut(request, result, "Accept");
       }
 
@@ -2124,7 +2255,11 @@ export default {
       // Add Vary header for content-negotiated responses
       const headers = new Headers(resp.headers);
       headers.set("Vary", "Accept");
-      const result = new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+      const result = new Response(resp.body, {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers,
+      });
       return cachePut(request, result, "Accept");
     }
 
@@ -2136,7 +2271,11 @@ export default {
         : renderPredicateHtml(HANDOFF_SCHEMA);
       const headers = new Headers(resp.headers);
       headers.set("Vary", "Accept");
-      const result = new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+      const result = new Response(resp.body, {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers,
+      });
       return cachePut(request, result, "Accept");
     }
 
@@ -2199,7 +2338,10 @@ export default {
       } else if (contentType.includes("text/html")) {
         // HTML — cache at edge for 60s with stale-while-revalidate for fast hits.
         // Browsers still revalidate on every navigation (s-maxage governs edge only).
-        newHeaders.set("Cache-Control", "public, s-maxage=60, stale-while-revalidate=300");
+        newHeaders.set(
+          "Cache-Control",
+          "public, s-maxage=60, stale-while-revalidate=300",
+        );
       } else if (contentType.includes("image/svg")) {
         // SVG favicon etc — long cache
         newHeaders.set("Cache-Control", "public, max-age=86400");

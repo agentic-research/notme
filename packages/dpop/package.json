@@ -1,6 +1,6 @@
 {
   "name": "@agentic-research/dpop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DPoP (RFC 9449) utilities and resource-server verifier SDK for notme-issued access tokens. Zero dependencies, pure Web Crypto — runs on Cloudflare Workers, Node, Deno, and browsers.",
   "type": "module",
   "license": "Apache-2.0",
@@ -19,6 +19,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test:package": "node ./scripts/check-package.mjs",
     "prepack": "pnpm run build",
     "prepublishOnly": "tsc -p tsconfig.json"
   },
@@ -28,7 +29,8 @@
   "files": [
     "dist",
     "src",
-    "README.md"
+    "README.md",
+    "docs"
   ],
   "keywords": [
     "dpop",
