@@ -1,0 +1,91 @@
+#!/bin/sh
+# Installed by `rsry hooks install`. Edit outside the rsry-managed
+# section below to add your own logic; re-running install will
+# regenerate only the marked block and preserve everything else.
+
+# >>> rsry-managed (do not edit between these markers; `rsry hooks install` regenerates) >>>
+# rsry-hook pre-commit v0.10.0 sha256:f7e7e00651b349885cddeab6376886adfc2506c39170815718fcb6c3678ddecc
+REPO=$(basename "$PWD")
+# Keep the git-tracked bead export current so bead state travels WITH the commit
+# (rosary-4ebf52). SQLite stores have no `dolt push`/`dolt pull` — those blocks in
+# post-push/post-merge are gated on `.beads/dolt/<repo>` and are silent no-ops here
+# — and `.beads/beads.db` is gitignored, so this JSONL export IS the shared record.
+#
+# OPT-IN BY TRACKING: only maintained when `.beads/beads.jsonl` is already tracked
+# by git. Installing hooks must never start committing a brand-new file in a repo
+# that didn't ask for it; `git add`ing the export once turns the sync on.
+#
+# Safe on every commit: the export is id-sorted and convergent, so when no bead
+# changed it is byte-identical and stages nothing — code-only commits see no churn.
+if [ ! -d ".beads/dolt/$REPO" ] && git ls-files --error-unmatch .beads/beads.jsonl >/dev/null 2>&1; then
+
+    # ---- GUARD 1: canonical checkout only (rosary-599778) --------------------
+    # This git hook fires in contexts it was never designed for. rosary's agent
+    # workspaces are LINKED WORKTREES, and in a colocated repo (.jj + .git, which
+    # detect_vcs classifies as Git) it also fires from jj-driven operations. A
+    # worktree never receives `.beads/beads.db` — it is gitignored — but
+    # `SqliteBeadStore::connect` CREATES an empty store on demand, so any rsry
+    # command in a worktree materializes one. The export then legitimately reads
+    # 0 beads and this hook stages a file that deletes every record.
+    #
+    # That already happened: PR #403 landed `.beads/beads.jsonl | 1115 ------`,
+    # wiping the shared export on main. Git's line merge accepted it silently.
+    #
+    # A linked worktree has git-dir != git-common-dir; the canonical checkout has
+    # them equal. Only the canonical checkout may write the shared record.
+    _gd=$(git rev-parse --git-dir 2>/dev/null)
+    _gc=$(git rev-parse --git-common-dir 2>/dev/null)
+    if [ -n "$_gd" ] && [ -n "$_gc" ] && [ "$_gd" != "$_gc" ]; then
+        exit 0
+    fi
+
+    RSRY_HOOK_VERSION="0.10.0"
+    RSRY="${RSRY_BIN:-}"
+    if [ -z "$RSRY" ]; then
+        RSRY=$(command -v rsry 2>/dev/null || true)
+    fi
+    if [ -z "$RSRY" ] && [ -x "$HOME/.local/bin/rsry" ]; then
+        RSRY="$HOME/.local/bin/rsry"
+    fi
+    if [ -n "$RSRY" ]; then
+        _rsry_runtime_version=$("$RSRY" --version 2>/dev/null | awk '{print $2}')
+        if [ -n "$_rsry_runtime_version" ] && [ "$_rsry_runtime_version" != "$RSRY_HOOK_VERSION" ]; then
+            printf '⚠ rsry hook drift: hook v%s, runtime v%s — run `rsry hooks install`.\n' "$RSRY_HOOK_VERSION" "$_rsry_runtime_version" >&2
+        fi
+
+        # Export to a TEMP file first. The old code wrote straight over the
+        # tracked export, so a bad export destroyed the record before anything
+        # could inspect it.
+        _tmp=".beads/.beads.jsonl.tmp$$"
+        if "$RSRY" bead export --jsonl --status all \
+            --published-from .beads/beads.jsonl -o "$_tmp" >/dev/null 2>&1; then
+
+            # ---- GUARD 2: magnitude (rosary-599778) ----------------------------
+            # Backstop for any context guard 1 misses (e.g. a broken store in the
+            # canonical checkout). A legitimate change adds or edits a few lines;
+            # it never removes most of them. Refuse LOUDLY rather than silently
+            # staging a wipe — a missing store and a deleted store look identical
+            # downstream, which is the whole defect.
+            # `wc -l` always exits 0; `grep -c` exits 1 on zero matches, which
+            # made `|| echo 0` emit "0\n0" and break the arithmetic below.
+            _new=$(wc -l < "$_tmp" 2>/dev/null | tr -d ' ')
+            _old=$(git show HEAD:.beads/beads.jsonl 2>/dev/null | wc -l | tr -d ' ')
+            [ -n "$_new" ] || _new=0
+            [ -n "$_old" ] || _old=0
+            if [ "$_old" -gt 10 ] && [ "$((_new * 2))" -lt "$_old" ]; then
+                rm -f "$_tmp"
+                echo "ERROR: bead export would drop most records ($_old -> $_new)." >&2
+                echo "  Refusing to stage it — this is the rosary-599778 wipe." >&2
+                echo "  Likely an empty/auto-created store. Check .beads/beads.db," >&2
+                echo "  or commit with --no-verify if you are certain." >&2
+                exit 1
+            fi
+
+            mv -f "$_tmp" .beads/beads.jsonl
+            git add .beads/beads.jsonl >/dev/null 2>&1 || true
+        else
+            rm -f "$_tmp"
+        fi
+    fi
+fi
+# <<< rsry-managed <<<

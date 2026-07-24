@@ -1,0 +1,13 @@
+#!/bin/sh
+# Installed by `rsry hooks install`. Edit outside the rsry-managed
+# section below to add your own logic; re-running install will
+# regenerate only the marked block and preserve everything else.
+
+# >>> rsry-managed (do not edit between these markers; `rsry hooks install` regenerates) >>>
+# rsry-hook post-push v0.10.0 sha256:6bb3a8fde77d75e9bae5cabad7f33a824da65a6ebdecb742b020dc9df44414ad
+REPO=$(basename "$PWD")
+BEADS_DIR=".beads/dolt/$REPO"
+if [ -d "$BEADS_DIR" ]; then
+    (cd "$BEADS_DIR" && dolt push origin main 2>/dev/null) || true
+fi
+# <<< rsry-managed <<<

@@ -1,0 +1,61 @@
+#!/bin/sh
+# Installed by `rsry hooks install`. Edit outside the rsry-managed
+# section below to add your own logic; re-running install will
+# regenerate only the marked block and preserve everything else.
+
+# >>> rsry-managed (do not edit between these markers; `rsry hooks install` regenerates) >>>
+# rsry-hook post-merge v0.10.0 sha256:33416e9e336a45395b91cb52cac2c86850686b1b763771fe69bf96629019066c
+REPO=$(basename "$PWD")
+BEADS_DIR=".beads/dolt/$REPO"
+if [ -d "$BEADS_DIR" ]; then
+    (cd "$BEADS_DIR" && dolt pull 2>/dev/null) || true
+fi
+
+# Resolve rsry at execution time. Never pin the binary that installed this
+# hook: it may live in an ephemeral build/worktree path. RSRY_BIN is an
+# explicit override; PATH is the portable default; ~/.local/bin covers
+# PATH-restricted Git GUIs and launchd jobs.
+RSRY_HOOK_VERSION="0.10.0"
+RSRY="${RSRY_BIN:-}"
+if [ -z "$RSRY" ]; then
+    RSRY=$(command -v rsry 2>/dev/null || true)
+fi
+if [ -z "$RSRY" ] && [ -x "$HOME/.local/bin/rsry" ]; then
+    RSRY="$HOME/.local/bin/rsry"
+fi
+if [ -z "$RSRY" ]; then
+    echo "[rsry post-merge] rsry not found (RSRY_BIN, PATH, and ~/.local/bin checked); skipping bead auto-close" >&2
+else
+    _rsry_runtime_version=$("$RSRY" --version 2>/dev/null | awk '{print $2}')
+    if [ -n "$_rsry_runtime_version" ] && [ "$_rsry_runtime_version" != "$RSRY_HOOK_VERSION" ]; then
+        printf '⚠ rsry hook drift: hook v%s, runtime v%s — run `rsry hooks install`.\n' "$RSRY_HOOK_VERSION" "$_rsry_runtime_version" >&2
+    fi
+
+    # SQLite stores have no `dolt pull` (the block above is gated on
+    # .beads/dolt/<repo> and no-ops here), so the git-tracked JSONL export is the
+    # sync channel (rosary-4ebf52). Ingest whatever this merge brought:
+    # id-preserving, last-writer-wins on updated_at (a peer's close actually
+    # lands), and idempotent — a merge that changed no beads restores nothing.
+    # Runs BEFORE close-merged so that sweep sees the synced state.
+    if [ ! -d ".beads/dolt/$REPO" ] && [ -f ".beads/beads.jsonl" ]; then
+        "$RSRY" bead import --jsonl .beads/beads.jsonl >/dev/null 2>&1 || true
+    fi
+
+    # Close beads whose PR just merged, rsry-native: read the squash-merge commits
+    # `git pull` landed on the trunk (`[bead-id] … (#N)`) — no gh / webhook / tunnel.
+    # Best-effort: never block or fail the merge.
+    "$RSRY" close-merged --local --repo "$REPO" >/dev/null 2>&1 || true
+
+    # rsry version-drift nudge (rosary-d09889): in the rosary source repo, if this
+    # pull moved the crate version past the installed binary, say so — the release
+    # pull IS the trigger, so nobody has to notice manually. Warn-only: `task
+    # install` codesigns + restarts the MCP service, too heavy to fire silently.
+    if grep -q '^name = "rosary"' Cargo.toml 2>/dev/null; then
+        repo_ver=$(grep -m1 '^version' Cargo.toml 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')
+        inst_ver=$("$RSRY" --version 2>/dev/null | awk '{print $2}')
+        if [ -n "$repo_ver" ] && [ -n "$inst_ver" ] && [ "$repo_ver" != "$inst_ver" ]; then
+            printf '⚠ rsry drift: installed %s, repo is %s — run `task install` to update the binary + MCP service.\n' "$inst_ver" "$repo_ver" >&2
+        fi
+    fi
+fi
+# <<< rsry-managed <<<

@@ -3,6 +3,9 @@
 
 # Keep gitignore itself tracked.
 !.gitignore
+!.gitattributes
+!.githooks/
+!.githooks/**
 
 # Beads: the store binary (beads.db) stays ignored — a committed binary DB has
 # no git 3-way merge (rosary-05fbe0) — but the JSONL export is the tracked,
