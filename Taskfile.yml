@@ -1,5 +1,10 @@
 version: "3"
 
+includes:
+  dpop:
+    taskfile: ./packages/dpop
+    dir: ./packages/dpop
+
 tasks:
   # Root pnpm install — used by any root-scope task that runs `pnpm exec`.
   # --ignore-scripts: never run install hooks (defense-in-depth, matches

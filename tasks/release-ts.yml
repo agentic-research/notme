@@ -1,0 +1,37 @@
+version: "3"
+
+# Reusable TypeScript package release tasks.
+#
+# Package-local Taskfiles bind these variables:
+#   TARGET_PKG: package.json path to bump, relative to the package directory
+#   TAG_TEMPLATE: git tag template accepted by bumpp
+#   PKG_NAME: pnpm workspace package name
+vars:
+  TARGET_PKG: '{{.TARGET_PKG | default "package.json"}}'
+  TAG_TEMPLATE: '{{.TAG_TEMPLATE | default "v%s"}}'
+  PKG_NAME: '{{.PKG_NAME | default ""}}'
+
+tasks:
+  bump:
+    desc: "Interactively bump version, create a release commit, and tag via bumpp"
+    cmds:
+      # bumpp pushes by default. Keep pushing an explicit, separately reviewed
+      # action so an interactive version bump cannot mutate a remote.
+      - pnpm exec bumpp {{.TARGET_PKG}} --tag "{{.TAG_TEMPLATE}}" --no-push
+
+  test:package:
+    desc: "Verify the packed ESM package before publish"
+    cmds:
+      - pnpm --filter {{.PKG_NAME}} run test:package
+
+  publish:
+    desc: "Pack-smoke and publish a package to npm from a local CLI"
+    cmds:
+      - pnpm --filter {{.PKG_NAME}} run test:package
+      - pnpm --filter {{.PKG_NAME}} publish --access public
+
+  ci-publish:
+    desc: "Pack-smoke and publish a package to npm from CI with provenance"
+    cmds:
+      - pnpm --filter {{.PKG_NAME}} run test:package
+      - pnpm --filter {{.PKG_NAME}} publish --no-git-checks --access public --provenance

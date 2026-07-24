@@ -24,6 +24,10 @@
 !Taskfile.yml
 !go.work
 
+# Shared Taskfile modules used by package-local release wrappers.
+!tasks/
+!tasks/**
+
 # Root pnpm workspace (for repo-level scripts: scripts/check-sha-pins.ts,
 # scripts/doc-check.ts, schema/codegen/capnp-to-ts.ts). The workspace also
 # wires action/, worker/, and packages/* together so workspace deps like
