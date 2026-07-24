@@ -7,12 +7,18 @@
 // SQLite schema:
 //   keys  — singleton authority keypair (Ed25519)
 //   state — epoch, seqno, keyId for bundle generation
+//   dpop_jtis — atomically consumed DPoP proof identifiers
 //
 // The DO owns the full lifecycle: key generation, bundle signing, rotation.
 // The Worker writes signed bundles to KV for the revocation verifier.
 
 import { DurableObject } from "cloudflare:workers";
-import { X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
+import {
+  X509CertificateGenerator,
+  BasicConstraintsExtension,
+  KeyUsagesExtension,
+  KeyUsageFlags,
+} from "@peculiar/x509";
 import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 import { bundleCanonical, type CABundle } from "./revocation";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
@@ -86,6 +92,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO state (id, epoch, seqno) VALUES ('authority', 1, 1)",
     );
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS dpop_jtis (
+        jti        TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL
+      )
+    `);
     this.initialized = true;
   }
 
@@ -154,7 +166,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
             keyId,
           );
         }
-        return { signingKey: this.signingKey, verifyKey: this.verifyKey, keyId };
+        return {
+          signingKey: this.signingKey,
+          verifyKey: this.verifyKey,
+          keyId,
+        };
       }
     }
 
@@ -244,7 +260,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       verifyKey,
     )) as ArrayBuffer;
     const x = encodeBase64urlNoPadding(new Uint8Array(raw));
-    return { kty: "OKP", crv: "Ed25519", x, kid: keyId, use: "sig", alg: "EdDSA" };
+    return {
+      kty: "OKP",
+      crv: "Ed25519",
+      x,
+      kid: keyId,
+      use: "sig",
+      alg: "EdDSA",
+    };
   }
 
   // Self-signed X.509 CA certificate for CF mTLS trust store.
@@ -263,7 +286,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .exec("SELECT pem, key_id FROM ca_cert WHERE id = 'cert'")
       .toArray() as Array<{ pem: string; key_id: string }>;
     // v2: require CA:TRUE in cached cert (invalidate v1 certs without BasicConstraints)
-    if (cached.length > 0 && cached[0]!.key_id === currentKeyId && cached[0]!.pem.includes('BEGIN CERTIFICATE')) {
+    if (
+      cached.length > 0 &&
+      cached[0]!.key_id === currentKeyId &&
+      cached[0]!.pem.includes("BEGIN CERTIFICATE")
+    ) {
       // Check if cached cert has BasicConstraints by looking for the extension marker
       // If it was generated without extensions (v1), regenerate
       try {
@@ -271,12 +298,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         const x = new X509Certificate(cached[0]!.pem);
         const bc = x.getExtension("2.5.29.19"); // BasicConstraints OID
         if (bc) return cached[0]!.pem;
-      } catch { /* regenerate */ }
+      } catch {
+        /* regenerate */
+      }
     }
 
     const { signingKey, verifyKey } = await this.getOrCreateSigningKey();
     const now = new Date();
-    const notAfter = new Date(now.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000);
+    const notAfter = new Date(
+      now.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
+    );
     const serial = crypto
       .getRandomValues(new Uint8Array(16))
       .reduce((s, b) => s + b.toString(16).padStart(2, "0"), "");
@@ -290,7 +321,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       serialNumber: serial,
       extensions: [
         new BasicConstraintsExtension(true, 1, true), // pathlen=1: CA → orchestrator → agent
-        new KeyUsagesExtension(KeyUsageFlags.keyCertSign | KeyUsageFlags.cRLSign, true),
+        new KeyUsagesExtension(
+          KeyUsageFlags.keyCertSign | KeyUsageFlags.cRLSign,
+          true,
+        ),
       ],
     });
 
@@ -339,6 +373,50 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     });
   }
 
+  /**
+   * Atomically consume a DPoP proof JTI and mint its bound access token.
+   *
+   * SQLite statements run synchronously before the first await, so concurrent
+   * RPCs against this singleton DO cannot both observe a fresh JTI. If minting
+   * fails after insertion, the proof remains consumed and the client must retry
+   * with a new proof.
+   */
+  async mintDPoPTokenOnce(params: {
+    sub: string;
+    scope: string;
+    audience: string;
+    jkt: string;
+    proofJti: string;
+    replayTtlSeconds?: number;
+  }): Promise<
+    { ok: true; accessToken: string } | { ok: false; reason: "proof_reused" }
+  > {
+    this.ensureSchema();
+    const now = Math.floor(Date.now() / 1000);
+    const replayTtlSeconds = params.replayTtlSeconds ?? 600;
+
+    this.ctx.storage.sql.exec(
+      "DELETE FROM dpop_jtis WHERE expires_at <= ?",
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO dpop_jtis (jti, expires_at) VALUES (?, ?)",
+      params.proofJti,
+      now + replayTtlSeconds,
+    );
+    const [change] = [
+      ...this.ctx.storage.sql.exec<{ inserted: number }>(
+        "SELECT changes() AS inserted",
+      ),
+    ];
+    if (change.inserted !== 1) {
+      return { ok: false, reason: "proof_reused" };
+    }
+
+    const accessToken = await this.mintDPoPToken(params);
+    return { ok: true, accessToken };
+  }
+
   // Mint an unbound redirect token — no cnf.jkt, safe for verifyAccessToken (Bearer path).
   // Used by /authorize redirect flow where the DPoP keypair is ephemeral and lost after navigation.
   async mintRedirectToken(params: {
@@ -372,7 +450,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const { signingKey } = await this.getOrCreateSigningKey();
     const state = await this.getAuthorityState();
     const { mintGHABridgeCert } = await import("./cert-authority");
-    const result = await mintGHABridgeCert(subject, publicKeyPem, signingKey, ttlMs);
+    const result = await mintGHABridgeCert(
+      subject,
+      publicKeyPem,
+      signingKey,
+      ttlMs,
+    );
     return {
       ...result,
       authority: { epoch: state.epoch, key_id: state.keyId },
@@ -389,7 +472,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     scopes: string[];
     authMethod: string;
     ttlMs?: number;
-  }): Promise<import("./cert-authority").BridgeCertPairResult & { authority: { epoch: number; key_id: string } }> {
+  }): Promise<
+    import("./cert-authority").BridgeCertPairResult & {
+      authority: { epoch: number; key_id: string };
+    }
+  > {
     const { signingKey } = await this.getOrCreateSigningKey();
     const state = await this.getAuthorityState();
     const { mintBridgeCertPair } = await import("./cert-authority");
@@ -406,7 +493,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         ttlMs: params.ttlMs,
       },
     );
-    return { ...result, authority: { epoch: state.epoch, key_id: state.keyId } };
+    return {
+      ...result,
+      authority: { epoch: state.epoch, key_id: state.keyId },
+    };
   }
 
   // Current epoch and keyId for embedding in issued certs.
@@ -448,8 +538,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // `keys` and `prevKeyId`, so consumers can resolve the prev key AND the
     // revocation check (token.keyId === bundle.prevKeyId) sees it.
     const keys: Record<string, string> = { [keyId]: pubKeyB64 };
-    const prevKeyId = (await this.ctx.storage.get<string>("prevKeyId")) ?? undefined;
-    const prevPubKey = (await this.ctx.storage.get<string>("prevPubKey")) ?? undefined;
+    const prevKeyId =
+      (await this.ctx.storage.get<string>("prevKeyId")) ?? undefined;
+    const prevPubKey =
+      (await this.ctx.storage.get<string>("prevPubKey")) ?? undefined;
     const hasPrev = !!prevKeyId && prevKeyId !== keyId && !!prevPubKey;
     if (hasPrev) keys[prevKeyId] = prevPubKey;
 
@@ -587,7 +679,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     ttlSeconds = 3600,
   ): Promise<{ token: string; expiresAt: string }> {
     const { createInvite } = await import("./auth/principals");
-    const invite = createInvite(this.ctx.storage.sql, createdBy, scopes, ttlSeconds);
+    const invite = createInvite(
+      this.ctx.storage.sql,
+      createdBy,
+      scopes,
+      ttlSeconds,
+    );
     return { token: invite.token, expiresAt: invite.expiresAt };
   }
 
@@ -606,7 +703,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     scopes: string[],
     createdBy?: string,
   ): Promise<void> {
-    const { createPrincipal, grantCapability } = await import("./auth/principals");
+    const { createPrincipal, grantCapability } =
+      await import("./auth/principals");
     createPrincipal(this.ctx.storage.sql, principalId, undefined, createdBy);
     for (const scope of scopes) {
       grantCapability(this.ctx.storage.sql, principalId, scope, createdBy);
@@ -624,7 +722,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     providerSub: string,
   ): Promise<void> {
     const { linkFederatedIdentity } = await import("./auth/principals");
-    linkFederatedIdentity(this.ctx.storage.sql, principalId, provider, providerSub);
+    linkFederatedIdentity(
+      this.ctx.storage.sql,
+      principalId,
+      provider,
+      providerSub,
+    );
   }
 
   async findPrincipalByOIDC(
@@ -632,7 +735,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     providerSub: string,
   ): Promise<string | null> {
     const { findPrincipalByFederated } = await import("./auth/principals");
-    return findPrincipalByFederated(this.ctx.storage.sql, provider, providerSub);
+    return findPrincipalByFederated(
+      this.ctx.storage.sql,
+      provider,
+      providerSub,
+    );
   }
 
   // ── Connections: OIDC/x509 identity associations ──
@@ -649,7 +756,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   async getConnectionsForUser(
     credentialId: string,
-  ): Promise<Array<{ provider: string; subject: string; connectedAt: string }>> {
+  ): Promise<
+    Array<{ provider: string; subject: string; connectedAt: string }>
+  > {
     const { getConnections } = await import("./auth/connections");
     const conns = await getConnections(this.ctx.storage.sql, credentialId);
     return conns.map((c) => ({
@@ -673,7 +782,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Mark bootstrap as used — do NOT delete it.
     // A new code only appears on fresh DO instantiation, not after reset.
     // This prevents: know code → reset → new code → reset → infinite wipe loop.
-    this.ctx.storage.sql.exec("UPDATE bootstrap SET used = 1 WHERE id = 'code'");
+    this.ctx.storage.sql.exec(
+      "UPDATE bootstrap SET used = 1 WHERE id = 'code'",
+    );
     return { deleted: count };
   }
 
@@ -711,15 +822,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       "INSERT INTO bootstrap (id, code) VALUES ('code', ?)",
       code,
     );
-    console.log([
-      "",
-      "=".repeat(50),
-      "BOOTSTRAP CODE: " + code,
-      "Enter this at auth.notme.bot/login to register the admin passkey.",
-      "Single-use. Expires in 15 minutes.",
-      "=".repeat(50),
-      "",
-    ].join("\n"));
+    console.log(
+      [
+        "",
+        "=".repeat(50),
+        "BOOTSTRAP CODE: " + code,
+        "Enter this at auth.notme.bot/login to register the admin passkey.",
+        "Single-use. Expires in 15 minutes.",
+        "=".repeat(50),
+        "",
+      ].join("\n"),
+    );
     return code;
   }
 
@@ -733,11 +846,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       )
     `);
     const rows = this.ctx.storage.sql
-      .exec("SELECT code, created_at FROM bootstrap WHERE id = 'code' AND used = 0")
+      .exec(
+        "SELECT code, created_at FROM bootstrap WHERE id = 'code' AND used = 0",
+      )
       .toArray() as Array<{ code: string; created_at: string }>;
 
     const { timingSafeEqual } = await import("./auth/timing-safe");
-    if (rows.length === 0 || !(await timingSafeEqual(rows[0]!.code, code))) return false;
+    if (rows.length === 0 || !(await timingSafeEqual(rows[0]!.code, code)))
+      return false;
 
     // Enforce 15-minute TTL here too (not just in getOrCreateBootstrapCode)
     const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
@@ -829,13 +945,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       last_outcome: string;
       first_fire_at: number;
     }>;
-    return rows[0] ?? {
-      failure_count: 0,
-      total_fires: 0,
-      last_fire_at: 0,
-      last_outcome: "",
-      first_fire_at: 0,
-    };
+    return (
+      rows[0] ?? {
+        failure_count: 0,
+        total_fires: 0,
+        last_fire_at: 0,
+        last_outcome: "",
+        first_fire_at: 0,
+      }
+    );
   }
 
   async scheduleNextRefresh(): Promise<void> {
@@ -939,9 +1057,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Without this re-check, the breaker would only trip on the NEXT fire,
     // leaking one extra alarm cycle past the policy threshold.
     const postRows = this.ctx.storage.sql
-      .exec(
-        "SELECT failure_count FROM alarm_health WHERE id = 'authority'",
-      )
+      .exec("SELECT failure_count FROM alarm_health WHERE id = 'authority'")
       .toArray() as Array<{ failure_count: number }>;
     const postFailureCount = postRows[0]?.failure_count ?? 0;
     if (postFailureCount >= MAX_CONSECUTIVE_ALARM_FAILURES) {

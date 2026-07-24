@@ -33,7 +33,10 @@ async function generateP256(): Promise<{
     true,
     ["sign", "verify"],
   )) as CryptoKeyPair;
-  const jwk = (await crypto.subtle.exportKey("jwk", keyPair.publicKey)) as JsonWebKey;
+  const jwk = (await crypto.subtle.exportKey(
+    "jwk",
+    keyPair.publicKey,
+  )) as JsonWebKey;
   return { keyPair, jwk };
 }
 
@@ -210,6 +213,23 @@ describe("validateDpopProof", () => {
     ).rejects.toThrow(/alg/i);
   });
 
+  it("rejects private key material in the proof JWK", async () => {
+    const { validateDpopProof } = await import("../auth/dpop");
+    const { keyPair, jwk } = await generateP256();
+    const proof = await buildDpopProof({
+      keyPair,
+      jwk,
+      headerOverrides: { jwk: { ...jwk, d: "private-material" } },
+    });
+
+    await expect(
+      validateDpopProof(proof, {
+        htm: "POST",
+        htu: "https://auth.notme.bot/token",
+      }),
+    ).rejects.toThrow(/private/i);
+  });
+
   it("rejects invalid signature (tampered payload)", async () => {
     const { validateDpopProof } = await import("../auth/dpop");
     const { keyPair, jwk } = await generateP256();
@@ -280,6 +300,56 @@ describe("validateDpopProof", () => {
         htu: "https://auth.notme.bot/token",
       }),
     ).rejects.toThrow(/htu/i);
+  });
+
+  it("matches htu after removing query and fragment", async () => {
+    const { validateDpopProof } = await import("../auth/dpop");
+    const { keyPair, jwk } = await generateP256();
+    const proof = await buildDpopProof({
+      keyPair,
+      jwk,
+    });
+
+    await expect(
+      validateDpopProof(proof, {
+        htm: "POST",
+        htu: "https://auth.notme.bot/token?flow=cli#ignored",
+      }),
+    ).resolves.toMatchObject({ jwk });
+  });
+
+  it("normalizes percent-encoded unreserved characters in htu", async () => {
+    const { validateDpopProof } = await import("../auth/dpop");
+    const { keyPair, jwk } = await generateP256();
+    const proof = await buildDpopProof({
+      keyPair,
+      jwk,
+      payloadOverrides: { htu: "https://auth.notme.bot/%7etoken" },
+    });
+
+    await expect(
+      validateDpopProof(proof, {
+        htm: "POST",
+        htu: "https://auth.notme.bot/~token",
+      }),
+    ).resolves.toMatchObject({ jwk });
+  });
+
+  it("treats HTTP method tokens as case-sensitive", async () => {
+    const { validateDpopProof } = await import("../auth/dpop");
+    const { keyPair, jwk } = await generateP256();
+    const proof = await buildDpopProof({
+      keyPair,
+      jwk,
+      payloadOverrides: { htm: "post" },
+    });
+
+    await expect(
+      validateDpopProof(proof, {
+        htm: "POST",
+        htu: "https://auth.notme.bot/token",
+      }),
+    ).rejects.toThrow(/htm/i);
   });
 
   it("rejects missing jti", async () => {

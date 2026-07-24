@@ -2,7 +2,7 @@
 //
 // Separated from worker.ts routes so it can be tested without DO bindings.
 // The Worker route extracts session/proof/audience from the request and
-// delegates here. JTI replay is injected as callbacks (KV in prod, in-memory in tests).
+// delegates here. Atomic JTI consumption is injected for testability.
 
 import { validateDpopProof } from "./dpop";
 import { mintAccessToken } from "./token";
@@ -22,17 +22,17 @@ export interface HandleTokenInput {
   tokenEndpointUrl: string;
   signingKey: CryptoKey;
   keyId: string;
-  /** Returns true if this JTI has been seen before. */
-  checkJtiReplay: (jti: string) => Promise<boolean>;
-  /** Store a JTI to prevent replay. */
-  storeJti: (jti: string) => Promise<void>;
+  /** Atomically consume a JTI. Returns true only for its first consumer. */
+  consumeJti: (jti: string) => Promise<boolean>;
 }
 
 export type HandleTokenResult =
   | { ok: true; accessToken: string; tokenType: "DPoP"; expiresIn: number }
   | { ok: false; status: number; error: string };
 
-export async function handleToken(input: HandleTokenInput): Promise<HandleTokenResult> {
+export async function handleToken(
+  input: HandleTokenInput,
+): Promise<HandleTokenResult> {
   // 1. Session required
   if (!input.session) {
     return { ok: false, status: 401, error: "session_required" };
@@ -59,21 +59,14 @@ export async function handleToken(input: HandleTokenInput): Promise<HandleTokenR
     return { ok: false, status: 401, error: "invalid_dpop_proof" };
   }
 
-  // 5. JTI replay check
-  const replayed = await input.checkJtiReplay(proofResult.jti);
-  if (replayed) {
+  // 5. Atomically consume the JTI before minting. If minting fails, the proof
+  // remains consumed and the client retries with a new proof.
+  const consumed = await input.consumeJti(proofResult.jti);
+  if (!consumed) {
     return { ok: false, status: 401, error: "proof_reused" };
   }
 
-  // 6. Store JTI BEFORE minting — prevents TOCTOU race across concurrent
-  // requests (KV is eventually consistent, so two edge nodes can both
-  // pass the replay check at step 5 before either's store lands).
-  // Matches worker.ts /token order. If mint fails after this, the JTI
-  // is burned — acceptable, client retries with a new proof.
-  // (rosary-9b969c)
-  await input.storeJti(proofResult.jti);
-
-  // 7. Mint access token bound to DPoP key
+  // 6. Mint access token bound to DPoP key
   const scope = input.session.scopes.join(" ");
   const accessToken = await mintAccessToken({
     sub: input.session.principalId,
@@ -103,6 +96,8 @@ export interface JwkPublicKey {
   alg: string;
 }
 
-export function buildJwksResponse(publicKey: JwkPublicKey): { keys: JwkPublicKey[] } {
+export function buildJwksResponse(publicKey: JwkPublicKey): {
+  keys: JwkPublicKey[];
+} {
   return { keys: [publicKey] };
 }
