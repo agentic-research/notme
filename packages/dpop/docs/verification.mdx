@@ -7,6 +7,12 @@ description: Verify notme access tokens and DPoP proofs safely.
 one operation. Provide the exact compact `token` and `proof`, the request's
 `method` and full `url`, a JWKS URL (or `publicKey`), and a non-empty `audience`.
 `issuer` is optional for self-hosted deployments, and `kv` may cache JWKS data.
+`checkAndRecordJti` is optional at the type boundary, but production resource
+servers need it for single-use proofs. The callback must atomically return
+`true` for an already-recorded JTI, or record a new JTI and return `false`.
+It runs only after every stateless token, proof, `ath`, and key-binding check
+has succeeded. See [Replay protection](replay-protection.mdx) for storage
+requirements.
 
 The verifier checks the access-token signature, `typ`, required `exp`, and
 `exp`/`nbf`/`iat`/`iss`/`aud`/`sub` claims. Its token clock tolerance defaults
