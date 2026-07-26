@@ -27,7 +27,11 @@ describe("APAS public summary", () => {
   });
 
   it("keeps the homepage status in sync", () => {
-    expect(home).toContain("APAS 0.2.1-draft");
-    expect(home).not.toContain("DSSE signing coming");
+    const summary = home.replace(/\s+/g, " ");
+    expect(summary).toContain("APAS 0.2.1-draft");
+    expect(summary).toContain(
+      "identity, inputs, declared boundaries, actions, and outputs",
+    );
+    expect(summary).not.toContain("DSSE signing coming");
   });
 });
