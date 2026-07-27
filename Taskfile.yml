@@ -103,28 +103,71 @@ tasks:
       - pnpm exec wrangler rollback
 
   worker:verify:
-    desc: Smoke test live endpoints
+    desc: Smoke test live endpoints with bounded deployment-convergence retries
     cmds:
       - |
         FAIL=0
-        check() { curl -sf "$1" | grep -q "$2" && echo "✓ $3" || { echo "✗ $3"; FAIL=1; }; }
+        VERIFY_NONCE="$(date +%s)"
+        MAX_ATTEMPTS=5
+        RETRY_DELAY_SECONDS=2
+        BODY_FILE="$(mktemp)"
+        trap 'rm -f "$BODY_FILE"' EXIT
+
+        check_request() {
+          label="$1"
+          method="$2"
+          url="$3"
+          expected_status="$4"
+          expected_pattern="$5"
+          data="${6:-}"
+          accept="${7:-}"
+          attempt=1
+
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            if [ "$method" = "POST" ]; then
+              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
+                -X POST "$url" -H "Content-Type: application/json" -d "$data")
+            elif [ -n "$accept" ]; then
+              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
+                -H "Accept: $accept" "$url")
+            else
+              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" "$url")
+            fi
+
+            if [ "$status" = "$expected_status" ] && grep -Fq "$expected_pattern" "$BODY_FILE"; then
+              echo "✓ $label"
+              return 0
+            fi
+
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              sleep "$RETRY_DELAY_SECONDS"
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          detail=$(head -c 160 "$BODY_FILE" | tr '\n' ' ')
+          echo "✗ $label (got $status; body: $detail)"
+          FAIL=1
+        }
+
         echo "=== auth.notme.bot ==="
-        check "https://auth.notme.bot/" "identity authority" "landing"
-        check "https://auth.notme.bot/login" "passkey" "login"
-        check "https://auth.notme.bot/.well-known/signet-authority.json" "issuer" "discovery"
-        check "https://auth.notme.bot/.well-known/ca-bundle.pem" "CERTIFICATE" "ca-bundle"
-        check "https://auth.notme.bot/.well-known/jwks.json" "Ed25519" "jwks"
-        check "https://auth.notme.bot/api/docs" "auth.notme.bot" "api-docs"
-        check "https://auth.notme.bot/auth/passkey/status" "rpId" "passkey-status"
-        # /authorize without params should 400 (missing redirect_uri), not 404
-        STATUS=$(curl -so /dev/null -w "%{http_code}" "https://auth.notme.bot/authorize")
-        [ "$STATUS" = "400" ] && echo "✓ authorize (400 without params)" || { echo "✗ authorize (got $STATUS)"; FAIL=1; }
-        # /token without DPoP should 400, not 500
-        STATUS=$(curl -so /dev/null -w "%{http_code}" -X POST "https://auth.notme.bot/token" -H "Content-Type: application/json" -d '{"audience":"https://test"}')
-        [ "$STATUS" = "400" ] && echo "✓ token (400 without DPoP)" || { echo "✗ token (got $STATUS)"; FAIL=1; }
+        check_request "landing" "GET" "https://auth.notme.bot/" "200" "identity authority"
+        check_request "login" "GET" "https://auth.notme.bot/login" "200" "passkey"
+        check_request "discovery" "GET" "https://auth.notme.bot/.well-known/signet-authority.json" "200" '"issuer"'
+        # Cache API entries survive Worker deployments. A unique query checks
+        # the newly deployed handler instead of the previous version's cache.
+        check_request "ca-bundle" "GET" "https://auth.notme.bot/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE" "200" "BEGIN CERTIFICATE"
+        check_request "jwks" "GET" "https://auth.notme.bot/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
+        check_request "api-docs" "GET" "https://auth.notme.bot/api/docs" "200" "auth.notme.bot"
+        check_request "passkey-status" "GET" "https://auth.notme.bot/auth/passkey/status" "401" '"error":"unauthorized"'
+        check_request "authorize" "GET" "https://auth.notme.bot/authorize" "400" '"error":"redirect_uri required"'
+        check_request "token" "POST" "https://auth.notme.bot/token" "400" '"error":"dpop_proof_required"' '{"audience":"https://test"}'
+
         echo "=== notme.bot ==="
-        check "https://notme.bot/" "notme" "homepage"
-        check "https://notme.bot/apas" "APAS" "apas"
+        check_request "homepage" "GET" "https://notme.bot/" "200" "notme"
+        check_request "apas" "GET" "https://notme.bot/apas?verify=$VERIFY_NONCE" "200" "0.2.1-draft"
+        check_request "apas-schema" "GET" "https://notme.bot/provenance/dispatch/v1?verify=$VERIFY_NONCE" "200" '"workItemRef"' "" "application/schema+json"
+
         echo "---"
         [ $FAIL -eq 0 ] && echo "All checks passed." || { echo "SOME CHECKS FAILED"; exit 1; }
 
