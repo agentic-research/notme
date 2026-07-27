@@ -1167,14 +1167,15 @@ function getSubdomain(host: string): string | null {
 
 function cacheKey(request: Request, vary?: string): Request {
   // For content-negotiated routes, include Accept in the cache key so
-  // JSON and HTML responses are cached separately.
+  // JSON and HTML responses are cached separately. Preserve caller query
+  // parameters so deployment verification can bypass entries created by an
+  // older Worker version. `_cache=v2` invalidates the v1 keys, which dropped
+  // the query string and classified application/schema+json as HTML.
   if (vary === "Accept") {
     const url = new URL(request.url);
-    const accept = request.headers.get("Accept") || "";
-    const suffix = accept.includes("application/json")
-      ? "?_accept=json"
-      : "?_accept=html";
-    return new Request(url.origin + url.pathname + suffix, request);
+    url.searchParams.set("_accept", wantsJson(request) ? "json" : "html");
+    url.searchParams.set("_cache", "v2");
+    return new Request(url.toString(), request);
   }
   return request;
 }
