@@ -798,8 +798,11 @@
             <h2>notme + apas</h2>
             <div class="card-role">ai agent layer + attestation standard</div>
             <p>
-              notme.bot applies self-sovereign identity to AI agents. APAS is
-              the spec for representing what the agent did.
+              notme.bot applies self-sovereign identity to AI agents. APAS binds
+              a dispatch's identity, inputs, declared boundaries, actions, and
+              outputs into a verifiable provenance chain.
+              <strong>APAS 0.2.1-draft</strong> reflects the implementation
+              status of the reference stack.
             </p>
             <a href="https://notme.bot/apas" class="card-link"
               >summary &rarr;</a
@@ -851,7 +854,7 @@
             <tr>
               <td>audit trail</td>
               <td>nothing</td>
-              <td>signed commits + chain hash (DSSE signing coming)</td>
+              <td>content-linked chain + in-toto/DSSE handoff envelopes</td>
             </tr>
             <tr>
               <td>on compromise</td>

@@ -931,15 +931,15 @@ const DISPATCH_SCHEMA = {
       type: "object",
       description: "What was dispatched and to whom",
       properties: {
-        beadRef: {
+        workItemRef: {
           type: "object",
           description: "Work item reference",
           properties: {
             repo: { type: "string" },
-            beadId: { type: "string" },
+            workItemId: { type: "string" },
             contentHash: { type: "string", pattern: "^sha256:[a-f0-9]+$" },
           },
-          required: ["repo", "beadId", "contentHash"],
+          required: ["repo", "workItemId", "contentHash"],
         },
         pipeline: {
           type: "object",
