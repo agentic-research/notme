@@ -102,6 +102,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
         if: matrix.image == 'notme-proxy'
         with:
+          # `toolchain` is REQUIRED when this action is pinned by SHA. It
+          # normally infers the toolchain from the ref it was called by
+          # (@stable), and a SHA carries no such name — so the input defaults
+          # to empty and the action runs `rustup default ''`, failing with
+          # "invalid toolchain name ''". ci.yml passes it for the same reason.
+          toolchain: stable
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       - name: Install zig + cargo-zigbuild

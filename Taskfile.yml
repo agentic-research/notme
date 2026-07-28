@@ -207,6 +207,14 @@ tasks:
 
   worker:build-local:
     desc: Bundle worker for local workerd
+    # worker.ts imports @agentic-research/dpop, a pnpm workspace sibling whose
+    # entry point is ./dist/index.js — produced by tsc, and gitignored. On a
+    # clean checkout that dist/ does not exist and esbuild fails with
+    # "Could not resolve @agentic-research/dpop". Locally it always happened to
+    # be there from an earlier build, which is why this only surfaced on the
+    # first real release run (v0.1.0-rc1). `pnpm install --ignore-scripts`
+    # cannot cover it either — that is exactly what skips the prepack build.
+    deps: [dpop:build]
     dir: worker
     cmds:
       - pnpm exec esbuild worker.ts --bundle --format=esm --outfile=dist/worker.js --conditions=workerd --external:cloudflare:workers --external:@cloudflare/vitest-pool-workers
