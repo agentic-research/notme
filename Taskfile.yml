@@ -253,17 +253,26 @@ tasks:
       NATIVE_ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
       ARCHS: "{{.ARCHS | default .NATIVE_ARCH}}"
+      # Explicit runner so local and CI agree. melange defaults to bubblewrap
+      # on Linux, and GitHub's ubuntu runners have no `bwrap` on PATH — the
+      # v0.1.0-rc2 release died on exactly that. docker is already a hard
+      # requirement for this pipeline (apko, `docker load`) and is the runner
+      # every local build here was validated against, so it is the honest
+      # common denominator rather than a second, untested path.
+      RUNNER: '{{.RUNNER | default "docker"}}'
     cmds:
       - mkdir -p packages/out
       - |
         melange build packages/melange-notme-app.yaml \
           --arch {{.ARCHS}} \
+          --runner {{.RUNNER}} \
           --signing-key packages/melange.rsa \
           --out-dir packages/out \
           --source-dir worker/
       - |
         melange build packages/melange-workerd.yaml \
           --arch {{.ARCHS}} \
+          --runner {{.RUNNER}} \
           --signing-key packages/melange.rsa \
           --out-dir packages/out
 
@@ -309,6 +318,8 @@ tasks:
       NATIVE_ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
       ARCHS: "{{.ARCHS | default .NATIVE_ARCH}}"
+      # See image:apk — bubblewrap is absent on GitHub's ubuntu runners.
+      RUNNER: '{{.RUNNER | default "docker"}}'
     cmds:
       - mkdir -p packages/out
       # --source-dir is proxy/target so the recipe's install paths are
@@ -317,6 +328,7 @@ tasks:
       - |
         melange build packages/melange-notme-proxy.yaml \
           --arch {{.ARCHS}} \
+          --runner {{.RUNNER}} \
           --signing-key packages/melange.rsa \
           --out-dir packages/out \
           --source-dir proxy/target
