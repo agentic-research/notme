@@ -178,6 +178,15 @@ it checks each `packages[]` entry independently — a correct `notme` alongside 
 
 `scripts/check-image-versions.ts` also asserts the two notme melange recipes track the release tag. `melange-workerd.yaml` is deliberately exempt — its version is workerd's, not ours.
 
+**prereleases use two spellings, on purpose.** apk reserves `-r<N>` for the package release suffix, so `0.1.0-rc1` is not a legal apk version — melange rejects it outright (`invalid version 0.1.0-rc1, could not parse`). The same version is spelled `0.1.0_rc1` in apk. So for a `v0.1.0-rc1` tag:
+
+| file | value |
+|---|---|
+| `server.json` `packages[].version` | `0.1.0-rc1` — must equal the pushed OCI tag exactly |
+| `melange-notme-app.yaml`, `melange-notme-proxy.yaml` | `0.1.0_rc1` — apk spelling |
+
+`version:check` knows the mapping (`-` → `_`) and checks each against the right form. apk's suffix grammar is narrower than semver's, so an exotic tag like `0.1.0-beta.2` maps to `0.1.0_beta.2` and melange will reject it at build time — the check doesn't reimplement apk's grammar.
+
 ### signing
 
 each image is signed by digest, not by tag — a tag is mutable and a re-push would strand the signature:

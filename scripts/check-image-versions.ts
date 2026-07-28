@@ -68,6 +68,29 @@ const VERSIONED_RECIPES = [
   "packages/melange-notme-proxy.yaml",
 ];
 
+/**
+ * Render a pushed OCI tag as the apk version a melange recipe must declare.
+ *
+ * These are NOT the same string for prereleases. apk reserves `-r<N>` for the
+ * package release suffix, so `0.1.0-rc1` is not a legal apk version — melange
+ * rejects it outright ("invalid version 0.1.0-rc1, could not parse"), while
+ * `0.1.0_rc1` builds fine and yields `notme-app-0.1.0_rc1-r0.apk`. Both
+ * verified against melange 0.48.2.
+ *
+ * So ADR-0041's producer-contract item 2 is that the recipe version TRACKS the
+ * tag, not that it is byte-identical to it. `packages[].version` still has to
+ * equal the pushed tag exactly — that one is a registry lookup and is checked
+ * without normalisation.
+ *
+ * apk's suffix grammar (`_alpha`/`_beta`/`_pre`/`_rc`/`_p`, optional digits)
+ * is narrower than semver's. A tag like `0.1.0-beta.2` maps to `0.1.0_beta.2`,
+ * which melange rejects at build time with a clear parse error. That is the
+ * right place for it to fail; this check does not reimplement apk's grammar.
+ */
+function toApkVersion(tag: string): string {
+  return tag.replace(/-/g, "_");
+}
+
 interface Violation {
   file: string;
   detail: string;
@@ -231,12 +254,18 @@ function checkRecipes(version: string): void {
     // YAML parses an unquoted 0.1.0 as a string, but 0.1 would become a
     // number — compare on the rendered form so a recipe that dropped a
     // patch segment fails loudly instead of throwing a type error.
-    if (String(recipeVersion) !== version) {
+    const expected = toApkVersion(version);
+    if (String(recipeVersion) !== expected) {
+      const note =
+        expected === version
+          ? ""
+          : ` (apk spelling of the tag ${JSON.stringify(version)} — apk reserves \`-r\` for the ` +
+            `package release, so a \`-\` prerelease must be written \`_\`)`;
       fail(
         relPath,
-        `package.version is ${JSON.stringify(String(recipeVersion))} but the release is ` +
-          `${JSON.stringify(version)}. ADR-0041 producer contract item 2 — the recipe version ` +
-          `tracks the tag.`,
+        `package.version is ${JSON.stringify(String(recipeVersion))} but the release expects ` +
+          `${JSON.stringify(expected)}${note}. ADR-0041 producer contract item 2 — the recipe ` +
+          `version tracks the tag.`,
       );
     }
   }
