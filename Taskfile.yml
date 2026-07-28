@@ -235,8 +235,16 @@ tasks:
       # it can run. `image:publish` overrides with both, because apko-notme.yaml
       # declares an x86_64 + aarch64 index and apko needs an apk for each arch
       # it is asked to assemble.
-      ARCHS:
+      #
+      # The `| default` template form is REQUIRED here. A task-level var
+      # defined as `ARCHS: {sh: ...}` silently wins over a value passed from a
+      # caller's `deps`/`cmds` vars, so the override was ignored and only the
+      # native arch got built — apko then failed with "nothing provides
+      # notme-app" for the other arch. Computing the native value into a
+      # separate var and defaulting to it keeps the caller authoritative.
+      NATIVE_ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
+      ARCHS: "{{.ARCHS | default .NATIVE_ARCH}}"
     cmds:
       - mkdir -p packages/out
       - |
@@ -288,8 +296,11 @@ tasks:
     desc: Build the notme-proxy apk via melange (signed)
     deps: [proxy:build:cross, image:keygen]
     vars:
-      ARCHS:
+      # See image:apk — `| default` is required so a caller-passed ARCHS wins
+      # over the native fallback.
+      NATIVE_ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
+      ARCHS: "{{.ARCHS | default .NATIVE_ARCH}}"
     cmds:
       - mkdir -p packages/out
       # --source-dir is proxy/target so the recipe's install paths are
@@ -418,7 +429,16 @@ tasks:
           --sbom-path . \
           --image-refs "${REFS}"
 
-        DIGEST=$(grep -m1 '@sha256:' "${REFS}" || true)
+        # LAST line, not first. apko writes one ref per per-arch image
+        # manifest and then the multi-arch INDEX last, and the index is what
+        # the tag resolves to. Signing the first line signs a child manifest,
+        # so `cosign verify <image>:<version>` — which resolves the tag to the
+        # index — finds no signature and the signing is silently useless.
+        # Verified against a local registry: line 1 was
+        # application/vnd.oci.image.manifest.v1+json, the last line was
+        # application/vnd.oci.image.index.v1+json, and the tag's
+        # Docker-Content-Digest matched the last line.
+        DIGEST=$(grep '@sha256:' "${REFS}" | tail -1)
         if [ -z "${DIGEST}" ]; then
           echo "apko wrote no digest reference to --image-refs; got:" >&2
           cat "${REFS}" >&2

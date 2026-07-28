@@ -83,9 +83,18 @@ jobs:
       # third-party setup action to a supply chain we're deliberately keeping
       # narrow (same reasoning as ci.yml's hand-rolled sha-pin check).
       - name: Install melange + apko
+        # Pinned to the exact versions the recipes in packages/ were validated
+        # against locally — apko 1.2.2 / melange 0.48.2. These are not
+        # arbitrary "recent" picks: `image:publish:one` depends on
+        # `apko publish --image-refs`, and running CI on a different major
+        # series than the one the recipes were exercised on is how you get a
+        # release that fails on tooling nobody tested.
+        #
+        # Bump deliberately, and re-run `task image` + `task image:proxy`
+        # locally against the new version before changing these.
         run: |
-          go install chainguard.dev/melange@v0.23.0
-          go install chainguard.dev/apko@v0.29.6
+          go install chainguard.dev/melange@v0.48.2
+          go install chainguard.dev/apko@v1.2.2
 
       # Rust + zig only for the proxy leg. The notme image is workerd plus a
       # JS bundle and needs no Rust at all — `image:publish:notme` depends
@@ -97,8 +106,13 @@ jobs:
 
       - name: Install zig + cargo-zigbuild
         if: matrix.image == 'notme-proxy'
+        # zig pinned to 0.15.2 — the version that actually produced the static
+        # musl binaries verified to run in the container. rosary's release.yml
+        # pins 0.13.0; that is correct for rosary and was NOT adopted here,
+        # because zig's build interfaces moved between those and the only
+        # evidence this crate cross-compiles cleanly is against 0.15.2.
         run: |
-          pip3 install ziglang==0.13.0
+          pip3 install ziglang==0.15.2
           cargo install --locked cargo-zigbuild
 
       - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
@@ -123,6 +137,15 @@ jobs:
       # intra-job integrity check with no external consumer. A persistent key
       # would be a secret to guard and rotate for no gain — the real
       # supply-chain property is the cosign signature on the image digest.
+
+      # worker/ deps, for the notme leg only. `image:apk` depends on
+      # `worker:build-local`, which runs `pnpm exec esbuild` in worker/ — and
+      # Task runs deps before cmds, so it executes BEFORE `version:check`
+      # pulls in `deps:install`. On a clean checkout there is no node_modules
+      # yet and esbuild is unresolvable. ci.yml bootstraps the same way.
+      - name: Install worker deps
+        if: matrix.image == 'notme'
+        run: task worker:install
 
       - name: Log in to ghcr
         # `docker login` rather than docker/login-action: apko reads the
