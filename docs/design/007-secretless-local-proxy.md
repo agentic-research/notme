@@ -318,7 +318,7 @@ Every endpoint gets a "try to hack it" test alongside the happy path. Tests are 
 5. Build script for workerd (`esbuild` + Taskfile)
 6. Fix `config.capnp` (enableSql, storage path, DO bindings)
 7. Adversarial tests for key extraction, replay, scope escalation
-8. Container image builds and pushes to ghcr.io
+8. ~~Container image builds and pushes to ghcr.io~~ → **done** (notme-83706a). `.github/workflows/release.yml` publishes `ghcr.io/agentic-research/notme` and `ghcr.io/agentic-research/notme-proxy` on a `v*` tag, multi-arch and cosign-signed by digest. See [`packages/README.md`](../../packages/README.md#distribution).
 
 ### Phase C — partial: notme-proxy crate landed
 
@@ -366,5 +366,5 @@ Every endpoint gets a "try to hack it" test alongside the happy path. Tests are 
 3. `crypto.subtle.exportKey("jwk", signingKey)` throws in all modes after key setup completes
 4. `NOTME_KEY_STORAGE=encrypted` without `NOTME_KEK_SECRET` is a hard startup error (not silent degradation)
 5. All existing 78 tests pass + new adversarial tests pass
-6. `docker run -p 8788:8788 ghcr.io/agentic-research/notme:latest` works
+6. `docker run -p 8788:8788 ghcr.io/agentic-research/notme:0.1.0` works — met by notme-83706a. note the versioned tag: no `:latest` is published, deliberately. a floating tag is mutable, and cloister pins by digest (ADR-0041)
 7. Same curl commands work against localhost:8788 and auth.notme.bot

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.agentic-research/notme",
+  "title": "notme",
+  "description": "Self-hostable identity authority — passkeys, bridge certs, DPoP-bound tokens, and APAS. Run your own, or use the hosted auth.notme.bot.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/agentic-research/notme",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/agentic-research/notme/blob/main/README.md",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/agentic-research/notme",
+      "version": "0.1.0"
+    },
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/agentic-research/notme-proxy",
+      "version": "0.1.0"
+    }
+  ],
+  "_meta": {
+    "io.github.agentic-research.notme/surface": {
+      "note": "This file has no `remotes` and no `packages[].transport`, deliberately. notme is an identity authority (OAuth/OIDC endpoints, cert mint), not an MCP server — there are no MCP tools in worker/. Cloister derives MCP session behaviour from `remotes[].type` or `packages[].transport.type`; with neither present it falls through cleanly, which is the correct outcome for a non-MCP package. Declaring an MCP surface here would be worse than omitting it: cloister would generate backends for tools that do not exist.",
+      "purpose": "This file exists for the ADR-0041 image-publish contract — it is the package-identity manifest consumers read to derive `<identifier>:<version>`, not an MCP registry entry."
+    },
+    "io.github.agentic-research.notme/packages": {
+      "note": "Two OCI packages, versioned and published together from a single `v*` tag. `version` is the tag the publish job actually pushes (ADR-0041 §2), asserted per-entry by `task version:check` before anything is pushed. notme strips the `v` — a `v0.1.0` tag publishes `:0.1.0` — because cloister's cluster.toml already names `notme:0.1.0`, so registry-qualifying it is a pure prefix addition with no version rewrite.",
+      "ghcr.io/agentic-research/notme": "workerd + the worker bundle. The identity authority itself: mints lease certs against the master CA, serves the OAuth/OIDC endpoints. Listens on 8788.",
+      "ghcr.io/agentic-research/notme-proxy": "The mTLS forward proxy / cloister-companion. Holds the bridge cert + private key in process memory and presents them on outbound TLS, so no Worker ever holds a credential."
+    },
+    "art.cloister/v1": {
+      "note": "Both images are hypervisor-tier bundles in a cloister cluster, declared separately (`notme-identity` and `notme-proxy`) and derived separately per ADR-0038. They are not interchangeable and do not share a lifecycle beyond the release tag.",
+      "bundles": [
+        {
+          "name": "notme-identity",
+          "tier": "hypervisor",
+          "kind": "external",
+          "package": "ghcr.io/agentic-research/notme",
+          "httpPort": 8788,
+          "rationale": "Identity authority: mints lease certs against the master CA. Mediates trust — every authenticated request transits a lease this bundle minted. Compromise blast radius is cluster-wide (forge any peer's identity). Singleton per cluster: one master CA. Three-criterion test per ADR-0011, expanded in ADR-0018."
+        },
+        {
+          "name": "notme-proxy",
+          "tier": "hypervisor",
+          "kind": "external",
+          "package": "ghcr.io/agentic-research/notme-proxy",
+          "ipcSocket": "/run/cloister-uds/companion.sock",
+          "rationale": "Holds the bridge cert + private key in process memory and presents them on outbound TLS, so no Worker ever holds a credential (two-plane model). Every attested egress and every UDS dial from workerd transits this bundle, so it mediates trust and its compromise blast radius is every upstream the cluster reaches. Singleton per host: one socket, one cert. Companion role per ADR-0005."
+        }
+      ]
+    }
+  }
+}

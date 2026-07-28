@@ -12,7 +12,30 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-lega
 http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
-tokio-rustls = "0.26"
-hyper-rustls = { version = "0.27", features = ["http1", "ring", "native-tokio"] }
+# Same defaulting trap as hyper-rustls below: tokio-rustls's default set also
+# includes `aws_lc_rs`. Both had to be pinned to `ring` — fixing only one left
+# the other still enabling the second provider, and the panic unchanged.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "ring",
+  "tls12",
+  "logging",
+] }
+# default-features = false is load-bearing, not tidiness. hyper-rustls's
+# default set includes `aws-lc-rs`, which enables `rustls/aws_lc_rs`. Combined
+# with the `ring` provider requested here and on `rustls` above, that left BOTH
+# providers enabled, and rustls refuses to guess between them — every startup
+# panicked in ClientConfig::builder() before the proxy ever bound a listener.
+#
+# The features below are hyper-rustls's defaults minus `aws-lc-rs`. `tls12` and
+# `logging` are restated deliberately: dropping the default set would otherwise
+# silently turn off TLS 1.2 and rustls logging, which is a behaviour change
+# this fix has no business making.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1",
+  "ring",
+  "native-tokio",
+  "tls12",
+  "logging",
+] }
 webpki-roots = "0.26"
 bytes = "1"

@@ -509,6 +509,33 @@ mod tests {
         ))
     }
 
+    /// Regression: the proxy panicked on EVERY startup, on every target,
+    /// before it ever bound a listener.
+    ///
+    /// `rustls` was declared with `default-features = false, features =
+    /// ["ring"]`, but `hyper-rustls` and `tokio-rustls` were NOT — and BOTH
+    /// of their default sets pull `aws_lc_rs`, which enables
+    /// `rustls/aws_lc_rs`. With two providers enabled, rustls refuses to
+    /// guess which to use and panics inside `ClientConfig::builder()`.
+    /// Pinning only one of the two left the other still enabling it, so the
+    /// panic was unchanged — both had to be given `default-features = false`.
+    ///
+    /// Nothing caught it: `cargo build`, `cargo test` and `clippy` all pass
+    /// because the failure is at runtime in main(), and every existing test
+    /// covers arg parsing or UDS bind — none of them constructs a TLS config.
+    /// This test is the one that would have.
+    #[test]
+    fn rustls_can_determine_a_crypto_provider() {
+        // This is the exact call inside build_mtls_config that panicked with
+        // "Could not automatically determine the process-level
+        // CryptoProvider". Driving the builder directly reproduces the defect
+        // without needing cert/key material — the failure is in provider
+        // selection, which happens before any cert is looked at, so no
+        // test-only cert-generation dependency is warranted to pin it.
+        let _ = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty());
+    }
+
     #[test]
     fn parses_tcp_listen_addr() {
         let addr = parse_listen_addr("127.0.0.1:1080").expect("parses");

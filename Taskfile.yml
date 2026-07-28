@@ -231,19 +231,31 @@ tasks:
     desc: Build the notme-app + workerd apks via melange (release-style, signed)
     deps: [worker:build-local, image:keygen]
     vars:
-      ARCH:
+      # Defaults to the host arch — the local dev loop only ever wants the one
+      # it can run. `image:publish` overrides with both, because apko-notme.yaml
+      # declares an x86_64 + aarch64 index and apko needs an apk for each arch
+      # it is asked to assemble.
+      #
+      # The `| default` template form is REQUIRED here. A task-level var
+      # defined as `ARCHS: {sh: ...}` silently wins over a value passed from a
+      # caller's `deps`/`cmds` vars, so the override was ignored and only the
+      # native arch got built — apko then failed with "nothing provides
+      # notme-app" for the other arch. Computing the native value into a
+      # separate var and defaulting to it keeps the caller authoritative.
+      NATIVE_ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
+      ARCHS: "{{.ARCHS | default .NATIVE_ARCH}}"
     cmds:
       - mkdir -p packages/out
       - |
         melange build packages/melange-notme-app.yaml \
-          --arch {{.ARCH}} \
+          --arch {{.ARCHS}} \
           --signing-key packages/melange.rsa \
           --out-dir packages/out \
           --source-dir worker/
       - |
         melange build packages/melange-workerd.yaml \
-          --arch {{.ARCH}} \
+          --arch {{.ARCHS}} \
           --signing-key packages/melange.rsa \
           --out-dir packages/out
 
@@ -260,6 +272,189 @@ tasks:
           --keyring-append melange.rsa.pub \
           --arch {{.ARCH}}
       - 'echo "Built packages/notme.tar — load with: docker load < packages/notme.tar"'
+
+  # --- notme-proxy image (notme-83706a, cloister ADR-0041) ------------------
+  #
+  # The proxy ships as its own image because cloister declares it as a
+  # separate hypervisor-tier bundle alongside notme-identity.
+  #
+  # Cross-compile happens HERE, natively, not inside melange. Neither existing
+  # melange recipe compiles anything (workerd fetches a prebuilt binary,
+  # notme-app installs a prebuilt worker.js) and this one doesn't either —
+  # melange only ever runs `install`, so the aarch64 leg needs qemu for a file
+  # copy rather than for a full cargo build.
+  proxy:build:cross:
+    desc: Cross-compile notme-proxy for x86_64 + aarch64 musl via cargo-zigbuild
+    dir: proxy
+    cmds:
+      # musl: the proxy uses rustls with `ring`, never OpenSSL, so a static
+      # binary drops the libc dependency from the image entirely.
+      - cargo zigbuild --release --locked --target x86_64-unknown-linux-musl
+      - cargo zigbuild --release --locked --target aarch64-unknown-linux-musl
+
+  image:proxy:apk:
+    desc: Build the notme-proxy apk via melange (signed)
+    deps: [proxy:build:cross, image:keygen]
+    vars:
+      # See image:apk — `| default` is required so a caller-passed ARCHS wins
+      # over the native fallback.
+      NATIVE_ARCH:
+        sh: uname -m | sed 's/arm64/aarch64/'
+      ARCHS: "{{.ARCHS | default .NATIVE_ARCH}}"
+    cmds:
+      - mkdir -p packages/out
+      # --source-dir is proxy/target so the recipe's install paths are
+      # <triple>/release/notme-proxy, mirroring how melange-notme-app.yaml
+      # reads worker/'s prebuilt dist/.
+      - |
+        melange build packages/melange-notme-proxy.yaml \
+          --arch {{.ARCHS}} \
+          --signing-key packages/melange.rsa \
+          --out-dir packages/out \
+          --source-dir proxy/target
+
+  image:proxy:
+    desc: Build the notme-proxy OCI image via apko (local tarball, dev loop)
+    deps: [image:proxy:apk]
+    vars:
+      TAG: '{{.TAG | default "0.1.0"}}'
+      ARCH:
+        sh: uname -m | sed 's/arm64/aarch64/'
+    cmds:
+      - |
+        cd packages && apko build apko-notme-proxy.yaml notme-proxy:{{.TAG}} notme-proxy.tar \
+          --keyring-append melange.rsa.pub \
+          --arch {{.ARCH}}
+      - 'echo "Built packages/notme-proxy.tar — load with: docker load < packages/notme-proxy.tar"'
+
+  # --- release ---------------------------------------------------------------
+
+  version:check:
+    desc: "Assert server.json + melange recipes match the tag being pushed (VERSION=x.y.z)"
+    deps: [deps:install]
+    cmds:
+      # VERSION is the tag apko will actually push, NOT the git tag. notme
+      # strips the `v`, so those differ — see the script header and cloister
+      # ADR-0041 §2 (corrected 2026-07-28).
+      - pnpm exec tsx scripts/check-image-versions.ts {{.VERSION}}
+
+  # Each image has its own publish task so CI can run them as INDEPENDENT
+  # jobs. Cloister declares notme-identity and notme-proxy as two separate
+  # hypervisor-tier bundles derived separately (ADR-0038), so coupling them
+  # into one job would let a notme-proxy failure cancel a healthy notme
+  # publish — the failure mode that cost rosary an image in v0.5.0.
+  #
+  # Both apk sets build for BOTH arches here: the apko configs declare an
+  # x86_64 + aarch64 index and apko fails if an arch it was asked to assemble
+  # has no apk. The local dev tasks keep their native-only default.
+
+  image:publish:notme:
+    desc: "Publish the notme image to ghcr (VERSION=x.y.z [REGISTRY=…] [SIGN=true])"
+    deps:
+      - task: image:apk
+        vars: { ARCHS: "x86_64,aarch64" }
+    vars:
+      REGISTRY: '{{.REGISTRY | default "ghcr.io/agentic-research"}}'
+    cmds:
+      # The guard runs FIRST, against the same VERSION used to tag below.
+      # Sharing the variable is what makes "publish a version server.json
+      # doesn't declare" structurally impossible rather than merely
+      # discouraged — a check against the git tag would pass while the
+      # registry 404s.
+      #
+      # It validates the WHOLE manifest, not just this image's entry. The
+      # manifest is repo-wide state and the check is free; a job that pushed
+      # a correct notme while server.json misdeclared notme-proxy would be
+      # publishing into a manifest it knows is broken.
+      - task: version:check
+        vars: { VERSION: "{{.VERSION}}" }
+      - task: image:publish:one
+        vars:
+          CONFIG: apko-notme.yaml
+          IMAGE: "{{.REGISTRY}}/notme"
+          VERSION: "{{.VERSION}}"
+          SIGN: "{{.SIGN}}"
+
+  image:publish:proxy:
+    desc: "Publish the notme-proxy image to ghcr (VERSION=x.y.z [REGISTRY=…] [SIGN=true])"
+    deps:
+      - task: image:proxy:apk
+        vars: { ARCHS: "x86_64,aarch64" }
+    vars:
+      REGISTRY: '{{.REGISTRY | default "ghcr.io/agentic-research"}}'
+    cmds:
+      - task: version:check
+        vars: { VERSION: "{{.VERSION}}" }
+      - task: image:publish:one
+        vars:
+          CONFIG: apko-notme-proxy.yaml
+          IMAGE: "{{.REGISTRY}}/notme-proxy"
+          VERSION: "{{.VERSION}}"
+          SIGN: "{{.SIGN}}"
+
+  image:publish:
+    desc: "Publish BOTH images (local convenience — CI publishes each independently)"
+    cmds:
+      - task: image:publish:notme
+        vars:
+          VERSION: "{{.VERSION}}"
+          REGISTRY: "{{.REGISTRY}}"
+          SIGN: "{{.SIGN}}"
+      - task: image:publish:proxy
+        vars:
+          VERSION: "{{.VERSION}}"
+          REGISTRY: "{{.REGISTRY}}"
+          SIGN: "{{.SIGN}}"
+
+  # Internal: publish one apko config. Not called directly — `image:publish`
+  # drives it once per image so both share a single definition of "publish".
+  image:publish:one:
+    internal: true
+    dir: packages
+    cmds:
+      # apko publish pushes a multi-arch index (archs come from the config).
+      # cosign must sign the DIGEST, not the tag — a tag is mutable and a
+      # re-push moves it, which would strand the signature on something else.
+      #
+      # The digest comes from `--image-refs`, apko's documented flag for
+      # exactly this, rather than from scraping stdout. Scraping would couple
+      # the release to apko's log formatting.
+      - |
+        set -euo pipefail
+        REFS=$(mktemp)
+        trap 'rm -f "${REFS}"' EXIT
+
+        apko publish {{.CONFIG}} "{{.IMAGE}}:{{.VERSION}}" \
+          --keyring-append melange.rsa.pub \
+          --sbom-path . \
+          --image-refs "${REFS}"
+
+        # LAST line, not first. apko writes one ref per per-arch image
+        # manifest and then the multi-arch INDEX last, and the index is what
+        # the tag resolves to. Signing the first line signs a child manifest,
+        # so `cosign verify <image>:<version>` — which resolves the tag to the
+        # index — finds no signature and the signing is silently useless.
+        # Verified against a local registry: line 1 was
+        # application/vnd.oci.image.manifest.v1+json, the last line was
+        # application/vnd.oci.image.index.v1+json, and the tag's
+        # Docker-Content-Digest matched the last line.
+        DIGEST=$(grep '@sha256:' "${REFS}" | tail -1)
+        if [ -z "${DIGEST}" ]; then
+          echo "apko wrote no digest reference to --image-refs; got:" >&2
+          cat "${REFS}" >&2
+          exit 1
+        fi
+        echo "published ${DIGEST}"
+
+        if [ "{{.SIGN}}" = "true" ]; then
+          cosign sign --yes "${DIGEST}"
+          # The SBOM apko emitted for the multi-arch index, attached as an
+          # in-toto attestation against the same digest.
+          cosign attest --yes --type spdxjson \
+            --predicate sbom-index.spdx.json "${DIGEST}"
+        else
+          echo "SIGN != true — skipping cosign (set SIGN=true to sign + attest)"
+        fi
 
   # schema-bridge tasks
   #

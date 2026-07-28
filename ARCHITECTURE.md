@@ -7,9 +7,9 @@ notme is an identity authority that gives AI agents their own cryptographic iden
 Same code runs in three environments:
 
 ```
-Local dev    →  workerd serve config.capnp    →  localhost:8788
-Container    →  docker run notme:latest       →  localhost:8788
-CF Workers   →  wrangler deploy               →  auth.notme.bot
+Local dev    →  workerd serve config.capnp                      →  localhost:8788
+Container    →  docker run ghcr.io/agentic-research/notme:0.1.0  →  localhost:8788
+CF Workers   →  wrangler deploy                                  →  auth.notme.bot
 ```
 
 Key storage differs by environment: ephemeral (in-memory only, local/CI), cf-managed (CF handles encryption, production). See `NOTME_KEY_STORAGE` in `docs/design/007-secretless-local-proxy.md`.
