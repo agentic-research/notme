@@ -1,0 +1,83 @@
+# apko-notme-proxy.yaml — mTLS forward proxy / cloister-companion
+#
+# The credential-holding half of the two-plane model: this process holds the
+# bridge cert + private key in memory and presents them on outbound TLS, so no
+# Worker ever holds a credential. Ships as its own image because cloister
+# declares it as a separate hypervisor-tier bundle (`notme-proxy`) alongside
+# `notme-identity` — see cloister cluster.toml and ADR-0011.
+#
+#   docker run ghcr.io/agentic-research/notme-proxy:0.1.0 \
+#     --cert /run/notme/bridge-cert.pem \
+#     --key  /run/notme/bridge-key.pem \
+#     --listen 127.0.0.1:1080
+#
+# Usage:
+#   melange build melange-notme-proxy.yaml --arch x86_64,aarch64 \
+#     --signing-key melange.rsa --out-dir ./out --source-dir ../proxy/target
+#   apko build apko-notme-proxy.yaml notme-proxy:0.1.0 notme-proxy.tar \
+#     --keyring-append melange.rsa.pub
+
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+    - ./out # local melange output
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - ca-certificates-bundle
+    - wolfi-baselayout
+    - notme-proxy
+
+accounts:
+  groups:
+    - groupname: notme
+      gid: 1000
+  users:
+    - username: notme
+      uid: 1000
+      gid: 1000
+  run-as: 1000
+
+environment:
+  HOME: /app
+
+paths:
+  - path: /app
+    type: directory
+    uid: 1000
+    gid: 1000
+    permissions: 0o755
+  # Where the deploy-time bridge cert + key are mounted. The image ships
+  # neither — the private key never exists in a layer, only in this process's
+  # memory once mounted at runtime. 0o700: the key is readable by uid 1000
+  # and nobody else.
+  - path: /run/notme
+    type: directory
+    uid: 1000
+    gid: 1000
+    permissions: 0o700
+  # Mount point for cluster-internal UDS sockets, matching apko-notme.yaml.
+  # In companion role (`X-Cloister-Transport: uds`) the proxy both binds its
+  # own `companion.sock` here and dials sibling bundles' sockets in the same
+  # dir.
+  - path: /run/cloister-uds
+    type: directory
+    uid: 1000
+    gid: 1000
+    permissions: 0o755
+
+# No args: cert/key paths and listen address are deploy-time concerns.
+# cloister's cluster.toml supplies them (ipcSocket = /run/cloister-uds/
+# companion.sock); a bare `docker run` passes them on the command line.
+entrypoint:
+  command: /usr/bin/notme-proxy
+
+archs:
+  - x86_64
+  - aarch64
+
+annotations:
+  org.opencontainers.image.title: notme-proxy
+  org.opencontainers.image.description: "mTLS forward proxy — presents the notme bridge cert on outbound TLS"
+  org.opencontainers.image.source: https://github.com/agentic-research/notme
+  org.opencontainers.image.licenses: Apache-2.0

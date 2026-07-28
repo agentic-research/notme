@@ -7,6 +7,19 @@ standalone tooling — small utilities run via `npx tsx` or by Taskfile targets,
 | file | purpose | invoke | exit |
 |---|---|---|---|
 | `doc-check.ts` | verify `@doc-check` claims in markdown/html match the codebase | `task docs:check` (or `npx tsx scripts/doc-check.ts [--skip-external] [--format json]`) | `0` all pass · `1` any claim fails or no `@doc-check` blocks found |
+| `check-sha-pins.ts` | verify every external `uses:` in `.github/workflows` is pinned to a 40-char commit SHA | `task pin:check` | `0` all pinned · `1` any violation · `2` malformed workflow |
+| `check-image-versions.ts` | verify `server.json` `packages[].oci` and the notme melange recipes agree with the tag the publish job will push | `task version:check VERSION=0.1.0` | `0` agree · `1` any mismatch · `2` missing/invalid VERSION or unreadable file |
+
+## how check-image-versions works
+
+it enforces cloister ADR-0041 §2: `packages[].version` must equal **the tag the publish job actually pushes**, because `<identifier>:<version>` has to resolve at the registry.
+
+that is deliberately *not* "matches the git tag". notme strips the `v`, so a `v0.1.0` tag publishes `:0.1.0` — checking against the git tag would pass while the registry 404s. the script therefore takes `VERSION`, the same variable `task image:publish` tags with, and `image:publish` invokes it before pushing anything. publishing a version `server.json` doesn't declare is structurally impossible rather than merely discouraged.
+
+two properties worth keeping when editing it:
+
+- **both halves, every time.** presence *and* correctness are asserted separately for each field. ley-line-open v0.11.2 shipped through a guard that rejected a tagged identifier but permitted an absent version — half a rule enforced is a guard that reports success on the failure it exists to catch.
+- **per entry, independently.** cloister declares `notme-identity` and `notme-proxy` as separate bundles derived separately, so "correct notme, stale notme-proxy" is reachable. every violation is collected and reported; the script does not stop at the first.
 
 ## how doc-check works
 

@@ -3,7 +3,11 @@
 # Run your own identity authority. Same code as auth.notme.bot.
 # No Cloudflare account needed. No wrangler. No cloud.
 #
-#   docker run -p 8788:8788 ghcr.io/agentic-research/notme:latest
+#   docker run -p 8788:8788 ghcr.io/agentic-research/notme:0.1.0
+#
+# Versioned tags only — no `:latest` is published. A floating tag is mutable
+# and cloister pins by digest (ADR-0041). `release.yml` publishes on a `v*`
+# tag, stripping the `v`.
 #
 # Usage:
 #   melange build melange-workerd.yaml --arch x86_64 --signing-key melange.rsa --out-dir ./out

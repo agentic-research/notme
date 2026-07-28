@@ -153,19 +153,46 @@ npx workerd serve config.capnp --experimental
 # → http://localhost:8788
 ```
 
-**container (melange + apko)**
+**container (published image)**
+```bash
+docker run -p 8788:8788 ghcr.io/agentic-research/notme:0.1.0
+curl localhost:8788/health    # → 200 ok
+```
+
+Multi-arch (x86_64 + aarch64), distroless, and cosign-signed. Verify the
+signature before running it:
+
+```bash
+cosign verify ghcr.io/agentic-research/notme:0.1.0 \
+  --certificate-identity-regexp '^https://github.com/agentic-research/notme/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The mTLS forward proxy ships as its own image, since a cloister cluster runs
+it as a separate bundle:
+
+```bash
+docker run ghcr.io/agentic-research/notme-proxy:0.1.0 \
+  --cert /run/notme/bridge-cert.pem \
+  --key  /run/notme/bridge-key.pem \
+  --listen 127.0.0.1:1080
+```
+
+**container (build it yourself)**
 ```bash
 task image              # bundles worker, signs apks, builds notme:0.1.0 OCI tar
 docker load < packages/notme.tar
 docker run -p 8788:8788 notme:0.1.0
-curl localhost:8788/health    # → 200 ok
+
+task image:proxy        # same, for notme-proxy
+docker load < packages/notme-proxy.tar
 ```
 
-The `task image` target wraps the full pipeline (`worker:build-local`
-→ melange apks → apko OCI tarball). Override the tag with
-`task image TAG=mytag`. Cloister's `cluster.capnp` consumes
-`notme:0.1.0`, so leave the default for cluster deployment. Requires
-`apko`, `melange`, and a running Docker daemon.
+`task image` wraps the full pipeline (`worker:build-local` → melange apks →
+apko OCI tarball) and builds for the host arch only. Override the tag with
+`task image TAG=mytag`. Requires `apko`, `melange`, and a running Docker
+daemon. See [`packages/README.md`](packages/README.md) for the recipes and the
+publish path.
 
 **cloudflare workers**
 ```bash

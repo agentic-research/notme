@@ -8,8 +8,8 @@
 #   npx workerd serve config.capnp --experimental
 #   # → http://localhost:8788
 #
-# Or via Docker:
-#   docker run -p 8788:8788 ghcr.io/agentic-research/notme:latest
+# Or via Docker (versioned tags only — no `:latest` is published):
+#   docker run -p 8788:8788 ghcr.io/agentic-research/notme:0.1.0
 
 using Workerd = import "/workerd/workerd.capnp";
 

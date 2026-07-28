@@ -1,0 +1,142 @@
+# Publish the notme + notme-proxy OCI images to ghcr.
+#
+# Why this exists: the build machinery already existed and nothing pushed it.
+# `task image` produced a LOCAL tarball, so cloister's cluster.toml could name
+# `notme:0.1.0` accurately and still not fetch it. With cloister's fail-closed
+# pinning (#214), an unresolvable digest is a refusal rather than a warning —
+# so the bare name was a hard blocker, not just imprecision (notme-83706a,
+# cloister ADR-0041).
+#
+# VERSION vs TAG. A `v0.1.0` git tag publishes `:0.1.0` — the `v` is stripped.
+# The `v` prefix is a per-repo convention, not a mandate (rosary strips, mache
+# and ley-line-open keep), and notme strips it so cloister's existing
+# `notme:0.1.0` reference registry-qualifies by adding a prefix rather than
+# rewriting a version. ADR-0041 §2 requires `packages[].version` to equal the
+# tag the publish job ACTUALLY PUSHES, which is why `task image:publish` runs
+# `version:check` against this same VERSION before pushing anything. Checking
+# against the git tag would pass while the registry 404s.
+#
+# Trigger: push a tag `v<version>`. The two jobs are deliberately INDEPENDENT
+# rather than chained — rosary v0.5.0 lost an image publish because an
+# unrelated flaky build it was chained to failed first.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  image:
+    name: Publish ${{ matrix.image }} → ghcr
+    runs-on: ubuntu-latest
+    strategy:
+      # Isolate leg failures: a notme-proxy problem must not cancel a healthy
+      # notme publish, and vice versa. Cloister declares them as two separate
+      # hypervisor-tier bundles derived separately (ADR-0038), so a partial
+      # release is a real, recoverable state — but only if the good half
+      # actually completes and reports.
+      fail-fast: false
+      matrix:
+        include:
+          - image: notme
+            publish_task: image:publish:notme
+          - image: notme-proxy
+            publish_task: image:publish:proxy
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # --- toolchain bootstrap ------------------------------------------------
+      # These install the runtimes themselves, so they must live in CI.
+      # Everything past this point is `task <thing>` — the Taskfile stays the
+      # single source of truth for what a release actually does.
+
+      # Registers binfmt handlers so melange can run its aarch64 build sandbox
+      # on an amd64 runner. Only `install` executes under emulation — the Rust
+      # cross-compile below is native via zig, and workerd is a prebuilt
+      # download — so this stays cheap.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      # melange + apko via `go install`: the module proxy's checksum database
+      # verifies these, which is a stronger provenance story than adding a
+      # third-party setup action to a supply chain we're deliberately keeping
+      # narrow (same reasoning as ci.yml's hand-rolled sha-pin check).
+      - name: Install melange + apko
+        run: |
+          go install chainguard.dev/melange@v0.23.0
+          go install chainguard.dev/apko@v0.29.6
+
+      # Rust + zig only for the proxy leg. The notme image is workerd plus a
+      # JS bundle and needs no Rust at all — `image:publish:notme` depends
+      # only on `image:apk`.
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        if: matrix.image == 'notme-proxy'
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - name: Install zig + cargo-zigbuild
+        if: matrix.image == 'notme-proxy'
+        run: |
+          pip3 install ziglang==0.13.0
+          cargo install --locked cargo-zigbuild
+
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2.0.0
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # --- publish ------------------------------------------------------------
+
+      # The melange signing key is EPHEMERAL, generated per run by
+      # `task image:keygen`. The apks it signs are consumed by apko within this
+      # same job and never published as an apk repo, so the signature is an
+      # intra-job integrity check with no external consumer. A persistent key
+      # would be a secret to guard and rotate for no gain — the real
+      # supply-chain property is the cosign signature on the image digest.
+
+      - name: Log in to ghcr
+        # `docker login` rather than docker/login-action: apko reads the
+        # docker keychain, and this avoids one more third-party action in the
+        # release path for a single credential write.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish + sign ${{ matrix.image }}
+        # VERSION strips the leading `v`. The publish task runs version:check
+        # against this exact value before it pushes anything.
+        run: |
+          task ${{ matrix.publish_task }} \
+            VERSION="${TAG#v}" \
+            REGISTRY="ghcr.io/${{ github.repository_owner }}" \
+            SIGN=true

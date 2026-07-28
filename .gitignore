@@ -24,6 +24,13 @@
 !Taskfile.yml
 !go.work
 
+# Package-identity manifest — declares the published OCI images as
+# packages[].oci so consumers derive `<identifier>:<version>` rather than being
+# told it (cloister ADR-0038/0041). `task version:check` asserts it against the
+# tag the publish job pushes. Must be tracked: it is the contract, and this
+# .gitignore is default-deny, so a new root file is invisible without this line.
+!server.json
+
 # Shared Taskfile modules used by package-local release wrappers.
 !tasks/
 !tasks/**

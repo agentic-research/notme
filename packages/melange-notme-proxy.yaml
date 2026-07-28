@@ -1,0 +1,69 @@
+# melange-notme-proxy.yaml — mTLS forward proxy + companion UDS bridge
+#
+# Packages a PREBUILT binary. It does not compile Rust.
+#
+# This mirrors melange-workerd.yaml (fetches a prebuilt workerd, installs it)
+# and melange-notme-app.yaml (installs a prebuilt dist/worker.js) — neither
+# existing recipe compiles anything, and this one doesn't either. Compiling
+# Rust inside melange would drag qemu into the aarch64 leg for the whole
+# cargo build; here emulation only ever runs `install`.
+#
+# The cross-compile happens ahead of this, natively, via cargo-zigbuild:
+#
+#   task proxy:build:cross     # -> proxy/target/<triple>/release/notme-proxy
+#   task image:proxy:apk       # this recipe, --source-dir proxy/target
+#
+# musl targets: the proxy uses rustls with `ring`, never OpenSSL, so a static
+# musl binary drops the libc dependency from the image entirely.
+#
+# Usage:
+#   melange build packages/melange-notme-proxy.yaml \
+#     --arch x86_64,aarch64 --signing-key packages/melange.rsa \
+#     --out-dir packages/out --source-dir proxy/target
+
+package:
+  name: notme-proxy
+  version: 0.1.0
+  epoch: 0
+  description: "notme mTLS forward proxy — presents the bridge cert on outbound TLS"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ca-certificates-bundle
+
+environment:
+  contents:
+    repositories:
+      - https://packages.wolfi.dev/os
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    packages:
+      - busybox
+
+pipeline:
+  - if: ${{build.arch}} == 'x86_64'
+    runs: |
+      install -Dm755 x86_64-unknown-linux-musl/release/notme-proxy \
+        "${{targets.destdir}}/usr/bin/notme-proxy"
+  - if: ${{build.arch}} == 'aarch64'
+    runs: |
+      install -Dm755 aarch64-unknown-linux-musl/release/notme-proxy \
+        "${{targets.destdir}}/usr/bin/notme-proxy"
+
+test:
+  pipeline:
+    # There is no --help flag (see the arg parsing in proxy/src/main.rs — an
+    # unrecognised flag is ignored and cert_path falls back to the default),
+    # and starting for real needs cert + key material we don't have here.
+    #
+    # So: run it against a path that cannot exist. main() prints the cert path
+    # it is about to load BEFORE load_certs_and_key panics on the missing file.
+    # Seeing that line proves the binary is present, executable, and loadable
+    # by this arch's loader, and that it reached main() — which is the whole
+    # property this test can honestly assert. The panic is expected; `|| true`
+    # keeps it from failing the build, and the grep is what actually gates.
+    - runs: |
+        test -x /usr/bin/notme-proxy
+        out=$(notme-proxy --cert /nonexistent.pem --key /nonexistent.pem 2>&1 || true)
+        echo "$out" | grep -q "loading cert from /nonexistent.pem"
