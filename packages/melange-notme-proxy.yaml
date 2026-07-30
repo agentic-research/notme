@@ -23,7 +23,7 @@
 
 package:
   name: notme-proxy
-  version: 0.1.0_rc3
+  version: 0.1.0
   epoch: 0
   description: "notme mTLS forward proxy — presents the bridge cert on outbound TLS"
   copyright:

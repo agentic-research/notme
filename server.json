@@ -3,7 +3,7 @@
   "name": "io.github.agentic-research/notme",
   "title": "notme",
   "description": "Self-hostable identity authority — passkeys, bridge certs, DPoP-bound tokens, and APAS.",
-  "version": "0.1.0-rc3",
+  "version": "0.1.0",
   "repository": {
     "url": "https://github.com/agentic-research/notme",
     "source": "github"
@@ -15,12 +15,12 @@
         {
           "registryType": "oci",
           "identifier": "ghcr.io/agentic-research/notme",
-          "version": "0.1.0-rc3"
+          "version": "0.1.0"
         },
         {
           "registryType": "oci",
           "identifier": "ghcr.io/agentic-research/notme-proxy",
-          "version": "0.1.0-rc3"
+          "version": "0.1.0"
         }
       ]
     },
