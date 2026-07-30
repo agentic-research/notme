@@ -72,6 +72,14 @@ jobs:
       - run: task worker:check
       - run: task docs:check
 
+      # server.json is the ADR-0041 package-identity contract cloister reads
+      # to derive `<identifier>:<version>`. Gated here, not only at release
+      # time: the previous shape declared a schema it did not satisfy and that
+      # went unnoticed in main until ley-line-open reported it (notme-6e5330).
+      # A release-only gate cannot catch a contract defect on the PR that
+      # introduces it.
+      - run: task server:check
+
   proxy:
     runs-on: ubuntu-latest
     permissions:

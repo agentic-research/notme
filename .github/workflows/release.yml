@@ -11,10 +11,16 @@
 # The `v` prefix is a per-repo convention, not a mandate (rosary strips, mache
 # and ley-line-open keep), and notme strips it so cloister's existing
 # `notme:0.1.0` reference registry-qualifies by adding a prefix rather than
-# rewriting a version. ADR-0041 §2 requires `packages[].version` to equal the
+# rewriting a version. ADR-0041 §2 requires the declared `version` to equal the
 # tag the publish job ACTUALLY PUSHES, which is why `task image:publish` runs
 # `version:check` against this same VERSION before pushing anything. Checking
 # against the git tag would pass while the registry 404s.
+#
+# The images are declared in `server.json` under
+# `_meta."io.modelcontextprotocol.registry/publisher-provided".artifacts`, NOT
+# `packages[]` — the registry schema requires a `transport` on a package entry
+# and notme serves no MCP, so the old shape could only be schema-invalid or a
+# lie about session behaviour (notme-6e5330, notme-38044e).
 #
 # Trigger: push a tag `v<version>`. The two jobs are deliberately INDEPENDENT
 # rather than chained — rosary v0.5.0 lost an image publish because an

@@ -166,7 +166,7 @@ the two images publish as **independent jobs**. cloister derives them separately
 
 ### the version guard
 
-`server.json` `packages[].version` must equal **the tag the publish job actually pushes** — because `<identifier>:<version>` has to resolve at the registry (cloister ADR-0041 §2). that is not the same as "matches the git tag": those differ whenever the tag is `v`-prefixed, and checking the git tag would pass while the registry 404s.
+each image's declared `version` in `server.json` must equal **the tag the publish job actually pushes** — because `<identifier>:<version>` has to resolve at the registry (cloister ADR-0041 §2). that is not the same as "matches the git tag": those differ whenever the tag is `v`-prefixed, and checking the git tag would pass while the registry 404s.
 
 so `task image:publish` runs `task version:check` against the *same* `VERSION` variable it tags with, before pushing anything:
 
@@ -174,15 +174,19 @@ so `task image:publish` runs `task version:check` against the *same* `VERSION` v
 task version:check VERSION=0.1.0
 ```
 
-it checks each `packages[]` entry independently — a correct `notme` alongside a stale `notme-proxy` is a reachable state — and rejects an **absent** version as firmly as a wrong one. that second half is the one that matters: ley-line-open v0.11.2 shipped through a guard that rejected a tagged identifier but permitted a missing version, so a broken shape went out through a guard written to prevent it.
+it checks each artifact entry independently — a correct `notme` alongside a stale `notme-proxy` is a reachable state — and rejects an **absent** version as firmly as a wrong one. that second half is the one that matters: ley-line-open v0.11.2 shipped through a guard that rejected a tagged identifier but permitted a missing version, so a broken shape went out through a guard written to prevent it.
 
 `scripts/check-image-versions.ts` also asserts the two notme melange recipes track the release tag. `melange-workerd.yaml` is deliberately exempt — its version is workerd's, not ours.
+
+**the images are declared in `_meta`, not `packages[]`.** the MCP registry schema puts `transport` in `Package.required`, and notme serves no MCP — so a `packages[]` entry can only be schema-invalid or carry a fabricated transport that makes cloister derive sessions for tools that don't exist. the addresses therefore live in `_meta."io.modelcontextprotocol.registry/publisher-provided".artifacts`, the schema's own open extension slot, matching what ley-line-open v0.13.0's `leyline-mcp-descriptor` emits for artifact-only producers. the guard refuses a `packages` key outright so the old shape can't quietly return.
+
+**there are two gates.** `task server:check` runs on every PR and asserts everything a branch can know — schema conformance, the artifact-only shape, recipes agreeing with the file's own version. `task version:check VERSION=<tag>` runs before every publish and adds the one thing only a release knows: that all of it equals the tag being pushed. the PR gate exists because a release-only gate cannot catch a contract defect on the PR that introduces it — which is how the schema violation sat in main until another repo reported it.
 
 **prereleases use two spellings, on purpose.** apk reserves `-r<N>` for the package release suffix, so `0.1.0-rc1` is not a legal apk version — melange rejects it outright (`invalid version 0.1.0-rc1, could not parse`). The same version is spelled `0.1.0_rc1` in apk. So for a `v0.1.0-rc1` tag:
 
 | file | value |
 |---|---|
-| `server.json` `packages[].version` | `0.1.0-rc1` — must equal the pushed OCI tag exactly |
+| `server.json` `_meta` → `artifacts[].version` | `0.1.0-rc1` — must equal the pushed OCI tag exactly |
 | `melange-notme-app.yaml`, `melange-notme-proxy.yaml` | `0.1.0_rc1` — apk spelling |
 
 `version:check` knows the mapping (`-` → `_`) and checks each against the right form. apk's suffix grammar is narrower than semver's, so an exotic tag like `0.1.0-beta.2` maps to `0.1.0_beta.2` and melange will reject it at build time — the check doesn't reimplement apk's grammar.
@@ -222,7 +226,8 @@ if these show up in `git status`, you ran a build. don't `git add` them.
 - [`../worker/config.capnp`](../worker/config.capnp) — workerd config baked into `/app/config.capnp` by `melange-notme-app.yaml`.
 - [`../worker/dist/worker.js`](../worker/) — esbuild bundle (`task worker:build-local`) embedded at `/app/dist/worker.js`.
 - [`../proxy/README.md`](../proxy/README.md) — the mTLS proxy itself: two-plane model, transport modes, the UDS companion role.
-- [`../server.json`](../server.json) — declares both images as `packages[].oci`. the manifest consumers read to derive `<identifier>:<version>`; `task version:check` keeps it honest.
+- [`../server.json`](../server.json) — declares both images as OCI artifacts under the publisher-provided `_meta` extension. the manifest consumers read to derive `<identifier>:<version>`; `task server:check` and `task version:check` keep it honest.
+- [`../schema/mcp/server.schema.2025-12-11.json`](../schema/mcp/server.schema.2025-12-11.json) — the vendored, digest-pinned MCP registry schema `server.json` declares and is now actually validated against.
 - [`../.github/workflows/release.yml`](../.github/workflows/release.yml) — the tag-gated publish.
 - [`../scripts/check-image-versions.ts`](../scripts/check-image-versions.ts) — the version guard, and why it checks both halves of the rule.
 - [top-level README — run your own](../README.md#run-your-own) — the three deploy paths (workerd, container, CF Workers).
