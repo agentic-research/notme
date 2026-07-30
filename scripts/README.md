@@ -8,7 +8,7 @@ standalone tooling — small utilities run via `npx tsx` or by Taskfile targets,
 |---|---|---|---|
 | `doc-check.ts` | verify `@doc-check` claims in markdown/html match the codebase | `task docs:check` (or `npx tsx scripts/doc-check.ts [--skip-external] [--format json]`) | `0` all pass · `1` any claim fails or no `@doc-check` blocks found |
 | `check-sha-pins.ts` | verify every external `uses:` in `.github/workflows` is pinned to a 40-char commit SHA | `task pin:check` | `0` all pinned · `1` any violation · `2` malformed workflow |
-| `check-image-versions.ts` | validate `server.json` against its declared schema, and verify its OCI artifacts + the notme melange recipes agree with the tag the publish job will push | `task server:check` (PR gate) · `task version:check VERSION=0.1.0` (release gate) | `0` agree · `1` any mismatch · `2` missing/invalid VERSION or unreadable file |
+| `check-image-versions.ts` | validate `server.json` against its declared schema, and verify its OCI artifacts + the notme melange recipes agree with the tag the publish job will push | `task server:check` (PR gate) · `task version:check VERSION=0.1.0` (release gate) | `0` agree · `1` any violation (including a `server.json` with no declared version) · `2` missing/invalid VERSION argument, or an unreadable/unparseable file |
 
 ## how check-image-versions works
 
@@ -34,7 +34,8 @@ nothing on a branch knows the release tag, so the PR gate cannot check it — an
 three properties worth keeping when editing it:
 
 - **both halves, every time.** presence *and* correctness are asserted separately for each field. ley-line-open v0.11.2 shipped through a guard that rejected a tagged identifier but permitted an absent version — half a rule enforced is a guard that reports success on the failure it exists to catch.
-- **per entry, independently.** cloister declares `notme-identity` and `notme-proxy` as separate bundles derived separately, so "correct notme, stale notme-proxy" is reachable. every violation is collected and reported; the script does not stop at the first.
+- **per entry, independently.** cloister declares `notme-identity` and `notme-proxy` as separate bundles, so "correct notme, stale notme-proxy" is reachable. every violation is collected and reported; the script does not stop at the first.
+- **both directions of the allowlist.** the expected-images list is checked for *presence* (deleting an entry fails) **and** for *exclusivity* (adding one fails). only the first was enforced initially, and an extra `ghcr.io/attacker/pwn` entry passed at exit 0 — consumers take the **first** `oci` entry rather than searching by name, so a prepended entry is the one that gets pinned. the passing message also reports the array's real length rather than the number of names it looked for.
 - **the schema is vendored and digest-asserted.** `schema/mcp/server.schema.2025-12-11.json`, sha256 pinned in the script. validating offline keeps CI network-free, and an upstream edit arrives as a reviewable diff instead of a result that changes under a file nobody touched.
 
 ## how doc-check works

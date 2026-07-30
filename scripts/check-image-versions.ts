@@ -133,6 +133,12 @@ interface Violation {
 
 const violations: Violation[] = [];
 
+// How many entries `artifacts[]` actually held, as opposed to how many were
+// looked for. Set by checkArtifactVersions and reported verbatim in the
+// success message. See the note there: printing EXPECTED_IDENTIFIERS.length
+// meant a passing run announced "2 artifacts" for a file containing three.
+let declaredArtifactCount: number | null = null;
+
 function fail(file: string, detail: string): void {
   violations.push({ file, detail });
 }
@@ -271,7 +277,7 @@ function checkNoPackagesKey(doc: Record<string, unknown>): void {
   );
 }
 
-function checkArtifactVersions(doc: Record<string, unknown>, version: string): void {
+function checkArtifactVersions(doc: Record<string, unknown>, version: string | null): void {
   const meta = doc._meta;
   if (typeof meta !== "object" || meta === null) {
     fail("server.json", "`_meta` is missing — nothing carries the published image addresses");
@@ -297,6 +303,42 @@ function checkArtifactVersions(doc: Record<string, unknown>, version: string): v
         `nothing to derive an image from`,
     );
     return;
+  }
+
+  declaredArtifactCount = artifacts.length;
+
+  // BOTH DIRECTIONS. The loop below asks "is each expected image present
+  // exactly once?" — it does not ask "are these the only ones?", and those
+  // are different questions. Checking only the first leaves every unexpected
+  // entry unvalidated and uncounted: an extra
+  // `{registryType:"oci", identifier:"ghcr.io/attacker/pwn", version:"1.0.0"}`
+  // passed at exit 0 while the success message still said "2 artifacts".
+  //
+  // That is this script's own stated failure mode pointed at itself — the
+  // header argues a guard must assert presence AND correctness together, and
+  // the EXPECTED_IDENTIFIERS comment above explains the list is hardcoded so
+  // DELETION fails. The ADDITION direction was left open, which is exactly
+  // the "half a rule enforced" shape ley-line-open v0.11.2 shipped through.
+  //
+  // It matters concretely because consumers take the FIRST oci entry rather
+  // than searching for a name: cloister's `parsePackagesOci`
+  // (scripts/resolve-inputs.mjs) does `doc.packages.find(p => p.registryType
+  // === "oci")`, and whatever cloister-02dd65 lands for `artifacts` will
+  // mirror it. A prepended entry would therefore be the one that gets pinned.
+  for (const entry of artifacts) {
+    const raw =
+      typeof entry === "object" && entry !== null
+        ? String((entry as Record<string, unknown>).identifier ?? "")
+        : String(entry);
+    if (EXPECTED_IDENTIFIERS.includes(bareIdentifier(raw))) continue;
+    fail(
+      "server.json",
+      `unexpected artifacts[] entry ${JSON.stringify(raw || entry)}. This repo publishes ` +
+        `exactly ${EXPECTED_IDENTIFIERS.join(" and ")}. An entry nobody publishes is an ` +
+        `address a consumer will still try to pin — and consumers take the FIRST oci ` +
+        `entry, so a prepended one wins. Add it to EXPECTED_IDENTIFIERS deliberately, or ` +
+        `remove it.`,
+    );
   }
 
   for (const identifier of EXPECTED_IDENTIFIERS) {
@@ -363,11 +405,62 @@ function checkArtifactVersions(doc: Record<string, unknown>, version: string): v
       continue;
     }
 
-    if (entryVersion !== version) {
+    if (version !== null && entryVersion !== version) {
       fail(
         "server.json",
         `${where}: version is ${JSON.stringify(entryVersion)} but the publish job pushes ` +
           `${JSON.stringify(version)}. ${rawIdentifier}:${entryVersion} would not resolve.`,
+      );
+    }
+  }
+}
+
+/**
+ * Every `art.cloister/v1.bundles[].package` must name a declared artifact.
+ *
+ * This block is the reason the file is hand-maintained rather than generated:
+ * leyline-mcp-descriptor uses the same `art.cloister/v1` key for tool-group
+ * claims and omits it entirely when there are no groups, so a generated file
+ * would silently drop notme's hypervisor-tier topology (ADR-0011/0018/0005).
+ *
+ * Content argued to be load-bearing, and guarded by nothing, is a claim
+ * waiting to rot. A typo in a bundle's `package` — or deleting the block
+ * outright — passed at exit 0. Cross-checking against `artifacts[]` catches
+ * the drift that actually happens: an image renamed in one place and not the
+ * other. Absence of the block is NOT flagged; it is optional metadata, and
+ * inventing a requirement the ecosystem does not have would be its own lie.
+ */
+function checkBundleTopology(doc: Record<string, unknown>): void {
+  const meta = doc._meta;
+  if (typeof meta !== "object" || meta === null) return;
+  const cloister = (meta as Record<string, unknown>)["art.cloister/v1"];
+  if (typeof cloister !== "object" || cloister === null) return;
+
+  const bundles = (cloister as Record<string, unknown>).bundles;
+  if (bundles === undefined) return;
+  if (!Array.isArray(bundles)) {
+    fail("server.json", '`_meta."art.cloister/v1".bundles` is present but not an array');
+    return;
+  }
+
+  for (const bundle of bundles) {
+    if (typeof bundle !== "object" || bundle === null) {
+      fail("server.json", `\`art.cloister/v1.bundles[]\` entry is not an object: ${bundle}`);
+      continue;
+    }
+    const b = bundle as Record<string, unknown>;
+    const name = String(b.name ?? "(unnamed)");
+    const pkg = b.package;
+    if (typeof pkg !== "string" || pkg === "") {
+      fail("server.json", `art.cloister/v1 bundle ${JSON.stringify(name)} has no \`package\``);
+      continue;
+    }
+    if (!EXPECTED_IDENTIFIERS.includes(bareIdentifier(pkg))) {
+      fail(
+        "server.json",
+        `art.cloister/v1 bundle ${JSON.stringify(name)} names package ${JSON.stringify(pkg)}, ` +
+          `which is not one of the published artifacts (${EXPECTED_IDENTIFIERS.join(", ")}). ` +
+          `A bundle pointing at an image this repo does not publish derives to nothing.`,
       );
     }
   }
@@ -380,7 +473,8 @@ function checkArtifactVersions(doc: Record<string, unknown>, version: string): v
  * registry listing notme at 0.1.0-rc2 while its images publish 0.1.0-rc3 is
  * the same drift class, in the field a human reads first.
  */
-function checkDocumentVersion(doc: Record<string, unknown>, version: string): void {
+function checkDocumentVersion(doc: Record<string, unknown>, version: string | null): void {
+  if (version === null) return; // absence already reported by the caller
   if (doc.version !== version) {
     fail(
       "server.json",
@@ -390,7 +484,7 @@ function checkDocumentVersion(doc: Record<string, unknown>, version: string): vo
   }
 }
 
-function checkRecipes(version: string): void {
+function checkRecipes(version: string | null): void {
   for (const relPath of VERSIONED_RECIPES) {
     const raw = readOrBail(relPath);
     let doc: { package?: { version?: unknown; name?: unknown } };
@@ -405,6 +499,8 @@ function checkRecipes(version: string): void {
       fail(relPath, "`package.version` is missing");
       continue;
     }
+
+    if (version === null) continue; // presence checked above; nothing to compare to
 
     // YAML parses an unquoted 0.1.0 as a string, but 0.1 would become a
     // number — compare on the rendered form so a recipe that dropped a
@@ -447,7 +543,16 @@ function main(): void {
     const doc = parseServerJson();
     const declared = doc.version;
     if (typeof declared !== "string" || declared === "") {
-      bail("server.json has no top-level `version` string to self-check against");
+      // Don't bail — a missing top-level `version` is a violation to REPORT
+      // alongside whatever else is wrong, not a reason to stop looking. An
+      // early exit here meant schema conformance and the packages-key refusal
+      // never ran, so a file with three defects showed one. `null` runs every
+      // SHAPE check and skips only the comparisons, which have nothing to
+      // compare against — reporting five "does not equal <nothing>" lines
+      // would bury the one violation that matters.
+      fail("server.json", "no top-level `version` string to self-check against");
+      runChecks(doc, null, "declared version");
+      return;
     }
     runChecks(doc, declared, "declared version");
     return;
@@ -491,17 +596,19 @@ function main(): void {
  */
 function runChecks(
   doc: Record<string, unknown>,
-  version: string,
+  version: string | null,
   source: "pushed tag" | "declared version" = "pushed tag",
 ): void {
   checkSchemaConformance(doc);
   checkNoPackagesKey(doc);
   checkDocumentVersion(doc, version);
   checkArtifactVersions(doc, version);
+  checkBundleTopology(doc);
   checkRecipes(version);
 
   if (violations.length > 0) {
-    console.error(`\nFAIL — ${violations.length} violation(s) against version ${version}:\n`);
+    const against = version === null ? "(no version declared)" : `version ${version}`;
+    console.error(`\nFAIL — ${violations.length} violation(s) against ${against}:\n`);
     for (const v of violations) {
       console.error(`  ${v.file}`);
       console.error(`    ${v.detail}\n`);
@@ -509,9 +616,12 @@ function runChecks(
     process.exit(1);
   }
 
+  // Report what was FOUND, not what was looked for. `declaredArtifactCount`
+  // is the array's real length; printing EXPECTED_IDENTIFIERS.length here
+  // meant the passing message asserted a count it had never checked.
   console.log(
     `server.json is valid against ${SCHEMA_PATH} and all image versions agree with the ` +
-      `${source} ${version} (${EXPECTED_IDENTIFIERS.length} artifacts, ` +
+      `${source} ${version} (${declaredArtifactCount ?? 0} artifacts, ` +
       `${VERSIONED_RECIPES.length} recipes).` +
       (source === "declared version"
         ? "\nNOTE: --self does NOT check the pushed tag. `task version:check VERSION=<tag>` does, and runs before every publish."

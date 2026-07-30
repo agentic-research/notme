@@ -177,6 +177,16 @@ there.
 
 ## Acceptance
 
+> **Superseded in part, 2026-07-30 (notme-38044e).** The `packages[].oci`
+> clause below was met as written and was *wrong*: the MCP registry schema
+> lists `transport` in `Package.required`, so two transport-less `packages[]`
+> entries produced a document that failed the schema its own `$schema` key
+> declared (notme-6e5330). The images are now declared under
+> `_meta."io.modelcontextprotocol.registry/publisher-provided".artifacts`.
+> Everything else in this clause stands and was verified. Left in place rather
+> than rewritten — this document is a dated record of what was designed, and
+> the gap between it and what shipped is the useful part.
+
 `ghcr.io/agentic-research/notme` and `ghcr.io/agentic-research/notme-proxy`
 are both pullable at a tagged version produced by the existing apko machinery,
 both declared in `server.json` `packages[].oci`, verified by `docker pull` of
