@@ -129,17 +129,54 @@ export class AuthService extends WorkerEntrypoint<any> {
    * Store credentials for proxy/sign operations.
    * Called after a successful 008 PoP exchange. Keys must be CryptoKey objects
    * (non-extractable). Certs are PEM strings (public data).
+   *
+   * `identity`, `scopes` and `expiresAt` are NOT parameters, deliberately.
+   * This method is reachable by any Worker holding an `AUTH` service binding,
+   * and it used to accept all three as caller-supplied fields and assign them
+   * verbatim — so a bound Worker could name itself any WIMSE principal and
+   * grant itself any scope, while `proxy()` gated on those scopes and the
+   * audit log recorded that identity as fact (notme-6ad276).
+   *
+   * The certs are the only unforgeable thing a caller can present: they are
+   * CA-signed and already carry the subject and granted scopes. So the
+   * principal is DERIVED from them here and the caller's opinion of who it is
+   * never enters. Extra fields on the argument are structurally ignored.
+   *
+   * @throws if either cert fails CA verification, is outside its validity
+   *         window, or names a different principal than its partner. On throw
+   *         the session stays unauthenticated — a failed authenticate() must
+   *         not leave stale creds from a previous successful one.
    */
   async authenticate(creds: {
     mtlsCert: string;
     signingCert: string;
     mtlsKey: CryptoKey;
     signingKey: CryptoKey;
-    identity: string;
-    scopes: string[];
-    expiresAt: number;
   }) {
-    this.heldCerts = creds;
+    const { deriveCredentialsFromCerts } = await import("./src/auth/derive-credentials");
+    const authority = this.getAuthority();
+    const caPublicKeyPem = await authority.getPublicKeyPem();
+
+    // Clear first: if verification throws, the session must not keep whatever
+    // it held before. Re-authenticating with a bad cert would otherwise leave
+    // the previous identity in place and look like it succeeded.
+    this.heldCerts = null;
+
+    const derived = await deriveCredentialsFromCerts(
+      creds.signingCert,
+      creds.mtlsCert,
+      caPublicKeyPem,
+    );
+
+    this.heldCerts = {
+      mtlsCert: creds.mtlsCert,
+      signingCert: creds.signingCert,
+      mtlsKey: creds.mtlsKey,
+      signingKey: creds.signingKey,
+      identity: derived.identity,
+      scopes: derived.scopes,
+      expiresAt: derived.expiresAt,
+    };
   }
 
   /**

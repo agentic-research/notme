@@ -55,9 +55,15 @@ const SIGNING_KEY_USAGE = new KeyUsagesExtension(
 // few business days). Until then, ANY third-party verifier that pins our OID
 // arc will be pinning the placeholder.
 const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigned PEN
-const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
+// Exported because verification has to read back exactly what minting wrote.
+// A second copy of these strings in the verifier would let the two drift, and
+// the failure mode of that drift is silent: `getExtension` returns undefined
+// for an unknown OID, so a mismatched verifier reads "no identity in this
+// cert" rather than erroring — which is how a derived-identity check
+// degrades back into a trust-the-caller one (notme-6ad276).
+export const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
 const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
-const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
+export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
 const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
 const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)

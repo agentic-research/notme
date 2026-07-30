@@ -21,6 +21,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
 
 // AuthService lives in worker.ts which imports cloudflare:workers at the
 // top of the module. Mock it so we can construct the class in pure Node
@@ -60,10 +61,14 @@ import { CertScope } from "../../../gen/ts/identity";
 // Constructor under cloudflare:workers' real types expects 0 args; our mock
 // supplies (ctx, env). Cast through the mock-friendly shape so the TS checker
 // doesn't fight the runtime contract.
+const TM_CA = await makeCA();
+
+// env is no longer null: authenticate() reaches SIGNING_AUTHORITY for the CA
+// public key it verifies presented certs against (notme-6ad276).
 const newAuthService = () =>
   new (AuthService as unknown as new (ctx: unknown, env: unknown) => AuthService)(
     null,
-    null,
+    stubEnv(TM_CA),
   );
 
 // ── 0. AuthService per-RPC-session credential isolation (regression guard) ─
@@ -80,17 +85,9 @@ const newAuthService = () =>
 // the same assertion pattern fails on a deliberately-buggy mirror class.
 
 describe("auth-service.state.session-isolation > regression guard", () => {
-  function makeCreds(identity: string, signingKey: CryptoKey) {
-    return {
-      mtlsCert: `cert:${identity}`,
-      signingCert: `cert:${identity}:signing`,
-      mtlsKey: signingKey, // shape-only; we don't sign with mtlsKey here
-      signingKey,
-      identity,
-      scopes: ["bridgeCert"],
-      expiresAt: Math.floor(Date.now() / 1000) + 300,
-    };
-  }
+  // Real CA-signed certs — authenticate() derives identity/scopes from them,
+  // so a test can no longer assert on an identity it supplied itself.
+  const makeCreds = (identity: string) => mintCreds(TM_CA, identity);
 
   it("two AuthService instances must not see each other's heldCerts", async () => {
     const kp = (await crypto.subtle.generateKey(
@@ -102,8 +99,8 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    await a.authenticate(makeCreds("wimse://notme.bot/gha/alice", kp.privateKey));
-    await b.authenticate(makeCreds("wimse://notme.bot/gha/bob", kp.privateKey));
+    await a.authenticate(await makeCreds("wimse://notme.bot/gha/alice"));
+    await b.authenticate(await makeCreds("wimse://notme.bot/gha/bob"));
 
     const idA = await a.identity();
     const idB = await b.identity();
@@ -121,7 +118,7 @@ describe("auth-service.state.session-isolation > regression guard", () => {
 
     const authenticated = newAuthService();
     await authenticated.authenticate(
-      makeCreds("wimse://notme.bot/gha/leaked", kp.privateKey),
+      await makeCreds("wimse://notme.bot/gha/leaked"),
     );
 
     const fresh = newAuthService();
@@ -141,8 +138,8 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    await a.authenticate(makeCreds("wimse://notme.bot/gha/alice", kp.privateKey));
-    await b.authenticate(makeCreds("wimse://notme.bot/gha/bob", kp.privateKey));
+    await a.authenticate(await makeCreds("wimse://notme.bot/gha/alice"));
+    await b.authenticate(await makeCreds("wimse://notme.bot/gha/bob"));
 
     const payload = new TextEncoder().encode("hello").buffer as ArrayBuffer;
     const signed = await a.sign(payload, "raw");
