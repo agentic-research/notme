@@ -24,11 +24,14 @@
 !Taskfile.yml
 !go.work
 
-# Package-identity manifest — declares the published OCI images as
-# packages[].oci so consumers derive `<identifier>:<version>` rather than being
-# told it (cloister ADR-0038/0041). `task version:check` asserts it against the
-# tag the publish job pushes. Must be tracked: it is the contract, and this
-# .gitignore is default-deny, so a new root file is invisible without this line.
+# Package-identity manifest — declares the published OCI images as artifacts
+# under the publisher-provided `_meta` extension (NOT packages[], which the
+# registry schema requires a `transport` on and notme has none of) so consumers
+# derive `<identifier>:<version>` rather than being told it (cloister
+# ADR-0038/0041). `task server:check` gates it on every PR; `task version:check`
+# asserts it against the tag the publish job pushes. Must be tracked: it is the
+# contract, and this .gitignore is default-deny, so a new root file is invisible
+# without this line.
 !server.json
 
 # Shared Taskfile modules used by package-local release wrappers.
@@ -49,6 +52,15 @@
 !schema/**/*.capnp
 !schema/codegen/
 !schema/codegen/**
+
+# Vendored MCP registry schema — the one server.json's `$schema` key names.
+# Vendored rather than fetched so `task version:check` validates offline and in
+# CI without a network dependency, and so a silent upstream edit shows up as a
+# reviewable diff. Byte-identical to the canonical URL and to ley-line-open's
+# copy (both sha256 3fba0959…14de0, checked 2026-07-30); the check script
+# asserts that digest so vendoring cannot drift unnoticed.
+!schema/mcp/
+!schema/mcp/*.json
 
 # Generated code from schemas (committed so consumers don't need capnp toolchain)
 !gen/

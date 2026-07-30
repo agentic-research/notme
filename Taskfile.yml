@@ -358,6 +358,23 @@ tasks:
       # ADR-0041 §2 (corrected 2026-07-28).
       - pnpm exec tsx scripts/check-image-versions.ts {{.VERSION}}
 
+  server:check:
+    desc: "Validate server.json against its declared schema + its own version (PR gate)"
+    deps: [deps:install]
+    cmds:
+      # The branch-time half of version:check. It cannot assert "matches the
+      # pushed tag" — nothing on a PR knows the tag — so it asserts everything
+      # else: schema conformance against the vendored 2025-12-11 schema, the
+      # artifact-only shape, and the recipes agreeing with the file's own
+      # declared version.
+      #
+      # This exists because running ONLY the release-time check is how two
+      # defects shipped: the `packages[]`-without-`transport` schema violation
+      # sat in main for two days and was found from another repo
+      # (notme-6e5330), and a `description` 35 chars over the schema's limit
+      # had never been checked by anything at all.
+      - pnpm exec tsx scripts/check-image-versions.ts --self
+
   # Each image has its own publish task so CI can run them as INDEPENDENT
   # jobs. Cloister declares notme-identity and notme-proxy as two separate
   # hypervisor-tier bundles derived separately (ADR-0038), so coupling them
