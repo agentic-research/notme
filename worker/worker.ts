@@ -1843,7 +1843,7 @@ export default {
         const codeChallengeMethod =
           url.searchParams.get("code_challenge_method") || "";
 
-        const { isValidCodeChallenge } = await import("./src/auth/pkce");
+        const { isValidCodeChallenge } = await import("@agentic-research/dpop");
         if (codeChallenge) {
           // S256 only. RFC 7636 §4.2 also defines "plain", where the verifier
           // IS the challenge — which would put the verifier in the redirect
@@ -1981,7 +1981,7 @@ export default {
           const v = validateRedirectUri(body.redirect_uri || "");
           if (!v.ok) return jsonErr(v.reason, v.status);
 
-          const { isValidCodeChallenge } = await import("./src/auth/pkce");
+          const { isValidCodeChallenge } = await import("@agentic-research/dpop");
           if (!isValidCodeChallenge(body.code_challenge)) {
             return jsonErr("malformed or missing code_challenge", 400);
           }
@@ -2037,7 +2037,7 @@ export default {
             /* empty body */
           }
 
-          const { isValidCodeVerifier } = await import("./src/auth/pkce");
+          const { isValidCodeVerifier } = await import("@agentic-research/dpop");
           if (!body.code || typeof body.code !== "string") {
             return Response.json(
               { error: "invalid_request", error_description: "code required" },

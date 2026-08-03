@@ -443,7 +443,7 @@ function newVerifier(): string {
 }
 
 async function challengeFor(verifier: string): Promise<string> {
-  const { sha256Base64url } = await import("./auth/pkce");
+  const { sha256Base64url } = await import("@agentic-research/dpop");
   return sha256Base64url(verifier);
 }
 

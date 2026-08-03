@@ -1008,3 +1008,89 @@ export function validateClaims(
     }
   }
 }
+
+// ── PKCE (RFC 7636) ───────────────────────────────────────────────────────
+//
+// Lives here rather than in either consumer because PKCE is inherently a
+// TWO-SIDED protocol: one party derives a challenge from a verifier, another
+// recomputes it. Implemented separately on each side, the halves drift — and
+// the drift is invisible. A padded base64 on one side, or a different length
+// bound, produces a challenge that simply never matches, and the only symptom
+// is `invalid_grant` with nothing in the error pointing at encoding.
+//
+// That failure mode is why this is shared code and not a copied helper: the
+// authority (notme) and its clients (rig, and anyone else completing the
+// /authorize flow) MUST agree byte-for-byte, so they should be running the
+// same function.
+
+/**
+ * Generate a PKCE `code_verifier` (RFC 7636 §4.1).
+ *
+ * 32 CSPRNG bytes as base64url is 43 characters drawn only from the
+ * unreserved set, satisfying §4.1's 43-128 length range and alphabet without
+ * further encoding — so it survives a URL or JSON round-trip unchanged.
+ */
+export function generateCodeVerifier(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return base64urlEncode(bytes);
+}
+
+/**
+ * Derive the S256 `code_challenge` for a verifier (RFC 7636 §4.2):
+ * `BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`.
+ *
+ * Unpadded, per §4.2 — a padded digest would never match a compliant peer's.
+ */
+export async function codeChallengeS256(verifier: string): Promise<string> {
+  return sha256Base64url(verifier);
+}
+
+/** SHA-256 of a string as unpadded base64url. */
+export async function sha256Base64url(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return base64urlEncode(new Uint8Array(digest));
+}
+
+/** RFC 7636 §4.1 verifier length bounds. */
+export const MIN_CODE_VERIFIER_LENGTH = 43;
+export const MAX_CODE_VERIFIER_LENGTH = 128;
+
+/** RFC 7636 §4.1 unreserved set: ALPHA / DIGIT / "-" / "." / "_" / "~". */
+const UNRESERVED = /^[A-Za-z0-9\-._~]+$/;
+
+/**
+ * Whether a value is a well-formed `code_verifier`.
+ *
+ * An authority must CHECK this rather than trust it: PKCE's entire security
+ * argument is the verifier's entropy, so accepting a short one hands back a
+ * working flow with none of the protection — failing open, silently, in the
+ * component whose job is to not do that.
+ */
+export function isValidCodeVerifier(verifier: unknown): verifier is string {
+  return (
+    typeof verifier === "string" &&
+    verifier.length >= MIN_CODE_VERIFIER_LENGTH &&
+    verifier.length <= MAX_CODE_VERIFIER_LENGTH &&
+    UNRESERVED.test(verifier)
+  );
+}
+
+/**
+ * Whether a value is a well-formed S256 `code_challenge`.
+ *
+ * base64url of a 32-byte digest is always exactly 43 unreserved characters.
+ * Checking it where the flow STARTS turns a malformed challenge into a
+ * diagnosable error there, instead of an opaque `invalid_grant` one
+ * round-trip later with the user already logged in.
+ */
+export function isValidCodeChallenge(challenge: unknown): challenge is string {
+  return (
+    typeof challenge === "string" &&
+    challenge.length === 43 &&
+    UNRESERVED.test(challenge)
+  );
+}

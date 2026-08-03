@@ -20,6 +20,9 @@ import {
   KeyUsageFlags,
 } from "@peculiar/x509";
 import { encodeBase64urlNoPadding } from "@oslojs/encoding";
+// PKCE + code hashing come from the shared package so the authority and its
+// clients run the SAME implementation — see the RFC 7636 section there.
+import { sha256Base64url } from "@agentic-research/dpop";
 import { bundleCanonical, type CABundle } from "./revocation";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 
@@ -44,7 +47,7 @@ const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
-import { sha256Base64url } from "./auth/pkce";
+
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
