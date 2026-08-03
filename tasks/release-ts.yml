@@ -31,7 +31,26 @@ tasks:
       - pnpm --filter {{.PKG_NAME}} publish --access public
 
   ci-publish:
-    desc: "Pack-smoke and publish a package to npm from CI with provenance"
+    desc: "DEPRECATED — do not use. See publish-dpop.yml for the OIDC path."
+    # Kept as a tombstone rather than deleted, because the shape of it is the
+    # bug and a future package would otherwise copy it again (notme-4fa4a5).
+    #
+    # `--provenance` IS NOT A PNPM FLAG. It is absent from `pnpm publish
+    # --help` on the pinned 10.30.3, and it was silently ignored: dpop-v0.2.0
+    # published successfully through CI with this task and its tarball has NO
+    # attestation (the registry attestations endpoint returns "Not found").
+    # So this task advertised a verifiable build origin it never delivered.
+    #
+    # It also required a long-lived NODE_AUTH_TOKEN, the credential shape this
+    # repository exists to eliminate.
+    #
+    # The replacement is `npm publish` under npm trusted publishing (OIDC),
+    # wired directly in .github/workflows/publish-dpop.yml, with a post-publish
+    # step that FAILS the build if the attestation is not actually queryable —
+    # because "the flag was silently ignored" and "the flag worked" are
+    # indistinguishable without checking.
     cmds:
-      - pnpm --filter {{.PKG_NAME}} run test:package
-      - pnpm --filter {{.PKG_NAME}} publish --no-git-checks --access public --provenance
+      - |
+        echo "release:ci-publish is deprecated — it published without the provenance it claimed." >&2
+        echo "Use npm trusted publishing; see .github/workflows/publish-dpop.yml." >&2
+        exit 1
