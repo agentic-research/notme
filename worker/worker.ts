@@ -760,6 +760,10 @@ function authorizePageHtml(
   redirectUri: string,
   audience: string,
   state: string,
+  // ADR-013. Empty string means the caller sent no PKCE challenge, and the
+  // page takes the legacy `?token=` path. Threaded as a data attribute like
+  // the others rather than inlined into script text — same no-eval rule.
+  codeChallenge: string,
 ): string {
   // HTML-escape to prevent injection via query params
   const esc = (s: string) =>
@@ -862,6 +866,7 @@ function authorizePageHtml(
   data-redirect-uri="${esc(redirectUri)}"
   data-audience="${esc(audience)}"
   data-state="${esc(state)}"
+  data-code-challenge="${esc(codeChallenge)}"
   style="display:none"></div>
 
 <div class="term-window">
@@ -889,6 +894,7 @@ function authorizePageHtml(
   var redirectUri = el.getAttribute('data-redirect-uri');
   var audience = el.getAttribute('data-audience');
   var state = el.getAttribute('data-state');
+  var codeChallenge = el.getAttribute('data-code-challenge');
   var output = document.getElementById('output');
   var statusLine = document.getElementById('statusLine');
 
@@ -910,10 +916,14 @@ function authorizePageHtml(
       // Session cookie sent automatically (same origin).
       // No client-side crypto needed — the session IS the identity proof.
       addLine('requesting redirect token...', 'info');
-      var res = await fetch('/authorize/token', {
+      var res = await fetch(codeChallenge ? '/authorize/code' : '/authorize/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audience: audience }),
+        body: JSON.stringify(
+          codeChallenge
+            ? { audience: audience, redirect_uri: redirectUri, code_challenge: codeChallenge }
+            : { audience: audience }
+        ),
         credentials: 'same-origin'
       });
 
@@ -924,14 +934,28 @@ function authorizePageHtml(
       }
 
       var data = await res.json();
-      var token = data.access_token;
-      if (!token) throw new Error('no access_token in response');
-
-      addLine('redirect token issued (5min TTL)', 'ok');
-
-      // 5. Redirect back to caller with token + state
       var sep = redirectUri.indexOf('?') === -1 ? '?' : '&';
-      var dest = redirectUri + sep + 'token=' + encodeURIComponent(token);
+      var dest;
+
+      if (codeChallenge) {
+        // ADR-013: the URL carries a single-use code, not a credential. The
+        // access token is fetched server-to-server by the party holding the
+        // PKCE verifier, so it never enters this URL, browser history, or a
+        // Referer.
+        var code = data.code;
+        if (!code) throw new Error('no code in response');
+        addLine('authorization code issued (60s TTL, PKCE-bound)', 'ok');
+        dest = redirectUri + sep + 'code=' + encodeURIComponent(code);
+      } else {
+        // Legacy path, removed once rig ships its side (notme-2bba44). This
+        // puts a live bearer token in the URL — see THREAT_MODEL.md
+        // 'token in URL logs'.
+        var token = data.access_token;
+        if (!token) throw new Error('no access_token in response');
+        addLine('redirect token issued (5min TTL)', 'ok');
+        dest = redirectUri + sep + 'token=' + encodeURIComponent(token);
+      }
+
       if (state) dest += '&state=' + encodeURIComponent(state);
 
       setStatus('redirecting to ' + new URL(redirectUri).hostname + '...', 'ok');
@@ -1805,6 +1829,35 @@ export default {
           url.searchParams.get("audience") || "https://rosary.bot";
         const state = url.searchParams.get("state") || "";
 
+        // ADR-013: capability negotiation, not a feature flag. A client that
+        // sends a PKCE challenge gets the authorization-code completion
+        // (`?code=`); one that does not gets the legacy `?token=`. This exists
+        // solely so rig can be migrated without a flag day — and a flag day is
+        // unacceptable here for a specific reason: /admin/setup-github is the
+        // flow used to RECOVER admin access, so breaking it costs more than
+        // the exposure being closed.
+        //
+        // The legacy branch has no reason to outlive rig's deploy. Deleting it
+        // is tracked on notme-2bba44.
+        const codeChallenge = url.searchParams.get("code_challenge") || "";
+        const codeChallengeMethod =
+          url.searchParams.get("code_challenge_method") || "";
+
+        const { isValidCodeChallenge } = await import("./src/auth/pkce");
+        if (codeChallenge) {
+          // S256 only. RFC 7636 §4.2 also defines "plain", where the verifier
+          // IS the challenge — which would put the verifier in the redirect
+          // URL and reintroduce precisely the leak this flow removes.
+          if (codeChallengeMethod !== "S256") {
+            return jsonErr("code_challenge_method must be S256", 400);
+          }
+          if (!isValidCodeChallenge(codeChallenge)) {
+            // Fail at flow START, where the error is diagnosable, rather than
+            // one round-trip later as an opaque invalid_grant.
+            return jsonErr("malformed code_challenge", 400);
+          }
+        }
+
         // Validate redirect_uri via the shared helper — keeps the matrix
         // (required / parsable / https-or-localhost / allowlist) under
         // unit tests in worker/src/auth/redirect-uri.ts rather than
@@ -1842,37 +1895,210 @@ export default {
 
         // Session valid — serve the authorize page
         // Params are injected into a data attribute and read by JS (no inline eval)
-        return new Response(authorizePageHtml(redirectUri, audience, state), {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            // Scope this precisely, because it is easy to overclaim (an
-            // earlier draft of this comment did): a Referrer-Policy on THIS
-            // document governs the Referer THIS document sends — on its own
-            // subresource loads, and on the navigation away to redirect_uri.
-            // It does NOT govern what the DESTINATION page sends once the
-            // browser is sitting on `${redirect_uri}?token=...`; that is the
-            // destination's own Referrer-Policy (rig's, today), and it is the
-            // vector that actually leaks the ACCESS TOKEN onward. notme
-            // cannot close that from here.
-            //
-            // What this DOES protect is the authorize URL itself — which
-            // carries `state`, a CSRF value — from being handed to the
-            // destination as a Referer. Modern browsers default to
-            // strict-origin-when-cross-origin and would send only the origin
-            // anyway, so treat this as making an existing default explicit
-            // and covering the same-origin case, not as a fix for the token.
-            //
-            // The token-in-URL exposure is untouched by this header. See
-            // THREAT_MODEL.md `token in URL logs` / notme-07204f for the real
-            // residual and the three delivery changes that would remove it.
-            "Referrer-Policy": "no-referrer",
+        return new Response(
+          authorizePageHtml(redirectUri, audience, state, codeChallenge),
+          {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              // Scope this precisely, because it is easy to overclaim (an
+              // earlier draft of this comment did): a Referrer-Policy on THIS
+              // document governs the Referer THIS document sends — on its own
+              // subresource loads, and on the navigation away to redirect_uri.
+              // It does NOT govern what the DESTINATION page sends once the
+              // browser is sitting on `${redirect_uri}?token=...`; that is the
+              // destination's own Referrer-Policy (rig's, today), and it is the
+              // vector that actually leaks the ACCESS TOKEN onward. notme
+              // cannot close that from here.
+              //
+              // What this DOES protect is the authorize URL itself — which
+              // carries `state`, a CSRF value — from being handed to the
+              // destination as a Referer. Modern browsers default to
+              // strict-origin-when-cross-origin and would send only the origin
+              // anyway, so treat this as making an existing default explicit
+              // and covering the same-origin case, not as a fix for the token.
+              //
+              // The token-in-URL exposure is untouched by this header. See
+              // THREAT_MODEL.md `token in URL logs` / notme-07204f for the real
+              // residual and the three delivery changes that would remove it.
+              "Referrer-Policy": "no-referrer",
+            },
           },
-        });
+        );
+      }
+
+      // POST /authorize/code — mint a single-use authorization code (ADR-013).
+      //
+      // Called by the /authorize page JS, same-origin, with the session
+      // cookie. Returns a code that goes in the redirect URL INSTEAD of an
+      // access token: a code in a log is worthless once redeemed, and PKCE
+      // means an attacker who reads one cannot redeem it at all.
+      if (pathname === "/authorize/code" && request.method === "POST") {
+        try {
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          if (!cookie) {
+            return Response.json(
+              { error: "session_required" },
+              { status: 401 },
+            );
+          }
+
+          let body: {
+            audience?: string;
+            redirect_uri?: string;
+            code_challenge?: string;
+          } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+
+          const audience = body.audience || "";
+          if (!audience) {
+            return Response.json(
+              { error: "audience_required" },
+              { status: 400 },
+            );
+          }
+          const allowedAudiences = getAllowedAudiences(env);
+          if (!allowedAudiences.has(audience)) {
+            return Response.json(
+              { error: "invalid_audience", allowed: [...allowedAudiences] },
+              { status: 400 },
+            );
+          }
+
+          // The redirect_uri is re-validated here, not trusted from the page.
+          // This endpoint is reachable directly, so the allowlist has to hold
+          // at the point the code is BOUND to a destination — otherwise a
+          // caller could bind a code to an arbitrary URI and the check on
+          // /authorize would be decorative.
+          const { validateRedirectUri } =
+            await import("./src/auth/redirect-uri");
+          const v = validateRedirectUri(body.redirect_uri || "");
+          if (!v.ok) return jsonErr(v.reason, v.status);
+
+          const { isValidCodeChallenge } = await import("./src/auth/pkce");
+          if (!isValidCodeChallenge(body.code_challenge)) {
+            return jsonErr("malformed or missing code_challenge", 400);
+          }
+
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const { verifySessionCookie } = await import("./src/auth/session");
+          const sessionSecret = await authority.getSessionSecret();
+          const session = await verifySessionCookie(cookie, sessionSecret);
+          if (!session) {
+            return Response.json({ error: "invalid_session" }, { status: 401 });
+          }
+
+          const { code, expiresAt } = await authority.createAuthorizationCode({
+            principalId: session.principalId,
+            scopes: session.scopes,
+            audience,
+            redirectUri: body.redirect_uri!,
+            codeChallenge: body.code_challenge,
+          });
+
+          return Response.json({
+            code,
+            expires_in: expiresAt - Math.floor(Date.now() / 1000),
+          });
+        } catch (e: any) {
+          return jsonErr("authorize code error: " + e.message, 500);
+        }
+      }
+
+      // POST /authorize/redeem — exchange an authorization code for a token
+      // (ADR-013, RFC 6749 §4.1.3 shape).
+      //
+      // Server-to-server: the caller is the party that started the flow and
+      // holds the PKCE verifier. NO session cookie — this is not a browser
+      // call, and requiring one would defeat the point (the whole reason the
+      // code exists is that the browser hands off to a backend).
+      //
+      // Authentication IS the PKCE verifier plus possession of the code. That
+      // is why no client_secret appears here: the redirect-host allowlist is
+      // the client registry (ADR-013 "deliberately not in scope"), and PKCE
+      // binds the redemption to whoever started the flow.
+      if (pathname === "/authorize/redeem" && request.method === "POST") {
+        try {
+          let body: {
+            code?: string;
+            code_verifier?: string;
+            redirect_uri?: string;
+          } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+
+          const { isValidCodeVerifier } = await import("./src/auth/pkce");
+          if (!body.code || typeof body.code !== "string") {
+            return Response.json(
+              { error: "invalid_request", error_description: "code required" },
+              { status: 400 },
+            );
+          }
+          if (!isValidCodeVerifier(body.code_verifier)) {
+            // Checked rather than trusted: PKCE's security argument IS the
+            // verifier's entropy, so accepting a short one would hand back a
+            // working flow with none of the protection.
+            return Response.json(
+              {
+                error: "invalid_request",
+                error_description:
+                  "code_verifier must be 43-128 unreserved characters (RFC 7636 §4.1)",
+              },
+              { status: 400 },
+            );
+          }
+          if (!body.redirect_uri || typeof body.redirect_uri !== "string") {
+            return Response.json(
+              {
+                error: "invalid_request",
+                error_description: "redirect_uri required",
+              },
+              { status: 400 },
+            );
+          }
+
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const result = await authority.redeemAuthorizationCode({
+            code: body.code,
+            codeVerifier: body.code_verifier,
+            redirectUri: body.redirect_uri,
+          });
+
+          if (!result.ok) {
+            // One answer for unknown / spent / expired / wrong-redirect_uri /
+            // bad-verifier. Distinguishing them would tell an attacker
+            // probing with harvested codes which ones were real.
+            return Response.json({ error: result.reason }, { status: 400 });
+          }
+
+          return Response.json({
+            access_token: result.accessToken,
+            token_type: "Bearer",
+            expires_in: 300,
+          });
+        } catch (e: any) {
+          return jsonErr("authorize redeem error: " + e.message, 500);
+        }
       }
 
       // POST /authorize/token — Unbound redirect token for /authorize flow.
       // Session cookie required. No DPoP — token has no cnf.jkt.
       // Used by the /authorize page JS after passkey login.
+      //
+      // LEGACY (ADR-013). Superseded by /authorize/code + /authorize/redeem,
+      // which keep the credential out of the URL entirely. Retained only
+      // until rig ships its side; deletion tracked on notme-2bba44.
       if (pathname === "/authorize/token" && request.method === "POST") {
         try {
           const cookie = parseCookie(
