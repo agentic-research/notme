@@ -2,3 +2,25 @@ packages:
   - "action"
   - "worker"
   - "packages/*"
+
+# Transitive-dependency pins for advisories with no direct upgrade path.
+#
+# These live HERE, not under a `pnpm.overrides` key in package.json. pnpm 10
+# (this repo pins pnpm@10.30.3 via `packageManager`) stopped reading the
+# `pnpm` field from package.json and warns on every invocation:
+#   "The 'pnpm' field in package.json is no longer read by pnpm."
+# The warning is easy to scroll past, so the overrides sat inert and
+# `task worker:audit` went red the moment a new advisory landed — with the
+# repo still carrying config that looked like it was handling the problem.
+#
+# When adding an entry, pin to the version the ADVISORY names as patched,
+# not the next version after the vulnerable range. The previous undici entry
+# pinned ^6.27.0 against `<6.27.0` while GHSA-8xcm-r25x-g524,
+# GHSA-m8rv-5g2x-5cg5 and GHSA-v3r7-h72x-cjcm all require >=6.28.0 — so even
+# once the mechanism worked, the pin would still have admitted a vulnerable
+# 6.27.x.
+overrides:
+  ws@<8.20.1: "^8.20.1"
+  # undici reaches us only via action>@actions/http-client — no direct dep to
+  # bump, hence the override.
+  undici@<6.28.0: "^6.28.0"
