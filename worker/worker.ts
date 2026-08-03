@@ -54,6 +54,7 @@ const DENIED_HOSTS = new Set([
 // Implementation in src/allowed-audiences.ts so unit tests can import it
 // without pulling in cloudflare:workers via worker.ts.
 import { getAllowedAudiences } from "./src/allowed-audiences";
+import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 
 function isDeniedDestination(url: string): boolean {
   try {
@@ -1917,6 +1918,10 @@ export default {
           // ── Resolve identity: session cookie OR client cert ──
           let principalId: string | null = null;
           let scopes: string[] = [];
+          // Hoisted: the DPoP nonce MAC key is derived from this same secret
+          // (src/auth/dpop-nonce.ts), and re-fetching it below would be a
+          // second DO round-trip for a value already in hand.
+          let sessionSecret: string | null = null;
 
           // Try session cookie first (browser/passkey users)
           const cookie = parseCookie(
@@ -1925,8 +1930,9 @@ export default {
           );
           if (cookie) {
             const { verifySessionCookie } = await import("./src/auth/session");
-            const sessionSecret = await authority.getSessionSecret();
-            const session = await verifySessionCookie(cookie, sessionSecret);
+            const secret: string = await authority.getSessionSecret();
+            sessionSecret = secret;
+            const session = await verifySessionCookie(cookie, secret);
             if (session) {
               principalId = session.principalId;
               scopes = session.scopes;
@@ -1969,6 +1975,51 @@ export default {
             );
           }
 
+          // ── Nonce challenge (RFC 9449 §8/§9) ──
+          //
+          // Placed AFTER session resolution, rate limiting and proof
+          // validation, so a challenge is only ever minted for a caller that
+          // has already authenticated and proved possession of the proof key.
+          // Issuing nonces earlier would hand an unauthenticated caller a
+          // free HMAC oracle on the rejection path.
+          //
+          // Off by default: turning it on rejects the first request of every
+          // client that has never seen a challenge, which is correct per spec
+          // but is a breaking change for deployed clients. Deployments opt in
+          // once their clients handle the retry.
+          if (dpopNonceRequired(env)) {
+            if (!sessionSecret) {
+              // Unreachable — principalId is only set on the cookie path,
+              // which assigns the secret. Explicit rather than a `!`: if a
+              // future auth path sets principalId without the secret, this
+              // must fail closed, not skip the nonce check.
+              return jsonErr("nonce unavailable: no session secret", 500);
+            }
+            const { issueDpopNonce, verifyDpopNonce, nonceHeaders } =
+              await import("./src/auth/dpop-nonce");
+            const nonceOk = await verifyDpopNonce(
+              proofResult.nonce,
+              sessionSecret,
+            );
+            if (!nonceOk) {
+              // §8.1: 400 + `use_dpop_nonce`, carrying the nonce to retry
+              // with. The JTI is deliberately NOT consumed — the client will
+              // re-sign with a fresh proof, and burning the jti here would
+              // make every challenge cost the client an extra round-trip.
+              return Response.json(
+                {
+                  error: "use_dpop_nonce",
+                  error_description:
+                    "Authorization server requires a nonce in the DPoP proof",
+                },
+                {
+                  status: 400,
+                  headers: nonceHeaders(await issueDpopNonce(sessionSecret)),
+                },
+              );
+            }
+          }
+
           // Atomically consume the proof JTI and mint inside the singleton DO.
           // SQLite uniqueness closes the cross-edge read/write race that an
           // eventually-consistent KV cache cannot.
@@ -1983,11 +2034,27 @@ export default {
             return Response.json({ error: "proof_reused" }, { status: 401 });
           }
 
-          return Response.json({
-            access_token: mintResult.accessToken,
-            token_type: "DPoP",
-            expires_in: 300,
-          });
+          // §8.2 permits a fresh nonce on a SUCCESSFUL response too. Without
+          // it a client only ever learns a nonce by being rejected, so every
+          // token would cost two round-trips once the nonce it holds ages
+          // out. sessionSecret is non-null here whenever the flag is on —
+          // the challenge block above returns otherwise.
+          let successHeaders: Record<string, string> = {};
+          if (dpopNonceRequired(env) && sessionSecret) {
+            const { issueDpopNonce, nonceHeaders } = await import(
+              "./src/auth/dpop-nonce"
+            );
+            successHeaders = nonceHeaders(await issueDpopNonce(sessionSecret));
+          }
+
+          return Response.json(
+            {
+              access_token: mintResult.accessToken,
+              token_type: "DPoP",
+              expires_in: 300,
+            },
+            { headers: successHeaders },
+          );
         } catch (e: any) {
           return jsonErr("token endpoint error: " + e.message, 500);
         }

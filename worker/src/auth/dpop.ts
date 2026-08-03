@@ -11,8 +11,45 @@ import {
   jsonParseSafe,
 } from "@agentic-research/dpop";
 
-/** Maximum allowed age of a DPoP proof (seconds). */
+/**
+ * Maximum allowed skew of a DPoP proof's `iat`, in seconds — applied in BOTH
+ * directions (see the check in `validateDpopProof`).
+ *
+ * RFC 9449 §4.3 step 11 only asks that `iat` be "within an acceptable
+ * timeframe", which is normally read as *not too old*. Future-dated proofs
+ * are rejected here as well, deliberately: `iat` is written by the client, so
+ * without an upper bound a client could mint a batch of proofs stamped hours
+ * ahead and hold them, turning a 60-second freshness window into an
+ * open-ended one. Rejecting the future side costs nothing (a correct client
+ * has no reason to post-date) and closes that.
+ *
+ * `iat` is still a client-controlled claim either way. A server-controlled
+ * freshness signal is what `dpop-nonce.ts` provides.
+ */
 const MAX_IAT_AGE_SECONDS = 60;
+
+/**
+ * The single algorithm accepted for DPoP proof JWTs.
+ *
+ * DELIBERATE NARROWING. RFC 9449 §4.2 permits any asymmetric JWA algorithm;
+ * this accepts only ES256. Note the asymmetry with the rest of the system —
+ * this authority SIGNS with Ed25519, and still rejects an EdDSA proof. That
+ * is not an oversight:
+ *
+ *   - ES256 (P-256) is the only proof algorithm reachable from browser
+ *     WebCrypto across the browsers this endpoint exists for, and browsers
+ *     are the residual scope of the DPoP path (ADR-006 — non-browser surfaces
+ *     use the ADR-008 bridge cert pair instead).
+ *   - One accepted algorithm means no algorithm-negotiation surface, which is
+ *     where JWT verifiers historically go wrong.
+ *
+ * It is not a silent restriction: `dpop_signing_alg_values_supported` in
+ * as-metadata.ts publishes it, so a client discovers the constraint rather
+ * than meeting it as a 401. `as-metadata.test.ts` pins the two together —
+ * widening this list without widening the published one (or vice versa) fails
+ * that test.
+ */
+export const ACCEPTED_PROOF_ALG = "ES256";
 
 export interface DpopValidationOptions {
   /** Expected HTTP method (e.g. "POST"). */
@@ -32,6 +69,16 @@ export interface DpopValidationResult {
   jti: string;
   /** RFC 7638 JWK Thumbprint of the proof key. */
   thumbprint: string;
+  /**
+   * The raw `nonce` claim, or undefined if the proof carried none.
+   *
+   * Surfaced rather than checked here because this module cannot verify a
+   * server-issued nonce: `dpop-nonce.ts` nonces are MACs over their own
+   * timestamp, so validating one needs the authority secret, which this
+   * module deliberately has no access to. `options.nonce` remains the
+   * exact-match path for a caller that already holds the expected value.
+   */
+  nonce?: string;
 }
 
 /**
@@ -71,8 +118,10 @@ export async function validateDpopProof(
   if (header.typ !== "dpop+jwt") {
     throw new Error(`DPoP proof typ must be "dpop+jwt", got "${header.typ}"`);
   }
-  if (header.alg !== "ES256") {
-    throw new Error(`DPoP proof alg must be "ES256", got "${header.alg}"`);
+  if (header.alg !== ACCEPTED_PROOF_ALG) {
+    throw new Error(
+      `DPoP proof alg must be "${ACCEPTED_PROOF_ALG}", got "${header.alg}"`,
+    );
   }
   if (!header.jwk || typeof header.jwk !== "object") {
     throw new Error("DPoP proof header must contain a jwk");
@@ -165,6 +214,7 @@ export async function validateDpopProof(
     jwk: header.jwk,
     jti: payload.jti,
     thumbprint,
+    nonce: typeof payload.nonce === "string" ? payload.nonce : undefined,
   };
 }
 

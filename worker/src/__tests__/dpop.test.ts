@@ -266,6 +266,79 @@ describe("validateDpopProof", () => {
     ).rejects.toThrow(/iat|expired|old/i);
   });
 
+  it("rejects future-dated iat (>60s ahead)", async () => {
+    // The symmetric half of the window, and the reason it exists: `iat` is
+    // written by the CLIENT. With only the too-old bound enforced, a client
+    // could mint proofs stamped hours ahead and hold them, so the 60-second
+    // freshness window would bound nothing. RFC 9449 §4.3 step 11 does not
+    // require this direction — it is ours, and untested it is one dropped
+    // `age < -MAX` comparison away from silently disappearing.
+    const { validateDpopProof } = await import("../auth/dpop");
+    const { keyPair, jwk } = await generateP256();
+
+    const proof = await buildDpopProof({
+      keyPair,
+      jwk,
+      payloadOverrides: { iat: Math.floor(Date.now() / 1000) + 120 },
+    });
+
+    await expect(
+      validateDpopProof(proof, {
+        htm: "POST",
+        htu: "https://auth.notme.bot/token",
+      }),
+    ).rejects.toThrow(/iat|future/i);
+  });
+
+  it("accepts iat inside the window on both sides", async () => {
+    // Guards the opposite failure: a tightening that rejects legitimate
+    // clock skew would break every client whose clock is a few seconds off,
+    // and the rejection tests above would still pass.
+    const { validateDpopProof } = await import("../auth/dpop");
+    const now = Math.floor(Date.now() / 1000);
+
+    for (const iat of [now - 30, now + 30]) {
+      const { keyPair, jwk } = await generateP256();
+      const proof = await buildDpopProof({
+        keyPair,
+        jwk,
+        payloadOverrides: { iat },
+      });
+      await expect(
+        validateDpopProof(proof, {
+          htm: "POST",
+          htu: "https://auth.notme.bot/token",
+        }),
+      ).resolves.toBeTruthy();
+    }
+  });
+
+  it("surfaces the nonce claim to the caller", async () => {
+    // The route verifies server-issued nonces with the authority secret,
+    // which this module has no access to — so it must hand the raw claim
+    // back rather than silently dropping it.
+    const { validateDpopProof } = await import("../auth/dpop");
+    const { keyPair, jwk } = await generateP256();
+
+    const withNonce = await buildDpopProof({
+      keyPair,
+      jwk,
+      payloadOverrides: { nonce: "server-issued-value" },
+    });
+    const result = await validateDpopProof(withNonce, {
+      htm: "POST",
+      htu: "https://auth.notme.bot/token",
+    });
+    expect(result.nonce).toBe("server-issued-value");
+
+    const without = await buildDpopProof({ keyPair, jwk });
+    const bare = await validateDpopProof(without, {
+      htm: "POST",
+      htu: "https://auth.notme.bot/token",
+    });
+    expect(bare.nonce).toBeUndefined();
+  });
+
   it("rejects htm mismatch", async () => {
     const { validateDpopProof } = await import("../auth/dpop");
     const { keyPair, jwk } = await generateP256();
