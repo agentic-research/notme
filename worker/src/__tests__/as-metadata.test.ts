@@ -140,6 +140,24 @@ describe("AS metadata — signing algorithms", () => {
     expect(DPOP_PROOF_ALGS).toContain("ES256");
   });
 
+  it("advertises exactly the proof alg the validator enforces", async () => {
+    // The drift this catches runs in BOTH directions and neither shows up as
+    // a test failure anywhere else:
+    //
+    //   - widen the validator, forget the metadata -> the server accepts an
+    //     alg no client can discover, so nobody uses it and the extra
+    //     verification surface is carried for nothing.
+    //   - widen the metadata, forget the validator -> discovery promises an
+    //     alg, every client that picks it gets a 401, and the failure looks
+    //     like a client bug.
+    //
+    // Locked as an equality, not a subset: ACCEPTED_PROOF_ALG is a single
+    // value in dpop.ts today, so the published list is exactly [it]. When a
+    // second alg is genuinely added, both sides move in one commit.
+    const { ACCEPTED_PROOF_ALG } = await import("../auth/dpop");
+    expect([...DPOP_PROOF_ALGS]).toEqual([ACCEPTED_PROOF_ALG]);
+  });
+
   it("publishes the issuer's JWS alg — absence makes go-oidc assume RS256", () => {
     // go-oidc verifyJWT: "If no algorithms were specified by both the config
     // and discovery, default to the one mandatory algorithm RS256."
