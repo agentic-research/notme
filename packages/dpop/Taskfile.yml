@@ -25,7 +25,7 @@ tasks:
       - task: release:publish
 
   ci-publish:
-    desc: "Pack-smoke and publish DPoP to npm from CI with provenance."
+    desc: "DEPRECATED — publishing happens in publish-dpop.yml via OIDC."
     cmds:
       - task: release:ci-publish
 

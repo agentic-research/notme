@@ -35,9 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # id-token lets npm attach a provenance attestation binding the tarball to
-      # this workflow + commit. Consumers can verify the package was built here
-      # and not uploaded from someone's laptop.
+      # Required for npm trusted publishing (OIDC): npm exchanges this token
+      # for short-lived publish credentials, and derives the provenance
+      # attestation from it. No NPM_TOKEN is stored anywhere.
       id-token: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -73,9 +73,6 @@ jobs:
         run: pnpm vitest run
       - run: task dpop:build
 
-      - name: Pack smoke
-        run: task dpop:test:package
-
       - name: Tag must match package version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
@@ -87,7 +84,58 @@ jobs:
           fi
           echo "version $PKG_VERSION matches tag"
 
-      - name: Publish via Taskfile
-        run: task dpop:ci-publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # npm, not pnpm, and no NODE_AUTH_TOKEN.
+      #
+      # Two verified defects motivated this (notme-4fa4a5):
+      #
+      #   1. `pnpm publish --provenance` was a NO-OP. `--provenance` is not a
+      #      pnpm flag (absent from `pnpm publish --help` on the pinned
+      #      10.30.3). dpop-v0.2.0 ran through this workflow successfully and
+      #      its published tarball still has NO attestation —
+      #      registry.npmjs.org/-/npm/v1/attestations/... returns "Not found".
+      #      So the comment above this step used to promise consumers a
+      #      verifiable build origin that was never actually attached.
+      #
+      #   2. Authentication was a long-lived stored NPM_TOKEN — the exact
+      #      credential shape this repository exists to eliminate.
+      #
+      # Trusted publishing fixes both at once: OIDC replaces the stored token,
+      # and npm derives provenance from the same id-token. Requires npm
+      # >= 11.5.1; setup-node's Node 22 bundles npm 10.x, hence the explicit
+      # upgrade.
+      #
+      # ONE-TIME MANUAL PREREQUISITE: the package must have a trusted publisher
+      # configured at npmjs.com (Settings -> Trusted publisher) naming this
+      # repository AND this workflow filename. Without it npm rejects the
+      # publish with an auth error rather than falling back to a token.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@^11.5.1
+
+      - name: Pack smoke
+        working-directory: packages/dpop
+        run: npm run test:package
+
+      - name: Publish (OIDC trusted publishing, no stored token)
+        working-directory: packages/dpop
+        run: npm publish --access public --provenance
+
+      # The claim is verified, not asserted. Defect (1) above survived because
+      # nothing ever checked that provenance actually landed — a silently
+      # ignored flag looks identical to a working one. This step turns that
+      # class of failure into a red build.
+      - name: Verify provenance actually landed
+        run: |
+          VERSION="$(node -p "require('./packages/dpop/package.json').version")"
+          URL="https://registry.npmjs.org/-/npm/v1/attestations/@agentic-research%2fdpop@${VERSION}"
+          echo "checking $URL"
+          for i in 1 2 3 4 5; do
+            BODY="$(curl -sS "$URL" || true)"
+            if echo "$BODY" | grep -q '"attestations"'; then
+              echo "provenance attestation present for ${VERSION}"
+              exit 0
+            fi
+            echo "not visible yet (attempt $i), waiting for registry propagation..."
+            sleep 10
+          done
+          echo "::error::published ${VERSION} but NO provenance attestation is queryable — do not advertise verifiable build origin for this version" >&2
+          exit 1
