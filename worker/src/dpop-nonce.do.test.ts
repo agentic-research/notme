@@ -105,10 +105,11 @@ async function makeProof(
 }
 
 function newKeyPair(): Promise<CryptoKeyPair> {
-  return crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
-    "sign",
-    "verify",
-  ]) as Promise<CryptoKeyPair>;
+  return crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  ) as Promise<CryptoKeyPair>;
 }
 
 /**
@@ -163,14 +164,13 @@ describe("/token nonce challenge — real route, real DO", () => {
   });
 
   it("challenges a nonce-less proof with 400 use_dpop_nonce + a readable nonce", async () => {
-
     const res = await postTokenNonced(
       await makeProof(await newKeyPair()),
       await realSessionCookie(),
     );
 
     expect(res.status).toBe(400);
-    expect((await res.json() as any).error).toBe("use_dpop_nonce");
+    expect(((await res.json()) as any).error).toBe("use_dpop_nonce");
     expect(res.headers.get("DPoP-Nonce")).toBeTruthy();
     // The half that makes the challenge actionable in a browser: without
     // this, JS reads null off the Headers object and loops forever.
@@ -188,7 +188,10 @@ describe("/token nonce challenge — real route, real DO", () => {
 
     // Fresh proof (new jti), same key, now carrying the server's nonce —
     // exactly what a spec-compliant client does on 400 use_dpop_nonce.
-    const res = await postTokenNonced(await makeProof(keyPair, { nonce }), cookie);
+    const res = await postTokenNonced(
+      await makeProof(keyPair, { nonce }),
+      cookie,
+    );
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
@@ -210,7 +213,10 @@ describe("/token nonce challenge — real route, real DO", () => {
     const keyPair = await newKeyPair();
     const jti = crypto.randomUUID();
 
-    const challenge = await postTokenNonced(await makeProof(keyPair, { jti }), cookie);
+    const challenge = await postTokenNonced(
+      await makeProof(keyPair, { jti }),
+      cookie,
+    );
     expect(challenge.status).toBe(400);
     const nonce = challenge.headers.get("DPoP-Nonce")!;
 
@@ -222,7 +228,6 @@ describe("/token nonce challenge — real route, real DO", () => {
   });
 
   it("rejects a forged nonce and re-challenges", async () => {
-
     const res = await postTokenNonced(
       await makeProof(await newKeyPair(), {
         nonce: `${Math.floor(Date.now() / 1000)}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`,
@@ -231,7 +236,7 @@ describe("/token nonce challenge — real route, real DO", () => {
     );
 
     expect(res.status).toBe(400);
-    expect((await res.json() as any).error).toBe("use_dpop_nonce");
+    expect(((await res.json()) as any).error).toBe("use_dpop_nonce");
     expect(res.headers.get("DPoP-Nonce")).toBeTruthy();
   });
 
@@ -250,7 +255,7 @@ describe("/token nonce challenge — real route, real DO", () => {
 
     const replay = await postTokenNonced(proof, cookie);
     expect(replay.status).toBe(401);
-    expect((await replay.json() as any).error).toBe("proof_reused");
+    expect(((await replay.json()) as any).error).toBe("proof_reused");
   });
 });
 
@@ -368,7 +373,7 @@ describe("/token CORS — real route (notme-0a27a6)", () => {
 
     expect(res.headers.get("Access-Control-Allow-Credentials")).toBeNull();
     expect(res.status).toBe(401);
-    expect((await res.json() as any).error).toBe("session_required");
+    expect(((await res.json()) as any).error).toBe("session_required");
   });
 
   it("does not emit ACAO for an origin outside the allowlist", async () => {
@@ -385,5 +390,40 @@ describe("/token CORS — real route (notme-0a27a6)", () => {
     );
 
     expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+});
+
+describe("nonce challenge is actionable from a cross-origin browser", () => {
+  it("carries ACAO and Expose-Headers together, so JS can read the nonce", async () => {
+    // The composite property the two fixes exist for, and which neither
+    // covers alone. A browser needs BOTH: Access-Control-Allow-Origin to be
+    // allowed to see the response at all (notme-0a27a6), and
+    // Access-Control-Expose-Headers to be allowed to read DPoP-Nonce off it
+    // (notme-e1700d). With either missing the client cannot complete the
+    // RFC 9449 §8 retry and loops on challenges forever — and browsers are
+    // the entire residual scope of this endpoint (ADR-006).
+    const res = await worker.fetch(
+      new Request(TOKEN_URL, {
+        method: "POST",
+        headers: {
+          Origin: "https://rosary.bot",
+          DPoP: await makeProof(await newKeyPair()),
+          cookie: await realSessionCookie(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ audience: AUDIENCE }),
+      }),
+      { ...env, ...LOCAL_ENV, DPOP_REQUIRE_NONCE: "true" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error).toBe("use_dpop_nonce");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://rosary.bot",
+    );
+    expect(res.headers.get("Access-Control-Expose-Headers")).toContain(
+      "DPoP-Nonce",
+    );
+    expect(res.headers.get("DPoP-Nonce")).toBeTruthy();
   });
 });
