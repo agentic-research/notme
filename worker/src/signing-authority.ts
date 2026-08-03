@@ -48,6 +48,18 @@ const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
 
+/**
+ * Outcome of a receipt-signing attempt (ADR-014).
+ *
+ * A union rather than throw-on-failure: an RPC rejection surfaces as an
+ * uncaught exception in the callee's context and stringifies the error, so a
+ * caller could only branch on message text. `code` is the stable contract —
+ * cloister re-reads `getReceiptFacts()` on `EPOCH_MISMATCH` instead of polling
+ * for key rotation.
+ */
+export type ReceiptSignResult =
+  | { ok: true; signature: Uint8Array; epoch: number }
+  | { ok: false; code: string; message: string };
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
@@ -442,6 +454,96 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const accessToken = await this.mintDPoPToken(params);
     return { ok: true, accessToken };
+  }
+
+  /**
+   * Sign an Interlace 0.2.0 receipt commitment with the master key (ADR-014).
+   *
+   * SIGN-ONLY, and deliberately NOT a general signing primitive. The bytes are
+   * validated and canonically re-encoded by `validateCommitment` before they
+   * reach `crypto.subtle.sign`, because this same key signs X.509
+   * `TBSCertificate` DER and `at+jwt` access tokens and the Interlace spec
+   * signs the commitment with no domain separator. A method here that signed
+   * whatever it was handed would let a caller submit a crafted
+   * `TBSCertificate` and assemble a certificate chaining to this authority for
+   * any identity and any scopes.
+   *
+   * `actor_fp` and `epoch` are DERIVED here from the authority's own state and
+   * the commitment is rejected if it disagrees — the notme-6ad276 invariant:
+   * facts about this authority are never taken from the caller.
+   *
+   * Returns the signature and the epoch. It cannot return key material:
+   * `CryptoKey` is not Structured Cloneable and cannot cross the RPC boundary.
+   */
+
+  /**
+   * The two commitment fields that are facts about THIS authority (ADR-014).
+   *
+   * Cloister needs both to construct a commitment, and `signReceiptCommitment`
+   * rejects any commitment that disagrees — so without this it would have to
+   * source them from `.well-known` and stay in sync with rotation on its own.
+   * Serving them from the same place that enforces them removes a class of
+   * "receipt rejected, epoch drifted" failures entirely.
+   *
+   * Cacheable, but not indefinitely: `epoch` changes on key rotation, which is
+   * alarm-driven here. Treat an EPOCH_MISMATCH from signing as the signal to
+   * re-read rather than polling.
+   */
+  async getReceiptFacts(): Promise<{ actorFp: Uint8Array; epoch: number }> {
+    this.ensureSchema();
+    const { verifyKey } = await this.getOrCreateSigningKey();
+
+    // actor_fp per RECEIPTS.md §2.1: SHA-256 of the actor's master PUBLIC key.
+    // Over the RAW Ed25519 key, which is what a verifier resolving
+    // `.well-known` gets — hashing a PEM or SPKI wrapper instead would yield a
+    // fingerprint no verifier can reproduce.
+    const rawPub = new Uint8Array(
+      (await crypto.subtle.exportKey("raw", verifyKey)) as ArrayBuffer,
+    );
+    const actorFp = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", rawPub),
+    );
+
+    const rows = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+
+    return { actorFp, epoch: rows[0]!.epoch };
+  }
+
+  async signReceiptCommitment(
+    commitment: Uint8Array,
+  ): Promise<ReceiptSignResult> {
+    const { signingKey } = await this.getOrCreateSigningKey();
+    const { actorFp, epoch } = await this.getReceiptFacts();
+
+    const { validateCommitment, CommitmentError } =
+      await import("./receipts/commitment");
+
+    let canonical: Uint8Array;
+    try {
+      canonical = validateCommitment(commitment, { actorFp, epoch });
+    } catch (e: any) {
+      // A discriminated union, not a throw, and not merely for tidiness.
+      //
+      // Rejecting across an RPC boundary surfaces as an uncaught exception in
+      // the callee's context even when the caller handles it — enough to fail
+      // the test run outright. It also stringifies the error, so a caller
+      // cannot branch on anything but message text.
+      //
+      // Returning a code is what makes the documented recovery possible:
+      // cloister re-reads getReceiptFacts() on EPOCH_MISMATCH rather than
+      // polling for rotation. Matches `mintDPoPTokenOnce` above.
+      if (e instanceof CommitmentError) {
+        return { ok: false, code: e.code, message: e.message };
+      }
+      throw e; // not a validation failure — a real fault, let it surface
+    }
+
+    const signature = new Uint8Array(
+      await crypto.subtle.sign(ED25519, signingKey, canonical),
+    );
+    return { ok: true, signature, epoch };
   }
 
   /**
