@@ -44,6 +44,7 @@ const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
+import { sha256Base64url } from "./auth/pkce";
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
@@ -96,6 +97,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       CREATE TABLE IF NOT EXISTS dpop_jtis (
         jti        TEXT PRIMARY KEY,
         expires_at INTEGER NOT NULL
+      )
+    `);
+    // Authorization codes for the /authorize redirect (ADR-013).
+    //
+    // Keyed by SHA-256 of the code, never the code itself: a code is a live
+    // credential until redeemed, so a read of this storage must not yield
+    // redeemable codes. Lookup is by hash, so this is also not a timing
+    // oracle on the code value.
+    //
+    // `redirect_uri` is stored so redemption can require the presented one to
+    // match (RFC 6749 §4.1.3) — that is what stops a code minted for one
+    // destination being redeemed toward another. `code_challenge` is the
+    // PKCE S256 challenge; it is what makes a code read out of a log inert
+    // rather than merely short-lived.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS auth_codes (
+        code_hash      TEXT PRIMARY KEY,
+        principal_id   TEXT NOT NULL,
+        scopes         TEXT NOT NULL,
+        audience       TEXT NOT NULL,
+        redirect_uri   TEXT NOT NULL,
+        code_challenge TEXT NOT NULL,
+        expires_at     INTEGER NOT NULL
       )
     `);
     this.initialized = true;
@@ -414,6 +438,127 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
 
     const accessToken = await this.mintDPoPToken(params);
+    return { ok: true, accessToken };
+  }
+
+  /**
+   * Issue an authorization code for the /authorize redirect (ADR-013).
+   *
+   * Returns the code in the clear exactly once — to the caller that will put
+   * it in the redirect URL. Only its SHA-256 is persisted.
+   *
+   * TTL is 60s, not the RFC 6749 §4.1.2 maximum of 600s: the code is redeemed
+   * by a server that already holds the PKCE verifier, so the window that
+   * needs covering is one round-trip. A short TTL is the cheapest defense and
+   * costs nothing a correct client will notice.
+   */
+  async createAuthorizationCode(params: {
+    principalId: string;
+    scopes: string[];
+    audience: string;
+    redirectUri: string;
+    codeChallenge: string;
+    ttlSeconds?: number;
+  }): Promise<{ code: string; expiresAt: number }> {
+    this.ensureSchema();
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = now + (params.ttlSeconds ?? 60);
+
+    // 32 bytes of CSPRNG. The code is the only thing standing between a log
+    // reader and a redemption attempt (PKCE stands behind it), so it must not
+    // be guessable.
+    const raw = new Uint8Array(32);
+    crypto.getRandomValues(raw);
+    const code = encodeBase64urlNoPadding(raw);
+
+    this.ctx.storage.sql.exec(
+      "DELETE FROM auth_codes WHERE expires_at <= ?",
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO auth_codes
+         (code_hash, principal_id, scopes, audience, redirect_uri, code_challenge, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      await sha256Base64url(code),
+      params.principalId,
+      params.scopes.join(" "),
+      params.audience,
+      params.redirectUri,
+      params.codeChallenge,
+      expiresAt,
+    );
+
+    return { code, expiresAt };
+  }
+
+  /**
+   * Atomically redeem an authorization code and mint its access token.
+   *
+   * Single-use is enforced by DELETE-then-check-changes() rather than
+   * SELECT-then-DELETE: the delete and its `changes()` read both run
+   * synchronously before the first await, so two concurrent redemptions of
+   * the same code cannot both see it present. Same discipline as
+   * `mintDPoPTokenOnce`. A SELECT-first shape would be a TOCTOU window, and
+   * the whole point of a code is that it works exactly once.
+   *
+   * The row is consumed BEFORE PKCE is checked, deliberately: a code whose
+   * verifier fails is a code that has been observed by someone who should not
+   * have it, so burning it is the correct response, not a bug. The caller
+   * restarts the flow.
+   */
+  async redeemAuthorizationCode(params: {
+    code: string;
+    codeVerifier: string;
+    redirectUri: string;
+  }): Promise<
+    | { ok: true; accessToken: string }
+    | { ok: false; reason: "invalid_grant" | "invalid_request" }
+  > {
+    this.ensureSchema();
+    const now = Math.floor(Date.now() / 1000);
+    const codeHash = await sha256Base64url(params.code);
+
+    const rows = [
+      ...this.ctx.storage.sql.exec<{
+        principal_id: string;
+        scopes: string;
+        audience: string;
+        redirect_uri: string;
+        code_challenge: string;
+        expires_at: number;
+      }>(
+        `DELETE FROM auth_codes WHERE code_hash = ? RETURNING
+           principal_id, scopes, audience, redirect_uri, code_challenge, expires_at`,
+        codeHash,
+      ),
+    ];
+    const row = rows[0];
+    // Unknown, already-redeemed and expired all collapse to one answer.
+    // Distinguishing them would tell an attacker probing with harvested codes
+    // which ones were real.
+    if (!row || row.expires_at <= now) {
+      return { ok: false, reason: "invalid_grant" };
+    }
+
+    // RFC 6749 §4.1.3 — the redirect_uri presented at redemption must equal
+    // the one the code was issued against, so a code cannot be walked to a
+    // different destination.
+    if (row.redirect_uri !== params.redirectUri) {
+      return { ok: false, reason: "invalid_grant" };
+    }
+
+    // PKCE S256 (RFC 7636 §4.6). This is what makes a code read out of a log
+    // useless: the verifier never left the client that started the flow.
+    const challenge = await sha256Base64url(params.codeVerifier);
+    if (challenge !== row.code_challenge) {
+      return { ok: false, reason: "invalid_grant" };
+    }
+
+    const accessToken = await this.mintRedirectToken({
+      sub: row.principal_id,
+      scope: row.scopes,
+      audience: row.audience,
+    });
     return { ok: true, accessToken };
   }
 

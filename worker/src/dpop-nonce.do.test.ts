@@ -1,15 +1,20 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
 /**
- * dpop-nonce.do.test.ts — the RFC 9449 §8/§9 nonce challenge, driven through
- * the REAL /token route in REAL workerd against a REAL SigningAuthority DO.
+ * dpop-nonce.do.test.ts — browser-facing auth routes driven through the REAL
+ * worker in REAL workerd against a REAL SigningAuthority DO.
  *
- * The unit suite (src/__tests__/dpop-nonce.test.ts) proves the nonce module's
- * crypto in isolation. It cannot prove the thing most likely to be wrong: that
- * the ROUTE wires it up correctly — that the challenge actually carries the
- * header, that the nonce a client reads off a 400 is accepted on the retry,
- * that the JTI is not burned by a challenge, and that the whole thing stays
- * off when the flag is off. Those are integration properties and every one of
- * them is a place a correct module can be wired into a broken endpoint.
+ * Named for the nonce work it started as; it now covers three flows that
+ * share this harness and could not be proven by unit tests, because each
+ * failure mode lives in the WIRING rather than in a module:
+ *
+ *   1. /token RFC 9449 §8/§9 nonce challenge — does the route actually emit
+ *      the header, is the nonce it hands out accepted on the retry, is the
+ *      JTI left unburned by a challenge, and does the whole thing stay off
+ *      when the flag is off.
+ *   2. /token CORS — ACAO and Access-Control-Expose-Headers must BOTH be
+ *      present or a browser cannot complete the nonce retry (notme-0a27a6).
+ *   3. /authorize authorization code + PKCE (ADR-013) — single-use,
+ *      verifier-bound, redirect_uri-bound, with no oracle distinguishing
+ *      failure reasons.
  *
  * Runs under vitest.workers.config.mts (`pnpm test:do`), NOT the plain suite.
  */
@@ -425,5 +430,240 @@ describe("nonce challenge is actionable from a cross-origin browser", () => {
       "DPoP-Nonce",
     );
     expect(res.headers.get("DPoP-Nonce")).toBeTruthy();
+  });
+});
+
+// ── ADR-013: authorization code + PKCE ────────────────────────────────────
+
+/** RFC 7636 §4.1 verifier: 43-128 chars from the unreserved set. */
+function newVerifier(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return b64url(bytes); // 43 chars, unreserved alphabet
+}
+
+async function challengeFor(verifier: string): Promise<string> {
+  const { sha256Base64url } = await import("./auth/pkce");
+  return sha256Base64url(verifier);
+}
+
+async function mintCode(
+  cookie: string,
+  challenge: string,
+  redirectUri = "https://rosary.bot/cb",
+): Promise<Response> {
+  return worker.fetch(
+    new Request(`${ORIGIN}/authorize/code`, {
+      method: "POST",
+      headers: { cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        audience: AUDIENCE,
+        redirect_uri: redirectUri,
+        code_challenge: challenge,
+      }),
+    }),
+    { ...env, ...LOCAL_ENV },
+  );
+}
+
+async function redeem(body: Record<string, unknown>): Promise<Response> {
+  return worker.fetch(
+    new Request(`${ORIGIN}/authorize/redeem`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+    { ...env, ...LOCAL_ENV },
+  );
+}
+
+describe("authorization code + PKCE (ADR-013, notme-2bba44)", () => {
+  it("completes the full flow: code in the URL, token server-to-server", async () => {
+    const cookie = await realSessionCookie();
+    const verifier = newVerifier();
+
+    const minted = await mintCode(cookie, await challengeFor(verifier));
+    expect(minted.status).toBe(200);
+    const { code, expires_in } = (await minted.json()) as any;
+    expect(code).toBeTruthy();
+    // Short by design — the redeemer already holds the verifier, so the
+    // window that needs covering is one round-trip, not RFC 6749's 600s max.
+    expect(expires_in).toBeLessThanOrEqual(60);
+
+    const res = await redeem({
+      code,
+      code_verifier: verifier,
+      redirect_uri: "https://rosary.bot/cb",
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.token_type).toBe("Bearer");
+    const claims = decodeJwtPayload(body.access_token);
+    expect(claims.aud).toBe(AUDIENCE);
+    expect(claims.sub).toBe("principal-nonce-e2e");
+  });
+
+  it("is single-use — a replayed code is dead", async () => {
+    // The property that makes a logged code worthless. If this regresses,
+    // the whole rationale for the flow goes with it.
+    const cookie = await realSessionCookie();
+    const verifier = newVerifier();
+    const { code } = (await (
+      await mintCode(cookie, await challengeFor(verifier))
+    ).json()) as any;
+    const args = {
+      code,
+      code_verifier: verifier,
+      redirect_uri: "https://rosary.bot/cb",
+    };
+
+    expect((await redeem(args)).status).toBe(200);
+    const replay = await redeem(args);
+    expect(replay.status).toBe(400);
+    expect(((await replay.json()) as any).error).toBe("invalid_grant");
+  });
+
+  it("rejects the wrong verifier — a stolen code alone is useless", async () => {
+    // This is the load-bearing claim of ADR-013: an attacker who reads the
+    // code out of an access log still cannot redeem it, because the verifier
+    // never left the client that started the flow.
+    const cookie = await realSessionCookie();
+    const verifier = newVerifier();
+    const { code } = (await (
+      await mintCode(cookie, await challengeFor(verifier))
+    ).json()) as any;
+
+    const res = await redeem({
+      code,
+      code_verifier: newVerifier(), // attacker's own, correctly formed
+      redirect_uri: "https://rosary.bot/cb",
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error).toBe("invalid_grant");
+  });
+
+  it("burns the code even when the verifier is wrong", async () => {
+    // A code whose verifier fails has been seen by someone who should not
+    // have it. Consuming it is the correct response, not a bug — so the
+    // legitimate holder cannot then redeem it either.
+    const cookie = await realSessionCookie();
+    const verifier = newVerifier();
+    const { code } = (await (
+      await mintCode(cookie, await challengeFor(verifier))
+    ).json()) as any;
+
+    await redeem({
+      code,
+      code_verifier: newVerifier(),
+      redirect_uri: "https://rosary.bot/cb",
+    });
+    const legitimate = await redeem({
+      code,
+      code_verifier: verifier,
+      redirect_uri: "https://rosary.bot/cb",
+    });
+    expect(legitimate.status).toBe(400);
+  });
+
+  it("rejects a redirect_uri that differs from the one bound (RFC 6749 §4.1.3)", async () => {
+    const cookie = await realSessionCookie();
+    const verifier = newVerifier();
+    const { code } = (await (
+      await mintCode(
+        cookie,
+        await challengeFor(verifier),
+        "https://rosary.bot/cb",
+      )
+    ).json()) as any;
+
+    const res = await redeem({
+      code,
+      code_verifier: verifier,
+      redirect_uri: "https://rosary.bot/other",
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error).toBe("invalid_grant");
+  });
+
+  it("rejects an unknown code with the same answer as a spent one", async () => {
+    // No oracle: unknown / spent / expired / wrong-uri / bad-verifier must be
+    // indistinguishable, or probing with harvested codes tells the attacker
+    // which were real.
+    const res = await redeem({
+      code: newVerifier(),
+      code_verifier: newVerifier(),
+      redirect_uri: "https://rosary.bot/cb",
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error).toBe("invalid_grant");
+  });
+
+  it("rejects a too-short code_verifier rather than failing open", async () => {
+    const cookie = await realSessionCookie();
+    const verifier = newVerifier();
+    const { code } = (await (
+      await mintCode(cookie, await challengeFor(verifier))
+    ).json()) as any;
+
+    const res = await redeem({
+      code,
+      code_verifier: "short",
+      redirect_uri: "https://rosary.bot/cb",
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error).toBe("invalid_request");
+  });
+
+  it("requires a session to mint a code", async () => {
+    const res = await worker.fetch(
+      new Request(`${ORIGIN}/authorize/code`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audience: AUDIENCE,
+          redirect_uri: "https://rosary.bot/cb",
+          code_challenge: await challengeFor(newVerifier()),
+        }),
+      }),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("re-validates redirect_uri at the code endpoint, not just at /authorize", async () => {
+    // /authorize/code is directly reachable, so the allowlist has to hold at
+    // the point the code is BOUND to a destination — otherwise the check on
+    // /authorize is decorative and a caller binds a code to anywhere.
+    const res = await mintCode(
+      await realSessionCookie(),
+      await challengeFor(newVerifier()),
+      "https://evil.example/cb",
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("refuses plain PKCE at /authorize — it would put the verifier in the URL", async () => {
+    const res = await worker.fetch(
+      new Request(
+        `${ORIGIN}/authorize?redirect_uri=${encodeURIComponent("https://rosary.bot/cb")}&code_challenge=${await challengeFor(newVerifier())}&code_challenge_method=plain`,
+        { headers: { cookie: await realSessionCookie() } },
+      ),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("still serves the legacy token path when no challenge is sent", async () => {
+    // The migration contract. rig has not shipped yet; breaking this breaks
+    // /admin/setup-github, which is the flow used to RECOVER admin access.
+    const res = await worker.fetch(
+      new Request(
+        `${ORIGIN}/authorize?redirect_uri=${encodeURIComponent("https://rosary.bot/cb")}&state=s`,
+        { headers: { cookie: await realSessionCookie() } },
+      ),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('data-code-challenge=""');
   });
 });
