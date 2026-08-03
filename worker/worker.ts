@@ -154,7 +154,8 @@ export class AuthService extends WorkerEntrypoint<any> {
     mtlsKey: CryptoKey;
     signingKey: CryptoKey;
   }) {
-    const { deriveCredentialsFromCerts } = await import("./src/auth/derive-credentials");
+    const { deriveCredentialsFromCerts } =
+      await import("./src/auth/derive-credentials");
     const authority = this.getAuthority();
     const caPublicKeyPem = await authority.getPublicKeyPem();
 
@@ -1281,6 +1282,42 @@ export default {
       });
     }
 
+    /**
+     * Mirror the preflight's origin decision onto a real response
+     * (notme-0a27a6).
+     *
+     * The preflight above answers 204 with `Access-Control-Allow-Origin` and
+     * permits the `DPoP` request header — but no non-preflight response
+     * carried ACAO, so a cross-origin call passed preflight and then had its
+     * response blocked with no diagnosable reason. Verified against the real
+     * route: preflight 204 `ACAO: https://rosary.bot`, actual POST
+     * `ACAO: null`.
+     *
+     * Deliberately NOT paired with `Access-Control-Allow-Credentials`.
+     * THREAT_MODEL §7 records omitting it as a decision, and the session
+     * cookie is `SameSite=Strict`, so a cross-origin caller sends no cookie
+     * and `/token` answers 401 `session_required`. Exposing that 401 leaks
+     * nothing — it is the same answer any unauthenticated caller gets — and
+     * turning an opaque CORS failure into a readable status is the whole
+     * point. Making cross-origin `/token` actually SUCCEED is a separate
+     * design question (accept the session via an Authorization header rather
+     * than a cookie), tracked on notme-0a27a6.
+     *
+     * `Vary: Origin` because the value depends on the request's Origin; a
+     * cache that omitted it could serve one origin's ACAO to another.
+     */
+    const withCors = (response: Response): Response => {
+      if (!corsAllowed) return response;
+      const headers = new Headers(response.headers);
+      headers.set("Access-Control-Allow-Origin", requestOrigin);
+      headers.append("Vary", "Origin");
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    };
+
     const url = new URL(request.url);
     const pathname = url.pathname;
     const host = request.headers.get("host") || "";
@@ -1806,7 +1843,24 @@ export default {
         // Session valid — serve the authorize page
         // Params are injected into a data attribute and read by JS (no inline eval)
         return new Response(authorizePageHtml(redirectUri, audience, state), {
-          headers: { "Content-Type": "text/html; charset=utf-8" },
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            // This page navigates to `${redirect_uri}?token=<access token>`.
+            // The token is an UNBOUND bearer (mintRedirectToken omits cnf.jkt
+            // — the flow's DPoP keypair does not survive the navigation), so
+            // the URL carries a live credential for its 5-minute lifetime.
+            //
+            // Without this header the browser sends that full URL as the
+            // Referer on every subsequent subresource request the destination
+            // page makes — handing the token to every third-party origin the
+            // app talks to, and into their logs. no-referrer costs nothing
+            // here: nothing in this flow reads the Referer.
+            //
+            // Does NOT remove the exposure (browser history, the target's own
+            // access log). See THREAT_MODEL.md `token in URL logs` /
+            // notme-07204f for the residual and what removing it would take.
+            "Referrer-Policy": "no-referrer",
+          },
         });
       }
 
@@ -1878,186 +1932,202 @@ export default {
 
       // POST /token — DPoP sender-constrained access token (RFC 9449)
       if (pathname === "/token" && request.method === "POST") {
-        try {
-          const dpopProof = request.headers.get("DPoP");
+        // withCors: the preflight advertises this origin; the response must
+        // honour it (notme-0a27a6). Wraps every exit, including the 500.
+        return withCors(
+          await (async (): Promise<Response> => {
+            try {
+              const dpopProof = request.headers.get("DPoP");
 
-          // Fast-fail: no DPoP proof = 400
-          if (!dpopProof) {
-            return Response.json(
-              { error: "dpop_proof_required" },
-              { status: 400 },
-            );
-          }
+              // Fast-fail: no DPoP proof = 400
+              if (!dpopProof) {
+                return Response.json(
+                  { error: "dpop_proof_required" },
+                  { status: 400 },
+                );
+              }
 
-          // Parse body for audience — validated against module-scope ALLOWED_AUDIENCES
-          let audience = "";
-          try {
-            const body = (await request.json()) as { audience?: string };
-            audience = body.audience || "";
-          } catch {
-            /* empty body */
-          }
+              // Parse body for audience — validated against module-scope ALLOWED_AUDIENCES
+              let audience = "";
+              try {
+                const body = (await request.json()) as { audience?: string };
+                audience = body.audience || "";
+              } catch {
+                /* empty body */
+              }
 
-          if (!audience) {
-            return Response.json(
-              { error: "audience_required" },
-              { status: 400 },
-            );
-          }
-          const allowedAudiences = getAllowedAudiences(env);
-          if (!allowedAudiences.has(audience)) {
-            return Response.json(
-              { error: "invalid_audience", allowed: [...allowedAudiences] },
-              { status: 400 },
-            );
-          }
+              if (!audience) {
+                return Response.json(
+                  { error: "audience_required" },
+                  { status: 400 },
+                );
+              }
+              const allowedAudiences = getAllowedAudiences(env);
+              if (!allowedAudiences.has(audience)) {
+                return Response.json(
+                  { error: "invalid_audience", allowed: [...allowedAudiences] },
+                  { status: 400 },
+                );
+              }
 
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+              const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+              const authority = env.SIGNING_AUTHORITY.get(authorityId);
 
-          // ── Resolve identity: session cookie OR client cert ──
-          let principalId: string | null = null;
-          let scopes: string[] = [];
-          // Hoisted: the DPoP nonce MAC key is derived from this same secret
-          // (src/auth/dpop-nonce.ts), and re-fetching it below would be a
-          // second DO round-trip for a value already in hand.
-          let sessionSecret: string | null = null;
+              // ── Resolve identity: session cookie OR client cert ──
+              let principalId: string | null = null;
+              let scopes: string[] = [];
+              // Hoisted: the DPoP nonce MAC key is derived from this same secret
+              // (src/auth/dpop-nonce.ts), and re-fetching it below would be a
+              // second DO round-trip for a value already in hand.
+              let sessionSecret: string | null = null;
 
-          // Try session cookie first (browser/passkey users)
-          const cookie = parseCookie(
-            request.headers.get("cookie") || "",
-            "notme_session",
-          );
-          if (cookie) {
-            const { verifySessionCookie } = await import("./src/auth/session");
-            const secret: string = await authority.getSessionSecret();
-            sessionSecret = secret;
-            const session = await verifySessionCookie(cookie, secret);
-            if (session) {
-              principalId = session.principalId;
-              scopes = session.scopes;
-            }
-          }
+              // Try session cookie first (browser/passkey users)
+              const cookie = parseCookie(
+                request.headers.get("cookie") || "",
+                "notme_session",
+              );
+              if (cookie) {
+                const { verifySessionCookie } =
+                  await import("./src/auth/session");
+                const secret: string = await authority.getSessionSecret();
+                sessionSecret = secret;
+                const session = await verifySessionCookie(cookie, secret);
+                if (session) {
+                  principalId = session.principalId;
+                  scopes = session.scopes;
+                }
+              }
 
-          // X-Client-Cert path REMOVED — mTLS not configured in wrangler.toml,
-          // so the header is attacker-controlled. Re-enable only when CF mTLS
-          // bindings are active and CF injects the cert (not the client).
+              // X-Client-Cert path REMOVED — mTLS not configured in wrangler.toml,
+              // so the header is attacker-controlled. Re-enable only when CF mTLS
+              // bindings are active and CF injects the cert (not the client).
 
-          if (!principalId) {
-            return Response.json(
-              { error: "session_required" },
-              { status: 401 },
-            );
-          }
+              if (!principalId) {
+                return Response.json(
+                  { error: "session_required" },
+                  { status: 401 },
+                );
+              }
 
-          // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
-          if (env.TOKEN_LIMITER) {
-            const { success } = await env.TOKEN_LIMITER.limit({
-              key: `token:${principalId}`,
-            });
-            if (!success) {
-              return Response.json({ error: "rate_limited" }, { status: 429 });
-            }
-          }
+              // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
+              if (env.TOKEN_LIMITER) {
+                const { success } = await env.TOKEN_LIMITER.limit({
+                  key: `token:${principalId}`,
+                });
+                if (!success) {
+                  return Response.json(
+                    { error: "rate_limited" },
+                    { status: 429 },
+                  );
+                }
+              }
 
-          // Validate DPoP proof
-          const { validateDpopProof } = await import("./src/auth/dpop");
-          let proofResult;
-          try {
-            proofResult = await validateDpopProof(dpopProof, {
-              htm: "POST",
-              htu: `${new URL(request.url).origin}/token`,
-            });
-          } catch {
-            return Response.json(
-              { error: "invalid_dpop_proof" },
-              { status: 401 },
-            );
-          }
+              // Validate DPoP proof
+              const { validateDpopProof } = await import("./src/auth/dpop");
+              let proofResult;
+              try {
+                proofResult = await validateDpopProof(dpopProof, {
+                  htm: "POST",
+                  htu: `${new URL(request.url).origin}/token`,
+                });
+              } catch {
+                return Response.json(
+                  { error: "invalid_dpop_proof" },
+                  { status: 401 },
+                );
+              }
 
-          // ── Nonce challenge (RFC 9449 §8/§9) ──
-          //
-          // Placed AFTER session resolution, rate limiting and proof
-          // validation, so a challenge is only ever minted for a caller that
-          // has already authenticated and proved possession of the proof key.
-          // Issuing nonces earlier would hand an unauthenticated caller a
-          // free HMAC oracle on the rejection path.
-          //
-          // Off by default: turning it on rejects the first request of every
-          // client that has never seen a challenge, which is correct per spec
-          // but is a breaking change for deployed clients. Deployments opt in
-          // once their clients handle the retry.
-          if (dpopNonceRequired(env)) {
-            if (!sessionSecret) {
-              // Unreachable — principalId is only set on the cookie path,
-              // which assigns the secret. Explicit rather than a `!`: if a
-              // future auth path sets principalId without the secret, this
-              // must fail closed, not skip the nonce check.
-              return jsonErr("nonce unavailable: no session secret", 500);
-            }
-            const { issueDpopNonce, verifyDpopNonce, nonceHeaders } =
-              await import("./src/auth/dpop-nonce");
-            const nonceOk = await verifyDpopNonce(
-              proofResult.nonce,
-              sessionSecret,
-            );
-            if (!nonceOk) {
-              // §8.1: 400 + `use_dpop_nonce`, carrying the nonce to retry
-              // with. The JTI is deliberately NOT consumed — the client will
-              // re-sign with a fresh proof, and burning the jti here would
-              // make every challenge cost the client an extra round-trip.
+              // ── Nonce challenge (RFC 9449 §8/§9) ──
+              //
+              // Placed AFTER session resolution, rate limiting and proof
+              // validation, so a challenge is only ever minted for a caller that
+              // has already authenticated and proved possession of the proof key.
+              // Issuing nonces earlier would hand an unauthenticated caller a
+              // free HMAC oracle on the rejection path.
+              //
+              // Off by default: turning it on rejects the first request of every
+              // client that has never seen a challenge, which is correct per spec
+              // but is a breaking change for deployed clients. Deployments opt in
+              // once their clients handle the retry.
+              if (dpopNonceRequired(env)) {
+                if (!sessionSecret) {
+                  // Unreachable — principalId is only set on the cookie path,
+                  // which assigns the secret. Explicit rather than a `!`: if a
+                  // future auth path sets principalId without the secret, this
+                  // must fail closed, not skip the nonce check.
+                  return jsonErr("nonce unavailable: no session secret", 500);
+                }
+                const { issueDpopNonce, verifyDpopNonce, nonceHeaders } =
+                  await import("./src/auth/dpop-nonce");
+                const nonceOk = await verifyDpopNonce(
+                  proofResult.nonce,
+                  sessionSecret,
+                );
+                if (!nonceOk) {
+                  // §8.1: 400 + `use_dpop_nonce`, carrying the nonce to retry
+                  // with. The JTI is deliberately NOT consumed — the client will
+                  // re-sign with a fresh proof, and burning the jti here would
+                  // make every challenge cost the client an extra round-trip.
+                  return Response.json(
+                    {
+                      error: "use_dpop_nonce",
+                      error_description:
+                        "Authorization server requires a nonce in the DPoP proof",
+                    },
+                    {
+                      status: 400,
+                      headers: nonceHeaders(
+                        await issueDpopNonce(sessionSecret),
+                      ),
+                    },
+                  );
+                }
+              }
+
+              // Atomically consume the proof JTI and mint inside the singleton DO.
+              // SQLite uniqueness closes the cross-edge read/write race that an
+              // eventually-consistent KV cache cannot.
+              const mintResult = await authority.mintDPoPTokenOnce({
+                sub: principalId,
+                scope: scopes.join(" "),
+                audience,
+                jkt: proofResult.thumbprint,
+                proofJti: proofResult.jti,
+              });
+              if (!mintResult.ok) {
+                return Response.json(
+                  { error: "proof_reused" },
+                  { status: 401 },
+                );
+              }
+
+              // §8.2 permits a fresh nonce on a SUCCESSFUL response too. Without
+              // it a client only ever learns a nonce by being rejected, so every
+              // token would cost two round-trips once the nonce it holds ages
+              // out. sessionSecret is non-null here whenever the flag is on —
+              // the challenge block above returns otherwise.
+              let successHeaders: Record<string, string> = {};
+              if (dpopNonceRequired(env) && sessionSecret) {
+                const { issueDpopNonce, nonceHeaders } =
+                  await import("./src/auth/dpop-nonce");
+                successHeaders = nonceHeaders(
+                  await issueDpopNonce(sessionSecret),
+                );
+              }
+
               return Response.json(
                 {
-                  error: "use_dpop_nonce",
-                  error_description:
-                    "Authorization server requires a nonce in the DPoP proof",
+                  access_token: mintResult.accessToken,
+                  token_type: "DPoP",
+                  expires_in: 300,
                 },
-                {
-                  status: 400,
-                  headers: nonceHeaders(await issueDpopNonce(sessionSecret)),
-                },
+                { headers: successHeaders },
               );
+            } catch (e: any) {
+              return jsonErr("token endpoint error: " + e.message, 500);
             }
-          }
-
-          // Atomically consume the proof JTI and mint inside the singleton DO.
-          // SQLite uniqueness closes the cross-edge read/write race that an
-          // eventually-consistent KV cache cannot.
-          const mintResult = await authority.mintDPoPTokenOnce({
-            sub: principalId,
-            scope: scopes.join(" "),
-            audience,
-            jkt: proofResult.thumbprint,
-            proofJti: proofResult.jti,
-          });
-          if (!mintResult.ok) {
-            return Response.json({ error: "proof_reused" }, { status: 401 });
-          }
-
-          // §8.2 permits a fresh nonce on a SUCCESSFUL response too. Without
-          // it a client only ever learns a nonce by being rejected, so every
-          // token would cost two round-trips once the nonce it holds ages
-          // out. sessionSecret is non-null here whenever the flag is on —
-          // the challenge block above returns otherwise.
-          let successHeaders: Record<string, string> = {};
-          if (dpopNonceRequired(env) && sessionSecret) {
-            const { issueDpopNonce, nonceHeaders } = await import(
-              "./src/auth/dpop-nonce"
-            );
-            successHeaders = nonceHeaders(await issueDpopNonce(sessionSecret));
-          }
-
-          return Response.json(
-            {
-              access_token: mintResult.accessToken,
-              token_type: "DPoP",
-              expires_in: 300,
-            },
-            { headers: successHeaders },
-          );
-        } catch (e: any) {
-          return jsonErr("token endpoint error: " + e.message, 500);
-        }
+          })(),
+        );
       }
 
       // GET /.well-known/jwks.json — Ed25519 public key for token verification
