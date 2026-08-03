@@ -1995,9 +1995,8 @@ export default {
               // must fail closed, not skip the nonce check.
               return jsonErr("nonce unavailable: no session secret", 500);
             }
-            const { issueDpopNonce, verifyDpopNonce } = await import(
-              "./src/auth/dpop-nonce"
-            );
+            const { issueDpopNonce, verifyDpopNonce, nonceHeaders } =
+              await import("./src/auth/dpop-nonce");
             const nonceOk = await verifyDpopNonce(
               proofResult.nonce,
               sessionSecret,
@@ -2015,9 +2014,7 @@ export default {
                 },
                 {
                   status: 400,
-                  headers: {
-                    "DPoP-Nonce": await issueDpopNonce(sessionSecret),
-                  },
+                  headers: nonceHeaders(await issueDpopNonce(sessionSecret)),
                 },
               );
             }
@@ -2042,10 +2039,12 @@ export default {
           // token would cost two round-trips once the nonce it holds ages
           // out. sessionSecret is non-null here whenever the flag is on —
           // the challenge block above returns otherwise.
-          const successHeaders: Record<string, string> = {};
+          let successHeaders: Record<string, string> = {};
           if (dpopNonceRequired(env) && sessionSecret) {
-            const { issueDpopNonce } = await import("./src/auth/dpop-nonce");
-            successHeaders["DPoP-Nonce"] = await issueDpopNonce(sessionSecret);
+            const { issueDpopNonce, nonceHeaders } = await import(
+              "./src/auth/dpop-nonce"
+            );
+            successHeaders = nonceHeaders(await issueDpopNonce(sessionSecret));
           }
 
           return Response.json(

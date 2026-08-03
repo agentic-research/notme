@@ -61,6 +61,35 @@ const NONCE_FUTURE_SKEW_SECONDS = 5;
 const NONCE_DOMAIN = "notme-dpop-nonce-v1";
 
 /**
+ * Response headers carrying a nonce to the client.
+ *
+ * `Access-Control-Expose-Headers` is not optional garnish. CORS exposes only
+ * a small safelist of response headers to JS (Cache-Control, Content-Language,
+ * Content-Length, Content-Type, Expires, Last-Modified, Pragma) — `DPoP-Nonce`
+ * is not among them. Without this, a cross-origin browser client receives the
+ * 400 challenge, cannot read the nonce it is being told to use, retries
+ * without one, and is challenged again: an infinite loop whose cause is
+ * invisible from the JS side because the header is simply absent from the
+ * Headers object.
+ *
+ * Browsers are the ENTIRE residual scope of the DPoP path (ADR-006 — CLI and
+ * CI use the ADR-008 bridge cert pair), and the OPTIONS preflight in
+ * worker.ts already allowlists rosary.bot / mcp.rosary.bot and permits the
+ * `DPoP` request header. So the cross-origin browser case is the case this
+ * endpoint exists for, and it is the one that breaks without this.
+ *
+ * Built as one helper rather than two literals so the challenge path and the
+ * success path cannot drift — a nonce readable on one and not the other is a
+ * bug that only shows up under a specific retry ordering.
+ */
+export function nonceHeaders(nonce: string): Record<string, string> {
+  return {
+    "DPoP-Nonce": nonce,
+    "Access-Control-Expose-Headers": "DPoP-Nonce",
+  };
+}
+
+/**
  * Whether this deployment requires a server-issued nonce on DPoP proofs.
  *
  * Defaults to OFF. Requiring a nonce means every client's first request is

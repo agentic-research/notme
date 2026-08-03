@@ -12,6 +12,7 @@ import {
   dpopNonceRequired,
   issueDpopNonce,
   NONCE_TTL_SECONDS,
+  nonceHeaders,
   verifyDpopNonce,
 } from "../auth/dpop-nonce";
 
@@ -98,6 +99,36 @@ describe("issueDpopNonce / verifyDpopNonce", () => {
       "99999999999999999999.AAAA", // beyond safe-integer range
     ]) {
       expect(await verifyDpopNonce(bad, SECRET)).toBe(false);
+    }
+  });
+});
+
+describe("nonceHeaders", () => {
+  it("exposes DPoP-Nonce to cross-origin JS", async () => {
+    // Without Access-Control-Expose-Headers, a browser client gets the 400
+    // challenge but cannot READ the nonce it is told to retry with — the
+    // header is simply absent from the Headers object — so it retries
+    // without one and is challenged forever. Browsers are the entire
+    // residual scope of the DPoP path (ADR-006), so this is the case that
+    // matters, and the failure is invisible from the JS side.
+    const nonce = await issueDpopNonce(SECRET);
+    const headers = nonceHeaders(nonce);
+
+    expect(headers["DPoP-Nonce"]).toBe(nonce);
+    expect(headers["Access-Control-Expose-Headers"]).toBe("DPoP-Nonce");
+  });
+
+  it("names the header it exposes", () => {
+    // Guards the rename footgun: changing the header name in one string and
+    // not the other yields a response that looks correct server-side and is
+    // unreadable client-side.
+    const headers = nonceHeaders("v");
+    const exposed = headers["Access-Control-Expose-Headers"]
+      .split(",")
+      .map((h) => h.trim());
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase().startsWith("access-control")) continue;
+      expect(exposed).toContain(name);
     }
   });
 });
