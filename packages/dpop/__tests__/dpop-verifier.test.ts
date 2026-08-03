@@ -1687,3 +1687,73 @@ describe("DPoPVerificationError codes", () => {
     });
   });
 });
+
+describe("PKCE (RFC 7636)", () => {
+  it("matches the RFC 7636 Appendix B known vector", async () => {
+    // Pinned against the SPEC, not round-tripped through our own code. A
+    // self-consistent but wrongly-encoded implementation passes a round-trip
+    // test and then fails against every real peer — which is exactly the
+    // drift this shared module exists to prevent.
+    const { codeChallengeS256 } = await import("../src/index");
+    expect(
+      await codeChallengeS256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+    ).toBe("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+  });
+
+  it("generates verifiers inside §4.1 bounds and alphabet", async () => {
+    const { generateCodeVerifier, isValidCodeVerifier } = await import(
+      "../src/index"
+    );
+    for (let i = 0; i < 25; i++) {
+      const v = generateCodeVerifier();
+      expect(isValidCodeVerifier(v)).toBe(true);
+      expect(v).toMatch(/^[A-Za-z0-9\-._~]{43}$/);
+    }
+  });
+
+  it("generates distinct verifiers", async () => {
+    const { generateCodeVerifier } = await import("../src/index");
+    const seen = new Set(
+      Array.from({ length: 100 }, () => generateCodeVerifier()),
+    );
+    expect(seen.size).toBe(100);
+  });
+
+  it("round-trips generate -> challenge -> validate", async () => {
+    const { generateCodeVerifier, codeChallengeS256, isValidCodeChallenge } =
+      await import("../src/index");
+    const challenge = await codeChallengeS256(generateCodeVerifier());
+    expect(isValidCodeChallenge(challenge)).toBe(true);
+    expect(challenge).not.toContain("=");
+  });
+
+  it("rejects verifiers outside the length range rather than failing open", async () => {
+    const { isValidCodeVerifier, MIN_CODE_VERIFIER_LENGTH, MAX_CODE_VERIFIER_LENGTH } =
+      await import("../src/index");
+    expect(isValidCodeVerifier("a".repeat(MIN_CODE_VERIFIER_LENGTH - 1))).toBe(false);
+    expect(isValidCodeVerifier("a".repeat(MIN_CODE_VERIFIER_LENGTH))).toBe(true);
+    expect(isValidCodeVerifier("a".repeat(MAX_CODE_VERIFIER_LENGTH))).toBe(true);
+    expect(isValidCodeVerifier("a".repeat(MAX_CODE_VERIFIER_LENGTH + 1))).toBe(false);
+  });
+
+  it("rejects reserved characters and non-strings", async () => {
+    const { isValidCodeVerifier, isValidCodeChallenge } = await import(
+      "../src/index"
+    );
+    // '+' and '/' are base64 but NOT base64url — accepting them would let a
+    // verifier through that changes value when URL-encoded.
+    expect(isValidCodeVerifier("a".repeat(42) + "+")).toBe(false);
+    expect(isValidCodeVerifier("a".repeat(42) + "/")).toBe(false);
+    expect(isValidCodeVerifier("a".repeat(42) + "=")).toBe(false);
+    for (const bad of [undefined, null, 42, {}, [], ""]) {
+      expect(isValidCodeVerifier(bad)).toBe(false);
+      expect(isValidCodeChallenge(bad)).toBe(false);
+    }
+  });
+
+  it("rejects a challenge of the wrong length", async () => {
+    const { isValidCodeChallenge } = await import("../src/index");
+    expect(isValidCodeChallenge("a".repeat(42))).toBe(false);
+    expect(isValidCodeChallenge("a".repeat(44))).toBe(false);
+  });
+});
