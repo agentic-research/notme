@@ -204,8 +204,9 @@ export interface VerifiedTokenClaims {
  * Compute a JWK Thumbprint per RFC 7638.
  *
  * 1. Extract only the required members for the key type (lexicographically sorted).
- *    - EC (kty "EC"): crv, kty, x, y
- *    - (RSA/OKP could be added later if needed)
+ *    - EC  (kty "EC"):  crv, kty, x, y
+ *    - RSA (kty "RSA"): e, kty, n
+ *    - OKP (kty "OKP"): crv, kty, x
  * 2. JSON.stringify with no whitespace.
  * 3. SHA-256 hash via crypto.subtle.digest.
  * 4. Base64url encode (no padding).
