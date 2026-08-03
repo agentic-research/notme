@@ -288,9 +288,12 @@ describe("/authorize redirect token — real route, real DO (notme-07204f)", () 
   });
 
   it("serves the authorize page with Referrer-Policy: no-referrer", async () => {
-    // The page navigates to `${redirect_uri}?token=<bearer>`. Without this
-    // header the browser leaks that URL — token included — as the Referer on
-    // every subresource the destination loads.
+    // Narrow claim, deliberately: this protects the AUTHORIZE URL (which
+    // carries `state`) from being sent onward as a Referer. It does NOT
+    // protect the access token — once the browser is on
+    // `${redirect_uri}?token=...`, onward Referers are governed by the
+    // destination's own Referrer-Policy, not ours. See THREAT_MODEL.md
+    // `token in URL logs`.
     // Session cookie required — without one the route 302s to /login, and
     // the header would go untested while the assertion still "passed" on a
     // redirect that never carries the token.

@@ -1845,20 +1845,26 @@ export default {
         return new Response(authorizePageHtml(redirectUri, audience, state), {
           headers: {
             "Content-Type": "text/html; charset=utf-8",
-            // This page navigates to `${redirect_uri}?token=<access token>`.
-            // The token is an UNBOUND bearer (mintRedirectToken omits cnf.jkt
-            // — the flow's DPoP keypair does not survive the navigation), so
-            // the URL carries a live credential for its 5-minute lifetime.
+            // Scope this precisely, because it is easy to overclaim (an
+            // earlier draft of this comment did): a Referrer-Policy on THIS
+            // document governs the Referer THIS document sends — on its own
+            // subresource loads, and on the navigation away to redirect_uri.
+            // It does NOT govern what the DESTINATION page sends once the
+            // browser is sitting on `${redirect_uri}?token=...`; that is the
+            // destination's own Referrer-Policy (rig's, today), and it is the
+            // vector that actually leaks the ACCESS TOKEN onward. notme
+            // cannot close that from here.
             //
-            // Without this header the browser sends that full URL as the
-            // Referer on every subsequent subresource request the destination
-            // page makes — handing the token to every third-party origin the
-            // app talks to, and into their logs. no-referrer costs nothing
-            // here: nothing in this flow reads the Referer.
+            // What this DOES protect is the authorize URL itself — which
+            // carries `state`, a CSRF value — from being handed to the
+            // destination as a Referer. Modern browsers default to
+            // strict-origin-when-cross-origin and would send only the origin
+            // anyway, so treat this as making an existing default explicit
+            // and covering the same-origin case, not as a fix for the token.
             //
-            // Does NOT remove the exposure (browser history, the target's own
-            // access log). See THREAT_MODEL.md `token in URL logs` /
-            // notme-07204f for the residual and what removing it would take.
+            // The token-in-URL exposure is untouched by this header. See
+            // THREAT_MODEL.md `token in URL logs` / notme-07204f for the real
+            // residual and the three delivery changes that would remove it.
             "Referrer-Policy": "no-referrer",
           },
         });
