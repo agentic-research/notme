@@ -1,91 +1,25 @@
-// DPoP token handler — orchestrates proof validation + token minting.
+// JWKS response builder.
 //
-// Separated from worker.ts routes so it can be tested without DO bindings.
-// The Worker route extracts session/proof/audience from the request and
-// delegates here. Atomic JTI consumption is injected for testability.
-
-import { validateDpopProof } from "./dpop";
-import { mintAccessToken } from "./token";
-
-export interface SessionPayload {
-  principalId: string;
-  scopes: string[];
-  authMethod: string;
-  exp: number;
-}
-
-export interface HandleTokenInput {
-  dpopProof: string | null;
-  session: SessionPayload | null;
-  audience: string;
-  /** The token endpoint URL — must match the DPoP proof htu claim exactly. */
-  tokenEndpointUrl: string;
-  signingKey: CryptoKey;
-  keyId: string;
-  /** Atomically consume a JTI. Returns true only for its first consumer. */
-  consumeJti: (jti: string) => Promise<boolean>;
-}
-
-export type HandleTokenResult =
-  | { ok: true; accessToken: string; tokenType: "DPoP"; expiresIn: number }
-  | { ok: false; status: number; error: string };
-
-export async function handleToken(
-  input: HandleTokenInput,
-): Promise<HandleTokenResult> {
-  // 1. Session required
-  if (!input.session) {
-    return { ok: false, status: 401, error: "session_required" };
-  }
-
-  // 2. DPoP proof required
-  if (!input.dpopProof) {
-    return { ok: false, status: 400, error: "dpop_proof_required" };
-  }
-
-  // 3. Audience required
-  if (!input.audience) {
-    return { ok: false, status: 400, error: "invalid_audience" };
-  }
-
-  // 4. Validate DPoP proof
-  let proofResult;
-  try {
-    proofResult = await validateDpopProof(input.dpopProof, {
-      htm: "POST",
-      htu: input.tokenEndpointUrl,
-    });
-  } catch (e: any) {
-    return { ok: false, status: 401, error: "invalid_dpop_proof" };
-  }
-
-  // 5. Atomically consume the JTI before minting. If minting fails, the proof
-  // remains consumed and the client retries with a new proof.
-  const consumed = await input.consumeJti(proofResult.jti);
-  if (!consumed) {
-    return { ok: false, status: 401, error: "proof_reused" };
-  }
-
-  // 6. Mint access token bound to DPoP key
-  const scope = input.session.scopes.join(" ");
-  const accessToken = await mintAccessToken({
-    sub: input.session.principalId,
-    scope,
-    audience: input.audience,
-    jkt: proofResult.thumbprint,
-    signingKey: input.signingKey,
-    keyId: input.keyId,
-  });
-
-  return {
-    ok: true,
-    accessToken,
-    tokenType: "DPoP",
-    expiresIn: 300,
-  };
-}
-
-// ── JWKS response builder ────────────────────────────────────
+// This file used to also export `handleToken` — a composable token-minting
+// orchestrator with an injected JTI consumer, built so the flow could be
+// tested without Durable Objects. It was deleted (notme-e73c64) because it
+// was never on the live path: the `/token` route in worker.ts implements the
+// flow inline against `authority.mintDPoPTokenOnce`, and `handleToken` was
+// referenced only by its own tests.
+//
+// That is not a tidiness complaint. The parallel implementation cost real
+// work: rosary-9b969c was a genuine JTI-replay window found and fixed IN THE
+// ORPHAN (notme commit 95ef0dd) — a review cycle spent on code that could
+// never run — and rosary-0b40d2 cited this file as the /token endpoint spec,
+// pointing a downstream integrator at the wrong artifact. It also shipped:
+// worker.ts dynamically imports `buildJwksResponse` from here, so esbuild
+// pulled the whole module, dead orchestrator included, into the bundle.
+//
+// The DO-free testability argument was real when the Durable Object had no
+// atomic consume-and-mint. `mintDPoPTokenOnce` (signing-authority.ts)
+// superseded it, and src/dpop-nonce.do.test.ts now drives the real route
+// end-to-end against a real DO, which is strictly better evidence than
+// testing a stand-in.
 
 export interface JwkPublicKey {
   kty: string;
