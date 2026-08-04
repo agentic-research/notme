@@ -48,6 +48,7 @@ const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
 import type { CommitmentErrorCode } from "./receipts/commitment";
+import type { DelegatedJwtErrorCode } from "./jwt/delegated-claims";
 
 /**
  * Outcome of a receipt-signing attempt (ADR-014).
@@ -79,6 +80,24 @@ export type ReceiptSignResult =
       code: CommitmentErrorCode;
       message: string;
     };
+
+/**
+ * Outcome of a delegated JWT signing attempt (ADR-015).
+ *
+ * Union rather than throw, for the reasons on ReceiptSignResult: an RPC
+ * rejection surfaces as an uncaught exception in the callee and stringifies
+ * the error. None of these codes are retryable — each means the caller must
+ * change what it sent.
+ */
+export type DelegatedJwtSignResult =
+  | {
+      ok: true;
+      /** Raw 64-byte Ed25519 signature. The caller assembles the compact JWS. */
+      signature: Uint8Array;
+      /** kid of the DELEGATED key — not the CA master's. */
+      kid: string;
+    }
+  | { ok: false; code: DelegatedJwtErrorCode; message: string };
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
@@ -160,6 +179,30 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         key_id     TEXT NOT NULL,
         public_raw TEXT NOT NULL,
         retired_at INTEGER NOT NULL
+      )
+    `);
+    // Delegated JWT signing keys, one per issuer (ADR-015).
+    //
+    // SEPARATE from the CA master, and that separation is the entire security
+    // control. notme's own access tokens are at+jwt signed by the master with
+    // iss=https://auth.notme.bot, and the SDK leaves `issuer` unchecked by
+    // default — so an endpoint that signed a delegated caller's JWT with the
+    // master key would let that caller mint a token every notme resource
+    // server accepts, for any subject and any scope. A distinct key makes such
+    // a token cryptographically unrelated to notme's own, rather than merely
+    // wrongly-claimed and hopefully-noticed.
+    //
+    // Unlike receipts (ADR-014), nothing pins the key here: cloister's JWKS
+    // publishes whatever pubkey its manifest binding holds and takes `kid`
+    // from the manifest, so it is indifferent to which key it publishes. That
+    // freedom is what makes separation possible; receipts had none.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS delegated_jwt_keys (
+        issuer      TEXT PRIMARY KEY,
+        private_jwk TEXT NOT NULL,
+        public_raw  TEXT NOT NULL,
+        kid         TEXT NOT NULL,
+        created_at  INTEGER NOT NULL
       )
     `);
     // Authorization codes for the /authorize redirect (ADR-013).
@@ -623,6 +666,120 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray() as Array<{ epoch: number }>;
 
     return { actorFp, epoch: rows[0]!.epoch };
+  }
+
+  /**
+   * Get (or create on first use) the delegated signing key for `issuer`.
+   *
+   * Returns PUBLIC material only — the raw public key for cloister to publish
+   * in its JWKS, and the kid. The private half is generated here, stored as a
+   * non-extractable JWK, and never crosses the RPC boundary.
+   *
+   * Created lazily rather than provisioned: the operator's act of allowlisting
+   * an issuer is the authorization, and a separate provisioning step would be
+   * one more place for the allowlist and the keyring to disagree.
+   */
+  async getDelegatedJwtKey(
+    issuer: string,
+  ): Promise<{ publicRawB64: string; kid: string }> {
+    this.ensureSchema();
+
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT public_raw, kid FROM delegated_jwt_keys WHERE issuer = ?",
+        issuer,
+      )
+      .toArray() as Array<{ public_raw: string; kid: string }>;
+    if (rows[0]) {
+      return { publicRawB64: rows[0].public_raw, kid: rows[0].kid };
+    }
+
+    const kp = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const privJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+    const rawPub = new Uint8Array(
+      (await crypto.subtle.exportKey("raw", kp.publicKey)) as ArrayBuffer,
+    );
+    const publicRawB64 = btoa(String.fromCharCode(...rawPub));
+    const spki = new Uint8Array(
+      (await crypto.subtle.exportKey("spki", kp.publicKey)) as ArrayBuffer,
+    );
+    const kid = await keyIdFromSpki(btoa(String.fromCharCode(...spki)));
+
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO delegated_jwt_keys
+         (issuer, private_jwk, public_raw, kid, created_at) VALUES (?, ?, ?, ?, ?)`,
+      issuer,
+      JSON.stringify(privJwk),
+      publicRawB64,
+      kid,
+      Math.floor(Date.now() / 1000),
+    );
+
+    // Re-read rather than returning what we just generated: INSERT OR IGNORE
+    // means a concurrent first-use may have won, and both callers must see the
+    // same key or they publish different JWKS for one issuer.
+    const after = this.ctx.storage.sql
+      .exec(
+        "SELECT public_raw, kid FROM delegated_jwt_keys WHERE issuer = ?",
+        issuer,
+      )
+      .toArray() as Array<{ public_raw: string; kid: string }>;
+    return { publicRawB64: after[0]!.public_raw, kid: after[0]!.kid };
+  }
+
+  /**
+   * Sign a JWS signing input on a delegated issuer's behalf (ADR-015).
+   *
+   * NEVER uses the CA master key. The header and payload are validated first —
+   * see src/jwt/delegated-claims.ts for which footguns each check closes — and
+   * the signing input is returned by the validator rather than re-derived
+   * here, so there is no gap between what was checked and what gets signed.
+   */
+  async signDelegatedJwt(params: {
+    issuer: string;
+    headerB64: string;
+    payloadB64: string;
+  }): Promise<DelegatedJwtSignResult> {
+    this.ensureSchema();
+    const { kid } = await this.getDelegatedJwtKey(params.issuer);
+
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT private_jwk FROM delegated_jwt_keys WHERE issuer = ?",
+        params.issuer,
+      )
+      .toArray() as Array<{ private_jwk: string }>;
+
+    const { validateDelegatedJws, DelegatedJwtError } = await import(
+      "./jwt/delegated-claims"
+    );
+    let signingInput: Uint8Array;
+    try {
+      signingInput = validateDelegatedJws(params.headerB64, params.payloadB64, {
+        issuer: params.issuer,
+        kid,
+      });
+    } catch (e: any) {
+      if (e instanceof DelegatedJwtError) {
+        return { ok: false, code: e.code, message: e.message };
+      }
+      throw e;
+    }
+
+    const signingKey = await crypto.subtle.importKey(
+      "jwk",
+      JSON.parse(rows[0]!.private_jwk),
+      ED25519,
+      false, // non-extractable once imported
+      ["sign"],
+    );
+    const sig = new Uint8Array(
+      await crypto.subtle.sign(ED25519, signingKey, signingInput),
+    );
+    return { ok: true, signature: sig, kid };
   }
 
   async signReceiptCommitment(

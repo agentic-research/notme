@@ -165,6 +165,7 @@ note: discovery (`/.well-known/signet-authority.json`) and the JSON landing page
 | `JTI_MIN_TTL_SECONDS`  | var (optional) | min jti replay window; default 60                                            | optional                               |
 | `RATE_LIMIT_*`         | var (optional) | KV-limiter knobs (legacy path; CF rate limiter is preferred)                 | optional                               |
 | `ALLOWED_AUDIENCES`    | var (optional) | CSV override of token-mint audience allowlist (`allowed-audiences.ts`)       | optional                               |
+| `DELEGATED_JWT_ISSUERS` | var (optional) | CSV of issuers permitted to use `JwtSigner` (ADR-015). Empty = delegated JWT signing is off. An allowlist, not caller-supplied — a caller that could register an issuer could register this authority's own | optional |
 | `DPOP_REQUIRE_NONCE`   | var (optional) | `true`/`1` requires a server-issued nonce on `/token` DPoP proofs (RFC 9449 §8). Default off — enabling it 400s the first request of any client that doesn't handle the `use_dpop_nonce` retry | optional |
 | `NOTME_KEY_STORAGE`    | var            | `ephemeral` / `cf-managed` / `encrypted` (last is unimplemented, fails fast) | config.capnp sets `ephemeral`          |
 
