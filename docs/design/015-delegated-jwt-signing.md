@@ -8,6 +8,7 @@
 **Bead:** notme-d87ef2
 **Relates to:** ADR-014 (receipt signing — same hazard class, different resolution), notme-6ad276 (derive-never-receive), cloister `src/routes/well-known-identity.ts` (`/oauth/token`, `/.well-known/jwks.json`)
 **Standards:** RFC 7515 §3.1 (JWS signing input), RFC 8037 (EdDSA in JWK/JWS), RFC 9068 (`at+jwt`)
+**Generalized by:** [016-signing-surfaces.md](016-signing-surfaces.md) — the normative rules this ADR is one instance of. Read that first for a new signing request.
 
 ## The ask
 
