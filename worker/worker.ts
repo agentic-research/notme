@@ -168,6 +168,101 @@ export class ReceiptSigner extends WorkerEntrypoint<any> {
   }
 }
 
+/**
+ * JwtSigner — delegated OAuth token signing for cloister (ADR-015).
+ *
+ * Separate entrypoint AND separate key. The key separation is the security
+ * control: notme's own access tokens are `at+jwt` signed by the CA master with
+ * `iss: https://auth.notme.bot`, and `verifyAccessToken` leaves `issuer`
+ * unchecked by default — so signing a delegated caller's JWT with the master
+ * key would hand that caller a token every notme resource server accepts, for
+ * any subject and any scope. That is an authentication bypass, not merely a
+ * forgery oracle, and no amount of claim validation fixes it. A distinct key
+ * makes such a token cryptographically unrelated to notme's own.
+ *
+ * BINDING: needs its OWN dedicated binding, for the same reason ReceiptSigner
+ * does —
+ *
+ *     ( name = "NOTME_JWT", service = "notme-bot", entrypoint = "JwtSigner" )
+ *
+ * NOT an `entrypoint` on the existing `NOTME` binding, which is live for the
+ * /identity/* fetch proxy.
+ */
+export class JwtSigner extends WorkerEntrypoint<any> {
+  /**
+   * Operator-configured delegated issuers, CSV in `DELEGATED_JWT_ISSUERS`.
+   *
+   * An allowlist rather than caller-supplied, because a caller that could
+   * register an issuer could register `https://auth.notme.bot` and be handed a
+   * key that mints tokens under this authority's own name.
+   */
+  #allowedIssuers(): Set<string> {
+    const raw = (this.env.DELEGATED_JWT_ISSUERS ?? "").trim();
+    return new Set(
+      raw
+        .split(",")
+        .map((s: string) => s.trim())
+        .filter((s: string) => s.length > 0),
+    );
+  }
+
+  #authority() {
+    return this.env.SIGNING_AUTHORITY.get(
+      this.env.SIGNING_AUTHORITY.idFromName("default"),
+    );
+  }
+
+  /**
+   * The public key and kid for a delegated issuer, for the caller to publish
+   * in its own JWKS.
+   *
+   * Cloister must point `manifest.actor.pubkeyBinding` at THIS key, not at
+   * notme's master. Publishing the master while signing with the delegated key
+   * makes every issued token fail verification — the right failure direction,
+   * but worth doing in the right order.
+   */
+  async issuerPublicKey(
+    issuer: string,
+  ): Promise<
+    | { ok: true; publicRawB64: string; kid: string }
+    | { ok: false; code: "ISSUER_NOT_DELEGATED"; message: string }
+  > {
+    if (!this.#allowedIssuers().has(issuer)) {
+      return {
+        ok: false,
+        code: "ISSUER_NOT_DELEGATED",
+        message: `issuer ${JSON.stringify(issuer)} is not in DELEGATED_JWT_ISSUERS`,
+      };
+    }
+    const { publicRawB64, kid } =
+      await this.#authority().getDelegatedJwtKey(issuer);
+    return { ok: true, publicRawB64, kid };
+  }
+
+  /**
+   * Sign a JWS signing input (RFC 7515 §3.1) for a delegated issuer.
+   *
+   * @returns raw 64-byte Ed25519 signature + the delegated kid. The caller
+   *   assembles `header.payload.signature` itself — notme does not build the
+   *   compact serialization, for the same reason it does not build receipt
+   *   envelopes: one wire format, one implementation.
+   */
+  async signJwt(params: {
+    issuer: string;
+    headerB64: string;
+    payloadB64: string;
+  }): Promise<import("./src/signing-authority").DelegatedJwtSignResult> {
+    if (!this.#allowedIssuers().has(params.issuer)) {
+      return {
+        ok: false,
+        code: "ISSUER_NOT_DELEGATED",
+        message: `issuer ${JSON.stringify(params.issuer)} is not in DELEGATED_JWT_ISSUERS`,
+      };
+    }
+    return this.#authority().signDelegatedJwt(params);
+  }
+}
+
 export class AuthService extends WorkerEntrypoint<any> {
   // RPC-session-scoped credentials. WorkerEntrypoint creates a fresh `this`
   // per RPC session in workerd, so this field is naturally per-caller.
@@ -1502,6 +1597,17 @@ export default {
     // namespace. It is registered before host enforcement and answers from the
     // public internet. Harmless for a public CA bundle; a signing oracle on
     // the CA master key if copied. Hence RPC.
+    if (pathname === "/internal/sign-jwt") {
+      return Response.json(
+        {
+          error: "not_an_http_endpoint",
+          error_description:
+            'Delegated JWT signing is an RPC method, not a route, and signs with a DELEGATED key rather than the CA master (ADR-015). Add a dedicated binding — ( name = "NOTME_JWT", service = "notme-bot", entrypoint = "JwtSigner" ) — and call env.NOTME_JWT.signJwt({issuer, headerB64, payloadB64}). See docs/design/015-delegated-jwt-signing.md.',
+        },
+        { status: 404 },
+      );
+    }
+
     if (pathname === "/internal/sign-receipt") {
       return Response.json(
         {
