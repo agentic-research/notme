@@ -164,9 +164,15 @@ signature before running it:
 
 ```bash
 cosign verify ghcr.io/agentic-research/notme:0.1.0 \
-  --certificate-identity-regexp '^https://github.com/agentic-research/notme/' \
+  --certificate-identity-regexp '^https://github\.com/agentic-research/notme/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+The identity pins the **release workflow**, not just the repository. The
+previous pattern (`^https://github.com/agentic-research/notme/`) had no
+terminator, so it matched *any* workflow in the repo — and any workflow with
+`id-token: write` could have produced a signature that passed it. Dots are
+escaped for the same reason: unescaped, `.` matches any character.
 
 The mTLS forward proxy ships as its own image, since a cloister cluster runs
 it as a separate bundle:

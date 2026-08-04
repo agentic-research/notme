@@ -493,6 +493,41 @@ tasks:
           # in-toto attestation against the same digest.
           cosign attest --yes --type spdxjson \
             --predicate sbom-index.spdx.json "${DIGEST}"
+
+          # VERIFY WHAT WE JUST SIGNED, against this exact workflow identity.
+          #
+          # Without this, "we sign our images" is a claim nothing executes —
+          # and a signature that is never checked is indistinguishable from
+          # one that silently did not happen. That is not hypothetical here:
+          # `pnpm publish --provenance` was a no-op in this repo for three
+          # releases (notme-77ead7) because `--provenance` is not a pnpm flag
+          # and nothing checked the attestation landed.
+          #
+          # This is also what makes the REGISTRY CREDENTIAL non-load-bearing.
+          # A stolen ghcr token can push an image; it cannot produce a keyless
+          # signature, because that requires this workflow's OIDC identity
+          # from Fulcio. So the push credential's blast radius is "can publish
+          # something no verifier accepts" — but only if verification actually
+          # happens somewhere.
+          #
+          # GITHUB_WORKFLOW_REF is exactly `owner/repo/.github/workflows/x.yml@ref`,
+          # so the identity is EXACT rather than a regex. A regex here would be
+          # a place for a too-permissive pattern to hide; an exact match cannot
+          # accidentally admit a different workflow. It is also correct under
+          # workflow_dispatch, where the ref is a branch rather than a tag.
+          if [ -n "${GITHUB_WORKFLOW_REF:-}" ]; then
+            cosign verify \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${DIGEST}" > /dev/null
+            cosign verify-attestation --type spdxjson \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${DIGEST}" > /dev/null
+            echo "verified signature + SBOM attestation for ${DIGEST}"
+          else
+            echo "GITHUB_WORKFLOW_REF unset (not in GHA) — signed but NOT verified" >&2
+          fi
         else
           echo "SIGN != true — skipping cosign (set SIGN=true to sign + attest)"
         fi
