@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-06-25
-**Bead:** (TBD — bd embeddeddolt format mismatch in `.beads/`; file when bd state is reconciled, or track via cloister-side cross-link)
+**Bead:** notme-0078a9 (open, P3) — was filed 2026-06-25 and scopes this exact file; the TBD note here predated it and was never updated.
 **Relates to:** notme `/oauth/token` (client_credentials) already shipped via cloister.capnp identity-bridge tenant; cloister ADR-0007 (Interlace substrate, the orthogonal internal trust layer); cloister ADR-0018 (notme co-location)
 **Companion reading:** [Cloudflare "OAuth for All" (2026-06)](https://blog.cloudflare.com/oauth-for-all/)
 

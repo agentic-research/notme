@@ -1,5 +1,25 @@
 # 007: Secretless Local Proxy
 
+**Status:** Partially implemented (audited 2026-08-04)
+**Bead:** notme-ae3130 (open — Platform interface in this doc differs from the implementation)
+
+> **AUDIT NOTE (2026-08-04).** This doc had no Status line, so it read as a
+> live problem statement with no indication which problems were solved. State
+> of the three boundaries in "Problem" below:
+>
+> | Boundary | State |
+> |---|---|
+> | Wire — server returns the private key | Addressed; the CSR/PoP path (ADR-008) does not return private keys |
+> | Disk — GHA action writes key to `$GITHUB_OUTPUT` | Addressed |
+> | SQLite — CA private key stored as plaintext JWK | **STILL TRUE in persistent mode.** `signing-authority.ts` exports the private JWK and `JSON.stringify`s it into the `keys` table. Ephemeral (workerd) mode is fixed — `extractable: false`. |
+>
+> So the headline claim of this ADR — "a system that claims to be secretless
+> cannot have `cat *.sqlite | strings | grep '\"d\"'` extract the CA key" — is
+> still accurate for the CF-edge deployment. Do not read this doc as done.
+>
+> Also note the file references in "Problem" are stale: `cert-exchange.ts` no
+> longer exists.
+
 > Private keys exist only in process memory unless explicitly encrypted at rest.
 
 ## Problem
