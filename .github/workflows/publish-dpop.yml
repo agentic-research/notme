@@ -53,6 +53,13 @@ jobs:
           scope: "@agentic-research"
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2.0.0
         with:
+          # Authenticate the release lookup. Unauthenticated, this action
+          # resolves the Task binary through the GitHub API on the RUNNER's
+          # shared IP, which hits the anonymous rate limit — it failed three
+          # separate jobs on 2026-08-04 with 'API rate limit exceeded for
+          # <ip>'. A flake indistinguishable from a real failure, on a
+          # dependency fetch, is worth one line to remove.
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
           version: 3.x
 
       - run: pnpm install --frozen-lockfile
