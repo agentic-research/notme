@@ -47,7 +47,38 @@ const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
+import type { CommitmentErrorCode } from "./receipts/commitment";
 
+/**
+ * Outcome of a receipt-signing attempt (ADR-014).
+ *
+ * A union rather than throw-on-failure: an RPC rejection surfaces as an
+ * uncaught exception in the callee's context and stringifies the error, so a
+ * caller could only branch on message text. `code` is the stable contract —
+ * cloister re-reads `getReceiptFacts()` on `EPOCH_MISMATCH` instead of polling
+ * for key rotation.
+ */
+export type ReceiptSignResult =
+  | {
+      ok: true;
+      /**
+       * RAW 64-byte Ed25519 signature. NOT a receipt envelope.
+       *
+       * The caller owns envelope construction — cloister already has a
+       * ReceiptEnvelope encoder, and a second one here would be two
+       * implementations of one wire format, which is how canonical encodings
+       * drift apart.
+       */
+      signature: Uint8Array;
+      /** The authority's epoch at signing time — the one the commitment names. */
+      epoch: number;
+    }
+  | {
+      ok: false;
+      /** Exhaustive; switch on it. Only EPOCH_MISMATCH is retryable. */
+      code: CommitmentErrorCode;
+      message: string;
+    };
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
@@ -100,6 +131,35 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       CREATE TABLE IF NOT EXISTS dpop_jtis (
         jti        TEXT PRIMARY KEY,
         expires_at INTEGER NOT NULL
+      )
+    `);
+    // Retired authority public keys, by epoch (ADR-014).
+    //
+    // `rotate()` DELETEs the keypair row and keeps a single prevKeyId/prevPubKey
+    // slot, which the next rotation overwrites — retention depth one. That is
+    // correct for 5-minute access tokens, where an old epoch is simply dead.
+    //
+    // Receipts are the first artifact whose verifiability must OUTLIVE
+    // rotation. Interlace RECEIPTS.md §2.3 makes historical resolution a MUST
+    // and names the failure mode: "without that, A can defeat audits by
+    // aggressive key rotation." Under depth-one retention, two rotations make
+    // every receipt naming epoch N permanently unverifiable — the actor voids
+    // its own evidence with two administrative actions, and an auditor cannot
+    // tell that apart from a forgery.
+    //
+    // PUBLIC KEYS ONLY. Nothing here is secret; the private key is still
+    // destroyed on rotation, which is the point of rotating.
+    //
+    // Never pruned. Retention is the irreversible half — a key deleted is gone
+    // for good, while a discovery endpoint can be added at any time. Serving
+    // these at /.well-known/interlace/index.json per §2.3 is tracked
+    // separately; persisting them cannot wait for it.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS retired_keys (
+        epoch      INTEGER PRIMARY KEY,
+        key_id     TEXT NOT NULL,
+        public_raw TEXT NOT NULL,
+        retired_at INTEGER NOT NULL
       )
     `);
     // Authorization codes for the /authorize redirect (ADR-013).
@@ -375,11 +435,21 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return btoa(String.fromCharCode(...new Uint8Array(raw)));
   }
 
-  // Sign arbitrary data with the authority key.
-  async sign(data: ArrayBuffer): Promise<ArrayBuffer> {
-    const { signingKey } = await this.getOrCreateSigningKey();
-    return crypto.subtle.sign(ED25519, signingKey, data);
-  }
+  // `sign(data: ArrayBuffer)` — "sign arbitrary data with the authority key" —
+  // was DELETED here (ADR-014, found in adversarial review of PR #61).
+  //
+  // It was exactly the universal forgery oracle that ADR-014 argues must not
+  // exist: hand it a DER TBSCertificate and it returns a signature that
+  // assembles into a certificate chaining to this authority, for any identity
+  // and any scopes. It had zero callers — `grep -rn "\.sign("` over worker/
+  // and packages/ found none outside its own tests — so nothing is lost.
+  //
+  // Not left in place with a warning comment, deliberately. An unused method
+  // on a DO is one `env.X.sign(bytes)` away from being reachable, and it sat
+  // adjacent to the carefully-gated `signReceiptCommitment` below where it
+  // reads as the simpler, more general alternative. Signing must stay
+  // format-specific: every path that touches the master key validates what it
+  // is about to sign.
 
   // Mint a DPoP-bound access token inside the DO — CryptoKey never crosses RPC.
   async mintDPoPToken(params: {
@@ -442,6 +512,156 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const accessToken = await this.mintDPoPToken(params);
     return { ok: true, accessToken };
+  }
+
+  /**
+   * Sign an Interlace 0.2.0 receipt commitment with the master key (ADR-014).
+   *
+   * SIGN-ONLY, and deliberately NOT a general signing primitive. The bytes are
+   * validated and canonically re-encoded by `validateCommitment` before they
+   * reach `crypto.subtle.sign`, because this same key signs X.509
+   * `TBSCertificate` DER and `at+jwt` access tokens and the Interlace spec
+   * signs the commitment with no domain separator. A method here that signed
+   * whatever it was handed would let a caller submit a crafted
+   * `TBSCertificate` and assemble a certificate chaining to this authority for
+   * any identity and any scopes.
+   *
+   * `actor_fp` and `epoch` are DERIVED here from the authority's own state and
+   * the commitment is rejected if it disagrees — the notme-6ad276 invariant:
+   * facts about this authority are never taken from the caller.
+   *
+   * Returns the signature and the epoch. It cannot return key material:
+   * `CryptoKey` is not Structured Cloneable and cannot cross the RPC boundary.
+   */
+
+  /**
+   * The two commitment fields that are facts about THIS authority (ADR-014).
+   *
+   * Cloister needs both to construct a commitment, and `signReceiptCommitment`
+   * rejects any commitment that disagrees — so without this it would have to
+   * source them from `.well-known` and stay in sync with rotation on its own.
+   * Serving them from the same place that enforces them removes a class of
+   * "receipt rejected, epoch drifted" failures entirely.
+   *
+   * Cacheable, and worth caching — this is a DO round-trip that would
+   * otherwise run on every proxied response. Only two things invalidate it:
+   * an EPOCH_MISMATCH from signing, and an operator `rotate()`.
+   *
+   * Do NOT poll. `alarm()` calls `generateBundle()`, never `rotate()`, so the
+   * epoch does not move on a timer. (An earlier version of this comment said
+   * rotation was "alarm-driven" — that was wrong.)
+   */
+  /**
+   * Resolve the public key that signed a given epoch's receipts (ADR-014).
+   *
+   * Answers the question RECEIPTS.md §2.2.2 step 2 asks at audit time: which
+   * key verifies a receipt naming epoch N? The live `keys` table can only
+   * answer for the current epoch, and it is keyed by keyId rather than epoch,
+   * so historical resolution needs its own lookup.
+   *
+   * Returns raw base64 Ed25519 public key bytes — the same form `actor_fp` is
+   * computed over — or null when the epoch is unknown. Null is honest rather
+   * than an error: an auditor must be able to distinguish "notme does not have
+   * this" from a transport failure.
+   */
+  async getEpochPublicKey(
+    epoch: number,
+  ): Promise<{
+    keyId: string;
+    publicRawB64: string;
+    retiredAt: number | null;
+  } | null> {
+    this.ensureSchema();
+
+    const current = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    if (current[0]?.epoch === epoch) {
+      return {
+        keyId: this.getKeyId(),
+        publicRawB64: await this.getPublicKeyRawB64(),
+        retiredAt: null, // still active
+      };
+    }
+
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT key_id, public_raw, retired_at FROM retired_keys WHERE epoch = ?",
+        epoch,
+      )
+      .toArray() as Array<{
+      key_id: string;
+      public_raw: string;
+      retired_at: number;
+    }>;
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      keyId: row.key_id,
+      publicRawB64: row.public_raw,
+      retiredAt: row.retired_at,
+    };
+  }
+
+  async getReceiptFacts(): Promise<{ actorFp: Uint8Array; epoch: number }> {
+    this.ensureSchema();
+    const { verifyKey } = await this.getOrCreateSigningKey();
+
+    // actor_fp per RECEIPTS.md §2.1: SHA-256 of the actor's master PUBLIC key.
+    // Over the RAW Ed25519 key, which is what a verifier resolving
+    // `.well-known` gets — hashing a PEM or SPKI wrapper instead would yield a
+    // fingerprint no verifier can reproduce.
+    const rawPub = new Uint8Array(
+      (await crypto.subtle.exportKey("raw", verifyKey)) as ArrayBuffer,
+    );
+    const actorFp = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", rawPub),
+    );
+
+    const rows = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+
+    return { actorFp, epoch: rows[0]!.epoch };
+  }
+
+  async signReceiptCommitment(
+    commitment: Uint8Array,
+  ): Promise<ReceiptSignResult> {
+    const { signingKey } = await this.getOrCreateSigningKey();
+    const { actorFp, epoch } = await this.getReceiptFacts();
+
+    const { validateCommitment, CommitmentError } =
+      await import("./receipts/commitment");
+
+    let canonical: Uint8Array;
+    try {
+      canonical = validateCommitment(commitment, {
+        actorFp,
+        epoch,
+        nowMs: Date.now(),
+      });
+    } catch (e: any) {
+      // A discriminated union, not a throw, and not merely for tidiness.
+      //
+      // Rejecting across an RPC boundary surfaces as an uncaught exception in
+      // the callee's context even when the caller handles it — enough to fail
+      // the test run outright. It also stringifies the error, so a caller
+      // cannot branch on anything but message text.
+      //
+      // Returning a code is what makes the documented recovery possible:
+      // cloister re-reads getReceiptFacts() on EPOCH_MISMATCH rather than
+      // polling for rotation. Matches `mintDPoPTokenOnce` above.
+      if (e instanceof CommitmentError) {
+        return { ok: false, code: e.code, message: e.message };
+      }
+      throw e; // not a validation failure — a real fault, let it surface
+    }
+
+    const signature = new Uint8Array(
+      await crypto.subtle.sign(ED25519, signingKey, canonical),
+    );
+    return { ok: true, signature, epoch };
   }
 
   /**
@@ -725,6 +945,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // until they expire; storing only the id (prevKeyId) left the pubkey gone
     // and the grace window broken (notme-54f84b).
     const oldPubKeyB64 = await this.getPublicKeyRawB64();
+
+    // Archive the outgoing PUBLIC key by epoch BEFORE the delete (ADR-014).
+    //
+    // Ordering is the whole point: after the DELETE below there is nothing
+    // left to archive, and the prevPubKey slot written further down holds
+    // exactly one generation. Receipts must stay verifiable for arbitrary
+    // later audit (RECEIPTS.md §2.3), so the key that signed epoch N has to
+    // survive epochs N+2, N+3, … — otherwise the actor voids its own evidence
+    // by rotating twice.
+    //
+    // INSERT OR IGNORE, not REPLACE: an epoch's public key is immutable once
+    // recorded. Overwriting one would rewrite history, which is precisely the
+    // capability an audit trail exists to deny.
+    const oldEpochRows = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO retired_keys (epoch, key_id, public_raw, retired_at) VALUES (?, ?, ?, ?)",
+      oldEpochRows[0]!.epoch,
+      oldKeyId,
+      oldPubKeyB64,
+      Math.floor(Date.now() / 1000),
+    );
 
     // Delete old key
     this.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");

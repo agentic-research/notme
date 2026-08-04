@@ -70,20 +70,136 @@ function isDeniedDestination(url: string): boolean {
   }
 }
 
+/**
+ * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
+ *
+ * An RPC entrypoint, NOT a fetch route, and that is the whole point. The
+ * requirement was that this "must not be externally routable". The existing
+ * `/internal/ca-bundle` route does not achieve that — it is registered before
+ * host enforcement and answers from the public internet, which is fine for a
+ * public CA bundle and a trap for anything else. No header, shared secret, or
+ * `request.cf` inspection reliably distinguishes a service-binding fetch from
+ * an internet request, and the CA master key is not the place to bet on one.
+ * An RPC method has no URL: non-routability is structural, not enforced.
+ *
+ * A separate entrypoint rather than a method on AuthService keeps least
+ * privilege — a binding to ReceiptSigner grants receipt signing and nothing
+ * else, not `proxy()`/`sign()`/`authenticate()`.
+ *
+ * BINDING: this needs its OWN service binding, e.g.
+ *
+ *     ( name = "NOTME_RECEIPTS", service = "notme-bot", entrypoint = "ReceiptSigner" )
+ *
+ * NOT an `entrypoint` added to an existing plain binding. Cloister's `NOTME`
+ * binding is live for the `/identity/*` fetch proxy (cloister config.capnp:207,
+ * typed `Fetcher` at types.ts:113); pinning an entrypoint on it would redirect
+ * that traffic to this class, which has no `fetch` handler, and break identity.
+ * An earlier draft of this comment said to add the entrypoint to `NOTME` — that
+ * instruction would have broken the first integrator to follow it.
+ *
+ * Both methods live on THIS entrypoint, so one dedicated binding is enough.
+ */
+export class ReceiptSigner extends WorkerEntrypoint<any> {
+  /**
+   * Sign a canonical Interlace commitment with the authority master key.
+   *
+   * @param commitment Canonical CBOR commitment bytes (RECEIPTS.md §2.1).
+   *   NOT trusted: validated, canonically re-encoded, and required to match
+   *   byte-for-byte before anything is signed. See src/receipts/commitment.ts
+   *   for why signing caller-supplied bytes with this key would be a CA
+   *   compromise rather than merely sloppy.
+   *
+   * @returns `{ signature, epoch }`. `epoch` is the authority's, so cloister
+   *   does not have to track it separately — and cannot assert it.
+   *
+   *   On failure returns `{ ok: false, code, message }` rather than throwing:
+   *   an RPC rejection stringifies, leaving a caller nothing but message text
+   *   to branch on. `EPOCH_MISMATCH` specifically means re-read
+   *   `receiptFacts()` — key rotation moved underneath you.
+   */
+  /**
+   * The `actor_fp` and `epoch` a commitment must carry.
+   *
+   * Cloister needs both to build a commitment and `signReceipt` rejects any
+   * that disagree, so serving them from the same authority that enforces them
+   * removes a whole class of "receipt rejected, epoch drifted" failures.
+   * Cache it, but re-read on an EPOCH_MISMATCH rather than polling — rotation
+   * here is alarm-driven.
+   */
+  async receiptFacts(): Promise<{
+    /**
+     * ALREADY HASHED: SHA-256 of the raw Ed25519 master public key, 32 bytes,
+     * ready to place in the commitment's `actor_fp` field verbatim.
+     *
+     * Returned hashed rather than as the pubkey deliberately. If the caller
+     * hashed it, the caller would own a derivation this authority then
+     * validates against — reintroducing exactly the drift this method exists
+     * to remove.
+     */
+    actorFp: Uint8Array;
+    epoch: number;
+  }> {
+    const id = this.env.SIGNING_AUTHORITY.idFromName("default");
+    return this.env.SIGNING_AUTHORITY.get(id).getReceiptFacts();
+  }
+
+  async signReceipt(
+    commitment: Uint8Array | ArrayBuffer,
+  ): Promise<import("./src/signing-authority").ReceiptSignResult> {
+    const bytes =
+      commitment instanceof ArrayBuffer
+        ? new Uint8Array(commitment)
+        : new Uint8Array(
+            commitment.buffer,
+            commitment.byteOffset,
+            commitment.byteLength,
+          );
+    // Copy when the view is not the whole buffer: `validateCommitment`
+    // re-encodes and compares against exactly these bytes, and a view over a
+    // larger buffer would otherwise compare against neighbouring data.
+    const owned =
+      bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+        ? bytes
+        : new Uint8Array(bytes);
+
+    const id = this.env.SIGNING_AUTHORITY.idFromName("default");
+    const authority = this.env.SIGNING_AUTHORITY.get(id);
+    return authority.signReceiptCommitment(owned);
+  }
+}
+
 export class AuthService extends WorkerEntrypoint<any> {
   // RPC-session-scoped credentials. WorkerEntrypoint creates a fresh `this`
   // per RPC session in workerd, so this field is naturally per-caller.
   // DO NOT hoist to module scope — see notme/worker review Finding 1.
   private heldCerts: HeldCerts | null = null;
 
-  private getAuthority() {
+  /**
+   * ECMAScript #private, NOT TypeScript `private`.
+   *
+   * TS `private` is erased at compile time. This is a prototype method on a
+   * WorkerEntrypoint, and workerd exposes those over RPC — so as `private` it
+   * was a live RPC method handing any caller the raw SigningAuthority stub,
+   * and with it the whole DO: mintBridgeCertPair() with caller-chosen identity
+   * and scopes, rotate(), getSessionSecret(), createPrincipalWithCapabilities().
+   * A complete CA compromise for anyone holding an AUTH binding, which per
+   * ADR-009 is every agent Worker.
+   *
+   * That also falsified ADR-014's least-privilege rationale for putting
+   * receipt signing on its own entrypoint: the separation was real for
+   * ReceiptSigner and undone next door.
+   *
+   * `#` is enforced by the runtime, not the type system. Never rely on TS
+   * `private` at an RPC boundary.
+   */
+  #getAuthority() {
     const id = this.env.SIGNING_AUTHORITY.idFromName("default");
     return this.env.SIGNING_AUTHORITY.get(id);
   }
 
   /** Mint a bridge cert for a verified subject. */
   async mintBridgeCert(subject: string, publicKeyPem: string, ttlMs?: number) {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.mintBridgeCert(subject, publicKeyPem, ttlMs);
   }
 
@@ -94,31 +210,31 @@ export class AuthService extends WorkerEntrypoint<any> {
     audience: string;
     jkt: string;
   }) {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.mintDPoPToken(params);
   }
 
   /** Get the CA public key PEM. */
   async getPublicKeyPem() {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.getPublicKeyPem();
   }
 
   /** Get the X.509 CA certificate PEM (for mTLS trust store). */
   async getCACertificatePem() {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.getCACertificatePem();
   }
 
   /** Get authority state (epoch, seqno, keyId). */
   async getAuthorityState() {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.getAuthorityState();
   }
 
   /** Verify a session cookie, return principal info. */
   async verifySession(cookie: string) {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     const { verifySessionCookie } = await import("./src/auth/session");
     const secret = await authority.getSessionSecret();
     return verifySessionCookie(cookie, secret);
@@ -156,7 +272,7 @@ export class AuthService extends WorkerEntrypoint<any> {
   }) {
     const { deriveCredentialsFromCerts } =
       await import("./src/auth/derive-credentials");
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     const caPublicKeyPem = await authority.getPublicKeyPem();
 
     // Clear first: if verification throws, the session must not keep whatever
@@ -1375,6 +1491,28 @@ export default {
       return handleInternalCABundle(request, env, platform);
     }
 
+    // Receipt signing is NOT an HTTP path (ADR-014). Refused explicitly rather
+    // than left absent, for two reasons: notme-c1b7fd originally specified
+    // this wire shape, so a caller built against that bead needs to be told
+    // where it went; and an unhandled /internal/* path falls through to the
+    // asset handler, which would answer a signing request with a 404 page and
+    // no explanation.
+    //
+    // The route above is the cautionary tale — /internal/ is NOT a private
+    // namespace. It is registered before host enforcement and answers from the
+    // public internet. Harmless for a public CA bundle; a signing oracle on
+    // the CA master key if copied. Hence RPC.
+    if (pathname === "/internal/sign-receipt") {
+      return Response.json(
+        {
+          error: "not_an_http_endpoint",
+          error_description:
+            'Receipt signing is an RPC method, not a route. Bind with entrypoint = "ReceiptSigner" and call env.NOTME.signReceipt(commitmentBytes). See docs/design/014-receipt-signing.md.',
+        },
+        { status: 404 },
+      );
+    }
+
     // ── Canonical host enforcement ──
     // Redirect any non-notme.bot host (e.g. workers.dev) to the canonical domain.
     // This prevents Google from indexing the workers.dev URL as a duplicate.
@@ -1981,7 +2119,8 @@ export default {
           const v = validateRedirectUri(body.redirect_uri || "");
           if (!v.ok) return jsonErr(v.reason, v.status);
 
-          const { isValidCodeChallenge } = await import("@agentic-research/dpop");
+          const { isValidCodeChallenge } =
+            await import("@agentic-research/dpop");
           if (!isValidCodeChallenge(body.code_challenge)) {
             return jsonErr("malformed or missing code_challenge", 400);
           }
@@ -2037,7 +2176,8 @@ export default {
             /* empty body */
           }
 
-          const { isValidCodeVerifier } = await import("@agentic-research/dpop");
+          const { isValidCodeVerifier } =
+            await import("@agentic-research/dpop");
           if (!body.code || typeof body.code !== "string") {
             return Response.json(
               { error: "invalid_request", error_description: "code required" },
