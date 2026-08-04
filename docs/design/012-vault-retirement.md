@@ -1,3 +1,7 @@
+<!--
+@doc-check
+@types: CertScope
+-->
 # 012: Retire notme/vault — cloister is the canonical credential vault
 
 **Status:** Accepted

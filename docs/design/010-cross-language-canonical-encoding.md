@@ -1,3 +1,8 @@
+<!--
+@doc-check
+@types: CertScope
+@endpoints: GET /.well-known/signet-authority.json
+-->
 # 010: Cross-Language Canonical Encoding for Signature Verification
 
 **Status:** Accepted

@@ -89,14 +89,30 @@ function parseFrontmatter(filePath: string): DocClaims | null {
 
 // ── Step 3: Validate ──
 
+/** Coverage bookkeeping — reported so the gate cannot imply more than it checked. */
+let unannotated: string[] = [];
+let annotatedCount = 0;
+let totalDocCount = 0;
+
 interface Result { file: string; claim: string; kind: "type" | "endpoint" | "link"; pass: boolean; detail?: string }
 
 async function validate(): Promise<Result[]> {
   const types = extractTypes();
   const endpoints = extractEndpoints();
   const results: Result[] = [];
-  const docs = findDocFiles().map(parseFrontmatter).filter((d): d is DocClaims => d !== null);
+  const allDocFiles = findDocFiles();
+  const docs = allDocFiles.map(parseFrontmatter).filter((d): d is DocClaims => d !== null);
   if (docs.length === 0) { console.error("No files with @doc-check frontmatter found."); process.exit(1); }
+  // Record what this run does NOT look at. Without this the gate printed
+  // "All N claims verified" while covering 5 of 14 design docs, and every
+  // stale claim found in the 2026-08-04 ADR audit was in an uncovered one.
+  // A gate that cannot state its own denominator reads as comprehensive.
+  unannotated = allDocFiles
+    .filter((f) => parseFrontmatter(f) === null)
+    .map((f) => relative(ROOT, f))
+    .sort();
+  annotatedCount = docs.length;
+  totalDocCount = allDocFiles.length;
 
   for (const doc of docs) {
     for (const t of doc.types) {
@@ -145,7 +161,19 @@ async function main() {
     if (!jsonOutput) console.log(`\x1b[31m${failed.length} claim(s) failed.\x1b[0m`);
     process.exit(1);
   } else {
-    if (!jsonOutput) console.log(`\x1b[32mAll ${results.length} claims verified.\x1b[0m`);
+    if (!jsonOutput) {
+      console.log(
+        `\x1b[32mAll ${results.length} claims verified\x1b[0m ` +
+          `(${annotatedCount}/${totalDocCount} docs annotated).`,
+      );
+      if (unannotated.length > 0) {
+        console.log(
+          `\x1b[33m${unannotated.length} doc(s) carry NO @doc-check block — ` +
+            `nothing in them is verified:\x1b[0m`,
+        );
+        for (const f of unannotated) console.log(`    ${f}`);
+      }
+    }
   }
 }
 

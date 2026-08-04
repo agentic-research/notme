@@ -1,3 +1,7 @@
+<!--
+@doc-check
+@endpoints: GET /.well-known/ca-bundle.pem
+-->
 # 009: Identity-Gated Runtime
 
 **Status:** Partially implemented (audited 2026-08-04)

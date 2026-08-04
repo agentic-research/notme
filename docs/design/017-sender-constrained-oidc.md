@@ -1,8 +1,14 @@
-# 012: Sender-constrained OIDC — id_tokens that prove possession, not presence
+<!--
+@doc-check
+@types: CertScope
+@endpoints: GET /.well-known/openid-configuration, GET /.well-known/jwks.json
+-->
+# ADR-017: Sender-constrained OIDC — id_tokens that prove possession, not presence
 
 **Status:** Proposed (2026-07-21)
 **Date:** 2026-07-21
-**Bead:** file when rsry reaches notme; cross-linked from the discovery-work session.
+**Bead:** notme-587188 (filed 2026-08-04; the previous line said "file when rsry reaches notme", which had long since happened)
+**Renumbered:** was 012, which collided with 012-vault-retirement. Verified zero inbound references before renaming.
 **Relates to:** [011-external-oauth-provider.md](011-external-oauth-provider.md) (the OAuth-surface predecessor, which never addressed the id_token-is-a-bearer problem); notme #26/#27/#28 (RFC 8414 AS metadata, shipped, deliberately *not* an OP); README value prop ("possession → proof").
 **Standards (verified against primary sources this session unless labeled):**
 - RFC 7800 — `cnf` (confirmation) claim, general to any JWT. Members: `jwk`, `jwe`, `kid`, `jku`.

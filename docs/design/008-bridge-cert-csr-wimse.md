@@ -1,3 +1,8 @@
+<!--
+@doc-check
+@types: CertScope
+@endpoints: POST /cert, GET /cert/gha, POST /cert/passkey, POST /token
+-->
 # 008: Bridge Certificate Issuance via Proof-of-Possession Exchange
 
 **Status:** Partially implemented (audited 2026-08-04)

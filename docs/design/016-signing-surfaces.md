@@ -6,6 +6,7 @@
 
 **Status:** Accepted (2026-08-04) — **normative**
 **Supersedes nothing; generalizes** ADR-014 (receipt signing) and ADR-015 (delegated JWT signing)
+**Bead:** none — this ADR generalizes 014 (notme-c1b7fd) and 015 (notme-d87ef2) rather than tracking work of its own. Stated explicitly so the missing field reads as a decision, not an omission.
 **Prompted by:** cloister, who pointed out that the same refusal had now happened twice and lived nowhere reusable
 
 ## Why this exists

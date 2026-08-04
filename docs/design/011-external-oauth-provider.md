@@ -1,3 +1,8 @@
+<!--
+@doc-check
+@types: CertScope
+@endpoints: GET /.well-known/oauth-authorization-server, GET /.well-known/openid-configuration, POST /token, GET /authorize, POST /authorize/code, POST /authorize/redeem
+-->
 # 011: notme as external OAuth 2.0 / OIDC provider
 
 **Status:** Proposed

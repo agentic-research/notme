@@ -1,3 +1,8 @@
+<!--
+@doc-check
+@types: CertScope
+@endpoints: POST /invites, GET /connections, POST /connections, POST /auth/oidc/login, GET /auth/passkey/status
+-->
 # 005: Multi-User Identity Architecture
 
 **Status:** Accepted

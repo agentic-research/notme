@@ -1,3 +1,7 @@
+<!--
+@doc-check
+@endpoints: GET /cert/gha, POST /cert
+-->
 # 007: Secretless Local Proxy
 
 **Status:** Partially implemented (audited 2026-08-04)

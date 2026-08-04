@@ -1,3 +1,7 @@
+<!--
+@doc-check
+@endpoints: GET /cert/gha
+-->
 # Secretless Local Proxy — Implementation Plan
 
 **Status:** Partially executed — see [007-secretless-local-proxy.md](007-secretless-local-proxy.md) for the audited state
