@@ -22,7 +22,10 @@ const cbor = new Encoder({
 
 const ACTOR_FP = new Uint8Array(32).fill(0xa1);
 const EPOCH = 7;
-const FACTS = { actorFp: ACTOR_FP, epoch: EPOCH };
+// Fixed clock so the timestamp bound is exercised deterministically rather
+// than depending on when the suite happens to run.
+const NOW_MS = 1_775_000_000_000;
+const FACTS = { actorFp: ACTOR_FP, epoch: EPOCH, nowMs: NOW_MS };
 
 function digest(fill: number) {
   return new Uint8Array(32).fill(fill);
@@ -38,7 +41,7 @@ function commitment(overrides: Record<string, unknown> = {}) {
     ["body_hash", digest(0xbb)],
     ["headers_hash", digest(0xcc)],
     ["request_hash", digest(0xdd)],
-    ["timestamp_ms", 1_775_000_000_000],
+    ["timestamp_ms", NOW_MS],
   ]);
   for (const [k, v] of Object.entries(overrides)) {
     if (v === undefined) base.delete(k);
@@ -88,7 +91,10 @@ describe("validateCommitment — cross-protocol forgery (the reason this exists)
   });
 
   it("refuses empty input", () => {
-    expectCode(() => validateCommitment(new Uint8Array(0), FACTS), "EMPTY_INPUT");
+    expectCode(
+      () => validateCommitment(new Uint8Array(0), FACTS),
+      "EMPTY_INPUT",
+    );
   });
 
   it("refuses a CBOR value that is not a map", () => {
@@ -106,7 +112,7 @@ describe("validateCommitment — canonical-encoding smuggling", () => {
     // this passes every structural check while carrying attacker-chosen
     // layout into the signature.
     const scrambled = new Map<string, unknown>([
-      ["timestamp_ms", 1_775_000_000_000],
+      ["timestamp_ms", NOW_MS],
       ["nonce", new Uint8Array(16).fill(0x11)],
       ["epoch", EPOCH],
       ["actor_fp", ACTOR_FP],
@@ -122,7 +128,10 @@ describe("validateCommitment — canonical-encoding smuggling", () => {
   });
 
   it("accepts the canonical encoding and returns identical bytes", () => {
-    const input = commitment();
+    // Built BY HAND from §4.2, not with cbor-x. Using an encoder to build the
+    // fixture for the encoder under test is a fixed point, not a conformance
+    // check — that is exactly how the float64 timestamp bug survived review.
+    const input = handEncodeCommitment({});
     const out = validateCommitment(input, FACTS);
     expect(Array.from(out)).toEqual(Array.from(input));
   });
@@ -153,9 +162,18 @@ describe("validateCommitment — structure", () => {
   });
 
   it("refuses a digest field of the wrong length", () => {
-    for (const field of ["request_hash", "body_hash", "headers_hash", "actor_fp"]) {
+    for (const field of [
+      "request_hash",
+      "body_hash",
+      "headers_hash",
+      "actor_fp",
+    ]) {
       expectCode(
-        () => validateCommitment(commitment({ [field]: new Uint8Array(31) }), FACTS),
+        () =>
+          validateCommitment(
+            commitment({ [field]: new Uint8Array(31) }),
+            FACTS,
+          ),
         "FIELD_WRONG_LENGTH",
       );
     }
@@ -181,7 +199,9 @@ describe("validateCommitment — structure", () => {
 
   it("accepts the 2xx boundaries", () => {
     for (const status of [200, 299]) {
-      expect(() => validateCommitment(commitment({ status }), FACTS)).not.toThrow();
+      expect(() =>
+        validateCommitment(handEncodeCommitment({ status }), FACTS),
+      ).not.toThrow();
     }
   });
 
@@ -220,3 +240,185 @@ describe("validateCommitment — derived, never received (notme-6ad276)", () => 
     );
   });
 });
+
+describe("validateCommitment — timestamp bound (adversarial review of PR #61)", () => {
+  it("refuses a backdated timestamp", () => {
+    // The attack this closes: a compromised binding holder mints receipts
+    // spread across years, each a valid signature over a canonical commitment
+    // and each provable evidence that the actor admitted a request it never
+    // served. Clamped, the same compromise only yields receipts datable to
+    // the window in which the attacker actually held the binding.
+    expectCode(
+      () =>
+        validateCommitment(
+          commitment({ timestamp_ms: NOW_MS - 86_400_000 }),
+          FACTS,
+        ),
+      "TIMESTAMP_OUT_OF_RANGE",
+    );
+  });
+
+  it("refuses a postdated timestamp", () => {
+    expectCode(
+      () =>
+        validateCommitment(
+          commitment({ timestamp_ms: NOW_MS + 86_400_000 }),
+          FACTS,
+        ),
+      "TIMESTAMP_OUT_OF_RANGE",
+    );
+  });
+
+  it("accepts skew a conformant verifier would accept", () => {
+    // The bound equals RECEIPTS.md §2.2.1 step 12's ±300s rather than
+    // something tighter. A narrower window here would reject receipts every
+    // conformant peer would have accepted — a defence that becomes an outage.
+    for (const offset of [-299_000, -1000, 0, 1000, 299_000]) {
+      expect(() =>
+        validateCommitment(
+          handEncodeCommitment({ timestampMs: NOW_MS + offset }),
+          FACTS,
+        ),
+      ).not.toThrow();
+    }
+  });
+
+  it("refuses just outside the window", () => {
+    for (const offset of [-300_001, 300_001]) {
+      expectCode(
+        () =>
+          validateCommitment(
+            commitment({ timestamp_ms: NOW_MS + offset }),
+            FACTS,
+          ),
+        "TIMESTAMP_OUT_OF_RANGE",
+      );
+    }
+  });
+});
+
+describe("canonical encoding conforms to RFC 8949 §4.2, not to cbor-x", () => {
+  // These are the tests that were missing. Every fixture above is built with
+  // an encoder and validated against the same encoder — a fixed point that
+  // ANY self-consistent encoder satisfies, including a wrong one. These build
+  // the bytes BY HAND from the spec instead.
+
+  it("accepts the shortest-form uint64 a conformant encoder emits", () => {
+    // Go's fxamacker/cbor under CanonicalEncOptions, ciborium, and every other
+    // §4.2 encoder emit `0x1b` for a millisecond timestamp. cbor-x emits a
+    // float64 and decodes `0x1b` to BigInt, so before the hand-rolled encoder
+    // this input was rejected with FIELD_NOT_UINT — i.e. notme refused 100% of
+    // conformant callers.
+    const ts = 1_775_000_000_000;
+    const hand = handEncodeCommitment({ timestampMs: ts });
+    expect(hand[hand.length - 9]).toBe(0x1b); // uint64 head, not 0xfb float64
+    expect(() =>
+      validateCommitment(hand, { ...FACTS, nowMs: ts }),
+    ).not.toThrow();
+  });
+
+  it("signs bytes containing no float64 — the spec forbids floats outright", () => {
+    // RECEIPTS.md §3.1: "Floats and NaN are forbidden … canonical receipt
+    // schemas in this spec contain no float fields at all."
+    const ts = 1_775_000_000_000;
+    const out = validateCommitment(handEncodeCommitment({ timestampMs: ts }), {
+      ...FACTS,
+      nowMs: ts,
+    });
+    expect(Array.from(out)).not.toContain(0xfb);
+  });
+
+  it("emits the exact byte sequence the spec prescribes", () => {
+    // Pins the full encoding, so a future encoder swap cannot silently change
+    // what the CA master key signs.
+    const ts = 1_775_000_000_000;
+    const out = validateCommitment(handEncodeCommitment({ timestampMs: ts }), {
+      ...FACTS,
+      nowMs: ts,
+    });
+    expect(out[0]).toBe(0xa8); // map(8), definite length
+    expect(Array.from(out.slice(1, 7))).toEqual([
+      0x65,
+      0x65,
+      0x70,
+      0x6f,
+      0x63,
+      0x68, // text(5) "epoch" — first canonical key
+    ]);
+  });
+
+  it("uses shortest-form integer heads across the size boundaries", () => {
+    // 23/24, 255/256, 65535/65536, 2^32-1/2^32 — where a non-shortest or
+    // float-promoting encoder diverges.
+    for (const [ts, head] of [
+      [23, 0x17],
+      [24, 0x18],
+      [255, 0x18],
+      [256, 0x19],
+      [65_535, 0x19],
+      [65_536, 0x1a],
+      [4_294_967_295, 0x1a],
+      [4_294_967_296, 0x1b],
+    ] as Array<[number, number]>) {
+      const hand = handEncodeCommitment({ timestampMs: ts });
+      const out = validateCommitment(hand, { ...FACTS, nowMs: ts });
+      // timestamp_ms is the last field; its head follows the 12-byte key.
+      const keyEnd =
+        out.length -
+        (head < 0x18
+          ? 1
+          : head === 0x18
+            ? 2
+            : head === 0x19
+              ? 3
+              : head === 0x1a
+                ? 5
+                : 9);
+      expect(out[keyEnd]).toBe(head);
+    }
+  });
+});
+
+/** Build a commitment BY HAND from RFC 8949 §4.2, with no encoder involved. */
+function handEncodeCommitment(opts: {
+  timestampMs?: number;
+  status?: number;
+}): Uint8Array {
+  const parts: number[] = [0xa8]; // map(8)
+  const text = (s: string) => {
+    const b = [...new TextEncoder().encode(s)];
+    return [0x60 | b.length, ...b];
+  };
+  const bytes = (b: Uint8Array) => [0x58, b.byteLength, ...b];
+  const uint = (v: number) => {
+    if (v < 24) return [v];
+    if (v < 0x100) return [0x18, v];
+    if (v < 0x10000) return [0x19, v >> 8, v & 0xff];
+    if (v < 0x100000000) {
+      return [
+        0x1a,
+        (v >>> 24) & 0xff,
+        (v >>> 16) & 0xff,
+        (v >>> 8) & 0xff,
+        v & 0xff,
+      ];
+    }
+    const bv = BigInt(v);
+    const out = [0x1b];
+    for (let i = 7; i >= 0; i--)
+      out.push(Number((bv >> BigInt(i * 8)) & 0xffn));
+    return out;
+  };
+  // 16-byte nonce uses the 0x50 short form, not 0x58.
+  const shortBytes = (b: Uint8Array) => [0x40 | b.byteLength, ...b];
+
+  parts.push(...text("epoch"), ...uint(EPOCH));
+  parts.push(...text("nonce"), ...shortBytes(new Uint8Array(16).fill(0x11)));
+  parts.push(...text("status"), ...uint(opts.status ?? 200));
+  parts.push(...text("actor_fp"), ...bytes(ACTOR_FP));
+  parts.push(...text("body_hash"), ...bytes(digest(0xbb)));
+  parts.push(...text("headers_hash"), ...bytes(digest(0xcc)));
+  parts.push(...text("request_hash"), ...bytes(digest(0xdd)));
+  parts.push(...text("timestamp_ms"), ...uint(opts.timestampMs ?? NOW_MS));
+  return new Uint8Array(parts);
+}

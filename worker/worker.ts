@@ -152,14 +152,32 @@ export class AuthService extends WorkerEntrypoint<any> {
   // DO NOT hoist to module scope — see notme/worker review Finding 1.
   private heldCerts: HeldCerts | null = null;
 
-  private getAuthority() {
+  /**
+   * ECMAScript #private, NOT TypeScript `private`.
+   *
+   * TS `private` is erased at compile time. This is a prototype method on a
+   * WorkerEntrypoint, and workerd exposes those over RPC — so as `private` it
+   * was a live RPC method handing any caller the raw SigningAuthority stub,
+   * and with it the whole DO: mintBridgeCertPair() with caller-chosen identity
+   * and scopes, rotate(), getSessionSecret(), createPrincipalWithCapabilities().
+   * A complete CA compromise for anyone holding an AUTH binding, which per
+   * ADR-009 is every agent Worker.
+   *
+   * That also falsified ADR-014's least-privilege rationale for putting
+   * receipt signing on its own entrypoint: the separation was real for
+   * ReceiptSigner and undone next door.
+   *
+   * `#` is enforced by the runtime, not the type system. Never rely on TS
+   * `private` at an RPC boundary.
+   */
+  #getAuthority() {
     const id = this.env.SIGNING_AUTHORITY.idFromName("default");
     return this.env.SIGNING_AUTHORITY.get(id);
   }
 
   /** Mint a bridge cert for a verified subject. */
   async mintBridgeCert(subject: string, publicKeyPem: string, ttlMs?: number) {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.mintBridgeCert(subject, publicKeyPem, ttlMs);
   }
 
@@ -170,31 +188,31 @@ export class AuthService extends WorkerEntrypoint<any> {
     audience: string;
     jkt: string;
   }) {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.mintDPoPToken(params);
   }
 
   /** Get the CA public key PEM. */
   async getPublicKeyPem() {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.getPublicKeyPem();
   }
 
   /** Get the X.509 CA certificate PEM (for mTLS trust store). */
   async getCACertificatePem() {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.getCACertificatePem();
   }
 
   /** Get authority state (epoch, seqno, keyId). */
   async getAuthorityState() {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     return authority.getAuthorityState();
   }
 
   /** Verify a session cookie, return principal info. */
   async verifySession(cookie: string) {
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     const { verifySessionCookie } = await import("./src/auth/session");
     const secret = await authority.getSessionSecret();
     return verifySessionCookie(cookie, secret);
@@ -232,7 +250,7 @@ export class AuthService extends WorkerEntrypoint<any> {
   }) {
     const { deriveCredentialsFromCerts } =
       await import("./src/auth/derive-credentials");
-    const authority = this.getAuthority();
+    const authority = this.#getAuthority();
     const caPublicKeyPem = await authority.getPublicKeyPem();
 
     // Clear first: if verification throws, the session must not keep whatever

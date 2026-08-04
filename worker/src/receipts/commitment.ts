@@ -17,20 +17,8 @@
  * place to smuggle attacker-chosen bytes — fails the equality check.
  */
 
-import { Decoder, Encoder } from "cbor-x";
-
-/**
- * Encoder settings must match `bundleCanonical` in ../revocation.ts, which is
- * itself matched to signet's fxamacker/cbor. A second, subtly different
- * canonical encoder in the same worker would be a silent interop bug: two
- * "canonical" encodings that disagree produce receipts some verifiers accept
- * and others reject.
- */
-const cbor = new Encoder({
-  mapsAsObjects: false,
-  useRecords: false,
-  tagUint8Array: false,
-});
+import { Decoder } from "cbor-x";
+import { encodeCanonicalMap, type CborValue } from "./canonical-cbor";
 
 /**
  * Strict decoder.
@@ -64,7 +52,10 @@ const MIN_NONCE_BYTES = 16;
 const DIGEST_BYTES = 32;
 
 export class CommitmentError extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
     super(message);
     this.name = "CommitmentError";
   }
@@ -95,7 +86,8 @@ function isBytes(v: unknown): v is Uint8Array {
 
 function requireBytes(m: Map<unknown, unknown>, key: string, len?: number) {
   const v = m.get(key);
-  if (!isBytes(v)) fail("FIELD_NOT_BYTES", `"${key}" must be a CBOR byte string`);
+  if (!isBytes(v))
+    fail("FIELD_NOT_BYTES", `"${key}" must be a CBOR byte string`);
   if (len !== undefined && v.byteLength !== len) {
     fail(
       "FIELD_WRONG_LENGTH",
@@ -105,11 +97,29 @@ function requireBytes(m: Map<unknown, unknown>, key: string, len?: number) {
   return v;
 }
 
+/**
+ * Read a CBOR unsigned integer, accepting BOTH `number` and `bigint`.
+ *
+ * Accepting bigint is required for conformance, not convenience. cbor-x
+ * decodes a shortest-form uint64 (`0x1b …`) to a BigInt, and every real
+ * `timestamp_ms` is above 2^32 — so an earlier `typeof v !== "number"` guard
+ * rejected 100% of commitments from any spec-conformant encoder, with a
+ * message ("must be a non-negative CBOR integer") describing exactly what the
+ * caller had correctly sent.
+ *
+ * Normalized to `number` after a safe-integer check so the range comparisons
+ * below stay ordinary arithmetic. Milliseconds stay exact well past year
+ * 275760; anything beyond Number.MAX_SAFE_INTEGER is refused rather than
+ * silently rounded.
+ */
 function requireUint(m: Map<unknown, unknown>, key: string): number {
   const v = m.get(key);
-  // Reject bigint as well as float: cbor-x surfaces large integers as bigint,
-  // and re-encoding a bigint that fits in a smaller form would change the
-  // bytes and trip the canonical-equality check with a confusing message.
+  if (typeof v === "bigint") {
+    if (v < 0n || v > BigInt(Number.MAX_SAFE_INTEGER)) {
+      fail("FIELD_NOT_UINT", `"${key}" is outside the safe integer range`);
+    }
+    return Number(v);
+  }
   if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) {
     fail("FIELD_NOT_UINT", `"${key}" must be a non-negative CBOR integer`);
   }
@@ -121,7 +131,23 @@ export interface CommitmentFacts {
   actorFp: Uint8Array;
   /** The authority's current key epoch. */
   epoch: number;
+  /**
+   * The authority's clock, in unix ms. Injected rather than read here so it
+   * stays derived-not-received alongside the other two facts, and so the
+   * bound is testable without faking time globally.
+   */
+  nowMs: number;
 }
+
+/**
+ * Tolerance on `timestamp_ms`, matching RECEIPTS.md §2.2.1 step 12 — the
+ * window a conformant peer already applies against its own clock.
+ *
+ * Chosen to equal the spec's rather than something tighter: a bound narrower
+ * than the verifier's would reject receipts that every conformant P would
+ * have accepted, turning a defence into an outage.
+ */
+const MAX_TIMESTAMP_SKEW_MS = 300_000;
 
 /**
  * Validate `input` as a canonical Interlace commitment and return the bytes to
@@ -167,7 +193,8 @@ export function validateCommitment(
     );
   }
   for (const key of REQUIRED_KEYS) {
-    if (!decoded.has(key)) fail("MISSING_KEY", `commitment is missing "${key}"`);
+    if (!decoded.has(key))
+      fail("MISSING_KEY", `commitment is missing "${key}"`);
   }
 
   const nonce = requireBytes(decoded, "nonce");
@@ -191,6 +218,26 @@ export function validateCommitment(
   }
 
   const timestampMs = requireUint(decoded, "timestamp_ms");
+  // Bounded to the authority's clock, because this is the ONE remaining field
+  // that is fully caller-chosen, semantically load-bearing, and cheaply
+  // checkable here.
+  //
+  // The other free fields are free for a reason: `nonce`, `request_hash`,
+  // `body_hash` and `headers_hash` describe a request notme structurally
+  // cannot see, so it has nothing to check them against. notme has a clock.
+  //
+  // Without this, a compromised binding holder mints receipts backdated
+  // across years — each a valid signature under the master key over a
+  // canonical commitment, each provable evidence that the actor admitted a
+  // request it never served, and none of them disprovable. Clamped, the same
+  // compromise yields receipts datable only to the window in which the
+  // attacker actually held the binding.
+  if (Math.abs(timestampMs - facts.nowMs) > MAX_TIMESTAMP_SKEW_MS) {
+    fail(
+      "TIMESTAMP_OUT_OF_RANGE",
+      `"timestamp_ms" is ${timestampMs}, outside ±${MAX_TIMESTAMP_SKEW_MS}ms of the authority clock`,
+    );
+  }
   const epoch = requireUint(decoded, "epoch");
 
   // ── Derived, not received (ADR-014) ──
@@ -210,17 +257,17 @@ export function validateCommitment(
   // Re-encode from the validated values. Key insertion order here is the
   // RFC 8949 §4.2 canonical order (length-then-bytewise over the encoded
   // keys), which the equality check below then proves against the input.
-  const canonical = new Map<string, unknown>([
-    ["epoch", epoch],
-    ["nonce", nonce],
-    ["status", status],
-    ["actor_fp", actorFp],
-    ["body_hash", bodyHash],
-    ["headers_hash", headersHash],
-    ["request_hash", requestHash],
-    ["timestamp_ms", timestampMs],
-  ]);
-  const reencoded = new Uint8Array(cbor.encode(canonical));
+  const canonical: ReadonlyArray<readonly [string, CborValue]> = [
+    ["epoch", { uint: epoch }],
+    ["nonce", { bytes: nonce }],
+    ["status", { uint: status }],
+    ["actor_fp", { bytes: actorFp }],
+    ["body_hash", { bytes: bodyHash }],
+    ["headers_hash", { bytes: headersHash }],
+    ["request_hash", { bytes: requestHash }],
+    ["timestamp_ms", { uint: timestampMs }],
+  ];
+  const reencoded = encodeCanonicalMap(canonical);
 
   // THE LOAD-BEARING CHECK. Everything above proves the STRUCTURE is a
   // commitment; this proves the BYTES are the ones that structure encodes to.

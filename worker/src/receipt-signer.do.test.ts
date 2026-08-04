@@ -17,6 +17,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { Encoder } from "cbor-x";
+import { commitmentVector } from "./__tests__/helpers/commitment-vector";
 import type { SigningAuthority } from "./signing-authority";
 
 const cbor = new Encoder({
@@ -40,22 +41,21 @@ function authority() {
  * obvious: cloister would have had the same problem, sourcing actor_fp and
  * epoch from .well-known and drifting on rotation.
  */
+/**
+ * Spec-built commitment bytes. NOT encoded with cbor-x: a fixture built by the
+ * same encoder the validator re-encodes with is a fixed point that any
+ * self-consistent encoder passes, including a wrong one.
+ */
 function commitment(
   facts: { actorFp: Uint8Array; epoch: number },
-  overrides: Record<string, unknown> = {},
+  overrides: Partial<{ status: number; timestampMs: number }> = {},
 ) {
-  const m = new Map<string, unknown>([
-    ["epoch", facts.epoch],
-    ["nonce", new Uint8Array(16).fill(0x11)],
-    ["status", 200],
-    ["actor_fp", facts.actorFp],
-    ["body_hash", new Uint8Array(32).fill(0xbb)],
-    ["headers_hash", new Uint8Array(32).fill(0xcc)],
-    ["request_hash", new Uint8Array(32).fill(0xdd)],
-    ["timestamp_ms", 1_775_000_000_000],
-  ]);
-  for (const [k, v] of Object.entries(overrides)) m.set(k, v);
-  return new Uint8Array(cbor.encode(m));
+  return commitmentVector({
+    actorFp: facts.actorFp,
+    epoch: facts.epoch,
+    timestampMs: overrides.timestampMs ?? Date.now(),
+    status: overrides.status,
+  });
 }
 
 describe("receipt signing — real SigningAuthority (ADR-014)", () => {
@@ -99,7 +99,11 @@ describe("receipt signing — real SigningAuthority (ADR-014)", () => {
     const stub = authority();
     const facts = await stub.getReceiptFacts();
     const res = await stub.signReceiptCommitment(
-      commitment(facts, { actor_fp: new Uint8Array(32).fill(0xff) }),
+      commitmentVector({
+        actorFp: new Uint8Array(32).fill(0xff),
+        epoch: facts.epoch,
+        timestampMs: Date.now(),
+      }),
     );
     expect(res.ok).toBe(false);
     if (res.ok) return;
@@ -112,7 +116,11 @@ describe("receipt signing — real SigningAuthority (ADR-014)", () => {
     const stub = authority();
     const facts = await stub.getReceiptFacts();
     const res = await stub.signReceiptCommitment(
-      commitment(facts, { epoch: facts.epoch + 1 }),
+      commitmentVector({
+        actorFp: facts.actorFp,
+        epoch: facts.epoch + 1,
+        timestampMs: Date.now(),
+      }),
     );
     expect(res.ok).toBe(false);
     if (res.ok) return;
@@ -136,7 +144,7 @@ describe("receipt signing — real SigningAuthority (ADR-014)", () => {
     const stub = authority();
     const facts = await stub.getReceiptFacts();
     const scrambled = new Map<string, unknown>([
-      ["timestamp_ms", 1_775_000_000_000],
+      ["timestamp_ms", Date.now()],
       ["nonce", new Uint8Array(16).fill(0x11)],
       ["epoch", facts.epoch],
       ["actor_fp", facts.actorFp],
