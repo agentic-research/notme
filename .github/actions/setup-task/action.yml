@@ -1,0 +1,56 @@
+name: Setup Task
+description: >-
+  Install go-task pinned to an exact version and verified against a published
+  SHA-256. No GitHub API call, so no token and no rate limit.
+
+# WHY THIS EXISTS instead of arduino/setup-task.
+#
+# Two problems with the action, and the second is the real one.
+#
+# 1. It resolves the Task release through the GitHub API. Unauthenticated that
+#    counts against the RUNNER's shared IP quota, which failed three separate
+#    jobs on 2026-08-04 ("API rate limit exceeded for 20.106.191.49" and
+#    "... for 57.154.4.124"). The obvious fix is to pass a token — but adding a
+#    credential to fetch a public binary is the wrong direction in this repo,
+#    and octo-sts would be worse: it needs `id-token: write` on jobs that
+#    currently hold only `contents: read`, escalating three jobs' permissions
+#    so they can download a build tool.
+#
+# 2. `version: 3.x` IS A MUTABLE DEPENDENCY REFERENCE. sha-pin-check exists in
+#    this repo because branch and tag refs are mutable, citing the Trivy/Aqua
+#    incident (March 2026) as the load-bearing reason. That check pins the
+#    ACTION, and the action then fetched whatever "3.x" resolved to that
+#    morning. The pin stopped at the wrapper.
+#
+# A pinned URL plus a published checksum removes the credential question by
+# removing the API call, and closes the mutable-reference gap the SHA-pinning
+# discipline was already trying to close. The release asset URL is a plain
+# redirect to the CDN — verified: no API involvement, no rate limit.
+#
+# TO UPGRADE: bump TASK_VERSION, then take the digest from
+# https://github.com/go-task/task/releases/download/<version>/task_checksums.txt
+# Do not skip the checksum. An unverified download is the thing this replaced.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TASK_VERSION: v3.45.4
+        # sha256 of task_linux_amd64.tar.gz, from the release's own
+        # task_checksums.txt. Runners are linux/amd64.
+        TASK_SHA256: 4367eba04abcbcb407578d18d2439ee32604a872419601abec76a829c797fb82
+      run: |
+        set -euo pipefail
+        url="https://github.com/go-task/task/releases/download/${TASK_VERSION}/task_linux_amd64.tar.gz"
+        tmp="$(mktemp -d)"
+        curl -sSfL "$url" -o "$tmp/task.tar.gz"
+
+        # Verify BEFORE extracting. Extracting first and checking after would
+        # already have written an unverified binary to disk.
+        echo "${TASK_SHA256}  ${tmp}/task.tar.gz" | sha256sum -c -
+
+        tar -xzf "$tmp/task.tar.gz" -C "$tmp" task
+        install -m 0755 "$tmp/task" /usr/local/bin/task
+        rm -rf "$tmp"
+        task --version

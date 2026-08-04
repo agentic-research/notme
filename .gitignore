@@ -134,3 +134,29 @@ coverage/
 
 # built package artifacts (published, not committed)
 packages/*/dist/
+
+# ── Secrets are never committable, regardless of anything above ────────────
+#
+# MUST STAY LAST. This file re-includes whole subtrees with negations such as
+# `!worker/**`, and git applies the LAST matching rule — so a broad negation
+# silently opts local-secret files back in. Found by cloister (2026-08-04):
+#
+#   $ git check-ignore -v worker/.dev.vars
+#   .gitignore:74:!worker/**   worker/.dev.vars
+#
+# `.dev.vars` is wrangler's standard LOCAL SECRETS file — exactly where an
+# operator is told to put things that must never be committed. It was
+# committable, along with .env, *.pem and *.key anywhere under worker/,
+# vault/, action/ and packages/. In a repository whose entire premise is that
+# private keys never touch disk, that is the wrong default to leave armed.
+#
+# Anything added below a negation in future must be re-checked against this
+# block. `worker/src/__tests__/gitignore-secrets.test.ts` asserts it.
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!melange.rsa.pub

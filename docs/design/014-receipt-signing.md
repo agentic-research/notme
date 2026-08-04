@@ -8,6 +8,7 @@
 **Bead:** notme-c1b7fd
 **Relates to:** cloister's Interlace 0.2.0 `RECEIPTS.md` §2.1/§2.4 (the wire contract this serves), notme-6ad276 / PR #54 (the "derive, never receive" invariant this reuses), notme-d87ef2 (`/internal/sign-jwt`, same hazard class, still unbuilt)
 **Standards:** RFC 8032 (Ed25519), RFC 8949 §4.2 (Core Deterministic Encoding)
+**Generalized by:** [016-signing-surfaces.md](016-signing-surfaces.md) — the normative rules this ADR is one instance of. Read that first for a new signing request.
 
 ## The ask
 
