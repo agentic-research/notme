@@ -618,8 +618,17 @@ describe("adversarial: scope escalation (additional)", () => {
 // ── Platform mode detection ─────────────────────────────────────────────────
 
 describe("adversarial: mode detection", () => {
-  it("encrypted mode throws not-yet-implemented", () => {
-    expect(() => validateKeyStorageConfig("encrypted")).toThrow(/not yet implemented/i);
+  it("encrypted mode without a KEK secret fails closed", () => {
+    // Was "throws not-yet-implemented" until notme-41d0d3 shipped encrypted
+    // storage. The adversarial property is unchanged and is what this file
+    // cares about: you cannot end up in encrypted mode with no key to encrypt
+    // with, silently writing the CA key in cleartext.
+    expect(() => validateKeyStorageConfig("encrypted")).toThrow(
+      /NOTME_KEK_SECRET is unset/,
+    );
+    expect(() =>
+      validateKeyStorageConfig("encrypted", "ab".repeat(16)),
+    ).not.toThrow();
   });
 
   it("default mode is cf-managed (not ephemeral) — safe for production", () => {

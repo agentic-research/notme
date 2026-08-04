@@ -25,6 +25,11 @@ import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 import { sha256Base64url } from "@agentic-research/dpop";
 import { bundleCanonical, type CABundle } from "./revocation";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
+import {
+  deriveKek,
+  readStoredJwk,
+  serialiseJwkForStorage,
+} from "./key-encryption";
 
 interface SigningAuthorityEnv {
   CA_BUNDLE_CACHE?: KVNamespace;
@@ -100,24 +105,51 @@ export type DelegatedJwtSignResult =
   | { ok: false; code: DelegatedJwtErrorCode; message: string };
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
-  private initialized = false;
-  private signingKey: CryptoKey | null = null;
-  private verifyKey: CryptoKey | null = null;
+  #initialized = false;
+  #signingKey: CryptoKey | null = null;
+  #verifyKey: CryptoKey | null = null;
   /** Key storage mode — uses shared detectKeyStorage() for consistency with Worker. */
-  private get keyStorageMode(): KeyStorageMode {
+  get #keyStorageMode(): KeyStorageMode {
     const mode = detectKeyStorage(this.env as Record<string, unknown>);
-    if (mode === "encrypted") {
+    if (mode === "encrypted" && !this.env.NOTME_KEK_SECRET) {
+      // Fail closed, same reasoning as validateKeyStorageConfig: proceeding
+      // would persist the CA private key in cleartext while the operator
+      // believes it is sealed. (Before notme-41d0d3 this threw for encrypted
+      // mode unconditionally, which meant setting NOTME_KEK_SECRET — the very
+      // thing that selects the mode — bricked the DO on boot.)
       throw new Error(
-        "encrypted key storage is not yet implemented. " +
-          "Use ephemeral (local/CI) or cf-managed (production). " +
-          "See docs/design/007-secretless-local-proxy.md for roadmap.",
+        "encrypted key storage selected but NOTME_KEK_SECRET is unset. " +
+          "See docs/design/007-secretless-local-proxy.md.",
       );
     }
     return mode;
   }
 
-  private ensureSchema(): void {
-    if (this.initialized) return;
+  /**
+   * Cached KEK, or null when this deployment stores keys in the clear.
+   *
+   * Cached per DO instance because HKDF runs on every call otherwise and
+   * `ensureKeys` is on the hot path for every sign. Null is a real answer, not
+   * a failure: `cf-managed` and `ephemeral` both legitimately have no KEK.
+   */
+  #kekPromise: Promise<CryptoKey> | null = null;
+  /**
+   * ECMAScript #private, NOT TypeScript `private`. The latter is erased at
+   * compile time, so a `private` method is live on the DO's RPC surface — the
+   * same trap ADR-016 records for #getAuthority(). rpc-surface.do.test.ts
+   * caught this one: `getKek` appeared as method 47 of an allow-list pinned at
+   * 46. It hands back a non-extractable CryptoKey so a leaked stub could not
+   * export the KEK, but a capability nobody needs should not be reachable.
+   */
+  #getKek(): Promise<CryptoKey> | null {
+    const secret = this.env.NOTME_KEK_SECRET;
+    if (!secret) return null;
+    this.#kekPromise ??= deriveKek(secret);
+    return this.#kekPromise;
+  }
+
+  #ensureSchema(): void {
+    if (this.#initialized) return;
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS keys (
         id          TEXT PRIMARY KEY DEFAULT 'authority',
@@ -228,10 +260,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         expires_at     INTEGER NOT NULL
       )
     `);
-    this.initialized = true;
+    this.#initialized = true;
   }
 
-  private static async keyIdFromSpki(spkiB64: string): Promise<string> {
+  static async #keyIdFromSpki(spkiB64: string): Promise<string> {
     return keyIdFromSpki(spkiB64);
   }
 
@@ -241,16 +273,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     verifyKey: CryptoKey;
     keyId: string;
   }> {
-    if (this.signingKey && this.verifyKey) {
-      const kid = this.getKeyId();
+    if (this.#signingKey && this.#verifyKey) {
+      const kid = this.#getKeyId();
       return {
-        signingKey: this.signingKey,
-        verifyKey: this.verifyKey,
+        signingKey: this.#signingKey,
+        verifyKey: this.#verifyKey,
         keyId: kid,
       };
     }
 
-    this.ensureSchema();
+    this.#ensureSchema();
 
     const rows = this.ctx.storage.sql
       .exec(
@@ -270,8 +302,34 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       if (!row.private_jwk) {
         // Fall through to key generation
       } else {
-        const jwk = JSON.parse(row.private_jwk);
-        this.signingKey = await crypto.subtle.importKey(
+        // May be a sealed envelope or a legacy bare JWK — readStoredJwk
+        // discriminates on an explicit marker and throws if a sealed row is
+        // met with no KEK, rather than falling through to key generation and
+        // silently invalidating every cert and token ever issued.
+        const kek = this.#getKek();
+        const resolvedKek = kek ? await kek : null;
+        const { jwk, wasSealed } = await readStoredJwk(
+          row.private_jwk,
+          resolvedKek,
+        );
+
+        // Migrate in place. An operator who sets NOTME_KEK_SECRET on an
+        // existing deployment expects the key to become sealed; without this
+        // it would stay in cleartext until the next rotation, which may be
+        // never. Best-effort: a failure here must not take down signing, since
+        // the key itself is loaded fine either way.
+        if (!wasSealed && resolvedKek) {
+          try {
+            this.ctx.storage.sql.exec(
+              "UPDATE keys SET private_jwk = ? WHERE id = 'authority'",
+              await serialiseJwkForStorage(jwk, resolvedKek),
+            );
+          } catch (e) {
+            console.error("authority key re-seal failed (key still usable)", e);
+          }
+        }
+
+        this.#signingKey = await crypto.subtle.importKey(
           "jwk",
           jwk,
           ED25519,
@@ -281,7 +339,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         const spkiBytes = Uint8Array.from(atob(row.public_spki), (c) =>
           c.charCodeAt(0),
         );
-        this.verifyKey = await crypto.subtle.importKey(
+        this.#verifyKey = await crypto.subtle.importKey(
           "spki",
           spkiBytes,
           ED25519,
@@ -290,22 +348,22 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         );
         let keyId = row.key_id;
         if (!keyId) {
-          keyId = await SigningAuthority.keyIdFromSpki(row.public_spki);
+          keyId = await SigningAuthority.#keyIdFromSpki(row.public_spki);
           this.ctx.storage.sql.exec(
             "UPDATE keys SET key_id = ? WHERE id = 'authority'",
             keyId,
           );
         }
         return {
-          signingKey: this.signingKey,
-          verifyKey: this.verifyKey,
+          signingKey: this.#signingKey,
+          verifyKey: this.#verifyKey,
           keyId,
         };
       }
     }
 
     // Generate the authority keypair
-    const isEphemeral = this.keyStorageMode === "ephemeral";
+    const isEphemeral = this.#keyStorageMode === "ephemeral";
     const kp = (await crypto.subtle.generateKey(
       ED25519,
       !isEphemeral, // extractable:false in ephemeral mode
@@ -320,7 +378,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const publicSpkiB64 = btoa(
       String.fromCharCode(...new Uint8Array(publicSpki)),
     );
-    const keyId = await SigningAuthority.keyIdFromSpki(publicSpkiB64);
+    const keyId = await SigningAuthority.#keyIdFromSpki(publicSpkiB64);
 
     if (isEphemeral) {
       // Store public key + key ID only — no private key material on disk
@@ -329,34 +387,44 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         publicSpkiB64,
         keyId,
       );
-      this.signingKey = kp.privateKey;
-      this.verifyKey = kp.publicKey;
+      this.#signingKey = kp.privateKey;
+      this.#verifyKey = kp.publicKey;
     } else {
-      // Persistent: export JWK, store, then re-import as non-extractable
-      const privateJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+      // Persistent: export JWK, store, then re-import as non-extractable.
+      // Sealed when a KEK is configured (notme-41d0d3); a bare JWK otherwise,
+      // which is the pre-existing cf-managed behaviour and relies solely on
+      // Cloudflare's encryption at rest.
+      const privateJwk = (await crypto.subtle.exportKey(
+        "jwk",
+        kp.privateKey,
+      )) as JsonWebKey;
+      const kekForWrite = this.#getKek();
       this.ctx.storage.sql.exec(
         "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
-        JSON.stringify(privateJwk),
+        await serialiseJwkForStorage(
+          privateJwk,
+          kekForWrite ? await kekForWrite : null,
+        ),
         publicSpkiB64,
         keyId,
       );
       // Re-import as non-extractable — JWK is stored, no need to keep extractable
-      this.signingKey = await crypto.subtle.importKey(
+      this.#signingKey = await crypto.subtle.importKey(
         "jwk",
         privateJwk,
         ED25519,
         false,
         ["sign"],
       );
-      this.verifyKey = kp.publicKey;
+      this.#verifyKey = kp.publicKey;
     }
 
     await this.scheduleNextRefresh();
-    return { signingKey: this.signingKey, verifyKey: this.verifyKey, keyId };
+    return { signingKey: this.#signingKey, verifyKey: this.#verifyKey, keyId };
   }
 
-  private getKeyId(): string {
-    this.ensureSchema();
+  #getKeyId(): string {
+    this.#ensureSchema();
     const rows = this.ctx.storage.sql
       .exec("SELECT key_id FROM keys WHERE id = 'authority'")
       .toArray() as Array<{ key_id: string }>;
@@ -403,7 +471,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Self-signed X.509 CA certificate for CF mTLS trust store.
   // Cached in DO SQLite; invalidated on key rotation (key_id mismatch).
   async getCACertificatePem(): Promise<string> {
-    this.ensureSchema();
+    this.#ensureSchema();
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS ca_cert (
         id     TEXT PRIMARY KEY DEFAULT 'cert',
@@ -411,7 +479,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         key_id TEXT NOT NULL
       )
     `);
-    const currentKeyId = this.getKeyId();
+    const currentKeyId = this.#getKeyId();
     const cached = this.ctx.storage.sql
       .exec("SELECT pem, key_id FROM ca_cert WHERE id = 'cert'")
       .toArray() as Array<{ pem: string; key_id: string }>;
@@ -531,7 +599,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }): Promise<
     { ok: true; accessToken: string } | { ok: false; reason: "proof_reused" }
   > {
-    this.ensureSchema();
+    this.#ensureSchema();
     const now = Math.floor(Date.now() / 1000);
     const replayTtlSeconds = params.replayTtlSeconds ?? 600;
 
@@ -614,14 +682,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     publicRawB64: string;
     retiredAt: number | null;
   } | null> {
-    this.ensureSchema();
+    this.#ensureSchema();
 
     const current = this.ctx.storage.sql
       .exec("SELECT epoch FROM state WHERE id = 'authority'")
       .toArray() as Array<{ epoch: number }>;
     if (current[0]?.epoch === epoch) {
       return {
-        keyId: this.getKeyId(),
+        keyId: this.#getKeyId(),
         publicRawB64: await this.getPublicKeyRawB64(),
         retiredAt: null, // still active
       };
@@ -647,7 +715,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   async getReceiptFacts(): Promise<{ actorFp: Uint8Array; epoch: number }> {
-    this.ensureSchema();
+    this.#ensureSchema();
     const { verifyKey } = await this.getOrCreateSigningKey();
 
     // actor_fp per RECEIPTS.md §2.1: SHA-256 of the actor's master PUBLIC key.
@@ -682,7 +750,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async getDelegatedJwtKey(
     issuer: string,
   ): Promise<{ publicRawB64: string; kid: string }> {
-    this.ensureSchema();
+    this.#ensureSchema();
 
     const rows = this.ctx.storage.sql
       .exec(
@@ -699,6 +767,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       "verify",
     ])) as CryptoKeyPair;
     const privJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+    const delegatedKek = this.#getKek();
     const rawPub = new Uint8Array(
       (await crypto.subtle.exportKey("raw", kp.publicKey)) as ArrayBuffer,
     );
@@ -712,7 +781,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       `INSERT OR IGNORE INTO delegated_jwt_keys
          (issuer, private_jwk, public_raw, kid, created_at) VALUES (?, ?, ?, ?, ?)`,
       issuer,
-      JSON.stringify(privJwk),
+      // Sealed alongside the CA master (notme-41d0d3). ADR-015 added this
+      // table into the same plaintext-at-rest posture it inherited; the
+      // separate-key control still held cryptographically, but at rest both
+      // keys were equally exposed.
+      await serialiseJwkForStorage(
+        privJwk as JsonWebKey,
+        delegatedKek ? await delegatedKek : null,
+      ),
       publicRawB64,
       kid,
       Math.floor(Date.now() / 1000),
@@ -743,7 +819,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     headerB64: string;
     payloadB64: string;
   }): Promise<DelegatedJwtSignResult> {
-    this.ensureSchema();
+    this.#ensureSchema();
     const { kid } = await this.getDelegatedJwtKey(params.issuer);
 
     const rows = this.ctx.storage.sql
@@ -769,9 +845,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       throw e;
     }
 
+    // Same dual-shape read as the CA master: sealed for deployments with a
+    // KEK, bare JWK for legacy rows. No in-place re-seal here — unlike the
+    // master this runs inside a request-path sign, and a storage write on the
+    // signing path is a failure mode not worth adding. Delegated rows migrate
+    // when getDelegatedJwtKey next creates one, or via the master's path.
+    const delegatedReadKek = this.#getKek();
+    const { jwk: delegatedJwk } = await readStoredJwk(
+      rows[0]!.private_jwk,
+      delegatedReadKek ? await delegatedReadKek : null,
+    );
     const signingKey = await crypto.subtle.importKey(
       "jwk",
-      JSON.parse(rows[0]!.private_jwk),
+      delegatedJwk,
       ED25519,
       false, // non-extractable once imported
       ["sign"],
@@ -840,7 +926,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     codeChallenge: string;
     ttlSeconds?: number;
   }): Promise<{ code: string; expiresAt: number }> {
-    this.ensureSchema();
+    this.#ensureSchema();
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = now + (params.ttlSeconds ?? 60);
 
@@ -894,7 +980,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     | { ok: true; accessToken: string }
     | { ok: false; reason: "invalid_grant" | "invalid_request" }
   > {
-    this.ensureSchema();
+    this.#ensureSchema();
     const now = Math.floor(Date.now() / 1000);
     const codeHash = await sha256Base64url(params.code);
 
@@ -1030,7 +1116,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     seqno: number;
     keyId: string;
   }> {
-    this.ensureSchema();
+    this.#ensureSchema();
     const { keyId } = await this.getOrCreateSigningKey();
     const rows = this.ctx.storage.sql
       .exec("SELECT epoch, seqno FROM state WHERE id = 'authority'")
@@ -1045,7 +1131,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const { signingKey, keyId } = await this.getOrCreateSigningKey();
     const pubKeyB64 = await this.getPublicKeyRawB64();
 
-    this.ensureSchema();
+    this.#ensureSchema();
 
     // Advance seqno
     this.ctx.storage.sql.exec(
@@ -1095,8 +1181,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Rotate the CA key. Increments epoch, generates new keypair.
   // Previous keyId is preserved in the bundle as prevKeyId for graceful transition.
   async rotate(): Promise<{ newKeyId: string; epoch: number }> {
-    this.ensureSchema();
-    const oldKeyId = this.getKeyId();
+    this.#ensureSchema();
+    const oldKeyId = this.#getKeyId();
     // Capture the old PUBLIC key BEFORE deleting it. The grace window needs it
     // published (generateBundle above) so tokens the old key signed still verify
     // until they expire; storing only the id (prevKeyId) left the pubkey gone
@@ -1128,8 +1214,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     // Delete old key
     this.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");
-    this.signingKey = null;
-    this.verifyKey = null;
+    this.#signingKey = null;
+    this.#verifyKey = null;
 
     // Increment epoch
     this.ctx.storage.sql.exec(
@@ -1196,7 +1282,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   // Get or generate the session HMAC secret (stored in DO SQLite)
   async getSessionSecret(): Promise<string> {
-    this.ensureSchema();
+    this.#ensureSchema();
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS session_config (
         id     TEXT PRIMARY KEY DEFAULT 'session',
@@ -1454,10 +1540,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   //   - Defense-in-depth: re-arm goes through getAlarm() check first
   //     (mirrors scheduleNextRefresh's pattern).
 
-  private alarmHealthInitialized = false;
+  #alarmHealthInitialized = false;
 
-  private ensureAlarmHealthSchema(): void {
-    if (this.alarmHealthInitialized) return;
+  #ensureAlarmHealthSchema(): void {
+    if (this.#alarmHealthInitialized) return;
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS alarm_health (
         id              TEXT PRIMARY KEY DEFAULT 'authority',
@@ -1471,17 +1557,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO alarm_health (id) VALUES ('authority')",
     );
-    this.alarmHealthInitialized = true;
+    this.#alarmHealthInitialized = true;
   }
 
-  private readAlarmHealthRow(): {
+  #readAlarmHealthRow(): {
     failure_count: number;
     total_fires: number;
     last_fire_at: number;
     last_outcome: string;
     first_fire_at: number;
   } {
-    this.ensureAlarmHealthSchema();
+    this.#ensureAlarmHealthSchema();
     const rows = this.ctx.storage.sql
       .exec(
         "SELECT failure_count, total_fires, last_fire_at, last_outcome, first_fire_at FROM alarm_health WHERE id = 'authority'",
@@ -1513,7 +1599,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   override async alarm(): Promise<void> {
     const now = Date.now();
-    this.ensureAlarmHealthSchema();
+    this.#ensureAlarmHealthSchema();
 
     // Read pre-fire state for the breaker decision.
     // Note: counters are written via atomic SQL increments below
@@ -1637,7 +1723,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     rearmed: boolean;
     previousFailureCount: number;
   }> {
-    const before = this.readAlarmHealthRow();
+    const before = this.#readAlarmHealthRow();
     // Reset failure_count + outcome but DO NOT update last_fire_at — a reset
     // is not an alarm fire, and observability/audit consumers reading
     // last_fire_at expect "when did alarm() last fire," not "when was the
@@ -1691,7 +1777,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     warmupComplete: boolean;
     circuitBreakerOpen: boolean;
   }> {
-    const health = this.readAlarmHealthRow();
+    const health = this.#readAlarmHealthRow();
     const now = Date.now();
     const elapsedHours =
       health.first_fire_at > 0

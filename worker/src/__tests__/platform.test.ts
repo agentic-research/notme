@@ -36,16 +36,24 @@ describe("platform detection", () => {
   });
 
   describe("validateKeyStorageConfig (fail closed)", () => {
-    it("throws on encrypted mode — not yet implemented", () => {
+    // These two asserted "encrypted always throws — not yet implemented".
+    // notme-41d0d3 implemented it (src/key-encryption.ts), so the contract
+    // inverted: encrypted mode is now valid WITH a secret and fail-closed
+    // WITHOUT one. Rewritten rather than deleted — the fail-closed half is
+    // the security-relevant assertion and must not be lost with the feature
+    // flag it used to ride on.
+    it("accepts encrypted mode when a KEK secret is present", () => {
       expect(() =>
         validateKeyStorageConfig("encrypted", "ab".repeat(16)),
-      ).toThrow("not yet implemented");
+      ).not.toThrow();
     });
 
-    it("throws on encrypted mode even without KEK", () => {
+    it("throws on encrypted mode without a KEK secret", () => {
+      // Proceeding would persist the CA private key in cleartext while the
+      // operator believes it is sealed.
       expect(() =>
         validateKeyStorageConfig("encrypted", undefined),
-      ).toThrow("not yet implemented");
+      ).toThrow(/NOTME_KEK_SECRET is unset/);
     });
 
     it("does not throw for ephemeral mode", () => {

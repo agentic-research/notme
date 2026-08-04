@@ -104,10 +104,24 @@ describe("RPC surface is an allow-list, not an accident", () => {
     // the universal forgery oracle. It must not come back.
     expect(surface).not.toContain("sign");
 
-    // Pinned COUNT rather than a full list: this class is large (46) and
+    // Pinned COUNT rather than a full list: this class is large (41) and
     // churns, and a brittle full pin gets updated reflexively instead of read.
     // A count still forces a diff to touch this file, which is where the
     // question gets asked.
+    //
+    // 46 -> 41 (notme-41d0d3): five methods declared `private` in TypeScript
+    // were live on the surface all along — `private` is a COMPILE-TIME
+    // annotation and is erased in the emitted JS, so it hides a member from the
+    // author and from nobody else. ensureSchema, getKeyId, keyStorageMode,
+    // ensureAlarmHealthSchema and readAlarmHealthRow are now ECMAScript
+    // #private and genuinely unreachable. None was individually dangerous, but
+    // the pin had been silently blessing them.
+    //
+    // The lesson this file exists to enforce: on an RPC-reachable class write
+    // `#foo()`, never `private foo()`. Same trap as #getAuthority() in
+    // worker.ts (ADR-016 rule 2). Note that this count only tells you the
+    // surface CHANGED, not that a member was wrongly exposed — it catches the
+    // mistake after it is written, so it is a backstop, not the rule.
     //
     // (The first version of this line was `toBe(surface.length)` — comparing a
     // value to itself, a test that always passes and asserts nothing. Left
@@ -120,6 +134,6 @@ describe("RPC surface is an allow-list, not an accident", () => {
         `for this DO is a full-CA capability — confirm the new method is safe ` +
         `in the hands of anyone who obtains one, then update this count.\n` +
         surface.join(", "),
-    ).toBe(46);
+    ).toBe(41);
   });
 });

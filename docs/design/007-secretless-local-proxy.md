@@ -11,11 +11,13 @@
 > |---|---|
 > | Wire — server returns the private key | Addressed; the CSR/PoP path (ADR-008) does not return private keys |
 > | Disk — GHA action writes key to `$GITHUB_OUTPUT` | Addressed |
-> | SQLite — CA private key stored as plaintext JWK | **STILL TRUE in persistent mode.** `signing-authority.ts` exports the private JWK and `JSON.stringify`s it into the `keys` table. Ephemeral (workerd) mode is fixed — `extractable: false`. |
+> | SQLite — CA private key stored as plaintext JWK | **Addressed (notme-41d0d3).** `src/key-encryption.ts` envelope-encrypts the key with a KEK derived from `NOTME_KEK_SECRET`; legacy plaintext rows migrate in place on first read. Ephemeral (workerd) mode was already fixed via `extractable: false`. Still plaintext in `cf-managed` mode with no secret set — that is the deliberate opt-out, and `validateKeyStorageConfig` fails closed if the mode says encrypted but no secret is present. |
 >
-> So the headline claim of this ADR — "a system that claims to be secretless
-> cannot have `cat *.sqlite | strings | grep '\"d\"'` extract the CA key" — is
-> still accurate for the CF-edge deployment. Do not read this doc as done.
+> The headline claim of this ADR — "a system that claims to be secretless
+> cannot have `cat *.sqlite | strings | grep '\"d\"'` extract the CA key" — now
+> holds whenever `NOTME_KEK_SECRET` is set, and is asserted by
+> `src/__tests__/key-encryption.test.ts`. It does NOT hold in `cf-managed` mode
+> without a secret, which relies solely on Cloudflare's encryption at rest.
 >
 > Also note the file references in "Problem" are stale: `cert-exchange.ts` no
 > longer exists.

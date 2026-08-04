@@ -56,18 +56,30 @@ export function detectKeyStorage(env: Record<string, unknown>): KeyStorageMode {
   return "cf-managed";
 }
 
-/** Validate config — fail closed on misconfiguration. */
+/**
+ * Validate config — fail closed on misconfiguration.
+ *
+ * Encrypted mode is IMPLEMENTED as of notme-41d0d3 (`src/key-encryption.ts`).
+ * Until then this threw unconditionally, which combined badly with
+ * `detectKeyStorage` above: setting NOTME_KEK_SECRET auto-selects "encrypted",
+ * so an operator following the ADR-007 roadmap and setting the secret bricked
+ * the authority on boot. Both halves are live now.
+ *
+ * The remaining fail-closed case is the one that matters: mode says encrypted
+ * but no secret is present. Continuing would write the CA private key in
+ * cleartext while the operator believes it is sealed — the exact false sense
+ * of security the previous throw existed to prevent.
+ */
 export function validateKeyStorageConfig(
   mode: KeyStorageMode,
-  _kekSecret?: string | undefined,
+  kekSecret?: string | undefined,
 ): void {
-  if (mode === "encrypted") {
-    // Encrypted mode is designed but not yet implemented (HKDF wrapping).
-    // Fail hard so operators don't get a false sense of security.
+  if (mode === "encrypted" && !kekSecret) {
     throw new Error(
-      "FATAL: encrypted key storage is not yet implemented.\n" +
-        "Use NOTME_KEY_STORAGE=ephemeral (local/CI) or cf-managed (production).\n" +
-        "See docs/design/007-secretless-local-proxy.md for roadmap.",
+      "FATAL: NOTME_KEY_STORAGE=encrypted but NOTME_KEK_SECRET is unset.\n" +
+        "Set the secret, or use NOTME_KEY_STORAGE=ephemeral (local/CI) or " +
+        "cf-managed (CF encryption at rest only, key stored as plaintext JWK).\n" +
+        "See docs/design/007-secretless-local-proxy.md.",
     );
   }
 }
