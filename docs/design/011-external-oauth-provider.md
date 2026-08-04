@@ -25,23 +25,48 @@ Today notme's identity-bridge surface (per `cloister.capnp`, registered under th
 | `GET /.well-known/oauth-authorization-server` | OAuth 2.0 AS metadata (RFC 8414) | ✓ | shipped 2026-07-21 |
 | `GET /.well-known/openid-configuration` | Same RFC 8414 body, for libraries that probe only this path. **Not an OIDC OP** — no `id_token`, no `scope=openid` | ✓ | shipped 2026-07-21 |
 | `POST /token` | DPoP-bound `at+jwt` mint (RFC 9449). Note: path is `/token`, **not** `/oauth/token` | ✓ | `worker.ts` token handler |
-| `GET /authorize` | Renders an HTML page; issues **no** authorization code | ✓ | `worker.ts` |
+| `GET /authorize` | ~~Renders an HTML page; issues **no** authorization code~~ **Issues a real authorization code since ADR-013** | ✓ | `worker.ts`, `/authorize/code` |
+| `POST /authorize/redeem` | Authorization code → token, PKCE S256 verified | ✓ | ADR-013 |
 | `GET /.well-known/webfinger` | JRD `?resource=acct:cluster@host` | ✗ | no route, no static asset |
 | `GET /.well-known/nostr.json` | NIP-05 names + relays | ✗ | no route, no static asset |
 | `POST /oauth/token` | `client_credentials` grant | ✗ | path does not exist |
 
 What's missing for a real third-party-app OAuth provider:
 
-| Endpoint / capability | Spec | Missing |
+> **CORRECTION (2026-08-04).** Three rows below said ✗ for things ADR-013
+> shipped. Same failure as the 2026-07-21 correction above, inverted: that
+> one claimed a surface existed when it did not; this one claimed surfaces
+> were missing when they exist. Both send someone to build the wrong thing.
+> The mechanical half of the auth-code flow is DONE — what is left is the
+> registry and consent, which is the part that was ever hard.
+
+| Endpoint / capability | Spec | Status |
 |---|---|---|
-| `GET /oauth/authorize` | RFC 6749 §4.1 — authorization-code flow entrypoint | ✗ |
-| Consent UI | The user-facing "Allow App X to access ...your beads?" page | ✗ |
-| Developer-app registration surface | `client_id` + `client_secret` + `redirect_uri` allowlist | ✗ |
-| Authorization-code → token exchange on `/oauth/token` | RFC 6749 §4.1.3 | ✗ |
-| PKCE for public clients | RFC 7636 | ✗ |
-| Token introspection | RFC 7662 (`/oauth/introspect`) | ✗ (currently using JWT-only verification) |
-| Token revocation | RFC 7009 (`/oauth/revoke`) | ✗ |
-| Refresh-token grant | RFC 6749 §6 | ✗ |
+| Authorization-code flow entrypoint | RFC 6749 §4.1 | ✅ **shipped (ADR-013)** as `/authorize`, not `/oauth/authorize` |
+| Authorization-code → token exchange | RFC 6749 §4.1.3 | ✅ **shipped (ADR-013)** as `/authorize/redeem` |
+| PKCE for public clients | RFC 7636 | ✅ **shipped (ADR-013)**, S256 only; `packages/dpop` has client helpers |
+| Developer-app registration surface | `client_id` + `redirect_uri` allowlist | ✗ — `ALLOWED_REDIRECT_HOSTS` is an exact-host allowlist standing in for it. **This is the real remaining work.** |
+| Consent UI | "Allow App X to access…" | ✗ — the other real remaining work |
+| Token introspection | RFC 7662 | ✗ — and arguably should stay ✗; offline JWT verification is the deliberate posture (see line on resource servers below) |
+| Token revocation | RFC 7009 | ✗ |
+| Refresh-token grant | RFC 6749 §6 | ✗ — ADR-013 deliberately declined it: 5-minute tokens, re-run the flow |
+
+### This ADR is NOT a prerequisite for OIDC federation
+
+Worth stating because it was gotten wrong once already. Two different things
+get called "notme as an identity provider":
+
+- **Federation** — a relying party (e.g. entire.io, AWS, GCP) trusts notme as
+  an *issuer* and validates JWTs notme mints, filtering on claims. Needs an
+  issuer URL, a JWKS, and stable claims. **notme has all three today.** No
+  consent screen exists in this model, because there is no third-party app
+  acting on a user's behalf — the same reason GitHub Actions OIDC has none.
+- **App authorization** — a third-party app asks a *user* for permission to
+  act as them. Needs `client_id`, redirect allowlist, and a consent screen.
+  **That is what this ADR is about.**
+
+Do not build this ADR to unblock a federation ask; it is the wrong shape and
+far more work. See `notme-1e067f` for the entire.io case.
 
 ## Why this is worth ratifying
 
