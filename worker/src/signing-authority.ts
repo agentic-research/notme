@@ -47,6 +47,7 @@ const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
+import type { CommitmentErrorCode } from "./receipts/commitment";
 
 /**
  * Outcome of a receipt-signing attempt (ADR-014).
@@ -58,8 +59,26 @@ import { keyIdFromSpki } from "./key-id";
  * for key rotation.
  */
 export type ReceiptSignResult =
-  | { ok: true; signature: Uint8Array; epoch: number }
-  | { ok: false; code: string; message: string };
+  | {
+      ok: true;
+      /**
+       * RAW 64-byte Ed25519 signature. NOT a receipt envelope.
+       *
+       * The caller owns envelope construction — cloister already has a
+       * ReceiptEnvelope encoder, and a second one here would be two
+       * implementations of one wire format, which is how canonical encodings
+       * drift apart.
+       */
+      signature: Uint8Array;
+      /** The authority's epoch at signing time — the one the commitment names. */
+      epoch: number;
+    }
+  | {
+      ok: false;
+      /** Exhaustive; switch on it. Only EPOCH_MISMATCH is retryable. */
+      code: CommitmentErrorCode;
+      message: string;
+    };
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   private initialized = false;
@@ -524,9 +543,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * Serving them from the same place that enforces them removes a class of
    * "receipt rejected, epoch drifted" failures entirely.
    *
-   * Cacheable, but not indefinitely: `epoch` changes on key rotation, which is
-   * alarm-driven here. Treat an EPOCH_MISMATCH from signing as the signal to
-   * re-read rather than polling.
+   * Cacheable, and worth caching — this is a DO round-trip that would
+   * otherwise run on every proxied response. Only two things invalidate it:
+   * an EPOCH_MISMATCH from signing, and an operator `rotate()`.
+   *
+   * Do NOT poll. `alarm()` calls `generateBundle()`, never `rotate()`, so the
+   * epoch does not move on a timer. (An earlier version of this comment said
+   * rotation was "alarm-driven" — that was wrong.)
    */
   /**
    * Resolve the public key that signed a given epoch's receipts (ADR-014).
@@ -543,7 +566,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    */
   async getEpochPublicKey(
     epoch: number,
-  ): Promise<{ keyId: string; publicRawB64: string; retiredAt: number | null } | null> {
+  ): Promise<{
+    keyId: string;
+    publicRawB64: string;
+    retiredAt: number | null;
+  } | null> {
     this.ensureSchema();
 
     const current = this.ctx.storage.sql

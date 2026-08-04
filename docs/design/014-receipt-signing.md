@@ -59,7 +59,9 @@ Two changes to the ask, both load-bearing.
 
 ### 1. Not a fetch route — an RPC entrypoint
 
-`ReceiptSigner extends WorkerEntrypoint`, reached as `env.NOTME.signReceipt(...)`.
+`ReceiptSigner extends WorkerEntrypoint`, reached as
+`env.NOTME_RECEIPTS.signReceipt(...)` over a DEDICATED binding (see integrator
+notes).
 
 The ask says `/internal/` "must not be externally routable." The existing
 `/internal/ca-bundle` (worker.ts) does not achieve that — it is a plain fetch
@@ -75,8 +77,9 @@ structural rather than enforced. A dedicated entrypoint rather than a method
 on `AuthService` keeps least privilege: a binding to `ReceiptSigner` grants
 receipt signing and nothing else.
 
-Cost: cloister adds `entrypoint = "ReceiptSigner"` to its `NOTME` binding.
-One line, and it must land before the first call.
+Cost: cloister adds a **dedicated** binding. Not an `entrypoint` on an
+existing one — see the integrator notes below, where an earlier version of
+this ADR got that wrong in a way that would have broken identity traffic.
 
 ### 2. Not a signing oracle — parse, re-encode, then sign our own bytes
 
@@ -128,3 +131,105 @@ instead of served.
 - **`/internal/sign-receipt` as an HTTP path is explicitly refused**, not
   merely absent, so a caller following the bead's original wire shape gets a
   clear 404 with a pointer instead of falling through to the asset handler.
+
+
+## Integrator notes (answers to cloister's questions, cloister-35ccf7)
+
+### The binding must be its own — CORRECTED
+
+An earlier draft said "add `entrypoint = "ReceiptSigner"` to your `NOTME`
+binding." **That instruction would have broken the first integrator to follow
+it**, and cloister caught it with the evidence: `NOTME` is live for the
+`/identity/*` fetch proxy (cloister `config.capnp:207`, typed `Fetcher` at
+`types.ts:113`). Setting `entrypoint` on a binding routes its `fetch()` to
+that entrypoint, and `ReceiptSigner` has no `fetch` handler — identity traffic
+would have gone to a class that cannot serve it.
+
+Declare a second binding to the same service:
+
+```capnp
+( name = "NOTME_RECEIPTS",
+  service = "notme-bot",
+  entrypoint = "ReceiptSigner" ),
+```
+
+leaving `NOTME` exactly as it is.
+
+### 1. Is `receiptFacts()` on the same entrypoint?
+
+Yes. Both `receiptFacts()` and `signReceipt()` are methods on `ReceiptSigner`,
+so **one** dedicated binding covers both.
+
+### 2. The full error-code set
+
+Exported as `CommitmentErrorCode` from `worker/src/receipts/commitment.ts`, so
+a `switch` gets exhaustiveness from the compiler rather than from a guess:
+
+| Code | Meaning | Retryable |
+|---|---|---|
+| `EMPTY_INPUT` | zero-length input | no |
+| `NOT_CBOR` | undecodable — where DER certs and JWT signing inputs land | no |
+| `NOT_A_MAP` | decoded to something other than a CBOR map | no |
+| `WRONG_KEY_COUNT` | not exactly 8 keys | no |
+| `MISSING_KEY` | a required key absent | no |
+| `FIELD_NOT_BYTES` | byte-string field wasn't one | no |
+| `FIELD_NOT_UINT` | uint field wasn't a non-negative integer | no |
+| `FIELD_WRONG_LENGTH` | digest field not exactly 32 bytes | no |
+| `NONCE_TOO_SHORT` | `nonce` under 16 bytes | no |
+| `STATUS_NOT_2XX` | `status` outside 200..299 | no |
+| `TIMESTAMP_OUT_OF_RANGE` | outside ±300s of the authority clock | no* |
+| `ACTOR_FP_MISMATCH` | `actor_fp` isn't this authority's | no |
+| `EPOCH_MISMATCH` | `epoch` isn't current | **YES — once** |
+| `NOT_CANONICAL` | bytes aren't the canonical encoding of the structure | no |
+
+\* not retryable *unchanged*; a caller whose clock has drifted must correct it,
+not resubmit.
+
+`RETRYABLE_CODES` is exported alongside, and contains exactly
+`EPOCH_MISMATCH`. **Fail closed on any code you do not recognise** — the set
+can grow.
+
+### 3. What crosses the wire
+
+`signReceipt(commitmentBytes)` → `{ ok: true, signature, epoch }`, where
+`signature` is the **raw 64-byte Ed25519 signature**. Not an envelope.
+
+Deliberate: cloister already owns a `ReceiptEnvelope` encoder, and a second
+one here would be two implementations of a single wire format — which is
+precisely how canonical encodings drift apart. notme signs; the caller
+assembles.
+
+### 4. `actor_fp` comes back already hashed
+
+`receiptFacts()` returns `actorFp` as the 32-byte **SHA-256 of the raw Ed25519
+master public key** — drop it into the commitment verbatim.
+
+Returning the pubkey instead would hand the caller a derivation that notme
+then validates against, recreating exactly the drift this method exists to
+kill. The hash is computed on the enforcing side, once.
+
+### 5. Caching and invalidation
+
+`receiptFacts()` is cacheable and **should** be cached — it is a DO round-trip
+and would otherwise run on every proxied response.
+
+Only two things invalidate it:
+
+1. **`EPOCH_MISMATCH` from `signReceipt`.** This is the signal. Re-read, retry
+   once.
+2. **An explicit `rotate()`**, which is an operator action over admin RPC.
+
+No TTL is needed and polling is the wrong shape: `alarm()` calls
+`generateBundle()`, never `rotate()`, so the epoch does not move on a timer.
+(An earlier version of this ADR and a code comment both said rotation was
+"alarm-driven" — that was drift; corrected.)
+
+### Bound the retry — one attempt
+
+Re-read facts and retry **at most once**, then surface the code.
+
+Rotation can move again between the re-read and the retry, so an unbounded
+loop can flap. This call sits in a `finally` on cloister's response path,
+where spinning would stall a proxied request that already succeeded upstream.
+A receipt is evidence about a response that has already been served; failing
+to attach one must never cost the response itself.

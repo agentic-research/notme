@@ -86,8 +86,18 @@ function isDeniedDestination(url: string): boolean {
  * privilege — a binding to ReceiptSigner grants receipt signing and nothing
  * else, not `proxy()`/`sign()`/`authenticate()`.
  *
- * Cloister must bind with `entrypoint = "ReceiptSigner"`; a plain service
- * binding reaches only the default fetch handler, where this does not exist.
+ * BINDING: this needs its OWN service binding, e.g.
+ *
+ *     ( name = "NOTME_RECEIPTS", service = "notme-bot", entrypoint = "ReceiptSigner" )
+ *
+ * NOT an `entrypoint` added to an existing plain binding. Cloister's `NOTME`
+ * binding is live for the `/identity/*` fetch proxy (cloister config.capnp:207,
+ * typed `Fetcher` at types.ts:113); pinning an entrypoint on it would redirect
+ * that traffic to this class, which has no `fetch` handler, and break identity.
+ * An earlier draft of this comment said to add the entrypoint to `NOTME` — that
+ * instruction would have broken the first integrator to follow it.
+ *
+ * Both methods live on THIS entrypoint, so one dedicated binding is enough.
  */
 export class ReceiptSigner extends WorkerEntrypoint<any> {
   /**
@@ -116,7 +126,19 @@ export class ReceiptSigner extends WorkerEntrypoint<any> {
    * Cache it, but re-read on an EPOCH_MISMATCH rather than polling — rotation
    * here is alarm-driven.
    */
-  async receiptFacts(): Promise<{ actorFp: Uint8Array; epoch: number }> {
+  async receiptFacts(): Promise<{
+    /**
+     * ALREADY HASHED: SHA-256 of the raw Ed25519 master public key, 32 bytes,
+     * ready to place in the commitment's `actor_fp` field verbatim.
+     *
+     * Returned hashed rather than as the pubkey deliberately. If the caller
+     * hashed it, the caller would own a derivation this authority then
+     * validates against — reintroducing exactly the drift this method exists
+     * to remove.
+     */
+    actorFp: Uint8Array;
+    epoch: number;
+  }> {
     const id = this.env.SIGNING_AUTHORITY.idFromName("default");
     return this.env.SIGNING_AUTHORITY.get(id).getReceiptFacts();
   }

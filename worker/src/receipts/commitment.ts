@@ -51,9 +51,58 @@ const MIN_NONCE_BYTES = 16;
 /** SHA-256 digest fields are exactly 32 bytes. */
 const DIGEST_BYTES = 32;
 
+/**
+ * Every rejection code `validateCommitment` can produce. Exhaustive.
+ *
+ * Exported as a union so a caller can `switch` and have the compiler catch a
+ * missing arm, rather than string-matching and guessing. Cloister asked for
+ * this specifically: it must branch exhaustively and fail closed on anything
+ * unrecognised.
+ *
+ * Only ONE code is retryable: EPOCH_MISMATCH — see `RETRYABLE_CODES`. Every
+ * other code means the commitment is malformed and retrying it unchanged will
+ * fail identically.
+ *
+ * These are a wire contract. Renaming one is a breaking change for every
+ * consumer branching on it.
+ */
+export type CommitmentErrorCode =
+  // — input is not a commitment at all —
+  | "EMPTY_INPUT"
+  | "NOT_CBOR" // where DER certs and JWT signing inputs land
+  | "NOT_A_MAP"
+  // — shape is wrong —
+  | "WRONG_KEY_COUNT"
+  | "MISSING_KEY"
+  | "FIELD_NOT_BYTES"
+  | "FIELD_NOT_UINT"
+  | "FIELD_WRONG_LENGTH"
+  | "NONCE_TOO_SHORT"
+  // — values are out of contract —
+  | "STATUS_NOT_2XX"
+  | "TIMESTAMP_OUT_OF_RANGE"
+  // — caller disagrees with the authority about the authority —
+  | "ACTOR_FP_MISMATCH"
+  | "EPOCH_MISMATCH" // RETRYABLE: re-read receiptFacts(), retry ONCE
+  // — bytes are not the canonical encoding of the validated structure —
+  | "NOT_CANONICAL";
+
+/**
+ * The codes worth retrying, and the only one there is.
+ *
+ * A caller that re-reads `receiptFacts()` and retries on EPOCH_MISMATCH
+ * MUST bound that to a single attempt. Rotation can move again between the
+ * re-read and the retry, and this call sits on cloister's response path in a
+ * `finally` — an unbounded loop there stalls a proxied request that already
+ * succeeded upstream. One retry, then surface the code.
+ */
+export const RETRYABLE_CODES: ReadonlySet<CommitmentErrorCode> = new Set([
+  "EPOCH_MISMATCH",
+]);
+
 export class CommitmentError extends Error {
   constructor(
-    readonly code: string,
+    readonly code: CommitmentErrorCode,
     message: string,
   ) {
     super(message);
@@ -61,7 +110,7 @@ export class CommitmentError extends Error {
   }
 }
 
-function fail(code: string, message: string): never {
+function fail(code: CommitmentErrorCode, message: string): never {
   throw new CommitmentError(code, message);
 }
 
