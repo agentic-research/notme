@@ -2060,6 +2060,187 @@ export default {
         return handleCertExchange(request, env);
       }
 
+      // POST /cert/passkey — passkey session → bridge cert pair.
+      //
+      // The passkey analogue of /cert/gha, and near-identical to it: verify an
+      // authenticator, prove possession of the submitted keys, mint the pair.
+      // The authenticator differs, and so does one thing that matters.
+      //
+      // /cert/gha hardcodes scopes:["bridgeCert"] because a GitHub OIDC token
+      // carries no privilege to inherit. A passkey session DOES — the deployer's
+      // carries authorityManage and certMint — so this INTERSECTS the session's
+      // scopes with an allowlist rather than passing them through. A cert that
+      // silently inherited certMint would turn a browser session into a minting
+      // credential, valid for its whole lifetime, usable from anywhere, with
+      // none of the properties that made the session acceptable (HttpOnly,
+      // SameSite=Strict, revocable by clearing a cookie). See
+      // src/auth/passkey-cert-scopes.ts.
+      //
+      // Why a passkey is the right authenticator for this: the human step that
+      // legitimately remains here is an AUTHORIZATION GRANT, and a passkey is
+      // what a grant should cost — a human present, one touch, unphishable,
+      // nothing transcribed. It also works on a phone, where a filesystem, a
+      // keychain helper and the signet binary all do not.
+      if (pathname === "/cert/passkey" && request.method === "POST") {
+        try {
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          if (!cookie) {
+            return Response.json(
+              { error: "session_required" },
+              { status: 401 },
+            );
+          }
+
+          let body: {
+            public_keys?: { mtls?: string; signing?: string };
+            proofs?: { mtls?: string; signing?: string };
+          } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+          if (!body.public_keys?.mtls || !body.public_keys?.signing) {
+            return jsonErr(
+              "public_keys.mtls and public_keys.signing required (SPKI PEM)",
+              400,
+            );
+          }
+          if (!body.proofs?.mtls || !body.proofs?.signing) {
+            return jsonErr(
+              "proofs.mtls and proofs.signing required (signatures over the binding payload)",
+              400,
+            );
+          }
+
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const { verifySessionCookie } = await import("./src/auth/session");
+          const sessionSecret = await authority.getSessionSecret();
+          const session = await verifySessionCookie(cookie, sessionSecret);
+          if (!session) {
+            return Response.json({ error: "invalid_session" }, { status: 401 });
+          }
+
+          const { importPublicKey } = await import("./src/cert-authority");
+          let mtlsPubKey: CryptoKey;
+          let signingPubKey: CryptoKey;
+          try {
+            mtlsPubKey = await importPublicKey(body.public_keys.mtls);
+            signingPubKey = await importPublicKey(body.public_keys.signing);
+          } catch (e: any) {
+            return jsonErr("invalid public key: " + e.message, 400);
+          }
+
+          // Binding = SHA-256(mtls_spki || signing_spki || SHA-256(session
+          // cookie)). The session term is what stops a captured
+          // public-keys+proofs pair being replayed under a DIFFERENT session:
+          // without it the proofs are a function of the keys alone, so anyone
+          // holding a valid session could submit a victim's captured pair and
+          // bind the victim's key to their own identity. /cert/gha binds the
+          // OIDC token for exactly this reason; the session cookie is this
+          // route's equivalent single-use-ish secret.
+          const mtlsSpki = (await crypto.subtle.exportKey(
+            "spki",
+            mtlsPubKey,
+          )) as ArrayBuffer;
+          const signingSpki = (await crypto.subtle.exportKey(
+            "spki",
+            signingPubKey,
+          )) as ArrayBuffer;
+          const sessionHash = await crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(cookie),
+          );
+          const bindingInput = new Uint8Array(
+            mtlsSpki.byteLength + signingSpki.byteLength + 32,
+          );
+          bindingInput.set(new Uint8Array(mtlsSpki), 0);
+          bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
+          bindingInput.set(
+            new Uint8Array(sessionHash),
+            mtlsSpki.byteLength + signingSpki.byteLength,
+          );
+          const bindingPayload = await crypto.subtle.digest(
+            "SHA-256",
+            bindingInput,
+          );
+
+          const b64uToBytes = (s: string) =>
+            Uint8Array.from(
+              atob(s.replace(/-/g, "+").replace(/_/g, "/")),
+              (c) => c.charCodeAt(0),
+            );
+          try {
+            const ok = await crypto.subtle.verify(
+              { name: "ECDSA", hash: "SHA-256" },
+              mtlsPubKey,
+              b64uToBytes(body.proofs.mtls),
+              bindingPayload,
+            );
+            if (!ok) return jsonErr("P-256 proof-of-possession failed", 401);
+          } catch (e: any) {
+            return jsonErr(`P-256 proof verification error: ${e.message}`, 401);
+          }
+          try {
+            const ok = await crypto.subtle.verify(
+              ED25519,
+              signingPubKey,
+              b64uToBytes(body.proofs.signing),
+              bindingPayload,
+            );
+            if (!ok) return jsonErr("Ed25519 proof-of-possession failed", 401);
+          } catch (e: any) {
+            return jsonErr(
+              `Ed25519 proof verification error: ${e.message}`,
+              401,
+            );
+          }
+
+          const { certScopesForSession } =
+            await import("./src/auth/passkey-cert-scopes");
+          const scopes = certScopesForSession(session.scopes);
+          if (scopes.length === 0) {
+            // The session holds nothing a cert may carry. Refuse rather than
+            // mint an authority-less cert, which would look like success and
+            // fail confusingly at first use.
+            return jsonErr(
+              "session holds no cert-eligible scopes (need bridgeCert)",
+              403,
+            );
+          }
+
+          const result = await authority.mintBridgeCertPair({
+            subject: session.principalId,
+            identity: `wimse://notme.bot/passkey/${session.principalId}`,
+            mtlsPublicKeyPem: body.public_keys.mtls,
+            signingPublicKeyPem: body.public_keys.signing,
+            scopes,
+            authMethod: "passkey",
+            ttlMs: 5 * 60 * 1000,
+          });
+
+          // Spread the mint result rather than rebuilding it field by field.
+          // The first version of this reconstructed `certificates` from
+          // `result.mtlsCertPem` / `result.signingCertPem`, which do not exist —
+          // BridgeCertPairResult already carries `certificates`, `identity`,
+          // `scopes`, `expires_at`, `subject` and `binding`. tsc did not catch
+          // it because the DO stub is loosely typed, so it would have shipped a
+          // 200 with `certificates.mtls: undefined`. Spreading keeps this
+          // response shape tied to the mint's, so the two cannot drift.
+          return Response.json({
+            ...result,
+            principal_id: session.principalId,
+            auth_method: "passkey",
+          });
+        } catch (e: any) {
+          return jsonErr("passkey cert error: " + e.message, 500);
+        }
+      }
+
       // POST /cert/gha — GHA OIDC JWT → bridge cert (legacy, kept for compat)
       if (pathname === "/cert/gha") {
         return handleCertGHA(request, env, platform);

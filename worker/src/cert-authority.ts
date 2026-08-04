@@ -23,7 +23,11 @@ import { ED25519 } from "./platform";
 //
 // BasicConstraints CA=false marks both certs as end-entity (not CAs).
 // Marked critical per RFC 5280 §4.2.1.9.
-const BASIC_CONSTRAINTS_LEAF = new BasicConstraintsExtension(false, undefined, true);
+const BASIC_CONSTRAINTS_LEAF = new BasicConstraintsExtension(
+  false,
+  undefined,
+  true,
+);
 
 // mTLS cert: digitalSignature (TLS handshake signing) + keyAgreement
 // (ECDHE in TLS 1.2+); ExtendedKeyUsage clientAuth so validators that
@@ -99,39 +103,70 @@ async function importMasterKey(pem: string): Promise<CryptoKey> {
     .replace("-----END PRIVATE KEY-----", "")
     .replace(/\s/g, "");
   const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  return crypto.subtle.importKey(
-    "pkcs8",
-    der,
-    ED25519,
-    false,
-    ["sign"],
-  );
+  return crypto.subtle.importKey("pkcs8", der, ED25519, false, ["sign"]);
 }
 
+/**
+ * Ed25519 AlgorithmIdentifier as it appears in an SPKI: SEQUENCE { OID
+ * 1.3.101.112 } — `30 05 06 03 2B 65 70` (RFC 8410 §3).
+ */
+const ED25519_SPKI_ALG_ID = [0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
+
+function isEd25519Spki(der: Uint8Array): boolean {
+  // The AlgorithmIdentifier sits near the front, after the outer SEQUENCE
+  // header. Scanning a short prefix is enough and avoids a full DER parser.
+  const limit = Math.min(der.length - ED25519_SPKI_ALG_ID.length, 16);
+  outer: for (let i = 0; i <= limit; i++) {
+    for (let j = 0; j < ED25519_SPKI_ALG_ID.length; j++) {
+      if (der[i + j] !== ED25519_SPKI_ALG_ID[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Import an SPKI PEM public key, dispatching on the key's OWN algorithm OID.
+ *
+ * WAS "try Ed25519, fall back to ECDSA P-256 on throw". That is broken on
+ * workerd: an Ed25519 import of a **P-256** SPKI SUCCEEDS rather than
+ * throwing, so the fallback never ran and every key came back as
+ * `{name:"Ed25519"}`. The SPKI bytes round-trip intact, so the certificate
+ * minted from it is fine — but the returned CryptoKey is unusable for the
+ * thing callers actually do with it:
+ *
+ *     crypto.subtle.verify({name:"ECDSA", hash:"SHA-256"}, key, sig, data)
+ *     → throws: Requested algorithm "ECDSA" does not match this CryptoKey's
+ *       algorithm "Ed25519".
+ *
+ * That is the P-256 proof-of-possession check on every cert-issuing path —
+ * /cert/gha, /cert, /cert/passkey. Verified against real workerd in the
+ * vitest-pool-workers suite; whether Cloudflare's production build is equally
+ * permissive on the Ed25519 import is NOT established here, so treat the
+ * blast radius as "at minimum local and CI" until checked against prod.
+ *
+ * Nothing caught it because no test imported a P-256 key through this
+ * function — `grep -rn importPublicKey src/__tests__` was empty. The three
+ * call sites all used it and all had coverage of their own; the shared
+ * primitive underneath had none.
+ *
+ * Now dispatches on the algorithm OID, so the result is determined by what
+ * the key IS rather than by which import happens to reject first.
+ */
 export async function importPublicKey(pem: string): Promise<CryptoKey> {
   const b64 = pem
     .replace("-----BEGIN PUBLIC KEY-----", "")
     .replace("-----END PUBLIC KEY-----", "")
     .replace(/\s/g, "");
   const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  // Try Ed25519 first, fall back to ECDSA P-256 (GHA ephemeral keys are P-256)
-  try {
-    return await crypto.subtle.importKey(
-      "spki",
-      der,
-      ED25519,
-      true,
-      ["verify"],
-    );
-  } catch {
-    return await crypto.subtle.importKey(
-      "spki",
-      der,
-      { name: "ECDSA", namedCurve: "P-256" },
-      true,
-      ["verify"],
-    );
-  }
+
+  return crypto.subtle.importKey(
+    "spki",
+    der,
+    isEd25519Spki(der) ? ED25519 : { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["verify"],
+  );
 }
 
 export interface BridgeCertResult {
@@ -212,12 +247,13 @@ export async function mintGHABridgeCert(
 
 // Encode ASN.1 SEQUENCE OF UTF8String for scope list
 function derScopeSequence(scopes: string[]): Uint8Array {
-  const encoded = scopes.map(s => derUtf8String(s));
+  const encoded = scopes.map((s) => derUtf8String(s));
   const totalLen = encoded.reduce((sum, e) => sum + e.length, 0);
   // SEQUENCE tag = 0x30
-  const header = totalLen < 128
-    ? new Uint8Array([0x30, totalLen])
-    : new Uint8Array([0x30, 0x81, totalLen]);
+  const header =
+    totalLen < 128
+      ? new Uint8Array([0x30, totalLen])
+      : new Uint8Array([0x30, 0x81, totalLen]);
   const buf = new Uint8Array(header.length + totalLen);
   buf.set(header, 0);
   let offset = header.length;
@@ -230,7 +266,14 @@ function derScopeSequence(scopes: string[]): Uint8Array {
 
 // Encode a 4-byte big-endian integer as ASN.1 INTEGER
 function derInteger(n: number): Uint8Array {
-  const buf = new Uint8Array([0x02, 0x04, (n >> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]);
+  const buf = new Uint8Array([
+    0x02,
+    0x04,
+    (n >> 24) & 0xff,
+    (n >> 16) & 0xff,
+    (n >> 8) & 0xff,
+    n & 0xff,
+  ]);
   return buf;
 }
 
@@ -256,14 +299,23 @@ export async function mintBridgeCertPair(
   const signingPubKey = await importPublicKey(signingPublicKeyPem);
 
   // Compute binding: SHA-256(P-256 SPKI DER || Ed25519 SPKI DER)
-  const mtlsSpki = (await crypto.subtle.exportKey("spki", mtlsPubKey)) as ArrayBuffer;
-  const signingSpki = (await crypto.subtle.exportKey("spki", signingPubKey)) as ArrayBuffer;
-  const bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
+  const mtlsSpki = (await crypto.subtle.exportKey(
+    "spki",
+    mtlsPubKey,
+  )) as ArrayBuffer;
+  const signingSpki = (await crypto.subtle.exportKey(
+    "spki",
+    signingPubKey,
+  )) as ArrayBuffer;
+  const bindingInput = new Uint8Array(
+    mtlsSpki.byteLength + signingSpki.byteLength,
+  );
   bindingInput.set(new Uint8Array(mtlsSpki), 0);
   bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
   const bindingHash = await crypto.subtle.digest("SHA-256", bindingInput);
   const bindingHex = Array.from(new Uint8Array(bindingHash))
-    .map(b => b.toString(16).padStart(2, "0")).join("");
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 
   // Shared extensions for both certs
   const sharedExtensions = [
@@ -290,11 +342,15 @@ export async function mintBridgeCertPair(
   const serial1 = crypto.getRandomValues(new Uint8Array(16));
   // Ensure positive (RFC 5280: serial must be positive integer)
   serial1[0] &= 0x7f;
-  const serialHex1 = Array.from(serial1).map(b => b.toString(16).padStart(2, "0")).join("");
+  const serialHex1 = Array.from(serial1)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 
   const serial2 = crypto.getRandomValues(new Uint8Array(16));
   serial2[0] &= 0x7f;
-  const serialHex2 = Array.from(serial2).map(b => b.toString(16).padStart(2, "0")).join("");
+  const serialHex2 = Array.from(serial2)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 
   // Mint P-256 mTLS cert
   const mtlsCert = await X509CertificateGenerator.create({

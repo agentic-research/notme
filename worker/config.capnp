@@ -71,6 +71,20 @@ const notmeWorker :Workerd.Worker = (
     ( name = "NOTME_KEY_STORAGE",
       text = "ephemeral",
     ),
+    # Delegated JWT issuers (ADR-015). Local cloister serves on :8787 and its
+    # `iss` is its request-derived base URL, so this is what unblocks a local
+    # /oauth/token — without it signJwt answers ISSUER_NOT_DELEGATED for every
+    # issuer and cloister 503s with everything else correct.
+    #
+    # Safe to commit BECAUSE it is localhost. This is an allowlist of who may
+    # be issued a delegated key, not a secret: a caller who could register an
+    # issuer could register https://auth.notme.bot, which is why it is operator
+    # config rather than caller-supplied. Deployed values belong in wrangler
+    # vars, and never in worker/.dev.vars — see the secrets block at the end of
+    # .gitignore for why that file was the wrong place to reach for.
+    ( name = "DELEGATED_JWT_ISSUERS",
+      text = "http://localhost:8787",
+    ),
 
     # Durable Object namespace bindings (must match env.SIGNING_AUTHORITY etc. in code)
     ( name = "SIGNING_AUTHORITY",
