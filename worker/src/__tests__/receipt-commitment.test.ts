@@ -422,3 +422,44 @@ function handEncodeCommitment(opts: {
   parts.push(...text("timestamp_ms"), ...uint(opts.timestampMs ?? NOW_MS));
   return new Uint8Array(parts);
 }
+
+describe("cross-implementation contract — cloister's encoder", () => {
+  // Bytes produced by CLOISTER's own commitmentCborMap() + canonicalCbor()
+  // (cloister/src/wire/receipts-cbor.ts), captured verbatim. This is the
+  // counterparty that actually calls us.
+  //
+  // Pinned because agreement between two implementations is the only real
+  // evidence of canonicality — everything else in this file is notme checking
+  // its own homework. Before the hand-rolled encoder landed, notme rejected
+  // exactly these bytes with FIELD_NOT_UINT, because cbor-x decodes the
+  // shortest-form uint64 timestamp to a BigInt. That was 100% of cloister's
+  // real traffic.
+  //
+  // If this test fails, notme and cloister have diverged on the signing input
+  // and every receipt notme signs is unverifiable. Do not "fix" it by
+  // loosening the validator — regenerate from cloister and find out which
+  // side moved.
+  const CLOISTER_VECTOR =
+    "qGVlcG9jaAdlbm9uY2VQEREREREREREREREREREREWZzdGF0dXMYyGhhY3Rvcl9mcFggoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaFpYm9keV9oYXNoWCC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u2xoZWFkZXJzX2hhc2hYIMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMbHJlcXVlc3RfaGFzaFgg3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d1sdGltZXN0YW1wX21zGwAAAZ1GPpYA";
+
+  it("accepts cloister's canonical bytes and re-encodes them identically", () => {
+    const bytes = Uint8Array.from(atob(CLOISTER_VECTOR), (c) =>
+      c.charCodeAt(0),
+    );
+    const out = validateCommitment(bytes, {
+      ...FACTS,
+      nowMs: 1_775_000_000_000,
+    });
+    expect(Array.from(out)).toEqual(Array.from(bytes));
+  });
+
+  it("cloister emits canonical uint64, not float64, for timestamp_ms", () => {
+    // 0x1b is the shortest-form uint64 head; 0xfb would be float64, which
+    // RECEIPTS.md §3.1 forbids outright.
+    const bytes = Uint8Array.from(atob(CLOISTER_VECTOR), (c) =>
+      c.charCodeAt(0),
+    );
+    expect(bytes[bytes.length - 9]).toBe(0x1b);
+    expect(Array.from(bytes)).not.toContain(0xfb);
+  });
+});
