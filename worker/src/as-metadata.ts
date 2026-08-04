@@ -162,9 +162,23 @@ export const FORBIDDEN_METADATA_FIELDS = [
   // Claims an OP capability we lack; unlike the alg list, omitting it breaks
   // nothing, so there is no interop argument for publishing it.
   "subject_types_supported",
-  // RFC 8414 §2 permits omission when no grant type uses it — and none does.
+  // RFC 8414 §2 permits omission when no grant type uses it — and no PUBLICLY
+  // AVAILABLE one does. Narrowed, not deleted, when ADR-013 shipped the
+  // authorization code flow: /authorize exists and works, but it is
+  // first-party by construction (ALLOWED_REDIRECT_HOSTS is the client
+  // registry), so there is nothing here a third party can integrate against.
   "authorization_endpoint",
-  // PKCE (code_challenge/code_verifier) is unimplemented.
+  // NOT because PKCE is missing — ADR-013 shipped S256 (worker.ts /authorize
+  // /code, packages/dpop client helpers). These two stay withheld because
+  // publishing them advertises "notme is an OAuth AS you can integrate with",
+  // and behind that advertisement there is still no client registry and no
+  // consent screen. That is ADR-011's job; flipping both entries is a one-line
+  // change that becomes correct at the same moment it becomes safe.
+  //
+  // So do not read this list as a to-do. The blocker is the registry, not the
+  // crypto — an earlier version of this comment said "PKCE is unimplemented",
+  // which survived ADR-013 and would send the next reader to build something
+  // that already exists.
   "code_challenge_methods_supported",
   // Non-standard, read by nothing, and it named the CURVE (Ed25519) where an
   // algorithm belongs. Superseded by id_token_signing_alg_values_supported.
