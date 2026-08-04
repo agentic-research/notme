@@ -99,6 +99,25 @@ from an internet request. `JwtSigner` has no URL.
 `ReceiptSigner` does: cloister's `NOTME` binding is live for the `/identity/*`
 fetch proxy, and pinning an `entrypoint` on it would redirect that traffic.
 
+### Deliberately NOT constrained: `sub`, `scope`, `aud`, lifetime
+
+A delegated issuer's entire job is minting tokens for its own subjects, so
+those are its business, and notme has no basis to judge the values.
+
+Worth stating as a decision rather than an omission, because the opposite
+reads as more secure and is not: a check on values you cannot evaluate **looks
+like a control while being none**. It would give a reviewer the impression
+that notme vets delegated claims, when in reality the issuer picks whatever
+passes and notme cannot tell a legitimate `scope` from an escalated one.
+
+The real control is upstream of all of it: whatever the issuer mints is only
+ever valid inside its own trust domain, because it is signed with a key that
+is not notme's. That property does not depend on any claim being inspected,
+which is exactly why it is the one worth relying on.
+
+(Raised by cloister reviewing this ADR — the reasoning was in the code and not
+here, which is the wrong half to keep it in.)
+
 ## What is deliberately not built
 
 - **No key export.** `JwtSigner` returns a signature and a `kid`. The public

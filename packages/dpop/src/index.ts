@@ -154,8 +154,8 @@ export interface VerifyDPoPTokenOptions {
    * set this to their own URL to prevent confused-deputy: a token minted
    * for a different resource server (same notme issuer, same public key)
    * would otherwise pass this verifier. Mirrors `VerifyAccessTokenOptions.audience`
-   * — was previously unchecked here (a real gap, found auditing an
-   * external consumer's usage; see notme-9c2b41).
+   * — was previously unchecked here, a real gap found while auditing an
+   * external consumer's usage.
    */
   audience: string | string[];
   /**
