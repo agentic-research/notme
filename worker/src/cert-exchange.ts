@@ -176,6 +176,36 @@ export async function handleCertExchange(
   // ── 008: cert pair if public_keys + proofs provided, else legacy token ──
   if (body.public_keys?.mtls && body.public_keys?.signing &&
       body.proofs?.mtls && body.proofs?.signing) {
+    // A CERTIFICATE may carry less than the session does. auth/
+    // passkey-cert-scopes.ts states the rule and the reason: certMint is "a
+    // delegation the human never agreed to at the touch prompt", and
+    // authorityManage in a long-lived exportable credential removes the
+    // "human present at a browser" property that made granting it
+    // acceptable. /cert/passkey enforced it; this route did not, so the same
+    // admin session yielded a cert carrying both one route over
+    // (notme-18dfd0).
+    //
+    // The rule belongs to the ARTIFACT, not the route — a certificate is
+    // long-lived, exportable and usable off-origin however it was obtained —
+    // so it is applied HERE, on the cert branch, and not to the token branch
+    // below, whose artifact is short-lived and DPoP-bound.
+    //
+    // This also narrows the bootstrap path deliberately. Its principal keeps
+    // authorityManage + certMint (persisted by notme-92a1b9); the CERT it
+    // walks away with does not. Capabilities live on the principal; a cert
+    // carries only what is safe to export.
+    const { certScopesForSession } = await import("./auth/passkey-cert-scopes");
+    const certScopes = certScopesForSession(effectiveScopes);
+    if (certScopes.length === 0) {
+      return Response.json(
+        {
+          error: "none of the requested scopes may be carried by a certificate",
+          requested: requestedScopes,
+          eligible: ["bridgeCert"],
+        },
+        { status: 403 },
+      );
+    }
     // PoP cert pair exchange — verify proofs, issue certs
     const { importPublicKey } = await import("./cert-authority");
     let mtlsPubKey: CryptoKey;
@@ -235,7 +265,7 @@ export async function handleCertExchange(
         identity,
         mtlsPublicKeyPem: body.public_keys.mtls,
         signingPublicKeyPem: body.public_keys.signing,
-        scopes: effectiveScopes,
+        scopes: certScopes,
         authMethod,
       });
     } catch (e: any) {
@@ -245,7 +275,7 @@ export async function handleCertExchange(
     const response: CertPairExchangeResponse = {
       certificates: result.certificates,
       identity: result.identity,
-      scopes: effectiveScopes,
+      scopes: certScopes,
       expires_at: result.expires_at,
       binding: result.binding,
       authority: result.authority,
