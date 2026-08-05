@@ -73,10 +73,21 @@ jobs:
       # run covers the SDK's own 67 tests AND proves worker still resolves the
       # package through its bare specifier — a stronger gate than testing the
       # package alone.
+      # BUILD BEFORE TEST. packages/dpop's `exports` resolves "." to
+      # ./dist/index.js, so every importer of the bare specifier needs dist/ to
+      # exist. This step used to run AFTER the test, which meant the test could
+      # only pass where a stale dist/ was already lying around — true on a
+      # developer machine, never true on a clean CI checkout. dpop-v0.4.0's
+      # first tag run failed here with "Failed to resolve entry for package
+      # @agentic-research/dpop" across six files.
+      #
+      # It failed safely: the publish step is tag-gated and never ran, so
+      # nothing reached npm. That is the gate working, not a near miss.
+      - run: task dpop:build
+
       - name: Test (worker suite includes packages/dpop)
         working-directory: worker
         run: pnpm vitest run
-      - run: task dpop:build
 
       - name: Tag must match package version
         if: startsWith(github.ref, 'refs/tags/')
