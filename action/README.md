@@ -71,7 +71,6 @@ sequenceDiagram
         Note over Step,Octo: not yet wired in TS action — see<br/>.github/workflows/gha-identity.yml
         Step-->>Octo: federated token request
         Octo-->>Step: scoped GitHub token
-        Step->>Step: setOutput github_token
     end
 
     Note over Step: step exits<br/>private keys garbage-collected
@@ -100,7 +99,6 @@ binding payload includes `SHA-256(jwt)` so the PoP signatures are inseparable fr
 | `notme_signing_cert` | Ed25519 bridge cert PEM — git commit signing + APAS attestations (public data) |
 | `notme_identity` | WIMSE identity URI: `wimse://notme.bot/gha/{owner}/{repo}` |
 | `expires_at` | cert expiry (Unix timestamp). worker default TTL is 5 minutes |
-| `github_token` | scoped GitHub token from octo-sts (empty if not requested) |
 
 private keys are **never** an output. they exist only in the step's process memory and are garbage-collected when the step exits. for cross-step usage, run the action again — each invocation gets its own keypair.
 

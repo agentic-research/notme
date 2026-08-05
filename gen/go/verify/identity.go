@@ -27,15 +27,18 @@ import (
 type Identity struct {
 	// URI is the WIMSE identity from the cert SAN (e.g. wimse://notme.bot/gha/owner/repo).
 	//
-	// DISPLAY AND ROUTING ONLY. Its auth-method segment is
-	// percent-encoded so an issuer-qualified method stays a SINGLE path
-	// segment — an OIDC cert reads
-	// wimse://notme.bot/oidc%3Ahttps%3A%2F%2Fissuer/<subject>, not
-	// wimse://notme.bot/oidc:https://issuer/<subject>. Compare AuthMethod,
-	// never a segment split out of this string: the obvious cross-check
-	// (strings.Split(uri.Path, "/")[1] == id.AuthMethod) reads as a tamper
-	// signal and fails on every OIDC cert, because the two are the same
-	// fact in two encodings.
+	// DISPLAY AND ROUTING ONLY — never authorize on it.
+	//
+	// Its second segment is NOT reliably AuthMethod. For a GHA cert the
+	// path is /gha/<owner>/<repo> while AuthMethod is "gha-oidc"; for a
+	// session-minted cert the segment IS the auth method, percent-encoded
+	// so an issuer-qualified value stays a single segment
+	// (wimse://notme.bot/oidc%3Ahttps%3A%2F%2Fissuer/<subject>). The
+	// segment count differs too — three for GHA, two for session certs.
+	//
+	// So the obvious cross-check, strings.Split(uri.Path, "/")[1] ==
+	// id.AuthMethod, reads as a tamper signal while being wrong in two
+	// different ways at once. Compare AuthMethod. Never split this string.
 	URI string
 
 	// Scopes are the granted capabilities from the cert extensions.

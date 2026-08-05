@@ -61,6 +61,27 @@ describe("gha-identity.yml output contract", () => {
     }
   });
 
+  it("action.yml declares NOTHING the action source fails to set", () => {
+    // The converse of the assertion below, and the direction that was
+    // missing: action.yml declared `github_token`, which src never sets —
+    // the same always-empty-output defect as the notme_token bug this file
+    // was written for, one file over. An external consumer wiring
+    // steps.<id>.outputs.github_token would silently get "".
+    const src = readFileSync(
+      fileURLToPath(new URL("../../../action/src/index.ts", import.meta.url)),
+      "utf8",
+    );
+    const setOutputs = new Set(
+      [...src.matchAll(/core\.setOutput\(\s*["'](\w+)["']/g)].map((m) => m[1]!),
+    );
+    for (const declared of actionOutputs) {
+      expect(
+        setOutputs,
+        `action.yml declares '${declared}' but action/src/index.ts never sets it — it would always resolve to the empty string`,
+      ).toContain(declared);
+    }
+  });
+
   it("action.yml declares every output the action source sets", () => {
     const src = readFileSync(
       fileURLToPath(new URL("../../../action/src/index.ts", import.meta.url)),
