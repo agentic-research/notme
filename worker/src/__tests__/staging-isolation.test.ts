@@ -98,6 +98,23 @@ describe("[env.staging] isolation (ADR-018)", () => {
     expect(new URL(authorityUrl!).host).toContain("staging");
   });
 
+  it("declares the rate limiters — an absent binding is a SILENT no-op", () => {
+    // worker.ts guards every limiter call with `if (env.X_LIMITER)`, so a
+    // missing binding does not error — it removes the control. That is how
+    // production came to run with no limit on passkey registration, /token,
+    // or cert exchange: the [[ratelimits]] blocks lived only in
+    // wrangler.toml.example and never in the deployed config (notme-191328).
+    // A security control that vanishes silently is the defect class here,
+    // so its presence is asserted rather than assumed.
+    const declared = stagingSections()
+      .filter((s) => /(^|\.)ratelimits$/.test(s.header))
+      .map((s) => s.body.match(/^\s*name\s*=\s*"([^"]+)"/m)?.[1])
+      .filter(Boolean);
+    for (const name of ["TOKEN_LIMITER", "CERT_LIMITER", "PASSKEY_LIMITER"]) {
+      expect(declared, `staging does not bind ${name}`).toContain(name);
+    }
+  });
+
   it("binds its OWN kv namespace id, not production's", () => {
     const stagingKv = stagingSections().filter((s) =>
       /(^|\.)kv_namespaces$/.test(s.header),
