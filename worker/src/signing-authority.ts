@@ -1403,6 +1403,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   // Reset passkey data — for when credentials are corrupted (e.g. userId mismatch bug)
+  //
+  // THIS IS THE ONLY CREDENTIAL-REMOVAL PATH IN THE WORKER. Nothing else
+  // deletes from passkey_credentials, federated_identities, principals, or
+  // invites. Two invariants currently rest on that being true:
+  //
+  //   1. The known gap in #hasAuthenticator — that it does not count
+  //      outstanding invites — is UNREACHABLE, because reaching "no
+  //      authenticator but a live authorityManage invite" requires losing a
+  //      credential, which requires this method, which requires consuming a
+  //      bootstrap code, which requires already having no authenticator. The
+  //      transition is circular (notme-2131e8).
+  //   2. Rotating the session secret below is sufficient to revoke sessions,
+  //      because no other route can orphan one.
+  //
+  // ADDING A SECOND CREDENTIAL-REMOVAL PATH — an admin "revoke device"
+  // route, an account deletion, a principal-removal API — BREAKS BOTH. Such
+  // a path must also revoke outstanding invites and rotate the session
+  // secret, or #hasAuthenticator must start counting invites.
   async resetPasskeyData(): Promise<{ deleted: number }> {
     const { ensurePasskeySchema } = await import("./auth/passkey");
     ensurePasskeySchema(this.ctx.storage.sql);
