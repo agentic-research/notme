@@ -61,7 +61,7 @@ Every PR, no exceptions (`.github/workflows/ci.yml`):
 | Gate | Command | Catches |
 |---|---|---|
 | SHA-pin check | `task pin:check` | mutable action refs (supply chain) |
-| Types + tests | `task worker:check` | 480 unit + 82 real-DO tests |
+| Types + tests | `task worker:check` | tsc (src + pool tests) then both vitest suites — the plain suite and the real-Worker/DO pool suite |
 | Dependency audit | `task worker:audit` | known-vuln production deps |
 | Doc/bead integrity | `task docs:check` | claims citing dead code/beads |
 | Package manifest | `task server:check` | server.json schema/version drift |

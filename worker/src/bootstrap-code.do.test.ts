@@ -30,8 +30,9 @@
 // same harness rationale as dpop-nonce.do.test.ts. isLocal mode routes the
 // auth surface without a host header.
 import worker from "../worker";
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import type { SigningAuthority } from "./signing-authority";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
@@ -95,14 +96,86 @@ describe("fresh-authority recovery (notme-976385)", () => {
     expect(second).not.toBe(first);
   });
 
-  it("does NOT regenerate once a principal exists — bootstrap closes for good", async () => {
-    const stub = authority("bs-closed-after-admin");
+  // THE CASE THE FIRST VERSION OF THIS FILE MISSED (found by adversarial
+  // review). The tests below it prove closure by calling
+  // createPrincipalWithCapabilities — but the PRIMARY deployer flow never
+  // creates a principal at all: registerPasskey writes passkey_users +
+  // passkey_credentials only (worker/src/auth/passkey.ts). So a
+  // principals-only predicate reports "nobody is here" on the exact
+  // configuration that means "the admin is here", and the DO would re-arm
+  // bootstrap for any caller that asked.
+  //
+  // Today the only caller gates on isFirstUser, which masks it — but that
+  // makes the invariant depend on the CALLER rather than on the DO that
+  // claims to enforce it. These tests pin it in the DO.
+  //
+  // The rows are inserted directly rather than by driving WebAuthn: a real
+  // registration needs an authenticator attestation, and the invariant under
+  // test is "an authenticator EXISTS", not how it got there.
+  it("does NOT regenerate when a passkey credential exists but no principal row does", async () => {
+    const stub = authority("bs-passkey-no-principal");
+    const code = await stub.getOrCreateBootstrapCode();
+    expect(await stub.consumeBootstrapCode(code!)).toBe(true);
+
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const { ensurePasskeySchema } = await import("./auth/passkey");
+      ensurePasskeySchema((a as any).ctx.storage.sql);
+      (a as any).ctx.storage.sql.exec(
+        "INSERT INTO passkey_users (user_id, display_name, is_admin) VALUES (?, ?, ?)",
+        "deployer",
+        "deployer",
+        1,
+      );
+      (a as any).ctx.storage.sql.exec(
+        "INSERT INTO passkey_credentials (credential_id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)",
+        "cred-1",
+        "deployer",
+        "AAAA",
+        0,
+        "[]",
+      );
+    });
+
+    // The deployer's authenticator is registered. Bootstrap must be closed —
+    // re-arming here would mint a fresh admin code into the Worker logs for
+    // an authority that already has an administrator.
+    expect(await stub.getOrCreateBootstrapCode()).toBeNull();
+  });
+
+  it("does NOT regenerate when a federated identity exists but no passkey does", async () => {
+    const stub = authority("bs-federated-no-passkey");
+    const code = await stub.getOrCreateBootstrapCode();
+    expect(await stub.consumeBootstrapCode(code!)).toBe(true);
+
+    const principalId = crypto.randomUUID();
+    await stub.createPrincipalWithCapabilities(principalId, ["bridgeCert"]);
+    await stub.linkFederatedId(
+      principalId,
+      "https://accounts.example",
+      "subject-1",
+    );
+
+    expect(await stub.getOrCreateBootstrapCode()).toBeNull();
+  });
+
+  it("DOES regenerate when only a bare principal exists — a cert holder is not an interactive admin", async () => {
+    // The /cert bootstrap path persists a principal (notme-92a1b9) that has
+    // no passkey credential and no federated identity, and no HTTP route
+    // turns a bridge cert into a session. Treating that row as "someone is
+    // here" would close bootstrap against an authority nobody can log in to
+    // — reintroducing notme-976385's strand through the one burn route that
+    // previously caused it. Counting authenticators keeps the two fixes from
+    // cancelling each other.
+    const stub = authority("bs-bare-principal");
     const code = await stub.getOrCreateBootstrapCode();
     expect(await stub.consumeBootstrapCode(code!)).toBe(true);
     await stub.createPrincipalWithCapabilities(crypto.randomUUID(), [
       "bridgeCert",
     ]);
-    expect(await stub.getOrCreateBootstrapCode()).toBeNull();
+    const regenerated = await stub.getOrCreateBootstrapCode();
+    expect(regenerated).toMatch(UUID_RE);
+    expect(regenerated).not.toBe(code);
   });
 });
 

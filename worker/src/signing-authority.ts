@@ -1414,8 +1414,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec("DELETE FROM passkey_users");
     this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
     // Mark bootstrap as used — do NOT delete it.
-    // A new code only appears on fresh DO instantiation, not after reset.
-    // This prevents: know code → reset → new code → reset → infinite wipe loop.
+    //
+    // Since notme-976385 a new code CAN appear after a reset: this wipe
+    // removes every passkey credential, so hasAuthenticator() goes false and
+    // getOrCreateBootstrapCode() re-arms rather than leaving the authority
+    // permanently unadministrable. The wipe-loop this comment used to claim
+    // was structurally impossible is instead bounded by what the loop yields:
+    // the regenerated code never crosses the HTTP boundary (the only caller
+    // discards it and answers 401), so an attacker who knows a burned code
+    // can still only wipe — never read the replacement — and gains no
+    // capability from repeating it.
     this.ctx.storage.sql.exec(
       "UPDATE bootstrap SET used = 1 WHERE id = 'code'",
     );
@@ -1426,7 +1434,61 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Generated on first call, deleted after first passkey registration.
   // Only visible to the deployer (via wrangler tail / console).
 
+  /**
+   * Can anyone actually authenticate to this authority?
+   *
+   * NOT `principalCount`. The primary deployer flow — registerPasskey — writes
+   * `passkey_users` + `passkey_credentials` and never creates a `principals`
+   * row (see worker/src/auth/passkey.ts), so a principals-only predicate
+   * reports "nobody is here" on the exact configuration that means "the
+   * administrator is here", and would re-arm the bootstrap gate for an
+   * authority that already has an admin. Adversarial review of PR #71 caught
+   * this; the first version of bootstrap-code.do.test.ts missed it because
+   * every test established the admin via createPrincipalWithCapabilities,
+   * which is the one path that DOES write principals.
+   *
+   * Conversely a bare `principals` row — which is what POST /cert bootstrap
+   * creates — is a revocation target, not a way in: it carries no credential
+   * and no federated identity, and no HTTP route turns a bridge cert into a
+   * session. Counting it as "someone is here" would strand the deployer with
+   * an authority nobody can interactively administer, which is the very
+   * failure notme-976385 exists to prevent.
+   *
+   * So the predicate is authenticators: a passkey credential, or a linked
+   * federated identity.
+   *
+   * `#`-private, NOT TypeScript `private`: this class is RPC-reachable, and
+   * TS `private` is erased at build time, so a `private` helper stays
+   * callable on any stub someone obtains — a full-CA capability. The
+   * rpc-surface.do.test.ts allow-list caught exactly that on the first
+   * version of this method.
+   */
+  async #hasAuthenticator(): Promise<boolean> {
+    const sql = this.ctx.storage.sql;
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema } = await import("./auth/principals");
+
+    ensurePasskeySchema(sql);
+    const creds = sql
+      .exec("SELECT COUNT(*) as c FROM passkey_credentials")
+      .toArray() as Array<{ c: number }>;
+    if ((creds[0]?.c ?? 0) > 0) return true;
+
+    ensurePrincipalSchema(sql);
+    const federated = sql
+      .exec("SELECT COUNT(*) as c FROM federated_identities")
+      .toArray() as Array<{ c: number }>;
+    return (federated[0]?.c ?? 0) > 0;
+  }
+
   async getOrCreateBootstrapCode(): Promise<string | null> {
+    // Imports hoisted ABOVE the read. `await import(...)` is a yield point,
+    // and having one between reading `used` and the DELETE/INSERT below let
+    // two concurrent callers each regenerate and log a distinct code, only
+    // the last of which is live — two apparently-valid admin codes in the
+    // log at exactly the moment that matters.
+    const hasAuthenticator = await this.#hasAuthenticator();
+
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap (
         id         TEXT PRIMARY KEY DEFAULT 'code',
@@ -1441,18 +1503,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     if (rows.length > 0) {
       if (rows[0]!.used) {
-        // A consumed code stays consumed on an ESTABLISHED authority. But
-        // three routes can burn it (register/options, /auth/passkey/reset,
-        // POST /cert) and only registration used to create an admin — so a
-        // fresh authority could be permanently stranded with zero principals
-        // and no way to ever create one (notme-976385). While NO principal
-        // exists, regenerate. This does not reopen the wipe-loop reset
-        // guarded against: the new code is a fresh crypto.randomUUID() only
-        // visible to the deployer, so knowing the burned code grants
-        // nothing; and once the first principal exists, bootstrap closes
-        // for good.
-        const { principalCount } = await import("./auth/principals");
-        if (principalCount(this.ctx.storage.sql) > 0) return null;
+        // A consumed code stays consumed on an authority someone can log in
+        // to. But three routes can burn it (register/options,
+        // /auth/passkey/reset, POST /cert) and only registration establishes
+        // a way in — so an authority could be permanently stranded with no
+        // administrator and no way to ever create one (notme-976385). While
+        // NOBODY can authenticate, regenerate.
+        //
+        // This does not reopen the wipe-loop the reset path guards against:
+        // the new code is a fresh crypto.randomUUID() that never crosses the
+        // HTTP boundary (the caller discards it and answers 401), so knowing
+        // the burned code buys an attacker nothing it did not already have.
+        if (hasAuthenticator) return null;
         this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
       } else {
         // Expire after 15 minutes

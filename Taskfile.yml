@@ -191,6 +191,15 @@ tasks:
     # an unsupported Node died inside worker:install with a raw
     # ERR_PNPM_UNSUPPORTED_ENGINE and no next step (notme-8bea0d) — CI never
     # sees this (workflows pin node 22), only local release runs do.
+    #
+    # SUPPORTED RANGE SYNTAX: `^x.y.z`, `>=x.y.z`, exact `x.y.z`, joined by
+    # `||`. That is deliberately a SUBSET of npm semver, and anything else
+    # (`~`, `x`-ranges, hyphen ranges, prerelease tags) fails CLOSED — an
+    # unrecognized range matches nothing, so the task refuses to run rather
+    # than admitting an untested runtime. If engines.node ever needs syntax
+    # outside that subset, extend this parser or depend on `semver` — do NOT
+    # widen the fallback, because failing open here silently restores the
+    # exact defect this task exists to prevent.
     cmds:
       - |
         node -e '
