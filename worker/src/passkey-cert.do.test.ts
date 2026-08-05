@@ -29,13 +29,16 @@ function pem(spki: ArrayBuffer, label: string): string {
   return `-----BEGIN ${label}-----\n${b64.match(/.{1,64}/g)!.join("\n")}\n-----END ${label}-----`;
 }
 
-async function sessionCookie(scopes: string[]): Promise<string> {
+async function sessionCookie(
+  scopes: string[],
+  authMethod = "passkey",
+): Promise<string> {
   const stub = env.SIGNING_AUTHORITY.get(
     env.SIGNING_AUTHORITY.idFromName("default"),
   );
   const secret = await stub.getSessionSecret();
   return createSessionCookie(
-    { principalId: "principal-passkey-test", scopes, authMethod: "passkey" },
+    { principalId: "principal-passkey-test", scopes, authMethod },
     secret,
   );
 }
@@ -216,6 +219,40 @@ describe("POST /cert/passkey", () => {
     const req = await mintRequest(cookie);
     expect((await post({ public_keys: req.public_keys }, cookie)).status).toBe(
       400,
+    );
+  });
+});
+
+describe("authMethod provenance (notme-ebc9af)", () => {
+  // The route accepts ANY valid session — /join sets authMethod "invite",
+  // /auth/oidc/login sets "oidc:<issuer>" — but used to stamp every minted
+  // cert authMethod:"passkey" and a wimse://…/passkey/… identity. A verifier
+  // reading such a cert concluded a human touched a passkey when none did.
+  // The cert must DERIVE its provenance from the session that authorized it.
+
+  it("an invite-authed session mints a cert that says invite, not passkey", async () => {
+    const cookie = await sessionCookie(["bridgeCert"], "invite");
+    const res = await post(await mintRequest(cookie), cookie);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.auth_method).toBe("invite");
+    expect(body.identity).toBe(
+      "wimse://notme.bot/invite/principal-passkey-test",
+    );
+    expect(body.identity).not.toContain("/passkey/");
+  });
+
+  it("an oidc session's cert carries the issuer-qualified method, URI-encoded", async () => {
+    const method = "oidc:https://accounts.example";
+    const cookie = await sessionCookie(["bridgeCert"], method);
+    const res = await post(await mintRequest(cookie), cookie);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.auth_method).toBe(method);
+    // The identity URI's method segment must stay a SINGLE path segment —
+    // ':' and '/' in the issuer are percent-encoded, not structural.
+    expect(body.identity).toBe(
+      `wimse://notme.bot/${encodeURIComponent(method)}/principal-passkey-test`,
     );
   });
 });

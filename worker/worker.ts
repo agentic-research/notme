@@ -2101,7 +2101,13 @@ export default {
         return handleCertExchange(request, env);
       }
 
-      // POST /cert/passkey — passkey session → bridge cert pair.
+      // POST /cert/passkey — authenticated session → bridge cert pair.
+      //
+      // Named for its primary caller, but it accepts ANY valid session —
+      // passkey, invite (/join), or OIDC (/auth/oidc/login) — and the minted
+      // cert's authMethod + wimse identity are DERIVED from the session's
+      // authMethod, so the cert never claims an authenticator the session
+      // didn't use (notme-ebc9af).
       //
       // The passkey analogue of /cert/gha, and near-identical to it: verify an
       // authenticator, prove possession of the submitted keys, mint the pair.
@@ -2254,13 +2260,20 @@ export default {
             );
           }
 
+          // Provenance is DERIVED from the session, never asserted by the
+          // route: /join sets authMethod "invite" and /auth/oidc/login sets
+          // "oidc:<issuer>", and this route accepts those sessions — so a
+          // hardcoded "passkey" told verifiers a human touched an
+          // authenticator when none did (notme-ebc9af). encodeURIComponent
+          // keeps an issuer-qualified method one URI path segment.
+          const sessionAuthMethod = session.authMethod;
           const result = await authority.mintBridgeCertPair({
             subject: session.principalId,
-            identity: `wimse://notme.bot/passkey/${session.principalId}`,
+            identity: `wimse://notme.bot/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
             mtlsPublicKeyPem: body.public_keys.mtls,
             signingPublicKeyPem: body.public_keys.signing,
             scopes,
-            authMethod: "passkey",
+            authMethod: sessionAuthMethod,
             ttlMs: 5 * 60 * 1000,
           });
 
@@ -2275,7 +2288,7 @@ export default {
           return Response.json({
             ...result,
             principal_id: session.principalId,
-            auth_method: "passkey",
+            auth_method: sessionAuthMethod,
           });
         } catch (e: any) {
           return jsonErr("passkey cert error: " + e.message, 500);
