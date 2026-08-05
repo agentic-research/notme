@@ -43,6 +43,34 @@ interface SigningAuthorityEnv {
   SIGNET_AUTHORITY_URL?: string;
 }
 
+/**
+ * The self-signed CA certificate's subject DN.
+ *
+ * Production keeps the exact historical literal, because the CA cert is
+ * generated once per authority and anything pinning the existing subject must
+ * keep matching. A NON-production authority gets its host appended, so a
+ * verifier inspecting the issuing CA can tell the two apart — previously both
+ * environments minted "CN=signet-authority,O=notme" byte-identically, and the
+ * only difference between a staging cert and a production one was which key
+ * signed it (notme-1532eb).
+ *
+ * Takes effect only for NEWLY created authorities: the CA cert is created once
+ * and stored, so an existing staging DO keeps its production-shaped subject
+ * until recreated.
+ */
+export function caSubjectForEnv(env: { SIGNET_AUTHORITY_URL?: string }): string {
+  const PRODUCTION_SUBJECT = "CN=signet-authority,O=notme";
+  if (!env.SIGNET_AUTHORITY_URL) return PRODUCTION_SUBJECT;
+  let host: string;
+  try {
+    host = new URL(env.SIGNET_AUTHORITY_URL).host;
+  } catch {
+    return PRODUCTION_SUBJECT;
+  }
+  if (!host || host === "auth.notme.bot") return PRODUCTION_SUBJECT;
+  return `CN=signet-authority ${host},O=notme`;
+}
+
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 
@@ -517,7 +545,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .reduce((s, b) => s + b.toString(16).padStart(2, "0"), "");
 
     const cert = await X509CertificateGenerator.createSelfSigned({
-      name: "CN=signet-authority,O=notme",
+      name: caSubjectForEnv(this.env),
       notBefore: now,
       notAfter,
       signingAlgorithm: ED25519,

@@ -30,9 +30,9 @@ vi.mock("cloudflare:workers", () => ({
   },
 }));
 
-const { authorityHostFromEnv, wimseTrustDomain } = await import(
-  "../../worker"
-);
+const { authorityHostFromEnv, wimseTrustDomain, getAllowedOwners } =
+  await import("../../worker");
+const { caSubjectForEnv } = await import("../signing-authority");
 
 describe("authorityHostFromEnv", () => {
   it("resolves the production authority URL to its host (parity with sub === 'auth')", () => {
@@ -82,5 +82,33 @@ describe("wimseTrustDomain", () => {
     // from a misconfigured environment — the exact defect this removes.
     expect(() => wimseTrustDomain({ SITE_URL: "not a url" })).toThrow();
     expect(() => wimseTrustDomain({ SITE_URL: "file:///etc" })).toThrow();
+  });
+});
+
+describe("cross-environment config must not inherit production (notme-1532eb)", () => {
+  it("allows NO GHA owners when unset — omission must fail closed", () => {
+    // Previously defaulted to "agentic-research", so deleting the staging var
+    // RE-SUPPLIED the production org rather than refusing. An authority that
+    // has not declared which orgs may exchange OIDC tokens should accept none.
+    expect(getAllowedOwners({}).size).toBe(0);
+    expect(getAllowedOwners({ GHA_ALLOWED_OWNERS: "" }).size).toBe(0);
+  });
+
+  it("uses exactly the owners declared, normalized", () => {
+    const owners = getAllowedOwners({ GHA_ALLOWED_OWNERS: "Foo, bar " });
+    expect([...owners].sort()).toEqual(["bar", "foo"]);
+  });
+
+  it("gives a non-production authority a distinguishable CA subject", () => {
+    // The CA subject DN was the literal CN=signet-authority,O=notme in BOTH
+    // environments, so a verifier inspecting the issuing CA could not tell
+    // staging from production.
+    expect(caSubjectForEnv({})).toBe("CN=signet-authority,O=notme");
+    expect(
+      caSubjectForEnv({ SIGNET_AUTHORITY_URL: "https://auth.notme.bot" }),
+    ).toBe("CN=signet-authority,O=notme");
+    expect(
+      caSubjectForEnv({ SIGNET_AUTHORITY_URL: "https://auth-staging.notme.bot" }),
+    ).toBe("CN=signet-authority auth-staging.notme.bot,O=notme");
   });
 });

@@ -571,12 +571,24 @@ function getConfig(env: any) {
     rateLimitKvTtlSeconds: Number(env.RATE_LIMIT_KV_TTL_SECONDS ?? 3600),
   };
 }
-function getAllowedOwners(env: any): Set<string> {
-  const raw: string = env.GHA_ALLOWED_OWNERS ?? "agentic-research";
+/**
+ * GitHub owners permitted to exchange an OIDC token for a bridge cert.
+ *
+ * NO DEFAULT — an unset or empty value yields the empty set, which refuses
+ * every exchange. It previously defaulted to "agentic-research", so a
+ * deployment that DELETED the variable silently re-supplied the production
+ * org: staging could mint certs for production's org precisely because its
+ * config said nothing (notme-1532eb). An authority that has not declared
+ * whose workflows it trusts must trust none.
+ */
+export function getAllowedOwners(env: {
+  GHA_ALLOWED_OWNERS?: string;
+}): Set<string> {
+  const raw: string = env.GHA_ALLOWED_OWNERS ?? "";
   return new Set(
     raw
       .split(",")
-      .map((s: string) => s.trim().toLowerCase())
+      .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
   );
 }

@@ -139,7 +139,14 @@ run_worker_first = true
 [env.staging.vars]
 SITE_URL = "https://staging.notme.bot"
 SIGNET_AUTHORITY_URL = "https://auth-staging.notme.bot"
-GHA_ALLOWED_OWNERS = "your-org"
+# MUST differ from production. worker.ts refuses every GHA exchange when this
+# is unset (no default), so a staging authority that says nothing trusts
+# nobody rather than silently inheriting production's org (notme-1532eb).
+GHA_ALLOWED_OWNERS = "your-staging-org"
+# MUST be set. Unset falls back to the PRODUCTION audience set in
+# allowed-audiences.ts, which would let staging mint tokens for production's
+# resource servers.
+ALLOWED_AUDIENCES = "https://staging.notme.bot,https://auth-staging.notme.bot"
 
 [[env.staging.kv_namespaces]]
 binding = "CA_BUNDLE_CACHE"

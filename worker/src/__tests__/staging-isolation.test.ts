@@ -37,6 +37,24 @@ const config = readFileSync(
  * `env.staging` — `[env.staging]`, `[[env.staging.routes]]`,
  * `[env.staging.vars]`, and so on.
  */
+/** The production (top-level) counterpart of a staging section, for
+ * cross-environment comparisons like "these two must not share an owner". */
+function productionSection(name: string): string | undefined {
+  const sections: Array<{ header: string; body: string }> = [];
+  let current: { header: string; body: string } | null = null;
+  for (const line of config.split("\n")) {
+    const header = line.match(/^\s*\[{1,2}\s*([^\]]+?)\s*\]{1,2}\s*$/);
+    if (header) {
+      if (current) sections.push(current);
+      current = { header: header[1]!, body: "" };
+      continue;
+    }
+    if (current) current.body += line + "\n";
+  }
+  if (current) sections.push(current);
+  return sections.find((s) => s.header === name)?.body;
+}
+
 function stagingSections(): Array<{ header: string; body: string }> {
   const sections: Array<{ header: string; body: string }> = [];
   let current: { header: string; body: string } | null = null;
@@ -96,6 +114,50 @@ describe("[env.staging] isolation (ADR-018)", () => {
     expect(new URL(siteUrl!).host).not.toBe("notme.bot");
     expect(new URL(authorityUrl!).host).not.toBe("auth.notme.bot");
     expect(new URL(authorityUrl!).host).toContain("staging");
+  });
+
+  it("sets ALLOWED_AUDIENCES — unset inherits the PRODUCTION audience set", () => {
+    // allowed-audiences.ts falls back to DEFAULT_ALLOWED_AUDIENCES (which
+    // includes https://auth.notme.bot and https://notme.bot) when the var is
+    // absent, so an unset staging would mint tokens for production's resource
+    // servers (notme-1532eb).
+    const vars = stagingSections().find((s) => s.header === "env.staging.vars");
+    const audiences = vars?.body.match(
+      /^\s*ALLOWED_AUDIENCES\s*=\s*"([^"]+)"/m,
+    )?.[1];
+    expect(audiences, "staging does not set ALLOWED_AUDIENCES").toBeDefined();
+    for (const production of [
+      "https://auth.notme.bot",
+      "https://notme.bot",
+      "https://rosary.bot",
+    ]) {
+      expect(
+        audiences!.split(",").map((a) => a.trim()),
+        `staging trusts the production audience ${production}`,
+      ).not.toContain(production);
+    }
+  });
+
+  it("declares a GHA_ALLOWED_OWNERS distinct from production's", () => {
+    // getAllowedOwners has NO default, so an unset value refuses every
+    // exchange — but a staging value equal to production's is worse than
+    // unset: it lets a workflow in the production org obtain staging certs.
+    const vars = stagingSections().find((s) => s.header === "env.staging.vars");
+    const owners = vars?.body.match(
+      /^\s*GHA_ALLOWED_OWNERS\s*=\s*"([^"]*)"/m,
+    )?.[1];
+    expect(owners, "staging does not declare GHA_ALLOWED_OWNERS").toBeTruthy();
+    const productionOwners = productionSection("vars")
+      ?.match(/^\s*GHA_ALLOWED_OWNERS\s*=\s*"([^"]*)"/m)?.[1]
+      ?.split(",")
+      .map((o) => o.trim().toLowerCase())
+      .filter(Boolean);
+    for (const owner of owners!.split(",").map((o) => o.trim().toLowerCase())) {
+      expect(
+        productionOwners ?? [],
+        `staging shares the GHA owner '${owner}' with production`,
+      ).not.toContain(owner);
+    }
   });
 
   it("declares the rate limiters — an absent binding is a SILENT no-op", () => {
