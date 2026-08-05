@@ -75,6 +75,35 @@ Format: `wimse://{trust-domain}/{context}/{identity}`
 
 The trust domain is a FQDN. The path is scoped within the trust domain. This follows `draft-ietf-wimse-arch-02` Section 3.1 and is compatible with SPIFFE ID conventions.
 
+#### `{context}` encoding, and which copy is canonical
+
+For session-minted certs the `{context}` segment is the session's auth
+method, and it is **percent-encoded** so an issuer-qualified method stays a
+single path segment:
+
+```
+wimse://notme.bot/invite/<principal>
+wimse://notme.bot/oidc%3Ahttps%3A%2F%2Fissuer/<principal>
+```
+
+The same fact also rides in the `authMethod` extension (OID `.1.5` below),
+**raw and unencoded**. That asymmetry is deliberate — a URI path segment must
+not contain `/` or `:`, while the extension is length-delimited DER where
+percent-encoding would only add a "literal `%` or escape?" ambiguity.
+
+**The extension is canonical for comparison; the URI's context segment is
+display and routing only.** A verifier authorizing on auth method must read
+`authMethod`. The obvious cross-check — splitting the URI path and comparing
+it to the extension — reads as a tamper signal and fails on every OIDC cert,
+because the two are one fact in two encodings. This is stated on the Go
+verifier's `Identity.URI` / `Identity.AuthMethod` fields
+(`gen/go/verify/identity.go`), which is what external consumers actually
+read.
+
+Both values are DERIVED from the authenticating session rather than asserted
+by the minting route, so a cert issued from an invite-authenticated session
+says `invite` even though the route is named `/cert/passkey` (notme-ebc9af).
+
 ### Where the identity lives
 
 | Context | Carrier |
