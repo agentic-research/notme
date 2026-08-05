@@ -216,10 +216,15 @@ read of your storage should not yield redeemable ones.
 
 ## Guides
 
-- [Verification](https://github.com/agentic-research/notme/blob/main/packages/dpop/docs/verification.mdx)
-- [Replay protection](https://github.com/agentic-research/notme/blob/main/packages/dpop/docs/replay-protection.mdx)
-- [Errors](https://github.com/agentic-research/notme/blob/main/packages/dpop/docs/errors.mdx)
-- [Migrating to 0.3](https://github.com/agentic-research/notme/blob/main/packages/dpop/docs/migration-0.3.mdx)
+<!-- These links are pinned to the release TAG, not main, so a reader of a
+     published version sees the docs that shipped with it. npm renders only
+     README.md — never docs/*.mdx — so these links are the entire discovery
+     path from the package page. Bump the tag when cutting a release; the
+     `docs links pinned to release tag` test in scripts/ guards the drift. -->
+- [Verification](https://github.com/agentic-research/notme/blob/dpop-v0.4.0/packages/dpop/docs/verification.mdx)
+- [Replay protection](https://github.com/agentic-research/notme/blob/dpop-v0.4.0/packages/dpop/docs/replay-protection.mdx)
+- [Errors](https://github.com/agentic-research/notme/blob/dpop-v0.4.0/packages/dpop/docs/errors.mdx)
+- [Migrating to 0.3](https://github.com/agentic-research/notme/blob/dpop-v0.4.0/packages/dpop/docs/migration-0.3.mdx)
 
 ## Breaking changes in 0.3
 
