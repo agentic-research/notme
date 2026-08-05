@@ -1,6 +1,19 @@
 # wasm
 
-> **currently empty by design.** the `leyline-sign` wasm32 artifact lands here once its gating chain unblocks. nothing to consume yet.
+> **empty, and superseded — not pending.** This directory's plan was written
+> when `leyline-sign` had no wasm distribution. All three gating beads below
+> closed on 2026-07-23, and the artifact reached consumers by a different
+> route: ley-line-open publishes `leyline_sign.wasm` as a release asset, and
+> cloister imports it from its own Rust build
+> (`cloister/src/wire/signet-verify.ts`) rather than from notme. Nothing
+> consumes this directory, and nothing is waiting on it.
+>
+> The cited source path below (`ley-line/rs/crates/sign/`) no longer exists
+> either — the crate lives at `ley-line-open/rs/ll-open/sign/`.
+>
+> Retire-vs-keep is tracked in `notme-ea5c65`; the corrections here are
+> `notme-ea3efc`. Everything after this note describes a future state that
+> was overtaken by events — read it as history.
 
 ## future state
 
