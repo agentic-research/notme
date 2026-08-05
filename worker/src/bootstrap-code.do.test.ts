@@ -179,6 +179,49 @@ describe("fresh-authority recovery (notme-976385)", () => {
   });
 });
 
+describe("resetPasskeyData revokes what it wipes", () => {
+  // The bootstrap predicate asks "can anyone authenticate?" — and a session
+  // cookie IS a way to authenticate. resetPasskeyData wipes every passkey
+  // credential but the session secret was generated once and never rotated,
+  // so cookies issued before a reset stayed valid for their full 24h TTL.
+  //
+  // That produced the predicate's most reachable gap: a deployer who resets
+  // WHILE LOGGED IN leaves hasAuthenticator() false and an admin session
+  // live, and bootstrap re-arms a fresh code into the Worker logs for an
+  // authority that still has a working administrator.
+  //
+  // Rotating the secret here makes "reset" mean what it says, which makes
+  // the predicate true by construction for this population — and it
+  // independently fixes the fact that a reset previously revoked nothing.
+  it("rotates the session secret, invalidating cookies issued before it", async () => {
+    const stub = authority("bs-reset-rotates-secret");
+    const before = await stub.getSessionSecret();
+    expect(before).toBeTruthy();
+
+    await stub.resetPasskeyData();
+
+    const after = await stub.getSessionSecret();
+    expect(after).toBeTruthy();
+    expect(after).not.toBe(before);
+
+    // A cookie minted under the old secret must no longer verify — the
+    // point of rotating, not merely that the stored string changed.
+    const { createSessionCookie, verifySessionCookie } = await import(
+      "./auth/session"
+    );
+    const staleCookie = await createSessionCookie(
+      {
+        principalId: "pre-reset-admin",
+        scopes: ["bridgeCert", "authorityManage", "certMint"],
+        authMethod: "passkey",
+      },
+      before,
+    );
+    const value = staleCookie.slice("notme_session=".length).split(";")[0]!;
+    expect(await verifySessionCookie(value, after)).toBeNull();
+  });
+});
+
 describe("POST /cert bootstrap persists the admin (notme-92a1b9)", () => {
   it("the minted credential's principal survives the exchange with its scopes", async () => {
     const stub = authority("default");

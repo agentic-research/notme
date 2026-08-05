@@ -1413,6 +1413,26 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec("DELETE FROM passkey_credentials");
     this.ctx.storage.sql.exec("DELETE FROM passkey_users");
     this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
+
+    // Rotate the session secret, invalidating every cookie issued before
+    // this reset. Without it a reset revoked NOTHING: the secret was minted
+    // once and never rotated, so sessions survived their credentials for the
+    // full 24h TTL. A deployer who reset while logged in therefore left an
+    // authority with no authenticator but a live admin session — the state
+    // in which getOrCreateBootstrapCode re-arms, mistakenly, for an
+    // authority that still has a working administrator.
+    const rotated = new Uint8Array(32);
+    crypto.getRandomValues(rotated);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_config (
+        id     TEXT PRIMARY KEY DEFAULT 'session',
+        secret TEXT NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO session_config (id, secret) VALUES ('session', ?)",
+      btoa(String.fromCharCode(...rotated)),
+    );
     // Mark bootstrap as used — do NOT delete it.
     //
     // Since notme-976385 a new code CAN appear after a reset: this wipe
@@ -1424,6 +1444,20 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // discards it and answers 401), so an attacker who knows a burned code
     // can still only wipe — never read the replacement — and gains no
     // capability from repeating it.
+    // CREATE IF NOT EXISTS before the UPDATE: on an authority where
+    // getOrCreateBootstrapCode has never run, this table does not exist and
+    // the UPDATE threw SQLITE_ERROR. Masked in practice because the register
+    // flow creates the table first, so only a reset on a genuinely untouched
+    // authority hit it — which is exactly when an operator is least able to
+    // interpret a raw SQL error.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap (
+        id         TEXT PRIMARY KEY DEFAULT 'code',
+        code       TEXT NOT NULL,
+        used       INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
     this.ctx.storage.sql.exec(
       "UPDATE bootstrap SET used = 1 WHERE id = 'code'",
     );
@@ -1455,7 +1489,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * failure notme-976385 exists to prevent.
    *
    * So the predicate is authenticators: a passkey credential, or a linked
-   * federated identity.
+   * federated identity. Session cookies are the third population, handled at
+   * the source instead — resetPasskeyData rotates the session secret, so a
+   * wipe leaves no valid cookie for this to have to count.
+   *
+   * IF YOU ADD A LOGIN PATH, COUNT IT HERE. `findByProvider` in
+   * auth/connections.ts is the near miss to watch: it is a
+   * provider→credential lookup that reads like a login path and is currently
+   * called only from tests. Wiring it to a route makes `connections` a
+   * fourth table this predicate must include.
+   *
+   * Synchronous by construction — the callers' schema-ensure imports are
+   * passed in — so the caller's read-check-write stays free of `await` and
+   * this cannot return a pre-yield snapshot.
    *
    * `#`-private, NOT TypeScript `private`: this class is RPC-reachable, and
    * TS `private` is erased at build time, so a `private` helper stays
@@ -1463,11 +1509,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * rpc-surface.do.test.ts allow-list caught exactly that on the first
    * version of this method.
    */
-  async #hasAuthenticator(): Promise<boolean> {
+  #hasAuthenticator(
+    ensurePasskeySchema: (sql: any) => void,
+    ensurePrincipalSchema: (sql: any) => void,
+  ): boolean {
     const sql = this.ctx.storage.sql;
-    const { ensurePasskeySchema } = await import("./auth/passkey");
-    const { ensurePrincipalSchema } = await import("./auth/principals");
-
     ensurePasskeySchema(sql);
     const creds = sql
       .exec("SELECT COUNT(*) as c FROM passkey_credentials")
@@ -1482,12 +1528,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   async getOrCreateBootstrapCode(): Promise<string | null> {
-    // Imports hoisted ABOVE the read. `await import(...)` is a yield point,
-    // and having one between reading `used` and the DELETE/INSERT below let
-    // two concurrent callers each regenerate and log a distinct code, only
-    // the last of which is live — two apparently-valid admin codes in the
-    // log at exactly the moment that matters.
-    const hasAuthenticator = await this.#hasAuthenticator();
+    // Only the IMPORTS are hoisted, not the predicate. `await import(...)`
+    // is a yield point, and one between reading `used` and the DELETE/INSERT
+    // below let two concurrent callers each regenerate and log a distinct
+    // code, only the last of which is live — two apparently-valid admin
+    // codes in the log at exactly the moment that matters.
+    //
+    // Evaluating the predicate up here instead would trade that for a stale
+    // snapshot: a registration committing between the counts and the resume
+    // would re-arm an authority that just gained an admin. The counts are
+    // synchronous, so running them inline below keeps the whole
+    // read-check-write free of `await` and reads current state.
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema } = await import("./auth/principals");
 
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap (
@@ -1514,7 +1567,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         // the new code is a fresh crypto.randomUUID() that never crosses the
         // HTTP boundary (the caller discards it and answers 401), so knowing
         // the burned code buys an attacker nothing it did not already have.
-        if (hasAuthenticator) return null;
+        if (
+          this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)
+        ) {
+          return null;
+        }
         this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
       } else {
         // Expire after 15 minutes
