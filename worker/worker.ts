@@ -1434,6 +1434,25 @@ function getSubdomain(host: string): string | null {
   return match?.[1] ?? null;
 }
 
+// The authority surface is selected by hostname. `auth.notme.bot` stays the
+// hardcoded production match (sub === "auth"); SIGNET_AUTHORITY_URL
+// additionally selects the surface on whatever host it names, so a staging
+// worker (env.staging routes auth-staging.notme.bot with
+// SIGNET_AUTHORITY_URL=https://auth-staging.notme.bot) serves the authority
+// from config alone. Malformed values resolve to null rather than throwing
+// inside the fetch path — the hardcoded match still works when this returns
+// null.
+export function authorityHostFromEnv(
+  signetAuthorityUrl: string | undefined,
+): string | null {
+  if (!signetAuthorityUrl) return null;
+  try {
+    return new URL(signetAuthorityUrl).host;
+  } catch {
+    return null;
+  }
+}
+
 // ── CF Edge Cache helpers ──
 // With run_worker_first = true, responses constructed in the Worker bypass CF
 // edge cache entirely. We use the Cache API to store and serve them at the edge.
@@ -1635,7 +1654,12 @@ export default {
     }
 
     // ── auth.notme.bot — signet identity authority ──
-    if (sub === "auth" || isLocal) {
+    // Also matched by SIGNET_AUTHORITY_URL's host, so non-production
+    // environments (auth-staging.notme.bot) select the authority surface
+    // without a code change. In production the var names auth.notme.bot,
+    // which sub === "auth" already matches — no behavior change.
+    const authorityHost = authorityHostFromEnv(env.SIGNET_AUTHORITY_URL);
+    if (sub === "auth" || isLocal || (authorityHost !== null && host === authorityHost)) {
       const authorityUrl: string =
         env.SIGNET_AUTHORITY_URL || "https://auth.notme.bot";
       const siteUrl: string = env.SITE_URL || "https://notme.bot";
@@ -1698,7 +1722,24 @@ export default {
         );
         const headers = new Headers(resp.headers);
         headers.set("Cache-Control", "public, max-age=3600");
-        const result = new Response(resp.body, {
+        // The asset hardcodes the production authority host. On any other
+        // environment (staging), rewrite it so the docs describe the host
+        // actually serving them — worker:verify treats a production URL
+        // rendered on staging as a config leak.
+        let body: BodyInit | null = resp.body;
+        if (
+          resp.ok &&
+          authorityHost !== null &&
+          authorityHost !== "auth.notme.bot"
+        ) {
+          const html = await resp.text();
+          body = html.replaceAll("auth.notme.bot", authorityHost);
+          // Stale after rewriting: length changed, and text() already
+          // decoded any content-encoding.
+          headers.delete("Content-Length");
+          headers.delete("Content-Encoding");
+        }
+        const result = new Response(body, {
           status: resp.status,
           statusText: resp.statusText,
           headers,

@@ -104,9 +104,18 @@ tasks:
 
   worker:verify:
     desc: Smoke test live endpoints with bounded deployment-convergence retries
+    # AUTH_BASE / SITE_BASE default to production; `worker:verify-staging`
+    # passes the staging hosts so both environments share ONE definition of
+    # "the service works" instead of a staging copy that drifts.
+    vars:
+      AUTH_BASE: '{{.AUTH_BASE | default "https://auth.notme.bot"}}'
+      SITE_BASE: '{{.SITE_BASE | default "https://notme.bot"}}'
     cmds:
       - |
         FAIL=0
+        AUTH_BASE="{{.AUTH_BASE}}"
+        SITE_BASE="{{.SITE_BASE}}"
+        AUTH_HOST="${AUTH_BASE#https://}"
         VERIFY_NONCE="$(date +%s)"
         MAX_ATTEMPTS=5
         RETRY_DELAY_SECONDS=2
@@ -150,26 +159,126 @@ tasks:
           FAIL=1
         }
 
-        echo "=== auth.notme.bot ==="
-        check_request "landing" "GET" "https://auth.notme.bot/" "200" "identity authority"
-        check_request "login" "GET" "https://auth.notme.bot/login" "200" "passkey"
-        check_request "discovery" "GET" "https://auth.notme.bot/.well-known/signet-authority.json" "200" '"issuer"'
+        echo "=== ${AUTH_HOST} ==="
+        check_request "landing" "GET" "${AUTH_BASE}/" "200" "identity authority"
+        check_request "login" "GET" "${AUTH_BASE}/login" "200" "passkey"
+        check_request "discovery" "GET" "${AUTH_BASE}/.well-known/signet-authority.json" "200" '"issuer"'
         # Cache API entries survive Worker deployments. A unique query checks
         # the newly deployed handler instead of the previous version's cache.
-        check_request "ca-bundle" "GET" "https://auth.notme.bot/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE" "200" "BEGIN CERTIFICATE"
-        check_request "jwks" "GET" "https://auth.notme.bot/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
-        check_request "api-docs" "GET" "https://auth.notme.bot/api/docs" "200" "auth.notme.bot"
-        check_request "passkey-status" "GET" "https://auth.notme.bot/auth/passkey/status" "401" '"error":"unauthorized"'
-        check_request "authorize" "GET" "https://auth.notme.bot/authorize" "400" '"error":"redirect_uri required"'
-        check_request "token" "POST" "https://auth.notme.bot/token" "400" '"error":"dpop_proof_required"' '{"audience":"https://test"}'
+        check_request "ca-bundle" "GET" "${AUTH_BASE}/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE" "200" "BEGIN CERTIFICATE"
+        check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
+        # Expect the environment's own authority host in the docs page — a
+        # staging deploy that renders production URLs is a config leak, not
+        # a pass. Nonce for the same reason as ca-bundle: Cache API entries
+        # survive deployments, and this handler cachePuts with max-age=3600.
+        check_request "api-docs" "GET" "${AUTH_BASE}/api/docs?verify=$VERIFY_NONCE" "200" "${AUTH_HOST}"
+        check_request "passkey-status" "GET" "${AUTH_BASE}/auth/passkey/status" "401" '"error":"unauthorized"'
+        check_request "authorize" "GET" "${AUTH_BASE}/authorize" "400" '"error":"redirect_uri required"'
+        check_request "token" "POST" "${AUTH_BASE}/token" "400" '"error":"dpop_proof_required"' '{"audience":"https://test"}'
 
-        echo "=== notme.bot ==="
-        check_request "homepage" "GET" "https://notme.bot/" "200" "notme"
-        check_request "apas" "GET" "https://notme.bot/apas?verify=$VERIFY_NONCE" "200" "0.2.1-draft"
-        check_request "apas-schema" "GET" "https://notme.bot/provenance/dispatch/v1?verify=$VERIFY_NONCE" "200" '"workItemRef"' "" "application/schema+json"
+        echo "=== ${SITE_BASE#https://} ==="
+        check_request "homepage" "GET" "${SITE_BASE}/" "200" "notme"
+        check_request "apas" "GET" "${SITE_BASE}/apas?verify=$VERIFY_NONCE" "200" "0.2.1-draft"
+        check_request "apas-schema" "GET" "${SITE_BASE}/provenance/dispatch/v1?verify=$VERIFY_NONCE" "200" '"workItemRef"' "" "application/schema+json"
 
         echo "---"
         [ $FAIL -eq 0 ] && echo "All checks passed." || { echo "SOME CHECKS FAILED"; exit 1; }
+
+  node:preflight:
+    desc: Fail fast, with remediation, when local Node can't run the release path
+    # Evaluates the DECLARED range (package.json engines.node) rather than
+    # hardcoding a second copy that would drift. Exists because ship-prod on
+    # an unsupported Node died inside worker:install with a raw
+    # ERR_PNPM_UNSUPPORTED_ENGINE and no next step (notme-8bea0d) — CI never
+    # sees this (workflows pin node 22), only local release runs do.
+    cmds:
+      - |
+        node -e '
+          const { engines } = require("./package.json");
+          const want = engines && engines.node;
+          if (!want) { console.error("package.json declares no engines.node — add one (notme-8bea0d)"); process.exit(1); }
+          const v = process.versions.node.split(".").map(Number);
+          const ge = (a, b) => { for (let i = 0; i < 3; i++) { if ((a[i]||0) !== (b[i]||0)) return (a[i]||0) > (b[i]||0); } return true; };
+          const ok = want.split("||").map(s => s.trim()).some(range => {
+            const m = range.match(/^(\^|>=)?(\d+)\.(\d+)\.(\d+)$/);
+            if (!m) return false;
+            const min = [Number(m[2]), Number(m[3]), Number(m[4])];
+            if (m[1] === "^") return v[0] === min[0] && ge(v, min);
+            if (m[1] === ">=") return ge(v, min);
+            return v[0] === min[0] && v[1] === min[1] && v[2] === min[2];
+          });
+          if (!ok) {
+            console.error("Node v" + process.versions.node + " cannot run the release path — package.json engines.node wants: " + want);
+            console.error("Remediation (CI pins Node 22):");
+            console.error("  mise use node@22    # or: nvm use 22");
+            process.exit(1);
+          }
+          console.log("node v" + process.versions.node + " satisfies engines.node (" + want + ")");
+        '
+
+  # --- staging + canary promotion (goal-zero release train) ------------------
+  #
+  # Promotion order: ship-staging (separate Worker, own DOs/KV, no VPC) →
+  # worker:deploy-preview (upload the EXACT production artifact, get a version
+  # id) → worker:canary (gradual deployment, split traffic) → worker:promote
+  # (100% to the version already soaking). Rollback at any point is
+  # worker:canary/promote back to the OLD version id — same mechanism, no
+  # special path. NOTE: a version carrying a new [[migrations]] entry cannot
+  # be split-deployed; Durable Object migrations promote atomically and
+  # deleted-class migrations do not roll back. Check `git diff` on
+  # wrangler.toml migrations before choosing the canary path.
+
+  worker:deploy-staging:
+    desc: Deploy to the staging Worker (notme-bot-staging, isolated state)
+    dir: worker
+    cmds:
+      - pnpm exec wrangler deploy --env staging
+
+  worker:verify-staging:
+    desc: Smoke test staging endpoints (same checks as production verify)
+    cmds:
+      - task: worker:verify
+        vars:
+          AUTH_BASE: "https://auth-staging.notme.bot"
+          SITE_BASE: "https://staging.notme.bot"
+
+  ship-staging:
+    desc: "Staging gate: preflight → install → check → docs → deploy staging → verify staging"
+    cmds:
+      - task: node:preflight
+      - task: worker:install
+      - task: worker:check
+      - task: docs:check
+      - task: worker:deploy-staging
+      - task: worker:verify-staging
+
+  worker:versions:
+    desc: List uploaded production versions (ids for canary/promote/rollback)
+    dir: worker
+    cmds:
+      - pnpm exec wrangler versions list
+
+  worker:canary:
+    desc: "Split production traffic: NEW=<version-id> OLD=<version-id> [PCT=10]"
+    dir: worker
+    vars:
+      PCT: '{{.PCT | default "10"}}'
+    preconditions:
+      - sh: test -n "{{.NEW}}"
+        msg: "NEW=<version-id> is required (task worker:versions to list)"
+      - sh: test -n "{{.OLD}}"
+        msg: "OLD=<version-id> is required — the id traffic falls back to"
+    cmds:
+      - pnpm exec wrangler versions deploy "{{.NEW}}@{{.PCT}}%" "{{.OLD}}@{{sub 100 (atoi .PCT)}}%" --yes
+
+  worker:promote:
+    desc: "Route 100% of production traffic to NEW=<version-id>"
+    dir: worker
+    preconditions:
+      - sh: test -n "{{.NEW}}"
+        msg: "NEW=<version-id> is required (task worker:versions to list)"
+    cmds:
+      - pnpm exec wrangler versions deploy "{{.NEW}}@100%" --yes
 
   docs:check:
     desc: Verify doc claims against code
@@ -188,21 +297,27 @@ tasks:
       - pnpm exec tsx scripts/check-sha-pins.ts
 
   ship:
-    desc: "Safe path: install → check → docs → preview → verify instructions"
+    desc: "Safe path: preflight → install → check → docs → preview → verify instructions"
     cmds:
+      - task: node:preflight
       - task: worker:install
       - task: worker:check
       - task: docs:check
       - task: worker:deploy-preview
       - echo ""
-      - echo "Preview version uploaded. To go live:"
-      - echo "  task worker:deploy      # route traffic to new version"
-      - echo "  task worker:verify      # smoke test"
-      - echo "  task worker:rollback    # if something breaks"
+      - echo "Preview version uploaded. To go live (canary path):"
+      - echo "  task worker:versions                   # find NEW/OLD version ids"
+      - echo "  task worker:canary NEW=<id> OLD=<id>   # 10% canary (PCT=n to change)"
+      - echo "  task worker:verify                     # smoke test during soak"
+      - echo "  task worker:promote NEW=<id>           # 100% after soak"
+      - echo "  task worker:promote NEW=<old-id>       # rollback = promote the old id"
+      - echo ""
+      - 'echo "Direct path (skips canary): task worker:deploy && task worker:verify"'
 
   ship-prod:
-    desc: "Full send: install → check → docs → deploy → verify (rollback on failure)"
+    desc: "Full send: preflight → install → check → docs → deploy → verify (rollback on failure)"
     cmds:
+      - task: node:preflight
       - task: worker:install
       - task: worker:check
       - task: docs:check

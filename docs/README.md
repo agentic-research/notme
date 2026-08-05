@@ -12,6 +12,7 @@ architecture decision records for notme.
 | **007** | [secretless plan](design/007-secretless-plan.md) | implementation plan (sibling of design 007) | task-by-task TDD checklist for executing 007 | — (drives changes across `worker/`, `Taskfile.yml`) |
 | **008** | [bridge cert + CSR + WIMSE](design/008-bridge-cert-csr-wimse.md) | accepted | proof-of-possession exchange producing a P-256 mTLS cert + Ed25519 signing cert with a shared binding extension; WIMSE identity URIs in SAN | `worker/src/cert-authority.ts`, `worker/src/cert-exchange.ts` |
 | **009** | [identity-gated runtime](design/009-identity-gated-runtime.md) | accepted | workerd config pattern: agent Worker has no `globalOutbound`, talks to notme Worker via service binding only; agent cannot `fetch()` | `worker/config.capnp`, `worker/worker.ts` (`AuthService`) |
+| **018** | [goal zero promotion](design/018-goal-zero-promotion.md) | accepted | staging Worker (own DOs/CA, no VPC) → version-id canary via gradual deployments → 100% promote; rollback = promote the old id; per-phase gates + release evidence bundle | `worker/wrangler.toml.example` (`[env.staging]`), `Taskfile.yml` (`ship-staging`, `worker:canary`, `worker:promote`), `worker/worker.ts` (`authorityHostFromEnv`) |
 
 statuses come from each ADR's own header. 007 and 009 don't carry an explicit status field — labelled "accepted" here based on shipped code. 005 was promoted from "proposed" to "accepted" in this PR (the principal model has shipped at `worker/src/auth/principals.ts`).
 
