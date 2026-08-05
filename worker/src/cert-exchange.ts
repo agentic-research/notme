@@ -126,6 +126,12 @@ export async function handleCertExchange(
     principalId = crypto.randomUUID();
     grantedScopes = ["bridgeCert", "authorityManage", "certMint"];
     authMethod = "bootstrap";
+    // Persist the admin this exchange mints a credential for. Pre-fix,
+    // principalId was local-only: the sole bootstrap code was burned, a live
+    // credential carrying authorityManage+certMint walked away, and the
+    // authority still had ZERO principals — nothing to look up, grant, or
+    // revoke against, and no admin to recover with (notme-92a1b9).
+    await authority.createPrincipalWithCapabilities(principalId, grantedScopes);
   } else {
     // Exhaustiveness: CertExchangeRequest.proof is a discriminated union.
     // If a new variant is added without a branch, the assignment below

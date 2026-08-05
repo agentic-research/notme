@@ -1440,14 +1440,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray() as Array<{ code: string; used: number; created_at: string }>;
 
     if (rows.length > 0) {
-      if (rows[0]!.used) return null;
-      // Expire after 15 minutes
-      const created = new Date(rows[0]!.created_at + "Z").getTime();
-      const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
-      if (Date.now() - created > BOOTSTRAP_TTL_MS) {
+      if (rows[0]!.used) {
+        // A consumed code stays consumed on an ESTABLISHED authority. But
+        // three routes can burn it (register/options, /auth/passkey/reset,
+        // POST /cert) and only registration used to create an admin — so a
+        // fresh authority could be permanently stranded with zero principals
+        // and no way to ever create one (notme-976385). While NO principal
+        // exists, regenerate. This does not reopen the wipe-loop reset
+        // guarded against: the new code is a fresh crypto.randomUUID() only
+        // visible to the deployer, so knowing the burned code grants
+        // nothing; and once the first principal exists, bootstrap closes
+        // for good.
+        const { principalCount } = await import("./auth/principals");
+        if (principalCount(this.ctx.storage.sql) > 0) return null;
         this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
       } else {
-        return rows[0]!.code;
+        // Expire after 15 minutes
+        const created = new Date(rows[0]!.created_at + "Z").getTime();
+        const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
+        if (Date.now() - created > BOOTSTRAP_TTL_MS) {
+          this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
+        } else {
+          return rows[0]!.code;
+        }
       }
     }
 
