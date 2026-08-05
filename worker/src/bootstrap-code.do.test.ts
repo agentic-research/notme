@@ -382,3 +382,46 @@ describe("first-boot 401 must not send operators after a code that was never min
     expect(body.error).toMatch(/administrator|already/i);
   });
 });
+
+describe("a bootstrap code is valid ONLY while nobody can authenticate (notme-addef9)", () => {
+  // The invariant must hold at CONSUME, not only at MINT. Gating
+  // getOrCreateBootstrapCode alone fixed what the authority REPORTS while
+  // leaving what it ACCEPTS unchanged: a code minted before the first admin
+  // existed, captured from the Worker logs and never redeemed, stayed
+  // consumable afterwards. POST /cert consumes bootstrap codes and mints
+  // authorityManage + certMint, so that is a live admin credential
+  // outliving its purpose — bounded only by the 15-minute TTL.
+  it("refuses a still-unused code once an authenticator exists", async () => {
+    const stub = authority("bs-consume-after-admin");
+    const code = await issuedCode(stub); // minted while nobody can authenticate
+
+    // An administrator arrives by some other path — here a registered
+    // passkey, which is the primary deployer flow.
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const { ensurePasskeySchema } = await import("./auth/passkey");
+      ensurePasskeySchema((a as any).ctx.storage.sql);
+      (a as any).ctx.storage.sql.exec(
+        "INSERT INTO passkey_credentials (credential_id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)",
+        "admin-cred",
+        "admin",
+        "AAAA",
+        0,
+        "[]",
+      );
+    });
+
+    // Reporting is already closed…
+    expect(await bootstrapStatus(stub)).toBe("closed");
+    // …and consumption must be too. This is the half that was missing.
+    expect(await stub.consumeBootstrapCode(code)).toBe(false);
+  });
+
+  it("still accepts a code while the authority has no way in — recovery must keep working", async () => {
+    // The guard must not break the case it exists to serve: a stranded
+    // authority with nobody able to authenticate.
+    const stub = authority("bs-consume-no-admin");
+    const code = await issuedCode(stub);
+    expect(await stub.consumeBootstrapCode(code)).toBe(true);
+  });
+});

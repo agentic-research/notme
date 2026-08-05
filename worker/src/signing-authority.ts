@@ -1527,7 +1527,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   //      authenticator but a live authorityManage invite" requires losing a
   //      credential, which requires this method, which requires consuming a
   //      bootstrap code, which requires already having no authenticator. The
-  //      transition is circular (notme-2131e8).
+  //      transition is circular (notme-2131e8). That last step is now
+  //      ENFORCED rather than emergent: consumeBootstrapCode refuses once
+  //      anyone can authenticate. The circularity used to hold only because
+  //      a consumed code stayed consumed, which is a weaker reason.
+  //
+  //      CONSEQUENCE, stated plainly: this method is unreachable on an
+  //      authority that has any authenticator, since it requires consuming a
+  //      code and consumption is now gated. That was ALREADY true by
+  //      accident (the code was already marked used), so nothing regressed —
+  //      but "corrupted credentials" is exactly the case this method claims
+  //      to serve, and corrupted rows still count as an authenticator. The
+  //      dead end is pre-existing and unresolved; it needs an authenticated
+  //      recovery path rather than a code.
   //   2. Rotating the session secret below is sufficient to revoke sessions,
   //      because no other route can orphan one.
   //
@@ -1745,6 +1757,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   async consumeBootstrapCode(code: string): Promise<boolean> {
+    // THE INVARIANT, enforced here as well as at mint: a bootstrap code is
+    // valid ONLY while nobody can authenticate.
+    //
+    // Gating getOrCreateBootstrapCode alone fixed what the authority REPORTS
+    // and left what it ACCEPTS unchanged — a code minted before the first
+    // administrator existed, read from the Worker logs and never redeemed,
+    // stayed consumable afterwards. POST /cert consumes bootstrap codes and
+    // mints authorityManage + certMint, so that was an admin credential
+    // outliving its purpose, bounded only by the 15-minute TTL.
+    //
+    // Mint-side gating cannot cover this: the code was legitimately issued at
+    // a moment when it was valid. Only the consumer knows the authority has
+    // since gained a way in.
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema } = await import("./auth/principals");
+    if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
+      return false;
+    }
+
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap (
         id         TEXT PRIMARY KEY DEFAULT 'code',
