@@ -39,6 +39,13 @@ jobs:
       # for short-lived publish credentials, and derives the provenance
       # attestation from it. No NPM_TOKEN is stored anywhere.
       id-token: write
+    # Deployment environment, enforced by GitHub OUTSIDE this file. The `if:`
+    # guards below are advisory — anyone who can dispatch this workflow can also
+    # edit it, so a condition in the workflow cannot constrain that same person.
+    # An environment protection rule can: it is repo configuration, and npm binds
+    # the OIDC `environment` claim, so npm itself rejects a token minted outside
+    # it. Configure the same name in npm's "Environment name" field.
+    environment: npm-publish
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # package.json pins the exact pnpm release; the action reads it rather
@@ -152,7 +159,16 @@ jobs:
         working-directory: packages/dpop
         run: npm run test:package
 
+      # TAG-GATED. Previously this ran on `workflow_dispatch` too, while the
+      # tag/version and doc-link guards above were both
+      # `if: startsWith(github.ref, 'refs/tags/')` and therefore SKIPPED on a
+      # dispatch. Net effect: anyone able to dispatch could publish arbitrary
+      # branch content to npm, and the provenance attestation would truthfully
+      # say it came from this workflow — making the bad package MORE credible,
+      # not less. workflow_dispatch stays, so the build and tests can be
+      # exercised without publishing; it just cannot publish any more.
       - name: Publish (OIDC trusted publishing, no stored token)
+        if: startsWith(github.ref, 'refs/tags/')
         working-directory: packages/dpop
         run: npm publish --access public --provenance
 
@@ -160,7 +176,12 @@ jobs:
       # nothing ever checked that provenance actually landed — a silently
       # ignored flag looks identical to a working one. This step turns that
       # class of failure into a red build.
+      # Same gate as Publish. Without it a dispatch would query the registry for
+      # a version this run never published — and PASS if that version happens to
+      # already be attested from an earlier release, reporting success for work
+      # it did not do.
       - name: Verify provenance actually landed
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           VERSION="$(node -p "require('./packages/dpop/package.json').version")"
           URL="https://registry.npmjs.org/-/npm/v1/attestations/@agentic-research%2fdpop@${VERSION}"
