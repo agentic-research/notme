@@ -53,6 +53,15 @@
 !schema/codegen/
 !schema/codegen/**
 
+# ADR-010 canonical-encoding fixtures — the cross-implementation gate signet
+# and ley-line-open consume (notme-e9d2b8). .bin included deliberately: the
+# raw canonical bytes ARE the contract.
+!schema/fixtures/
+!schema/fixtures/README.md
+!schema/fixtures/*.json
+!schema/fixtures/*.expected.hex
+!schema/fixtures/*.bin
+
 # Vendored MCP registry schema — the one server.json's `$schema` key names.
 # Vendored rather than fetched so `task version:check` validates offline and in
 # CI without a network dependency, and so a silent upstream edit shows up as a
