@@ -119,40 +119,11 @@ describe("passkey.admin.bootstrap", () => {
   });
 });
 
-describe("passkey.admin.bootstrap-code", () => {
-  it("bootstrap code is 8 chars", () => {
-    // The DO generates crypto.randomUUID().slice(0, 8)
-    const code = crypto.randomUUID().slice(0, 8);
-    expect(code).toHaveLength(8);
-    expect(code).toMatch(/^[0-9a-f]{8}$/);
-  });
-
-  it("bootstrap code is single-use", () => {
-    // Simulates the consume pattern: code exists + not used → valid
-    // After consume: used = 1 → invalid
-    let used = false;
-    const consume = (input: string, stored: string) => {
-      if (used || input !== stored) return false;
-      used = true;
-      return true;
-    };
-
-    const code = "abc12345";
-    expect(consume(code, code)).toBe(true);
-    expect(consume(code, code)).toBe(false); // already consumed
-  });
-
-  it("rejects wrong bootstrap code", () => {
-    let used = false;
-    const consume = (input: string, stored: string) => {
-      if (used || input !== stored) return false;
-      used = true;
-      return true;
-    };
-
-    expect(consume("wrong123", "abc12345")).toBe(false);
-  });
-});
+// Bootstrap-code lifecycle tests live in src/bootstrap-code.do.test.ts,
+// against the REAL SigningAuthority DO (notme-e9f809). The simulations that
+// used to sit here tested local lambdas, not the DO — and one asserted an
+// 8-char code shape the DO has never generated (it stores the full 36-char
+// UUID), documenting behavior that did not exist.
 
 describe("passkey.challenge.single-use", () => {
   it("stores challenge on registration options", async () => {

@@ -13,8 +13,47 @@
 // not been wired into vitest's pool — see notme-c38bb6 (P1, "revocation
 // tests dead since vitest config carved them out").
 
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { type CABundle, bundleCanonical } from "../revocation";
+
+// The ADR-010 cross-implementation fixture gate (notme-e9d2b8). The input
+// bundles and expected canonical bytes live in schema/fixtures/ as
+// language-neutral files so signet (Go) and ley-line-open (Rust) consume the
+// SAME fixtures instead of hand-copying hex between test files — the drift
+// mode that silently breaks signature verification across implementations.
+const FIXTURES = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../../schema/fixtures",
+);
+
+function loadFixture(name: string): {
+  bundle: CABundle;
+  expected: Uint8Array;
+} {
+  const input = JSON.parse(
+    readFileSync(join(FIXTURES, `${name}.json`), "utf-8"),
+  ) as {
+    epoch: number;
+    seqno: number;
+    keys: Record<string, string>;
+    keyId: string;
+    prevKeyId: string;
+    issuedAt: number;
+  };
+  const hex = readFileSync(join(FIXTURES, `${name}.expected.hex`), "utf-8")
+    .trim()
+    .replace(/\s+/g, "");
+  const expected = new Uint8Array(
+    hex.match(/.{2}/g)!.map((b) => parseInt(b, 16)),
+  );
+  // signature is part of the wire type but excluded from the signing input;
+  // fixtures deliberately omit it and the test supplies a decoy to prove
+  // the exclusion.
+  return { bundle: { ...input, signature: "ignored" }, expected };
+}
 
 function makeBundle(overrides: Partial<CABundle> = {}): CABundle {
   return {
@@ -80,26 +119,10 @@ describe("bundleCanonical (CBOR canonical, RFC 8949 §4.2)", () => {
     //     3:map[string][]byte{"kid":{0xab,0xcd}},
     //     4:"kid", 5:"", 6:int64(1234),
     //   })
-    // produces the same 25 bytes. A future bead adds a Go-side test that
-    // emits this fixture; this test then becomes the cross-runtime gate.
-    const bundle: CABundle = {
-      epoch: 1,
-      seqno: 1,
-      keys: { kid: btoa("\xab\xcd") }, // base64-standard of bytes [0xab, 0xcd]
-      keyId: "kid",
-      prevKeyId: "",
-      issuedAt: 1234,
-      signature: "ignored",
-    };
-    const expected = new Uint8Array([
-      0xa6,
-      0x01, 0x01,
-      0x02, 0x01,
-      0x03, 0xa1, 0x63, 0x6b, 0x69, 0x64, 0x42, 0xab, 0xcd,
-      0x04, 0x63, 0x6b, 0x69, 0x64,
-      0x05, 0x60,
-      0x06, 0x19, 0x04, 0xd2,
-    ]);
+    // produces the same 25 bytes. The bytes live in schema/fixtures/ (the
+    // ADR-010 mandated gate, notme-e9d2b8) so the Go/Rust sides consume the
+    // SAME files rather than a hand-copied hex literal.
+    const { bundle, expected } = loadFixture("cabundle-basic");
     expect(bundleCanonical(bundle)).toEqual(expected);
   });
 
@@ -116,30 +139,10 @@ describe("bundleCanonical (CBOR canonical, RFC 8949 §4.2)", () => {
     // Canonical sort puts "b" before "ab" (length 1 < length 2).
     //
     // If sortStringKeysCanonical regresses to plain alphabetical or
-    // skips sorting, this fixture catches it.
-    const bundle: CABundle = {
-      epoch: 1,
-      seqno: 1,
-      keys: { ab: btoa("\x02"), b: btoa("\x01") }, // intentional reverse insertion order
-      keyId: "b",
-      prevKeyId: "",
-      issuedAt: 1234,
-      signature: "",
-    };
-    const expected = new Uint8Array([
-      0xa6,                        // map(6)
-      0x01, 0x01,                  // 1 → 1
-      0x02, 0x01,                  // 2 → 1
-      0x03,                        // 3 → ...
-      0xa2,                        //   map(2)
-      0x61, 0x62,                  //     "b" (length 1, comes FIRST per §4.2)
-      0x41, 0x01,                  //     h'01'
-      0x62, 0x61, 0x62,            //     "ab" (length 2, comes SECOND)
-      0x41, 0x02,                  //     h'02'
-      0x04, 0x61, 0x62,            // 4 → "b"
-      0x05, 0x60,                  // 5 → ""
-      0x06, 0x19, 0x04, 0xd2,      // 6 → 1234
-    ]);
+    // skips sorting, this fixture catches it. JSON key order in the fixture
+    // file is intentionally reversed ("ab" before "b") so a pass can only
+    // come from sorting, never from insertion order.
+    const { bundle, expected } = loadFixture("cabundle-multikey");
     expect(bundleCanonical(bundle)).toEqual(expected);
   });
 });

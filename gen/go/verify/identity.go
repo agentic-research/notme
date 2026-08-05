@@ -26,6 +26,19 @@ import (
 // Identity represents a verified notme bridge cert identity.
 type Identity struct {
 	// URI is the WIMSE identity from the cert SAN (e.g. wimse://notme.bot/gha/owner/repo).
+	//
+	// DISPLAY AND ROUTING ONLY — never authorize on it.
+	//
+	// Its second segment is NOT reliably AuthMethod. For a GHA cert the
+	// path is /gha/<owner>/<repo> while AuthMethod is "gha-oidc"; for a
+	// session-minted cert the segment IS the auth method, percent-encoded
+	// so an issuer-qualified value stays a single segment
+	// (wimse://notme.bot/oidc%3Ahttps%3A%2F%2Fissuer/<subject>). The
+	// segment count differs too — three for GHA, two for session certs.
+	//
+	// So the obvious cross-check, strings.Split(uri.Path, "/")[1] ==
+	// id.AuthMethod, reads as a tamper signal while being wrong in two
+	// different ways at once. Compare AuthMethod. Never split this string.
 	URI string
 
 	// Scopes are the granted capabilities from the cert extensions.
@@ -37,7 +50,15 @@ type Identity struct {
 	// Epoch is the CA epoch at issuance time.
 	Epoch int
 
-	// AuthMethod is how the caller authenticated (gha-oidc, passkey, bootstrap).
+	// AuthMethod is how the caller authenticated: "passkey", "invite",
+	// "bootstrap", "gha-oidc", or "oidc:<issuer>" for an external provider.
+	//
+	// CANONICAL for comparison — this is the raw, unencoded value from the
+	// cert extension, and the one to authorize against. It is DERIVED from
+	// the session that authorized the mint, so it states what actually
+	// happened rather than what the minting route is named: a cert issued
+	// from an invite-authenticated session says "invite", not "passkey"
+	// (notme-ebc9af).
 	AuthMethod string
 
 	// Binding is the hex SHA-256 of both SPKI keys (P-256 || Ed25519).

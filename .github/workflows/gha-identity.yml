@@ -3,7 +3,23 @@ name: GHA Identity Exchange
 # Reusable workflow: one OIDC token → two exchanges.
 #
 #   1. octo-sts  → scoped GitHub App token   (eliminates stored PATs)
-#   2. notme.bot → signed access token        (secretless — no private key on disk)
+#   2. notme.bot → bridge CERT PAIR          (secretless — no private key on disk)
+#
+# OUTPUT SHAPE (corrected 2026-08-05, notme-c0a4aa). This workflow previously
+# declared `notme_token` and `expires_in`, which `action/` has never emitted —
+# it outputs a cert pair plus `expires_at` (action/src/index.ts, action.yml).
+# Both therefore resolved to the empty string for every caller. It went
+# unnoticed because the only caller is test-identity.yml, which is
+# workflow_dispatch-only and asserts nothing, and it last ran green weeks
+# before the action's output shape changed. Changing these outputs is safe
+# precisely because nothing could have been using them: a cross-repo sweep
+# found zero `uses:` consumers, and signet keeps a local copy that already
+# matches the cert-pair interface — signet's copy was RIGHT and this file was
+# wrong.
+#
+# The private keys behind these certs never leave the action's process, which
+# is the point: what crosses the job boundary is public certificate material,
+# useless on its own.
 #
 # Usage:
 #
@@ -22,11 +38,16 @@ name: GHA Identity Exchange
 #         - env:
 #             GH_TOKEN: ${{ needs.identity.outputs.github_token }}
 #           run: gh release download ...
-#         - name: Use notme identity (DPoP-bound)
-#           # NOTE: The DPoP token from the identity job is bound to that job's
-#           # ephemeral keypair. For cross-job usage, each job should run the
-#           # action independently to get its own DPoP keypair + bound token.
-#           # The token alone is proof-of-possession — useless without the key.
+#         - name: Use notme identity
+#           # The certs are public material; the matching private keys stayed
+#           # in the identity job's process and are NOT available here. A job
+#           # that needs to AUTHENTICATE (mTLS, signing, a DPoP-bound token)
+#           # must run the action itself to get its own keypair — the same
+#           # constraint the old note described, and the reason a token output
+#           # would have been the wrong shape even if it had worked.
+#           env:
+#             NOTME_IDENTITY: ${{ needs.identity.outputs.notme_identity }}
+#             NOTME_CERT: ${{ needs.identity.outputs.notme_cert }}
 
 on:
   workflow_call:
@@ -58,12 +79,18 @@ on:
       notme_url:
         description: 'Authority URL for subsequent API calls'
         value: ${{ jobs.exchange.outputs.notme_url }}
-      notme_token:
-        description: 'DPoP-bound access token — useless without the matching proof key'
-        value: ${{ jobs.exchange.outputs.notme_token }}
-      expires_in:
-        description: 'Token lifetime in seconds'
-        value: ${{ jobs.exchange.outputs.expires_in }}
+      notme_cert:
+        description: 'P-256 bridge cert PEM — mTLS transport auth. Public data; useless without the private key, which never leaves the action process.'
+        value: ${{ jobs.exchange.outputs.notme_cert }}
+      notme_signing_cert:
+        description: 'Ed25519 bridge cert PEM — commit signing and APAS attestations. Public data.'
+        value: ${{ jobs.exchange.outputs.notme_signing_cert }}
+      notme_identity:
+        description: 'WIMSE identity URI (wimse://notme.bot/gha/{owner}/{repo})'
+        value: ${{ jobs.exchange.outputs.notme_identity }}
+      expires_at:
+        description: 'Cert expiry, Unix timestamp'
+        value: ${{ jobs.exchange.outputs.expires_at }}
 
 jobs:
   exchange:
@@ -75,8 +102,10 @@ jobs:
     outputs:
       github_token: ${{ steps.octo-sts.outputs.token }}
       notme_url: ${{ steps.signet.outputs.notme_url }}
-      notme_token: ${{ steps.signet.outputs.notme_token }}
-      expires_in: ${{ steps.signet.outputs.expires_in }}
+      notme_cert: ${{ steps.signet.outputs.notme_cert }}
+      notme_signing_cert: ${{ steps.signet.outputs.notme_signing_cert }}
+      notme_identity: ${{ steps.signet.outputs.notme_identity }}
+      expires_at: ${{ steps.signet.outputs.expires_at }}
 
     steps:
       - name: Exchange OIDC → GitHub token (octo-sts)

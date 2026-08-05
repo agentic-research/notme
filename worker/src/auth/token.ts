@@ -13,8 +13,44 @@ import {
 } from "@agentic-research/dpop";
 import { ED25519 } from "../platform";
 
-const ISSUER = "https://auth.notme.bot";
 const TOKEN_LIFETIME_SECONDS = 300; // 5 minutes
+
+/** The documented default when no environment is configured. */
+const DEFAULT_ISSUER = "https://auth.notme.bot";
+
+/**
+ * This deployment's token issuer.
+ *
+ * Replaces a module constant that was used for BOTH minting and verifying.
+ * That made a non-production deployment internally self-consistent while
+ * externally lying: staging advertised `issuer: https://auth-staging...` in
+ * its discovery document (which is env-derived) and then minted tokens
+ * asserting the PRODUCTION issuer, signed with the staging key — an RFC 8414
+ * §2 violation requiring no attacker. Because verification used the same
+ * constant, staging also accepted production-issued tokens on their claims,
+ * failing only on signature, so any staging token-path exercise came back
+ * green while proving nothing about issuer identity (notme-28baf2).
+ *
+ * Mint and verify must move together, which is why `issuer` is now a required
+ * parameter of both rather than a default either can silently inherit.
+ *
+ * Absent vs malformed, as elsewhere in this codebase: absent means "no
+ * environment configured" and yields the production default; malformed means
+ * the operator configured something and got it wrong, and silently issuing
+ * production-issuer tokens from a misconfigured environment is the defect
+ * being closed — so it throws.
+ */
+export function issuerFromEnv(env: { SIGNET_AUTHORITY_URL?: string }): string {
+  if (!env.SIGNET_AUTHORITY_URL) return DEFAULT_ISSUER;
+  const u = new URL(env.SIGNET_AUTHORITY_URL); // throws on malformed
+  if (u.protocol !== "https:" && u.protocol !== "http:") {
+    throw new TypeError(
+      `SIGNET_AUTHORITY_URL must be http(s) to be a token issuer; got ${u.protocol}`,
+    );
+  }
+  if (!u.host) throw new TypeError("SIGNET_AUTHORITY_URL has no host");
+  return u.origin;
+}
 
 export interface MintAccessTokenParams {
   sub: string;
@@ -22,6 +58,11 @@ export interface MintAccessTokenParams {
   audience: string;
   /** JWK thumbprint — if provided, token is DPoP-bound (cnf.jkt). If omitted, token is unbound (Bearer/redirect). */
   jkt?: string;
+  /**
+   * This deployment's issuer — see issuerFromEnv. REQUIRED so no mint site
+   * can inherit a hardcoded one.
+   */
+  issuer: string;
   signingKey: CryptoKey;
   keyId: string;
 }
@@ -50,7 +91,7 @@ function encodeJwtPart(obj: Record<string, unknown>): string {
 export async function mintAccessToken(
   params: MintAccessTokenParams,
 ): Promise<string> {
-  const { sub, scope, audience, jkt, signingKey, keyId } = params;
+  const { sub, scope, audience, jkt, issuer, signingKey, keyId } = params;
 
   const header: Record<string, unknown> = {
     typ: "at+jwt",
@@ -61,7 +102,7 @@ export async function mintAccessToken(
   const iat = Math.floor(Date.now() / 1000);
   const payload: Record<string, unknown> = {
     sub,
-    iss: ISSUER,
+    iss: issuer,
     aud: audience,
     iat,
     nbf: iat,
@@ -96,6 +137,11 @@ export async function mintAccessToken(
 export async function verifyAccessToken(
   token: string,
   publicKey: CryptoKey,
+  /**
+   * This deployment's issuer. REQUIRED: a verifier that defaults its issuer
+   * accepts another environment's tokens on their claims.
+   */
+  issuer: string,
 ): Promise<AccessTokenClaims> {
   const parts = token.split(".");
   if (parts.length !== 3) {
@@ -130,7 +176,7 @@ export async function verifyAccessToken(
     throw new Error("missing exp claim");
   }
   validateClaims(payload, {
-    issuer: ISSUER,
+    issuer,
   });
 
   return {

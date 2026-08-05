@@ -26,7 +26,7 @@ This is wrong as written. Capnp **does** have a canonical form (RFC-style spec a
 
 ### 2. Signing canonicalization differs from signet protocol
 
-Signet's protocol spec (ADR-002 §2.3) and policy-bundle spec (ADR-011) both prescribe **canonical CBOR (RFC 8949 §4.2)** for any signed-bundle structure. Implementation lives at `signet/pkg/revocation/checker.go:168-188`:
+Signet's protocol spec (ADR-002 §2.3) and policy-bundle spec (ADR-011) both prescribe **canonical CBOR (RFC 8949 §4.2)** for any signed-bundle structure. Implementation lives at `signet/pkg/revocation/canonical.go` (`BundleCanonical`); verification is in `checker.go`:
 
 ```go
 message := map[int]interface{}{
@@ -35,8 +35,14 @@ message := map[int]interface{}{
 }
 encMode := cbor.CanonicalEncOptions().EncMode()
 canonical := encMode.Marshal(message)
-ed25519.Verify(trustAnchor, canonical, signature)
+// verified via signet's algorithm registry — NOT a hardcoded ed25519.Verify
 ```
+
+> Citation drift corrected 2026-08-05 (`notme-ea3efc`): this originally cited
+> `checker.go:168-188` and a direct `ed25519.Verify`. The encoder moved to
+> `canonical.go` in signet `ac0a82e`, and verification now dispatches through
+> an algorithm registry that accepts any `crypto.PublicKey` (Ed25519,
+> ML-DSA-44, …) — so this contract is **not** Ed25519-specific.
 
 notme TS canonicalization (currently) at `worker/src/revocation.ts::bundleCanonical()` and the inline duplicate at `worker/src/signing-authority.ts:443-447`:
 
@@ -109,6 +115,17 @@ If/when notme has production deployments with persistent signed bundles that pre
 
 Mandatory CI gate: `schema/fixtures/cabundle-*.bin` + `*.expected.hex`. signet-Go test produces canonical bytes for a known fixture; notme-TS test asserts byte-equality for the same fixture. Failure means a runtime divergence (a bug in `cbor-x`, `fxamacker/cbor`, or the canonical-encoding spec interpretation).
 
+**Status (2026-08-05, `notme-e9d2b8`): SHIPPED on the notme side.**
+[`schema/fixtures/`](../../schema/fixtures/) now holds `cabundle-basic` and
+`cabundle-multikey` as language-neutral `.json` input + `.expected.hex` +
+`.bin`, and `worker/src/__tests__/bundle-canonical.test.ts` consumes them
+instead of an inline hex literal. Signet already has a cross-runtime fixture
+test (`TestBundleCanonical_CrossRuntimeFixture` in
+`pkg/revocation/canonical_test.go`) but pins the bytes locally rather than
+reading these files — repointing it is `signet-0454a2`, and the Rust side is
+`ley-line-open-0466c0`. Until both land, three-way agreement is checked by
+hand-copied constants on two of the three sides.
+
 This catches the kind of drift that produced the original bug — silent JSON-canonical when CBOR-canonical was specified.
 
 ## Consequences
@@ -155,4 +172,4 @@ In-repo references — relative paths since these resolve within notme:
 - [`worker/src/revocation.ts::bundleCanonical`](../../worker/src/revocation.ts) — the canonical-CBOR encoder (shipped in this PR).
 - [`worker/src/signing-authority.ts::generateBundle`](../../worker/src/signing-authority.ts) — the signing-side caller (now imports `bundleCanonical` from `revocation.ts`; the previous inline duplicate was removed).
 - [`worker/src/__tests__/bundle-canonical.test.ts`](../../worker/src/__tests__/bundle-canonical.test.ts) — hand-computed CBOR fixtures (single-key + multi-key) locking the byte shape (shipped in this PR).
-- `schema/fixtures/cabundle-*.bin` — cross-runtime fixture suite **still to be created** (Go-side test produces the same fixture bytes; gates byte-for-byte interop with signet). Tracked as follow-up to this ADR.
+- [`schema/fixtures/`](../../schema/fixtures/) — cross-runtime fixture suite, **created 2026-08-05** (`notme-e9d2b8`). See `schema/fixtures/README.md` for the contract and the two consumer beads (`signet-0454a2`, `ley-line-open-0466c0`).

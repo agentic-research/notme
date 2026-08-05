@@ -134,6 +134,12 @@ describe("RPC surface is an allow-list, not an accident", () => {
         `for this DO is a full-CA capability — confirm the new method is safe ` +
         `in the hands of anyone who obtains one, then update this count.\n` +
         surface.join(", "),
-    ).toBe(41);
+      // 41 → 42: listEpochKeys (notme-a0cff4). Reviewed against the standard
+      // above — it returns epoch, keyId, PUBLIC key bytes and retiredAt, which
+      // is exactly the payload /.well-known/epochs.json serves
+      // unauthenticated. A leaked stub therefore gains nothing a public GET
+      // does not already give, and it exposes no private material, no minting
+      // and no mutation.
+    ).toBe(42);
   });
 });

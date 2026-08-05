@@ -571,12 +571,24 @@ function getConfig(env: any) {
     rateLimitKvTtlSeconds: Number(env.RATE_LIMIT_KV_TTL_SECONDS ?? 3600),
   };
 }
-function getAllowedOwners(env: any): Set<string> {
-  const raw: string = env.GHA_ALLOWED_OWNERS ?? "agentic-research";
+/**
+ * GitHub owners permitted to exchange an OIDC token for a bridge cert.
+ *
+ * NO DEFAULT — an unset or empty value yields the empty set, which refuses
+ * every exchange. It previously defaulted to "agentic-research", so a
+ * deployment that DELETED the variable silently re-supplied the production
+ * org: staging could mint certs for production's org precisely because its
+ * config said nothing (notme-1532eb). An authority that has not declared
+ * whose workflows it trusts must trust none.
+ */
+export function getAllowedOwners(env: {
+  GHA_ALLOWED_OWNERS?: string;
+}): Set<string> {
+  const raw: string = env.GHA_ALLOWED_OWNERS ?? "";
   return new Set(
     raw
       .split(",")
-      .map((s: string) => s.trim().toLowerCase())
+      .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
   );
 }
@@ -750,7 +762,7 @@ async function handleCertGHA(
   }
 
   // Build WIMSE identity URI
-  const identity = `wimse://notme.bot/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
+  const identity = `wimse://${wimseTrustDomain(env)}/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
 
   // Mint cert pair — both certs signed by CA, both carry the same identity + scopes
   let result;
@@ -1447,10 +1459,55 @@ export function authorityHostFromEnv(
 ): string | null {
   if (!signetAuthorityUrl) return null;
   try {
-    return new URL(signetAuthorityUrl).host;
+    const u = new URL(signetAuthorityUrl);
+    // Hostless schemes (file:, data:, about:, mailto:) parse fine and yield
+    // host "". Returning that would collapse the caller's `host ===
+    // authorityHost` check into `host === ""`, which the bare-IP health-probe
+    // path deliberately permits — a fail-OPEN guard. Require http(s) and a
+    // non-empty host so a malformed value fails closed.
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    return u.host || null;
   } catch {
     return null;
   }
+}
+
+/**
+ * The WIMSE trust domain every minted identity is scoped to.
+ *
+ * Derived from SITE_URL, NOT a literal. The literal is why a
+ * staging-minted cert was byte-identical to a production one in the only
+ * field a verifier reads by name: staging has its own CA key but named
+ * itself `wimse://notme.bot/...` all the same, so any consumer that trusts
+ * the trust-domain string — rather than pinning the exact CA key — could be
+ * handed a staging cert asserting a production identity.
+ *
+ * Production is unaffected: SITE_URL is https://notme.bot, so this returns
+ * "notme.bot", exactly the literal it replaces. Staging returns
+ * "staging.notme.bot", which makes every name-based verifier fail closed
+ * without needing to know staging exists.
+ */
+export function wimseTrustDomain(env: { SITE_URL?: string }): string {
+  // ABSENT and MALFORMED are treated differently, deliberately. Absent means
+  // "no environment configured", whose documented default is production —
+  // the value every mint site hardcoded before this existed. Malformed means
+  // the operator configured SOMETHING and got it wrong, and silently
+  // resolving that to the production trust domain would reintroduce exactly
+  // the staging-impersonates-production defect this function removes. So it
+  // throws, and the mint fails, rather than minting under a domain nobody
+  // chose. (authorityHostFromEnv fails closed for the same reason; the two
+  // were briefly inconsistent.)
+  if (!env.SITE_URL) return "notme.bot";
+  const u = new URL(env.SITE_URL); // throws on malformed — intentional
+  if (u.protocol !== "https:" && u.protocol !== "http:") {
+    throw new TypeError(
+      `SITE_URL must be http(s) to derive a WIMSE trust domain; got ${u.protocol}`,
+    );
+  }
+  if (!u.host) {
+    throw new TypeError("SITE_URL has no host; cannot derive a trust domain");
+  }
+  return u.host;
 }
 
 // ── CF Edge Cache helpers ──
@@ -2101,7 +2158,13 @@ export default {
         return handleCertExchange(request, env);
       }
 
-      // POST /cert/passkey — passkey session → bridge cert pair.
+      // POST /cert/passkey — authenticated session → bridge cert pair.
+      //
+      // Named for its primary caller, but it accepts ANY valid session —
+      // passkey, invite (/join), or OIDC (/auth/oidc/login) — and the minted
+      // cert's authMethod + wimse identity are DERIVED from the session's
+      // authMethod, so the cert never claims an authenticator the session
+      // didn't use (notme-ebc9af).
       //
       // The passkey analogue of /cert/gha, and near-identical to it: verify an
       // authenticator, prove possession of the submitted keys, mint the pair.
@@ -2254,13 +2317,34 @@ export default {
             );
           }
 
+          // Provenance is DERIVED from the session, never asserted by the
+          // route: /join sets authMethod "invite" and /auth/oidc/login sets
+          // "oidc:<issuer>", and this route accepts those sessions — so a
+          // hardcoded "passkey" told verifiers a human touched an
+          // authenticator when none did (notme-ebc9af). encodeURIComponent
+          // keeps an issuer-qualified method one URI path segment.
+          //
+          // Validated, not defaulted. verifySessionCookie JSON.parses its
+          // payload with no shape check, so a future issuer that omits
+          // authMethod would otherwise reach the mint as undefined —
+          // stamping the literal "undefined" into a certificate's identity
+          // and extension. Defaulting to "passkey" would be worse: it
+          // re-creates the exact lie notme-ebc9af fixed. A cert that cannot
+          // state its provenance honestly must not be minted.
+          const sessionAuthMethod = session.authMethod;
+          if (
+            typeof sessionAuthMethod !== "string" ||
+            sessionAuthMethod.length === 0
+          ) {
+            return jsonErr("session carries no authMethod", 401);
+          }
           const result = await authority.mintBridgeCertPair({
             subject: session.principalId,
-            identity: `wimse://notme.bot/passkey/${session.principalId}`,
+            identity: `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
             mtlsPublicKeyPem: body.public_keys.mtls,
             signingPublicKeyPem: body.public_keys.signing,
             scopes,
-            authMethod: "passkey",
+            authMethod: sessionAuthMethod,
             ttlMs: 5 * 60 * 1000,
           });
 
@@ -2275,7 +2359,7 @@ export default {
           return Response.json({
             ...result,
             principal_id: session.principalId,
-            auth_method: "passkey",
+            auth_method: sessionAuthMethod,
           });
         } catch (e: any) {
           return jsonErr("passkey cert error: " + e.message, 500);
@@ -2831,6 +2915,44 @@ export default {
       }
 
       // GET /.well-known/jwks.json — Ed25519 public key for token verification
+      // GET /.well-known/epochs.json — every epoch's signing key, current
+      // and retired, so a THIRD PARTY can verify history rather than only the
+      // present (notme-a0cff4).
+      //
+      // jwks.json answers "which key is live now", which is all a verifier of
+      // a FRESH token needs. An auditor holding a receipt or certificate that
+      // names epoch N needs the key that signed THAT epoch — and notme has
+      // retained retired keys since PR #64 (rotate() archives before
+      // deleting) while offering no way to read them. Cloister could only
+      // archive epochs it happened to observe by polling, so a rotation
+      // between polls left that epoch unresolvable even though notme held the
+      // key: the repudiation risk notme-acd503 describes.
+      //
+      // Unauthenticated by design, like jwks.json and the discovery document:
+      // this is public key material, and an auditor is not a principal.
+      // Requiring a credential to verify history would defeat the point.
+      if (pathname === "/.well-known/epochs.json") {
+        const cached = await cacheMatch(request);
+        if (cached) return cached;
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const epochs = await authority.listEpochKeys();
+        const resp = Response.json(
+          { epochs },
+          {
+            headers: {
+              // Short max-age: a rotation adds an entry, and an auditor
+              // fetching just after one should not be told the epoch is
+              // unknown. The set only ever grows, so a stale copy is
+              // incomplete rather than wrong.
+              "Cache-Control": "public, max-age=60",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+        return cachePut(request, resp);
+      }
+
       if (pathname === "/.well-known/jwks.json") {
         const cached = await cacheMatch(request);
         if (cached) return cached;

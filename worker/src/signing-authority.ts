@@ -35,6 +35,40 @@ interface SigningAuthorityEnv {
   CA_BUNDLE_CACHE?: KVNamespace;
   NOTME_KEY_STORAGE?: string;
   NOTME_KEK_SECRET?: string;
+  /**
+   * This deployment's authority origin. Tokens minted here carry it as `iss`
+   * (notme-28baf2) — a DO that hardcoded the issuer made staging assert the
+   * production one while signing with the staging key.
+   */
+  SIGNET_AUTHORITY_URL?: string;
+}
+
+/**
+ * The self-signed CA certificate's subject DN.
+ *
+ * Production keeps the exact historical literal, because the CA cert is
+ * generated once per authority and anything pinning the existing subject must
+ * keep matching. A NON-production authority gets its host appended, so a
+ * verifier inspecting the issuing CA can tell the two apart — previously both
+ * environments minted "CN=signet-authority,O=notme" byte-identically, and the
+ * only difference between a staging cert and a production one was which key
+ * signed it (notme-1532eb).
+ *
+ * Takes effect only for NEWLY created authorities: the CA cert is created once
+ * and stored, so an existing staging DO keeps its production-shaped subject
+ * until recreated.
+ */
+export function caSubjectForEnv(env: { SIGNET_AUTHORITY_URL?: string }): string {
+  const PRODUCTION_SUBJECT = "CN=signet-authority,O=notme";
+  if (!env.SIGNET_AUTHORITY_URL) return PRODUCTION_SUBJECT;
+  let host: string;
+  try {
+    host = new URL(env.SIGNET_AUTHORITY_URL).host;
+  } catch {
+    return PRODUCTION_SUBJECT;
+  }
+  if (!host || host === "auth.notme.bot") return PRODUCTION_SUBJECT;
+  return `CN=signet-authority ${host},O=notme`;
 }
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
@@ -511,7 +545,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .reduce((s, b) => s + b.toString(16).padStart(2, "0"), "");
 
     const cert = await X509CertificateGenerator.createSelfSigned({
-      name: "CN=signet-authority,O=notme",
+      name: caSubjectForEnv(this.env),
       notBefore: now,
       notAfter,
       signingAlgorithm: ED25519,
@@ -570,8 +604,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     jkt: string; // JWK thumbprint of the DPoP proof key
   }): Promise<string> {
     const { signingKey, keyId } = await this.getOrCreateSigningKey();
-    const { mintAccessToken } = await import("./auth/token");
+    const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
+      issuer: issuerFromEnv(this.env),
       sub: params.sub,
       scope: params.scope,
       audience: params.audience,
@@ -675,6 +710,70 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * than an error: an auditor must be able to distinguish "notme does not have
    * this" from a transport failure.
    */
+  /**
+   * Every epoch's signing key — current and retired — for third-party
+   * historical verification (notme-a0cff4).
+   *
+   * getEpochPublicKey answers for ONE epoch a caller already knows about. An
+   * auditor holding a receipt or cert from an arbitrary epoch, or a consumer
+   * backfilling an archive, needs the SET: cloister previously populated its
+   * epoch index only from what it happened to observe while polling, so a
+   * rotation between polls left that epoch permanently unresolvable even
+   * though notme still held the key.
+   *
+   * Returns PUBLIC key material only, ascending by epoch. Safe to serve
+   * unauthenticated — it is exactly what gets published — which is also why
+   * it is safe on the RPC surface.
+   */
+  async listEpochKeys(): Promise<
+    Array<{
+      epoch: number;
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }>
+  > {
+    this.#ensureSchema();
+
+    const retired = this.ctx.storage.sql
+      .exec(
+        "SELECT epoch, key_id, public_raw, retired_at FROM retired_keys ORDER BY epoch ASC",
+      )
+      .toArray() as Array<{
+      epoch: number;
+      key_id: string;
+      public_raw: string;
+      retired_at: number;
+    }>;
+
+    const out: Array<{
+      epoch: number;
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }> = retired.map((r) => ({
+      epoch: r.epoch,
+      keyId: r.key_id,
+      publicRawB64: r.public_raw,
+      retiredAt: r.retired_at,
+    }));
+
+    // The live epoch is not in retired_keys — it has not been retired.
+    const current = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    const currentEpoch = current[0]?.epoch;
+    if (typeof currentEpoch === "number") {
+      out.push({
+        epoch: currentEpoch,
+        keyId: this.#getKeyId(),
+        publicRawB64: await this.getPublicKeyRawB64(),
+        retiredAt: null,
+      });
+    }
+    return out;
+  }
+
   async getEpochPublicKey(
     epoch: number,
   ): Promise<{
@@ -1036,8 +1135,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     audience: string;
   }): Promise<string> {
     const { signingKey, keyId } = await this.getOrCreateSigningKey();
-    const { mintAccessToken } = await import("./auth/token");
+    const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
+      issuer: issuerFromEnv(this.env),
       sub: params.sub,
       scope: params.scope,
       audience: params.audience,
@@ -1403,6 +1503,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   // Reset passkey data — for when credentials are corrupted (e.g. userId mismatch bug)
+  //
+  // THIS IS THE ONLY CREDENTIAL-REMOVAL PATH IN THE WORKER. Nothing else
+  // deletes from passkey_credentials, federated_identities, principals, or
+  // invites. Two invariants currently rest on that being true:
+  //
+  //   1. The known gap in #hasAuthenticator — that it does not count
+  //      outstanding invites — is UNREACHABLE, because reaching "no
+  //      authenticator but a live authorityManage invite" requires losing a
+  //      credential, which requires this method, which requires consuming a
+  //      bootstrap code, which requires already having no authenticator. The
+  //      transition is circular (notme-2131e8).
+  //   2. Rotating the session secret below is sufficient to revoke sessions,
+  //      because no other route can orphan one.
+  //
+  // ADDING A SECOND CREDENTIAL-REMOVAL PATH — an admin "revoke device"
+  // route, an account deletion, a principal-removal API — BREAKS BOTH. Such
+  // a path must also revoke outstanding invites and rotate the session
+  // secret, or #hasAuthenticator must start counting invites.
   async resetPasskeyData(): Promise<{ deleted: number }> {
     const { ensurePasskeySchema } = await import("./auth/passkey");
     ensurePasskeySchema(this.ctx.storage.sql);
@@ -1413,9 +1531,51 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec("DELETE FROM passkey_credentials");
     this.ctx.storage.sql.exec("DELETE FROM passkey_users");
     this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
+
+    // Rotate the session secret, invalidating every cookie issued before
+    // this reset. Without it a reset revoked NOTHING: the secret was minted
+    // once and never rotated, so sessions survived their credentials for the
+    // full 24h TTL. A deployer who reset while logged in therefore left an
+    // authority with no authenticator but a live admin session — the state
+    // in which getOrCreateBootstrapCode re-arms, mistakenly, for an
+    // authority that still has a working administrator.
+    const rotated = new Uint8Array(32);
+    crypto.getRandomValues(rotated);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_config (
+        id     TEXT PRIMARY KEY DEFAULT 'session',
+        secret TEXT NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO session_config (id, secret) VALUES ('session', ?)",
+      btoa(String.fromCharCode(...rotated)),
+    );
     // Mark bootstrap as used — do NOT delete it.
-    // A new code only appears on fresh DO instantiation, not after reset.
-    // This prevents: know code → reset → new code → reset → infinite wipe loop.
+    //
+    // Since notme-976385 a new code CAN appear after a reset: this wipe
+    // removes every passkey credential, so hasAuthenticator() goes false and
+    // getOrCreateBootstrapCode() re-arms rather than leaving the authority
+    // permanently unadministrable. The wipe-loop this comment used to claim
+    // was structurally impossible is instead bounded by what the loop yields:
+    // the regenerated code never crosses the HTTP boundary (the only caller
+    // discards it and answers 401), so an attacker who knows a burned code
+    // can still only wipe — never read the replacement — and gains no
+    // capability from repeating it.
+    // CREATE IF NOT EXISTS before the UPDATE: on an authority where
+    // getOrCreateBootstrapCode has never run, this table does not exist and
+    // the UPDATE threw SQLITE_ERROR. Masked in practice because the register
+    // flow creates the table first, so only a reset on a genuinely untouched
+    // authority hit it — which is exactly when an operator is least able to
+    // interpret a raw SQL error.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap (
+        id         TEXT PRIMARY KEY DEFAULT 'code',
+        code       TEXT NOT NULL,
+        used       INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
     this.ctx.storage.sql.exec(
       "UPDATE bootstrap SET used = 1 WHERE id = 'code'",
     );
@@ -1426,7 +1586,80 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Generated on first call, deleted after first passkey registration.
   // Only visible to the deployer (via wrangler tail / console).
 
+  /**
+   * Can anyone actually authenticate to this authority?
+   *
+   * NOT `principalCount`. The primary deployer flow — registerPasskey — writes
+   * `passkey_users` + `passkey_credentials` and never creates a `principals`
+   * row (see worker/src/auth/passkey.ts), so a principals-only predicate
+   * reports "nobody is here" on the exact configuration that means "the
+   * administrator is here", and would re-arm the bootstrap gate for an
+   * authority that already has an admin. Adversarial review of PR #71 caught
+   * this; the first version of bootstrap-code.do.test.ts missed it because
+   * every test established the admin via createPrincipalWithCapabilities,
+   * which is the one path that DOES write principals.
+   *
+   * Conversely a bare `principals` row — which is what POST /cert bootstrap
+   * creates — is a revocation target, not a way in: it carries no credential
+   * and no federated identity, and no HTTP route turns a bridge cert into a
+   * session. Counting it as "someone is here" would strand the deployer with
+   * an authority nobody can interactively administer, which is the very
+   * failure notme-976385 exists to prevent.
+   *
+   * So the predicate is authenticators: a passkey credential, or a linked
+   * federated identity. Session cookies are the third population, handled at
+   * the source instead — resetPasskeyData rotates the session secret, so a
+   * wipe leaves no valid cookie for this to have to count.
+   *
+   * IF YOU ADD A LOGIN PATH, COUNT IT HERE. `findByProvider` in
+   * auth/connections.ts is the near miss to watch: it is a
+   * provider→credential lookup that reads like a login path and is currently
+   * called only from tests. Wiring it to a route makes `connections` a
+   * fourth table this predicate must include.
+   *
+   * Synchronous by construction — the callers' schema-ensure imports are
+   * passed in — so the caller's read-check-write stays free of `await` and
+   * this cannot return a pre-yield snapshot.
+   *
+   * `#`-private, NOT TypeScript `private`: this class is RPC-reachable, and
+   * TS `private` is erased at build time, so a `private` helper stays
+   * callable on any stub someone obtains — a full-CA capability. The
+   * rpc-surface.do.test.ts allow-list caught exactly that on the first
+   * version of this method.
+   */
+  #hasAuthenticator(
+    ensurePasskeySchema: (sql: any) => void,
+    ensurePrincipalSchema: (sql: any) => void,
+  ): boolean {
+    const sql = this.ctx.storage.sql;
+    ensurePasskeySchema(sql);
+    const creds = sql
+      .exec("SELECT COUNT(*) as c FROM passkey_credentials")
+      .toArray() as Array<{ c: number }>;
+    if ((creds[0]?.c ?? 0) > 0) return true;
+
+    ensurePrincipalSchema(sql);
+    const federated = sql
+      .exec("SELECT COUNT(*) as c FROM federated_identities")
+      .toArray() as Array<{ c: number }>;
+    return (federated[0]?.c ?? 0) > 0;
+  }
+
   async getOrCreateBootstrapCode(): Promise<string | null> {
+    // Only the IMPORTS are hoisted, not the predicate. `await import(...)`
+    // is a yield point, and one between reading `used` and the DELETE/INSERT
+    // below let two concurrent callers each regenerate and log a distinct
+    // code, only the last of which is live — two apparently-valid admin
+    // codes in the log at exactly the moment that matters.
+    //
+    // Evaluating the predicate up here instead would trade that for a stale
+    // snapshot: a registration committing between the counts and the resume
+    // would re-arm an authority that just gained an admin. The counts are
+    // synchronous, so running them inline below keeps the whole
+    // read-check-write free of `await` and reads current state.
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema } = await import("./auth/principals");
+
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap (
         id         TEXT PRIMARY KEY DEFAULT 'code',
@@ -1440,14 +1673,33 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray() as Array<{ code: string; used: number; created_at: string }>;
 
     if (rows.length > 0) {
-      if (rows[0]!.used) return null;
-      // Expire after 15 minutes
-      const created = new Date(rows[0]!.created_at + "Z").getTime();
-      const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
-      if (Date.now() - created > BOOTSTRAP_TTL_MS) {
+      if (rows[0]!.used) {
+        // A consumed code stays consumed on an authority someone can log in
+        // to. But three routes can burn it (register/options,
+        // /auth/passkey/reset, POST /cert) and only registration establishes
+        // a way in — so an authority could be permanently stranded with no
+        // administrator and no way to ever create one (notme-976385). While
+        // NOBODY can authenticate, regenerate.
+        //
+        // This does not reopen the wipe-loop the reset path guards against:
+        // the new code is a fresh crypto.randomUUID() that never crosses the
+        // HTTP boundary (the caller discards it and answers 401), so knowing
+        // the burned code buys an attacker nothing it did not already have.
+        if (
+          this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)
+        ) {
+          return null;
+        }
         this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
       } else {
-        return rows[0]!.code;
+        // Expire after 15 minutes
+        const created = new Date(rows[0]!.created_at + "Z").getTime();
+        const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
+        if (Date.now() - created > BOOTSTRAP_TTL_MS) {
+          this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
+        } else {
+          return rows[0]!.code;
+        }
       }
     }
 
