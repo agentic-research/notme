@@ -242,6 +242,26 @@ describe("authMethod provenance (notme-ebc9af)", () => {
     expect(body.identity).not.toContain("/passkey/");
   });
 
+  it("refuses a session with no authMethod rather than stamping a placeholder", async () => {
+    // verifySessionCookie JSON.parses the payload with no shape validation,
+    // so a future issuer that forgets authMethod would reach the mint with
+    // undefined. Defaulting to "passkey" would re-create the exact lie
+    // notme-ebc9af fixed; stamping String(undefined) puts the literal
+    // "undefined" in a certificate. Fail closed instead.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("default"),
+    );
+    const secret = await stub.getSessionSecret();
+    const cookie = await createSessionCookie(
+      { principalId: "principal-passkey-test", scopes: ["bridgeCert"] } as any,
+      secret,
+    );
+    const res = await post(await mintRequest(cookie), cookie);
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    const body = (await res.json()) as any;
+    expect(JSON.stringify(body)).not.toContain("undefined");
+  });
+
   it("an oidc session's cert carries the issuer-qualified method, URI-encoded", async () => {
     const method = "oidc:https://accounts.example";
     const cookie = await sessionCookie(["bridgeCert"], method);

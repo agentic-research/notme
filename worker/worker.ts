@@ -2266,7 +2266,21 @@ export default {
           // hardcoded "passkey" told verifiers a human touched an
           // authenticator when none did (notme-ebc9af). encodeURIComponent
           // keeps an issuer-qualified method one URI path segment.
+          //
+          // Validated, not defaulted. verifySessionCookie JSON.parses its
+          // payload with no shape check, so a future issuer that omits
+          // authMethod would otherwise reach the mint as undefined —
+          // stamping the literal "undefined" into a certificate's identity
+          // and extension. Defaulting to "passkey" would be worse: it
+          // re-creates the exact lie notme-ebc9af fixed. A cert that cannot
+          // state its provenance honestly must not be minted.
           const sessionAuthMethod = session.authMethod;
+          if (
+            typeof sessionAuthMethod !== "string" ||
+            sessionAuthMethod.length === 0
+          ) {
+            return jsonErr("session carries no authMethod", 401);
+          }
           const result = await authority.mintBridgeCertPair({
             subject: session.principalId,
             identity: `wimse://notme.bot/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
