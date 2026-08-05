@@ -842,11 +842,19 @@ async function handlePasskey(
       // First user requires bootstrap code (proves deployer ownership)
       // Everyone else can register freely — gets bridgeCert scope only
       if (result.isFirstUser && !body.bootstrapCode) {
-        await authority.getOrCreateBootstrapCode();
-        return jsonErr(
-          "bootstrap code required — check Worker logs (wrangler tail)",
-          401,
-        );
+        // Branch on the state rather than calling for the side effect. The
+        // "closed" case logs nothing, so the old unconditional message sent
+        // operators hunting for a code that was never minted (notme-addef9).
+        const bootstrap = await authority.getOrCreateBootstrapCode();
+        return bootstrap.status === "issued"
+          ? jsonErr(
+              "bootstrap code required — check Worker logs (wrangler tail)",
+              401,
+            )
+          : jsonErr(
+              "this authority already has an administrator — sign in with a passkey, or ask an admin for an invite",
+              401,
+            );
       }
       if (result.isFirstUser) {
         const valid = await authority.consumeBootstrapCode(body.bootstrapCode!);

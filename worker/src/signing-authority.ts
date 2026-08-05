@@ -71,6 +71,20 @@ export function caSubjectForEnv(env: { SIGNET_AUTHORITY_URL?: string }): string 
   return `CN=signet-authority ${host},O=notme`;
 }
 
+/**
+ * Whether a bootstrap code is available, and if so what it is.
+ *
+ * A bare `string | null` let the caller DISCARD the result: worker.ts called
+ * this for its side effect (mint + log) and then answered "bootstrap code
+ * required — check Worker logs" unconditionally. In the closed case nothing
+ * was logged, so an operator was sent to hunt for a UUID that does not exist
+ * (notme-addef9). Making the two states a discriminated union means a caller
+ * has to look at which one it got.
+ */
+export type BootstrapState =
+  | { status: "issued"; code: string }
+  | { status: "closed" };
+
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 
@@ -1645,7 +1659,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return (federated[0]?.c ?? 0) > 0;
   }
 
-  async getOrCreateBootstrapCode(): Promise<string | null> {
+  async getOrCreateBootstrapCode(): Promise<BootstrapState> {
     // Only the IMPORTS are hoisted, not the predicate. `await import(...)`
     // is a yield point, and one between reading `used` and the DELETE/INSERT
     // below let two concurrent callers each regenerate and log a distinct
@@ -1672,6 +1686,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .exec("SELECT code, used, created_at FROM bootstrap WHERE id = 'code'")
       .toArray() as Array<{ code: string; used: number; created_at: string }>;
 
+    // Gate BOTH branches, not just the consumed one. An UNUSED code minted
+    // before the first administrator existed stayed redeemable afterwards:
+    // the used-branch check below never ran, so this returned the standing
+    // code to any caller. It is TTL-bounded (15 min) and only ever reaches
+    // the logs, but POST /cert consumes bootstrap codes too and would mint
+    // authorityManage+certMint against one — a credential outliving its
+    // purpose. Once anyone can authenticate, bootstrap is closed, full stop.
+    if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
+      return { status: "closed" };
+    }
+
     if (rows.length > 0) {
       if (rows[0]!.used) {
         // A consumed code stays consumed on an authority someone can log in
@@ -1685,11 +1710,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         // the new code is a fresh crypto.randomUUID() that never crosses the
         // HTTP boundary (the caller discards it and answers 401), so knowing
         // the burned code buys an attacker nothing it did not already have.
-        if (
-          this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)
-        ) {
-          return null;
-        }
+        // Reached only when NOBODY can authenticate (guarded above), so a
+        // consumed code means a stranded authority: regenerate.
         this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
       } else {
         // Expire after 15 minutes
@@ -1698,7 +1720,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         if (Date.now() - created > BOOTSTRAP_TTL_MS) {
           this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
         } else {
-          return rows[0]!.code;
+          return { status: "issued", code: rows[0]!.code };
         }
       }
     }
@@ -1719,7 +1741,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         "",
       ].join("\n"),
     );
-    return code;
+    return { status: "issued", code };
   }
 
   async consumeBootstrapCode(code: string): Promise<boolean> {
