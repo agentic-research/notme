@@ -27,7 +27,7 @@ import { ED25519, type Platform } from "./src/platform";
 // No HTTP, no public URL, no CORS, no tokens needed.
 
 // ── Held credentials type ─────────────────────────────────────────────────
-// Per-RPC-session — stored on `this.heldCerts` so concurrent / sequential
+// Per-RPC-session — stored on `this.#heldCerts` so concurrent / sequential
 // callers never see each other's principals. See contract test
 // "authenticate must not leak credentials across RPC sessions".
 type HeldCerts = {
@@ -267,7 +267,13 @@ export class AuthService extends WorkerEntrypoint<any> {
   // RPC-session-scoped credentials. WorkerEntrypoint creates a fresh `this`
   // per RPC session in workerd, so this field is naturally per-caller.
   // DO NOT hoist to module scope — see notme/worker review Finding 1.
-  private heldCerts: HeldCerts | null = null;
+  // `#`-private, NOT TypeScript `private`: this class is RPC-reachable, and
+  // TS `private` is erased at build time, so the field would stay readable on
+  // any stub someone obtains. The runtime mitigations are real — workerd gives
+  // a fresh `this` per RPC session, so a caller sees only their own, and
+  // CryptoKeys are not structured-cloneable — but they are properties of the
+  // RUNTIME, not of the declaration (notme-2154b8).
+  #heldCerts: HeldCerts | null = null;
 
   /**
    * ECMAScript #private, NOT TypeScript `private`.
@@ -373,7 +379,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     // Clear first: if verification throws, the session must not keep whatever
     // it held before. Re-authenticating with a bad cert would otherwise leave
     // the previous identity in place and look like it succeeded.
-    this.heldCerts = null;
+    this.#heldCerts = null;
 
     const derived = await deriveCredentialsFromCerts(
       creds.signingCert,
@@ -381,7 +387,7 @@ export class AuthService extends WorkerEntrypoint<any> {
       caPublicKeyPem,
     );
 
-    this.heldCerts = {
+    this.#heldCerts = {
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
       mtlsKey: creds.mtlsKey,
@@ -406,10 +412,10 @@ export class AuthService extends WorkerEntrypoint<any> {
     headers: Record<string, string>;
     body: string;
   }> {
-    if (!this.heldCerts) {
+    if (!this.#heldCerts) {
       throw new Error("not authenticated — call authenticate() first");
     }
-    if (this.heldCerts.expiresAt <= Math.floor(Date.now() / 1000)) {
+    if (this.#heldCerts.expiresAt <= Math.floor(Date.now() / 1000)) {
       throw new Error("credentials expired — re-authenticate");
     }
 
@@ -421,7 +427,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     }
 
     // Scope check
-    if (!this.heldCerts.scopes.includes("bridgeCert")) {
+    if (!this.#heldCerts.scopes.includes("bridgeCert")) {
       throw new Error("scope insufficient — bridgeCert required for proxy");
     }
 
@@ -444,7 +450,7 @@ export class AuthService extends WorkerEntrypoint<any> {
       JSON.stringify({
         ts: new Date().toISOString(),
         type: "proxy",
-        identity: this.heldCerts.identity,
+        identity: this.#heldCerts.identity,
         destination: request.url,
         method: request.method || "GET",
         scope_checked: "bridgeCert",
@@ -469,7 +475,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     certificate: string;
     identity: string;
   }> {
-    if (!this.heldCerts) {
+    if (!this.#heldCerts) {
       throw new Error("not authenticated — call authenticate() first");
     }
 
@@ -478,7 +484,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     const hasSignScope =
       format === "raw"
         ? true // raw signing doesn't require a specific scope
-        : this.heldCerts.scopes.some((s) => signingScopes.includes(s));
+        : this.#heldCerts.scopes.some((s) => signingScopes.includes(s));
     if (!hasSignScope) {
       throw new Error(
         `scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`,
@@ -487,7 +493,7 @@ export class AuthService extends WorkerEntrypoint<any> {
 
     const signature = await crypto.subtle.sign(
       ED25519,
-      this.heldCerts.signingKey,
+      this.#heldCerts.signingKey,
       payload,
     );
 
@@ -501,21 +507,21 @@ export class AuthService extends WorkerEntrypoint<any> {
       JSON.stringify({
         ts: new Date().toISOString(),
         type: "sign",
-        identity: this.heldCerts.identity,
+        identity: this.#heldCerts.identity,
         format,
         payload_hash: `sha256:${payloadHash}`,
         scope_checked:
           format === "raw"
             ? "none"
-            : signingScopes.find((s) => this.heldCerts!.scopes.includes(s)),
+            : signingScopes.find((s) => this.#heldCerts!.scopes.includes(s)),
         allowed: true,
       }),
     );
 
     return {
       signature,
-      certificate: this.heldCerts.signingCert,
-      identity: this.heldCerts.identity,
+      certificate: this.#heldCerts.signingCert,
+      identity: this.#heldCerts.identity,
     };
   }
 
@@ -527,7 +533,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     expires_at: number;
     authenticated: boolean;
   }> {
-    if (!this.heldCerts) {
+    if (!this.#heldCerts) {
       return {
         identity: "",
         scopes: [],
@@ -537,13 +543,13 @@ export class AuthService extends WorkerEntrypoint<any> {
       };
     }
     return {
-      identity: this.heldCerts.identity,
-      scopes: this.heldCerts.scopes,
+      identity: this.#heldCerts.identity,
+      scopes: this.#heldCerts.scopes,
       certificates: {
-        mtls: this.heldCerts.mtlsCert,
-        signing: this.heldCerts.signingCert,
+        mtls: this.#heldCerts.mtlsCert,
+        signing: this.#heldCerts.signingCert,
       },
-      expires_at: this.heldCerts.expiresAt,
+      expires_at: this.#heldCerts.expiresAt,
       authenticated: true,
     };
   }

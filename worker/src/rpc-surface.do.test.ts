@@ -143,3 +143,37 @@ describe("RPC surface is an allow-list, not an accident", () => {
     ).toBe(42);
   });
 });
+
+// ── Instance fields, not just prototype methods (notme-2154b8) ──────────────
+//
+// The surface walk above reads `Cls.prototype`, which sees METHODS. TypeScript
+// `private` is erased for fields too, and a field lives on the INSTANCE — so a
+// `private` field on an RPC-reachable class is invisible to every assertion in
+// this file while remaining readable on any stub someone obtains.
+//
+// AuthService.heldCerts is the live instance of the pattern. It holds
+// per-session credential state, and the class is reachable by service binding.
+// The mitigations are real — workerd gives a fresh `this` per RPC session, so a
+// caller sees only their own, and CryptoKeys are not structured-cloneable — but
+// they are properties of the RUNTIME, not of the declaration, and the rule this
+// file exists to enforce is about the declaration: on an RPC-reachable class
+// write `#foo`, never `private foo`.
+describe("instance fields are private too, not merely TypeScript-private", () => {
+  it("AuthService exposes no own enumerable state on an instance", async () => {
+    const { AuthService } = await import("../worker");
+    // WorkerEntrypoint's ctor takes (ctx, env); neither is touched here.
+    const instance = new (AuthService as any)({}, {});
+    // ctx and env are WorkerEntrypoint's own, assigned by the base
+    // constructor — unavoidable and not ours to hide. Everything else on the
+    // instance is state WE declared, and must be #private.
+    const FRAMEWORK_OWNED = new Set(["ctx", "env"]);
+    const ours = Object.getOwnPropertyNames(instance).filter(
+      (n) => !FRAMEWORK_OWNED.has(n),
+    );
+    expect(
+      ours,
+      `AuthService instance exposes ${ours.join(", ")} — a TypeScript \`private\` ` +
+        `field is erased and stays readable on a stub. Use #private.`,
+    ).toEqual([]);
+  });
+});
