@@ -327,6 +327,10 @@ tasks:
     deps: [deps:install]
     cmds:
       - pnpm exec tsx scripts/check-sha-pins.ts
+      # A pin can be correctly SHA-formatted and still serve stale code. For
+      # our OWN action that is the only failure mode that matters, and it went
+      # unnoticed for three PRs (notme-28959a).
+      - pnpm exec tsx scripts/check-self-pins.ts
 
   ship:
     desc: "Safe path: preflight → install → check → docs → preview → verify instructions"

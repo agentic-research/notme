@@ -23,6 +23,13 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # check-self-pins.ts resolves the PINNED commit's action/ tree and
+          # compares it to the default branch. The default shallow checkout
+          # (depth 1) has neither, so the check would fail on a missing object
+          # rather than on a stale pin — a false red that teaches people to
+          # ignore it.
+          fetch-depth: 0
 
       # In-repo TS script — parses YAML via the `yaml` npm package and
       # walks the AST. We tried regex-on-YAML first; Copilot caught a
