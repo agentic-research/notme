@@ -7,7 +7,7 @@
 
 **Status:** Accepted (partially superseded by ADR-008 for non-browser surfaces — 2026-05-09)
 **Date:** 2026-04-01
-**Bead:** notme.bot-2b0d41
+**Bead:** none current — the original citation was `notme.bot-2b0d41`, a pre-rename repo prefix that resolves under neither `notme.bot-` nor `notme-`. Dropped rather than guessed at.
 
 > **Supersession note (2026-05-09):** for **non-browser surfaces** (CLI, CI, agent dispatch), the DPoP-bound token wire format defined here has been replaced by the bridge cert pair from ADR-008 (P-256 mTLS + Ed25519 signing). The action's `notme_token` / `notme_jkt` outputs were renamed to `notme_cert` / `notme_signing_cert`; the GHA `/cert/gha` flow now returns `{certificates: {mtls, signing}}` instead of `{token, token_type: "DPoP"}`. See ADR-008's "Migration from current state" table.
 >

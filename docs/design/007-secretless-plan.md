@@ -1,4 +1,11 @@
+<!--
+@doc-check
+@endpoints: GET /cert/gha
+-->
 # Secretless Local Proxy — Implementation Plan
+
+**Status:** Partially executed — see [007-secretless-local-proxy.md](007-secretless-local-proxy.md) for the audited state
+**Note:** shares the number 007 with that doc. This one is the *plan*; that one is the *decision*.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

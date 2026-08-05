@@ -1,4 +1,14 @@
+<!--
+@doc-check
+@endpoints: GET /.well-known/ca-bundle.pem
+-->
 # 009: Identity-Gated Runtime
+
+**Status:** Partially implemented (audited 2026-08-04)
+
+> `proxy/` exists and is tracked. The workerd service-binding topology this
+> doc describes is not fully realised; treat the architecture section as
+> intent, not as a description of the running system.
 
 > One process. Isolated Workers. Service bindings. The agent can't reach the internet. The identity service can.
 

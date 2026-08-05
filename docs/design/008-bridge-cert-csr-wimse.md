@@ -1,4 +1,17 @@
+<!--
+@doc-check
+@types: CertScope
+@endpoints: POST /cert, GET /cert/gha, POST /cert/passkey, POST /token
+-->
 # 008: Bridge Certificate Issuance via Proof-of-Possession Exchange
+
+**Status:** Partially implemented (audited 2026-08-04)
+**Bead:** notme-23219f (open — evolve `/token` to WIMSE WIT+WPT)
+
+> WIMSE *identity strings* are shipped and live (`wimse://notme.bot/gha/...`,
+> `wimse://notme.bot/passkey/...` in `worker.ts`). The WIT+WPT token shape is
+> not — `/token` issues `at+jwt` with DPoP `cnf.jkt` (ADR-006), not WIMSE
+> tokens. Both halves of this doc are real; only one is built.
 
 > Workload identity for AI agents. Composed from WIMSE, X.509, in-toto. No bearer tokens issued.
 

@@ -6,7 +6,7 @@
 
 **Status:** Accepted (2026-08-03)
 **Bead:** notme-2bba44
-**Relates to:** [011-external-oauth-provider.md](011-external-oauth-provider.md) (the public-AS project this is a down payment on), [012-sender-constrained-oidc.md](012-sender-constrained-oidc.md) (why notme refuses to vend bearer identity assertions), THREAT_MODEL.md `token in URL logs`, notme-07204f (the corrected threat-model claim that surfaced this)
+**Relates to:** [011-external-oauth-provider.md](011-external-oauth-provider.md) (the public-AS project this is a down payment on), [017-sender-constrained-oidc.md](017-sender-constrained-oidc.md) (why notme refuses to vend bearer identity assertions), THREAT_MODEL.md `token in URL logs`, notme-07204f (the corrected threat-model claim that surfaced this)
 **Standards:** RFC 6749 §4.1 (authorization code grant), RFC 7636 (PKCE), RFC 8414 §2 (AS metadata omission rules), OAuth 2.0 Security BCP (§4.3.2 — access tokens MUST NOT be transmitted in URI query parameters)
 
 ## Context

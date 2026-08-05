@@ -82,6 +82,45 @@ jobs:
           fi
           echo "version $PKG_VERSION matches tag"
 
+      # README doc links are pinned to the release tag rather than main, so a
+      # reader of a published version sees the docs that shipped with it. npm
+      # renders only README.md — never docs/*.mdx — so those links are the
+      # entire discovery path from the package page, and a stale one silently
+      # serves the wrong version's docs.
+      #
+      # This guard exists because the comment in README.md claimed a check
+      # already enforced this and none did. An unenforced claim in a comment is
+      # the same defect class as `pnpm publish --provenance`: it reads as a
+      # control while nothing runs.
+      - name: README doc links must be pinned to this tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          README=packages/dpop/README.md
+
+          # Any docs link NOT pinned to this exact tag is a failure — including
+          # blob/main, which is the drift this exists to catch.
+          if bad=$(grep -oE "blob/[^/]+/packages/dpop/docs/" "$README" \
+                   | grep -v "blob/${GITHUB_REF_NAME}/" | sort -u); then
+            if [ -n "$bad" ]; then
+              echo "README doc links not pinned to ${GITHUB_REF_NAME}:" >&2
+              echo "$bad" >&2
+              echo "Update them to blob/${GITHUB_REF_NAME}/packages/dpop/docs/" >&2
+              exit 1
+            fi
+          fi
+
+          # And every doc that exists must be linked, or shipping it is pointless
+          # — it reaches the tarball and nothing points a reader at it.
+          for f in packages/dpop/docs/*.mdx; do
+            base=$(basename "$f")
+            grep -q "blob/${GITHUB_REF_NAME}/packages/dpop/docs/${base}" "$README" || {
+              echo "docs/${base} ships but is not linked from README.md" >&2
+              exit 1
+            }
+          done
+          echo "all doc links pinned to ${GITHUB_REF_NAME} and every doc linked"
+
       # npm, not pnpm, and no NODE_AUTH_TOKEN.
       #
       # Two verified defects motivated this (notme-4fa4a5):

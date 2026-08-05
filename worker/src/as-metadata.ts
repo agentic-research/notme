@@ -115,19 +115,33 @@ export function buildAsMetadata(
 ): AsMetadata {
   return {
     issuer: authorityUrl,
-    // authorization_endpoint is DELIBERATELY ABSENT. RFC 8414 §2: "This is
-    // REQUIRED unless no grant types are supported that use the authorization
-    // endpoint." notme supports no such grant type — there is no
-    // authorization-code flow. /authorize exists but renders HTML and issues
-    // no code, so advertising it would point clients at an RFC 6749 §4.1 flow
-    // that isn't implemented. Verified safe: go-oidc does not require it.
+    // authorization_endpoint is DELIBERATELY ABSENT — but note WHY, because
+    // the reason changed. It is no longer "the flow isn't implemented":
+    // ADR-013 shipped RFC 6749 §4.1 + PKCE S256, and /authorize/code issues a
+    // real code that /authorize/redeem exchanges.
+    //
+    // It stays absent because the flow is FIRST-PARTY BY CONSTRUCTION:
+    // ALLOWED_REDIRECT_HOSTS (src/auth/redirect-uri.ts) is an exact-host
+    // allowlist and is the only client registry there is. Advertising the
+    // endpoint invites third-party integration that has no registry and no
+    // consent screen behind it. That is a POLICY constraint, not a truth
+    // constraint — see the note on FORBIDDEN_METADATA_FIELDS below.
+    // Verified safe to omit: go-oidc does not require it.
     token_endpoint: `${authorityUrl}/token`,
     jwks_uri: `${authorityUrl}/.well-known/jwks.json`,
     grant_types_supported: AUTHORITY_GRANT_TYPES,
     // Empty ON PURPOSE, and RFC 8414 §2 is still satisfied (the field is
-    // REQUIRED to be a JSON array, not to be non-empty). notme implements NO
-    // standard OAuth response type: no authorization-code issuance, no
-    // code->token exchange. Listing ["code"] would be a false claim.
+    // REQUIRED to be a JSON array, not to be non-empty).
+    //
+    // CAREFUL: the old justification here was "listing ["code"] would be a
+    // false claim." Since ADR-013 that is no longer true — notme does issue
+    // authorization codes and does exchange them. Listing ["code"] would now
+    // be ACCURATE, and it is withheld anyway, for the same first-party policy
+    // reason as authorization_endpoint above.
+    //
+    // This is the field where the distinction bites hardest, because unlike a
+    // comment this is a PUBLISHED VALUE. Anyone re-deriving it from the stale
+    // reason would conclude the flow is missing and go build it.
     response_types_supported: [],
     // Sourced from @notme/contract's SCOPES — never hand-listed here. That
     // package exists so scope drift fails at compile time in both repos; a
@@ -152,21 +166,65 @@ export function buildAsMetadata(
 }
 
 /**
- * Fields that MUST NOT appear. Their absence is load-bearing: a strict OIDC
- * client fails fast and legibly instead of discovering an "OP", requesting
- * scope=openid, and silently getting no id_token back. Publishing a capability
- * we lack would be worse than publishing nothing — this is a trust substrate.
- * Enforced by test so nobody "helpfully" re-adds them.
+ * Fields withheld because publishing them would be UNTRUE.
+ *
+ * These are permanent. No configuration should ever flip them, because the
+ * thing that makes them wrong is not a deployment choice — a strict OIDC
+ * client would discover an "OP", request scope=openid, and silently get no
+ * id_token back. Publishing a capability we lack is worse than publishing
+ * nothing; this is a trust substrate.
  */
-export const FORBIDDEN_METADATA_FIELDS = [
+export const UNTRUE_METADATA_FIELDS = [
   // Claims an OP capability we lack; unlike the alg list, omitting it breaks
   // nothing, so there is no interop argument for publishing it.
   "subject_types_supported",
-  // RFC 8414 §2 permits omission when no grant type uses it — and none does.
-  "authorization_endpoint",
-  // PKCE (code_challenge/code_verifier) is unimplemented.
-  "code_challenge_methods_supported",
   // Non-standard, read by nothing, and it named the CURVE (Ed25519) where an
   // algorithm belongs. Superseded by id_token_signing_alg_values_supported.
   "algorithms_supported",
+] as const;
+
+/**
+ * Fields withheld by POLICY, not by truth. Publishing these would be accurate
+ * today — that is exactly what makes them a different category.
+ *
+ * ADR-013 shipped RFC 6749 §4.1 + RFC 7636 S256. `/authorize/code` issues a
+ * code, `/authorize/redeem` exchanges it, `packages/dpop` has the client
+ * helpers. So `authorization_endpoint`, `code_challenge_methods_supported`
+ * and `["code"]` in `response_types_supported` are all TRUE statements.
+ *
+ * They stay withheld because publishing them advertises "notme is an OAuth AS
+ * you can integrate with", and behind that advertisement there is still no
+ * client registry and no consent screen. ALLOWED_REDIRECT_HOSTS
+ * (src/auth/redirect-uri.ts) is an exact-host allowlist — it is the whole
+ * registry, and it makes the flow first-party by construction.
+ *
+ * WHY THE SPLIT: everything above is permanent; everything here is a
+ * deployment posture. Keeping both in one list is why the reasons kept
+ * rotting — twice now a comment justified a policy choice with a truth claim
+ * ("PKCE is unimplemented", "listing ['code'] would be a false claim") that
+ * ADR-013 falsified, pointing the next reader at work that was already done.
+ *
+ * WHEN THIS BECOMES CONFIGURABLE (ADR-011): do not add a boolean. A flag can
+ * be flipped by someone who does not have a client registry, which is the one
+ * thing that makes publishing these safe. DERIVE it — emit these fields iff a
+ * registry is configured, so the document describes capability that actually
+ * exists rather than capability someone asserted. That is notme's own
+ * derive-never-receive invariant (notme-6ad276, ADR-016 rule 4) applied to its
+ * own discovery document, which is the one place it has not been applied yet.
+ */
+export const FIRST_PARTY_WITHHELD_FIELDS = [
+  "authorization_endpoint",
+  "code_challenge_methods_supported",
+] as const;
+
+/**
+ * Everything absent from the published document, for the contract test.
+ *
+ * Kept as one export because the test's question is "did this field leak?",
+ * which does not care why. The split above is for the reader deciding whether
+ * a field may ever be added — a question the test cannot answer.
+ */
+export const FORBIDDEN_METADATA_FIELDS = [
+  ...UNTRUE_METADATA_FIELDS,
+  ...FIRST_PARTY_WITHHELD_FIELDS,
 ] as const;
