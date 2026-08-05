@@ -30,7 +30,9 @@ vi.mock("cloudflare:workers", () => ({
   },
 }));
 
-const { authorityHostFromEnv } = await import("../../worker");
+const { authorityHostFromEnv, wimseTrustDomain } = await import(
+  "../../worker"
+);
 
 describe("authorityHostFromEnv", () => {
   it("resolves the production authority URL to its host (parity with sub === 'auth')", () => {
@@ -58,5 +60,27 @@ describe("authorityHostFromEnv", () => {
 
   it("returns null on a malformed URL instead of throwing in the fetch path", () => {
     expect(authorityHostFromEnv("not a url")).toBeNull();
+  });
+});
+
+describe("wimseTrustDomain", () => {
+  it("derives the domain from SITE_URL so staging cannot name production", () => {
+    expect(wimseTrustDomain({ SITE_URL: "https://staging.notme.bot" })).toBe(
+      "staging.notme.bot",
+    );
+  });
+
+  it("returns the production domain when SITE_URL is absent — the documented default", () => {
+    // Absent means "no environment configured", whose default is the value
+    // every mint site hardcoded before this function existed.
+    expect(wimseTrustDomain({})).toBe("notme.bot");
+  });
+
+  it("THROWS on a malformed SITE_URL rather than falling back to production", () => {
+    // The dangerous case: an operator configured something and got it wrong.
+    // Silently resolving that to notme.bot would mint production identities
+    // from a misconfigured environment — the exact defect this removes.
+    expect(() => wimseTrustDomain({ SITE_URL: "not a url" })).toThrow();
+    expect(() => wimseTrustDomain({ SITE_URL: "file:///etc" })).toThrow();
   });
 });

@@ -97,6 +97,19 @@ export async function handleCertExchange(
     }
     principalId = session.principalId;
     grantedScopes = session.scopes;
+    // Same guard as /cert/passkey (worker.ts): provenance is derived from the
+    // session, and a cert that cannot state it honestly must not be minted.
+    // Defaulting to "passkey" here would launder an invite- or OIDC-authed
+    // session into a cert claiming a human touched an authenticator.
+    if (
+      typeof session.authMethod !== "string" ||
+      session.authMethod.length === 0
+    ) {
+      return Response.json(
+        { error: "session carries no authMethod" },
+        { status: 401 },
+      );
+    }
     authMethod = session.authMethod;
   } else if (body.proof.type === "oidc") {
     // OIDC principal lookup not yet wired to DO RPC.
@@ -206,7 +219,14 @@ export async function handleCertExchange(
     }
 
     const { wimseTrustDomain } = await import("../worker");
-    const identity = `wimse://${wimseTrustDomain(env)}/${authMethod}/${principalId}`;
+    // encodeURIComponent, matching /cert/passkey: an issuer-qualified method
+    // ("oidc:https://issuer") contains ':' and '/', which without encoding
+    // split the URI into FIVE path segments instead of three — moving the
+    // subject from index 2 to index 4, so a consumer routing on path position
+    // silently reads the wrong field rather than failing. gen/go/verify's
+    // Identity.URI docs and ADR-008 both state the encoded form as the
+    // contract; this path is why they were not universally true.
+    const identity = `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(authMethod)}/${principalId}`;
 
     let result;
     try {

@@ -1476,12 +1476,26 @@ export function authorityHostFromEnv(
  * without needing to know staging exists.
  */
 export function wimseTrustDomain(env: { SITE_URL?: string }): string {
-  try {
-    const u = new URL(env.SITE_URL || "https://notme.bot");
-    return u.host || "notme.bot";
-  } catch {
-    return "notme.bot";
+  // ABSENT and MALFORMED are treated differently, deliberately. Absent means
+  // "no environment configured", whose documented default is production —
+  // the value every mint site hardcoded before this existed. Malformed means
+  // the operator configured SOMETHING and got it wrong, and silently
+  // resolving that to the production trust domain would reintroduce exactly
+  // the staging-impersonates-production defect this function removes. So it
+  // throws, and the mint fails, rather than minting under a domain nobody
+  // chose. (authorityHostFromEnv fails closed for the same reason; the two
+  // were briefly inconsistent.)
+  if (!env.SITE_URL) return "notme.bot";
+  const u = new URL(env.SITE_URL); // throws on malformed — intentional
+  if (u.protocol !== "https:" && u.protocol !== "http:") {
+    throw new TypeError(
+      `SITE_URL must be http(s) to derive a WIMSE trust domain; got ${u.protocol}`,
+    );
   }
+  if (!u.host) {
+    throw new TypeError("SITE_URL has no host; cannot derive a trust domain");
+  }
+  return u.host;
 }
 
 // ── CF Edge Cache helpers ──
