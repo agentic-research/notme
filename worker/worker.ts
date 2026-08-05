@@ -3133,15 +3133,37 @@ export default {
       }
 
       // Proxy everything else to signet via VPC tunnel (requires VPC_AUTH binding)
+      //
+      // The tunnel fetch is awaited inside a try so a REJECTION lands here
+      // instead of escaping the handler. Unawaited, it propagated and every
+      // unmatched path under the authority host answered with Cloudflare's
+      // error 1101 — a Worker exception, not a routing answer (notme-cb0354,
+      // live in production 2026-08-05 while known routes were healthy).
+      // Staging cannot catch this: with no VPC_AUTH binding it takes the 503
+      // fallthrough below, so the environments diverge exactly at this branch
+      // and a green staging run says nothing about this path.
+      //
+      // The 404 body is CONSTANT deliberately. From here a dead tunnel and a
+      // path that was never routable are the same event — the fetch fails
+      // identically for both — so the honest distinction is unavailable, and
+      // manufacturing one would leak the authority's private route table to
+      // unauthenticated callers. The cause goes to the log, where an operator
+      // can tell an outage from a typo; the caller learns only that nothing
+      // answers here.
       if (env.VPC_AUTH) {
         const originUrl = `http://localhost${pathname}${url.search}`;
-        return env.VPC_AUTH.fetch(
-          new Request(originUrl, {
-            method: request.method,
-            headers: request.headers,
-            body: request.body,
-          }),
-        );
+        try {
+          return await env.VPC_AUTH.fetch(
+            new Request(originUrl, {
+              method: request.method,
+              headers: request.headers,
+              body: request.body,
+            }),
+          );
+        } catch (vpcErr: any) {
+          console.error("[vpc-auth] proxy failed:", pathname, vpcErr?.message);
+          return Response.json({ error: "not_found" }, { status: 404 });
+        }
       }
       return Response.json(
         { error: "auth.notme.bot not yet configured" },

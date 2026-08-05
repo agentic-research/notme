@@ -175,6 +175,19 @@ tasks:
         check_request "passkey-status" "GET" "${AUTH_BASE}/auth/passkey/status" "401" '"error":"unauthorized"'
         check_request "authorize" "GET" "${AUTH_BASE}/authorize" "400" '"error":"redirect_uri required"'
         check_request "token" "POST" "${AUTH_BASE}/token" "400" '"error":"dpop_proof_required"' '{"audience":"https://test"}'
+        # Every check above names a route that exists. Nothing covered the
+        # fallthrough, which is where notme-cb0354 lived: unmatched paths came
+        # back as error 1101 in production for as long as the VPC tunnel was
+        # unhealthy, and the gate stayed green throughout.
+        #
+        # The body pattern is the Worker's own constant 404, which it returns
+        # when the VPC fetch fails. A HEALTHY tunnel would instead hand back
+        # whatever signet answers for an unknown path, so if this check ever
+        # fails on the pattern rather than the status, read it as "the tunnel
+        # came up" and decide there whether signet's 404 shape is acceptable
+        # to expose — do not just relax the assertion. The status is the part
+        # that must never regress: 1101 surfaces as 500.
+        check_request "unmatched-path" "GET" "${AUTH_BASE}/.well-known/not-a-route-$VERIFY_NONCE" "404" '"error":"not_found"'
 
         echo "=== ${SITE_BASE#https://} ==="
         check_request "homepage" "GET" "${SITE_BASE}/" "200" "notme"
