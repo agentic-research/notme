@@ -1,0 +1,15 @@
+{
+  "authority": "https://auth.notme.bot",
+  "bundle_url": "https://auth.notme.bot/.well-known/ca-bundle.pem",
+  "pem_file": "notme-root.pem",
+  "subject": "CN=signet-authority, O=notme",
+  "issuer": "CN=signet-authority, O=notme",
+  "self_signed": true,
+  "serial_number": "d01f2a0a580a92912a0d28d54517d5cf",
+  "key_algorithm": "Ed25519",
+  "spki_sha256": "a2e571d8834225781873fa621ead03393d57dc05ff8379c64755d709018d36a4",
+  "cert_sha256": "c1ddec9df94353d4fdee8817e2b399d251f7ab2645b1a06efeae1d2f7392ae86",
+  "not_before": "2026-03-31T01:44:33Z",
+  "not_after": "2036-03-30T13:44:33Z",
+  "observed_at": "2026-08-05T00:00:00Z"
+}

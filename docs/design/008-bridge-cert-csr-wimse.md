@@ -403,6 +403,15 @@ graph LR
 2. Standard X.509 client cert validation (built into every TLS library)
 3. Its own authorization policy (map identities/scopes to access rules)
 
+> **Pin the root out of band.** Step 1 fetches the CA over TLS from the same
+> host that issued the credential, and the root is self-signed — so on its own
+> that fetch *establishes* trust rather than confirming it. [`trust/`](../../trust/README.md)
+> commits the root certificate and its SPKI SHA-256 so a consumer can pin
+> through git, a channel distributed independently of `auth.notme.bot`, and
+> notice a substituted root instead of accepting it silently. What that still
+> does not cover — issuance transparency and revocation — is notme-907299 and
+> notme-77a024.
+
 **A service does NOT need:**
 - workerd or the notme Worker
 - The notme SDK

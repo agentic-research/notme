@@ -62,6 +62,17 @@
 !schema/fixtures/*.expected.hex
 !schema/fixtures/*.bin
 
+# Committed root trust anchor — the out-of-band copy of the signet root CA a
+# third party pins against, instead of re-establishing trust on every fetch of
+# /.well-known/ca-bundle.pem from the host that issued the credential
+# (notme-8e8836). Same shape as schema/fixtures/ above: re-include the dir so
+# git descends, then allow only the specific files. The certificate itself is
+# a .pem, which the secrets block at the bottom of this file re-ignores — see
+# the exact-path exception there, which MUST stay below it to take effect.
+!trust/
+!trust/README.md
+!trust/*.json
+
 # Vendored MCP registry schema — the one server.json's `$schema` key names.
 # Vendored rather than fetched so `task version:check` validates offline and in
 # CI without a network dependency, and so a silent upstream edit shows up as a
@@ -169,3 +180,16 @@ packages/*/dist/
 *.pem
 *.key
 !melange.rsa.pub
+
+# ── Public trust material: exact paths only ────────────────────────────────
+#
+# The committed root CA is a PUBLIC certificate whose entire purpose is that
+# strangers read it (trust/README.md, notme-8e8836). `*.pem` above matches it,
+# and git applies the LAST matching rule, so the re-include has to sit below
+# the secrets block rather than with the other trust/ allowlist lines.
+#
+# EXACT PATHS ONLY. Not `trust/*.pem`, not `!trust/**` — a glob here would
+# re-arm the hole the block above closes, silently making a private key
+# dropped into trust/ committable. One line per file that is public by
+# definition, and each one is a trust-root change that gets reviewed as such.
+!trust/notme-root.pem
