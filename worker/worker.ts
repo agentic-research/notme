@@ -3165,10 +3165,19 @@ export default {
           return Response.json({ error: "not_found" }, { status: 404 });
         }
       }
-      return Response.json(
-        { error: "auth.notme.bot not yet configured" },
-        { status: 503 },
-      );
+      // Same constant 404 as the VPC-failure branch above, deliberately.
+      //
+      // This used to answer 503 "auth.notme.bot not yet configured", which
+      // made an unmatched path mean two different things depending on whether
+      // a VPC binding happened to exist — so the verify check that is correct
+      // for production failed on staging the moment it was added, and the two
+      // environments disagreed about a response an auditor might rely on.
+      //
+      // It also disclosed deployment state to unauthenticated callers. From
+      // the caller's side the path simply does not resolve; whether an
+      // operator has configured a tunnel is not their business, and is not a
+      // fact worth handing to a stranger.
+      return Response.json({ error: "not_found" }, { status: 404 });
     }
 
     // /auth → canonical URL is auth.notme.bot (302 so BYO deploys can override)

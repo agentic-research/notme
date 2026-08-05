@@ -68,3 +68,32 @@ describe("unmatched authority paths (notme-cb0354)", () => {
     expect(res.status).toBe(200);
   });
 });
+
+describe("the fallthrough is identical WITHOUT a VPC binding (notme-cb0354)", () => {
+  // Staging binds no VPC_AUTH and took a different fallthrough — a 503
+  // "auth.notme.bot not yet configured". Fixing only the VPC branch left the
+  // two environments answering unmatched paths differently, which broke the
+  // verify gate the moment it started asserting the production shape.
+  //
+  // They should not differ. From the caller's side an unmatched path simply
+  // does not resolve; whether the operator has configured a tunnel is not
+  // their business, and saying so tells an unauthenticated stranger about
+  // deployment state. Same constant-404 argument as the VPC branch.
+  it("404s with no VPC_AUTH bound, exactly as it does with a failing one", async () => {
+    const withoutVpc = await get("/.well-known/not-a-route");
+    expect(withoutVpc.status).toBe(404);
+
+    const withFailingVpc = await get("/.well-known/not-a-route", {
+      VPC_AUTH: FAILING_VPC,
+    });
+    expect(withFailingVpc.status).toBe(404);
+    // Byte-identical across the two deployment shapes, so the response does
+    // not disclose which one is serving.
+    expect(await withoutVpc.text()).toBe(await withFailingVpc.text());
+  });
+
+  it("does not disclose configuration state to unauthenticated callers", async () => {
+    const res = await get("/whatever");
+    expect(await res.text()).not.toMatch(/configur/i);
+  });
+});
