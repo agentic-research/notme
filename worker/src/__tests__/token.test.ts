@@ -9,7 +9,7 @@ import { describe, expect, it, beforeAll } from "vitest";
 import { encodeBase64urlNoPadding, decodeBase64urlIgnorePadding } from "@oslojs/encoding";
 
 // Import the functions under test (will fail until implemented)
-import { mintAccessToken, verifyAccessToken } from "../auth/token";
+import { mintAccessToken, verifyAccessToken, issuerFromEnv } from "../auth/token";
 
 // Helper: generate an Ed25519 keypair for testing
 async function generateEd25519Keypair(): Promise<CryptoKeyPair> {
@@ -45,6 +45,7 @@ describe("mintAccessToken", () => {
 
   it("produces valid 3-part JWT", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -63,6 +64,7 @@ describe("mintAccessToken", () => {
 
   it("header has correct typ, alg, kid", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -76,6 +78,7 @@ describe("mintAccessToken", () => {
 
   it("payload has all required claims", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -96,6 +99,7 @@ describe("mintAccessToken", () => {
 
   it("exp is iat + 300", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -108,6 +112,7 @@ describe("mintAccessToken", () => {
   it("cnf.jkt matches provided thumbprint", async () => {
     const thumbprint = "my-custom-thumbprint-value";
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       jkt: thumbprint,
       signingKey,
@@ -120,6 +125,7 @@ describe("mintAccessToken", () => {
 
   it("scope is space-separated string", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       scope: "bridgeCert authorityManage certMint",
       signingKey,
@@ -136,6 +142,7 @@ describe("mintAccessToken", () => {
 
   it("sub matches provided principalId", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       sub: "principal:bob",
       signingKey,
@@ -146,8 +153,9 @@ describe("mintAccessToken", () => {
     expect(payload.sub).toBe("principal:bob");
   });
 
-  it("iss is https://auth.notme.bot", async () => {
+  it("iss is the issuer it was given (production, in this suite)", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -159,6 +167,7 @@ describe("mintAccessToken", () => {
 
   it("aud matches provided audience", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       audience: "https://mcp.rosary.bot",
       signingKey,
@@ -171,6 +180,7 @@ describe("mintAccessToken", () => {
 
   it("nbf equals iat", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -182,6 +192,7 @@ describe("mintAccessToken", () => {
 
   it("jti is a valid UUID", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -214,6 +225,7 @@ describe("verifyAccessToken", () => {
 
   it("accepts valid token", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -264,6 +276,7 @@ describe("verifyAccessToken", () => {
 
   it("rejects tampered payload", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -285,6 +298,7 @@ describe("verifyAccessToken", () => {
 
   it("rejects wrong signing key", async () => {
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       ...defaultParams,
       signingKey,
       keyId,
@@ -303,6 +317,7 @@ describe("mintAccessToken + verifyAccessToken roundtrip", () => {
   it("mint then verify succeeds with matching keypair", async () => {
     const kp = await generateEd25519Keypair();
     const token = await mintAccessToken({
+      issuer: "https://auth.notme.bot",
       sub: "principal:roundtrip",
       scope: "bridgeCert authorityManage",
       audience: "https://mcp.rosary.bot",
@@ -320,5 +335,66 @@ describe("mintAccessToken + verifyAccessToken roundtrip", () => {
     expect(claims.jti).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
     );
+  });
+});
+
+describe("issuer is per-environment, not a module constant (notme-28baf2)", () => {
+  let keys: CryptoKeyPair;
+  beforeAll(async () => {
+    keys = await generateEd25519Keypair();
+  });
+
+  const STAGING = "https://auth-staging.notme.bot";
+  const PROD = "https://auth.notme.bot";
+
+  it("derives the issuer from SIGNET_AUTHORITY_URL", () => {
+    expect(issuerFromEnv({ SIGNET_AUTHORITY_URL: STAGING })).toBe(STAGING);
+  });
+
+  it("falls back to production when unset — the documented default", () => {
+    expect(issuerFromEnv({})).toBe(PROD);
+  });
+
+  it("THROWS on a malformed authority URL rather than defaulting to production", () => {
+    // Silently issuing production-issuer tokens from a misconfigured
+    // environment is the defect this closes; absent is a default, malformed
+    // is an error.
+    expect(() => issuerFromEnv({ SIGNET_AUTHORITY_URL: "not a url" })).toThrow();
+  });
+
+  it("mints a token carrying the issuer it was given, not a hardcoded one", async () => {
+    const token = await mintAccessToken({
+      sub: "principal-1",
+      scope: "bridgeCert",
+      audience: "https://rosary.bot",
+      issuer: STAGING,
+      signingKey: keys.privateKey,
+      keyId: "kid-1",
+    });
+    expect(decodeJwtPart(token.split(".")[1]!).iss).toBe(STAGING);
+  });
+
+  it("REJECTS a token whose issuer is not this environment's", async () => {
+    // The load-bearing half. Before this, staging minted and validated the
+    // same false production issuer, so it was internally self-consistent
+    // while externally lying — and a production token cleared staging's
+    // issuer check, failing only on signature. A staging deployment must
+    // refuse a production-issued token on its claims, not by accident.
+    const prodToken = await mintAccessToken({
+      sub: "principal-1",
+      scope: "bridgeCert",
+      audience: "https://rosary.bot",
+      issuer: PROD,
+      signingKey: keys.privateKey,
+      keyId: "kid-1",
+    });
+    await expect(
+      verifyAccessToken(prodToken, keys.publicKey, STAGING),
+    ).rejects.toThrow();
+    // Same token, same key, correct issuer — accepted, proving the rejection
+    // above is the issuer check and not something incidental.
+    await expect(
+      verifyAccessToken(prodToken, keys.publicKey, PROD),
+    ).resolves.toMatchObject({ sub: "principal-1" });
   });
 });

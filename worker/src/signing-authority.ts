@@ -35,6 +35,12 @@ interface SigningAuthorityEnv {
   CA_BUNDLE_CACHE?: KVNamespace;
   NOTME_KEY_STORAGE?: string;
   NOTME_KEK_SECRET?: string;
+  /**
+   * This deployment's authority origin. Tokens minted here carry it as `iss`
+   * (notme-28baf2) — a DO that hardcoded the issuer made staging assert the
+   * production one while signing with the staging key.
+   */
+  SIGNET_AUTHORITY_URL?: string;
 }
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
@@ -570,8 +576,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     jkt: string; // JWK thumbprint of the DPoP proof key
   }): Promise<string> {
     const { signingKey, keyId } = await this.getOrCreateSigningKey();
-    const { mintAccessToken } = await import("./auth/token");
+    const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
+      issuer: issuerFromEnv(this.env),
       sub: params.sub,
       scope: params.scope,
       audience: params.audience,
@@ -1036,8 +1043,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     audience: string;
   }): Promise<string> {
     const { signingKey, keyId } = await this.getOrCreateSigningKey();
-    const { mintAccessToken } = await import("./auth/token");
+    const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
+      issuer: issuerFromEnv(this.env),
       sub: params.sub,
       scope: params.scope,
       audience: params.audience,
