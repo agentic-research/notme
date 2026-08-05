@@ -17,6 +17,13 @@ import { createSessionCookie } from "./auth/session";
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
 
+// The WIMSE trust domain is DERIVED from SITE_URL, not a literal — a
+// staging or local authority must not mint identities that name production
+// (notme-1532eb). These tests drive the worker in its local configuration,
+// so the expected domain is this origin's host, and asserting the literal
+// "notme.bot" here would pin exactly the confusion the derivation removes.
+const TRUST_DOMAIN = new URL(ORIGIN).host;
+
 function b64u(b: Uint8Array): string {
   return btoa(String.fromCharCode(...b))
     .replace(/\+/g, "-")
@@ -141,7 +148,7 @@ describe("POST /cert/passkey", () => {
     expect(body.certificates.mtls).toContain("BEGIN CERTIFICATE");
     expect(body.certificates.signing).toContain("BEGIN CERTIFICATE");
     expect(body.identity).toBe(
-      "wimse://notme.bot/passkey/principal-passkey-test",
+      `wimse://${TRUST_DOMAIN}/passkey/principal-passkey-test`,
     );
     expect(body.auth_method).toBe("passkey");
     expect(body.expires_at).toBeGreaterThan(0);
@@ -237,7 +244,7 @@ describe("authMethod provenance (notme-ebc9af)", () => {
     const body = (await res.json()) as any;
     expect(body.auth_method).toBe("invite");
     expect(body.identity).toBe(
-      "wimse://notme.bot/invite/principal-passkey-test",
+      `wimse://${TRUST_DOMAIN}/invite/principal-passkey-test`,
     );
     expect(body.identity).not.toContain("/passkey/");
   });
@@ -272,7 +279,7 @@ describe("authMethod provenance (notme-ebc9af)", () => {
     // The identity URI's method segment must stay a SINGLE path segment —
     // ':' and '/' in the issuer are percent-encoded, not structural.
     expect(body.identity).toBe(
-      `wimse://notme.bot/${encodeURIComponent(method)}/principal-passkey-test`,
+      `wimse://${TRUST_DOMAIN}/${encodeURIComponent(method)}/principal-passkey-test`,
     );
   });
 });

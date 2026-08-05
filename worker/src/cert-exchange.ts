@@ -205,7 +205,8 @@ export async function handleCertExchange(
       return Response.json({ error: "Ed25519 proof error: " + e.message }, { status: 401 });
     }
 
-    const identity = `wimse://notme.bot/${authMethod}/${principalId}`;
+    const { wimseTrustDomain } = await import("../worker");
+    const identity = `wimse://${wimseTrustDomain(env)}/${authMethod}/${principalId}`;
 
     let result;
     try {

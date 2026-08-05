@@ -750,7 +750,7 @@ async function handleCertGHA(
   }
 
   // Build WIMSE identity URI
-  const identity = `wimse://notme.bot/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
+  const identity = `wimse://${wimseTrustDomain(env)}/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
 
   // Mint cert pair — both certs signed by CA, both carry the same identity + scopes
   let result;
@@ -1447,9 +1447,40 @@ export function authorityHostFromEnv(
 ): string | null {
   if (!signetAuthorityUrl) return null;
   try {
-    return new URL(signetAuthorityUrl).host;
+    const u = new URL(signetAuthorityUrl);
+    // Hostless schemes (file:, data:, about:, mailto:) parse fine and yield
+    // host "". Returning that would collapse the caller's `host ===
+    // authorityHost` check into `host === ""`, which the bare-IP health-probe
+    // path deliberately permits — a fail-OPEN guard. Require http(s) and a
+    // non-empty host so a malformed value fails closed.
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    return u.host || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * The WIMSE trust domain every minted identity is scoped to.
+ *
+ * Derived from SITE_URL, NOT a literal. The literal is why a
+ * staging-minted cert was byte-identical to a production one in the only
+ * field a verifier reads by name: staging has its own CA key but named
+ * itself `wimse://notme.bot/...` all the same, so any consumer that trusts
+ * the trust-domain string — rather than pinning the exact CA key — could be
+ * handed a staging cert asserting a production identity.
+ *
+ * Production is unaffected: SITE_URL is https://notme.bot, so this returns
+ * "notme.bot", exactly the literal it replaces. Staging returns
+ * "staging.notme.bot", which makes every name-based verifier fail closed
+ * without needing to know staging exists.
+ */
+export function wimseTrustDomain(env: { SITE_URL?: string }): string {
+  try {
+    const u = new URL(env.SITE_URL || "https://notme.bot");
+    return u.host || "notme.bot";
+  } catch {
+    return "notme.bot";
   }
 }
 
@@ -2283,7 +2314,7 @@ export default {
           }
           const result = await authority.mintBridgeCertPair({
             subject: session.principalId,
-            identity: `wimse://notme.bot/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
+            identity: `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
             mtlsPublicKeyPem: body.public_keys.mtls,
             signingPublicKeyPem: body.public_keys.signing,
             scopes,
