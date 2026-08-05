@@ -710,6 +710,70 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * than an error: an auditor must be able to distinguish "notme does not have
    * this" from a transport failure.
    */
+  /**
+   * Every epoch's signing key — current and retired — for third-party
+   * historical verification (notme-a0cff4).
+   *
+   * getEpochPublicKey answers for ONE epoch a caller already knows about. An
+   * auditor holding a receipt or cert from an arbitrary epoch, or a consumer
+   * backfilling an archive, needs the SET: cloister previously populated its
+   * epoch index only from what it happened to observe while polling, so a
+   * rotation between polls left that epoch permanently unresolvable even
+   * though notme still held the key.
+   *
+   * Returns PUBLIC key material only, ascending by epoch. Safe to serve
+   * unauthenticated — it is exactly what gets published — which is also why
+   * it is safe on the RPC surface.
+   */
+  async listEpochKeys(): Promise<
+    Array<{
+      epoch: number;
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }>
+  > {
+    this.#ensureSchema();
+
+    const retired = this.ctx.storage.sql
+      .exec(
+        "SELECT epoch, key_id, public_raw, retired_at FROM retired_keys ORDER BY epoch ASC",
+      )
+      .toArray() as Array<{
+      epoch: number;
+      key_id: string;
+      public_raw: string;
+      retired_at: number;
+    }>;
+
+    const out: Array<{
+      epoch: number;
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }> = retired.map((r) => ({
+      epoch: r.epoch,
+      keyId: r.key_id,
+      publicRawB64: r.public_raw,
+      retiredAt: r.retired_at,
+    }));
+
+    // The live epoch is not in retired_keys — it has not been retired.
+    const current = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    const currentEpoch = current[0]?.epoch;
+    if (typeof currentEpoch === "number") {
+      out.push({
+        epoch: currentEpoch,
+        keyId: this.#getKeyId(),
+        publicRawB64: await this.getPublicKeyRawB64(),
+        retiredAt: null,
+      });
+    }
+    return out;
+  }
+
   async getEpochPublicKey(
     epoch: number,
   ): Promise<{

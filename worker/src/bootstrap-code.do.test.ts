@@ -252,3 +252,57 @@ describe("POST /cert bootstrap persists the admin (notme-92a1b9)", () => {
     );
   });
 });
+
+describe("epoch key index — third-party historical verification (notme-a0cff4)", () => {
+  // A third party auditing a receipt or cert that names epoch N must resolve
+  // which key signed it. Today notme retains retired keys (rotate() archives
+  // before deleting) and getEpochPublicKey() can answer — but it had ZERO
+  // callers and no HTTP surface, so the answer was unreachable to anyone
+  // without a service binding. Cloister could only archive epochs it happened
+  // to observe by polling; a rotation between polls left that epoch
+  // permanently unresolvable even though notme held the key.
+  //
+  // This is the notme half of third-party attestability: publish the epoch →
+  // key mapping so an auditor can verify history, not just the present.
+  it("serves every epoch's signing key, current and retired", async () => {
+    const stub = authority("default");
+    // Establish a key, then rotate twice so there is real history to resolve.
+    const first = await stub.getPublicKeyRawB64();
+    const r1 = await stub.rotate();
+    const r2 = await stub.rotate();
+
+    const res = await worker.fetch(
+      new Request(`${ORIGIN}/.well-known/epochs.json`),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      epochs: Array<{
+        epoch: number;
+        keyId: string;
+        publicRawB64: string;
+        retiredAt: number | null;
+      }>;
+    };
+
+    // Every epoch that ever existed is resolvable, including the two retired
+    // by the rotations above — the case cloister could previously miss.
+    const byEpoch = new Map(body.epochs.map((e) => [e.epoch, e]));
+    expect(byEpoch.size).toBeGreaterThanOrEqual(3);
+    expect(byEpoch.get(r2.epoch)?.retiredAt).toBeNull(); // current
+    expect(byEpoch.get(r1.epoch)?.retiredAt).toBeTypeOf("number"); // retired
+    // The original key is still resolvable two rotations later — the exact
+    // repudiation risk notme-acd503 described.
+    const oldest = [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch)[0]!;
+    expect(oldest.publicRawB64).toBe(first);
+  });
+
+  it("is cacheable and needs no authentication — an auditor is not a principal", async () => {
+    const res = await worker.fetch(
+      new Request(`${ORIGIN}/.well-known/epochs.json`),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Cache-Control")).toContain("max-age");
+  });
+});

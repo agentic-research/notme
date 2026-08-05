@@ -2915,6 +2915,44 @@ export default {
       }
 
       // GET /.well-known/jwks.json — Ed25519 public key for token verification
+      // GET /.well-known/epochs.json — every epoch's signing key, current
+      // and retired, so a THIRD PARTY can verify history rather than only the
+      // present (notme-a0cff4).
+      //
+      // jwks.json answers "which key is live now", which is all a verifier of
+      // a FRESH token needs. An auditor holding a receipt or certificate that
+      // names epoch N needs the key that signed THAT epoch — and notme has
+      // retained retired keys since PR #64 (rotate() archives before
+      // deleting) while offering no way to read them. Cloister could only
+      // archive epochs it happened to observe by polling, so a rotation
+      // between polls left that epoch unresolvable even though notme held the
+      // key: the repudiation risk notme-acd503 describes.
+      //
+      // Unauthenticated by design, like jwks.json and the discovery document:
+      // this is public key material, and an auditor is not a principal.
+      // Requiring a credential to verify history would defeat the point.
+      if (pathname === "/.well-known/epochs.json") {
+        const cached = await cacheMatch(request);
+        if (cached) return cached;
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const epochs = await authority.listEpochKeys();
+        const resp = Response.json(
+          { epochs },
+          {
+            headers: {
+              // Short max-age: a rotation adds an entry, and an auditor
+              // fetching just after one should not be told the epoch is
+              // unknown. The set only ever grows, so a stale copy is
+              // incomplete rather than wrong.
+              "Cache-Control": "public, max-age=60",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+        return cachePut(request, resp);
+      }
+
       if (pathname === "/.well-known/jwks.json") {
         const cached = await cacheMatch(request);
         if (cached) return cached;
