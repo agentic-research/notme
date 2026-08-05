@@ -102,6 +102,10 @@ task worker:versions           # confirm NEW (just uploaded) and OLD (current)
 task worker:canary NEW=<id> OLD=<id> PCT=10
 ```
 
+The same three tasks take `ENV=staging`, so the canary path is **rehearsed
+on staging with the identical commands** that promote production — not a
+staging rehearsal of a different mechanism.
+
 **Soak:** minimum 30 minutes at 10% for routine changes; 24 hours for
 identity-critical changes (auth/, signing-authority, cert-exchange, DPoP).
 During soak: `task worker:verify` (may hit either version — both must hold
@@ -216,9 +220,17 @@ Infrastructure:
   discovery issuer/CA/JWKS all staging-local, no VPC binding. Production
   verify green (12/12) with the parameterized task. Custom-domain DNS
   propagates within minutes (negative-cache lag on first lookup expected).
-- Gradual deployments confirmed available on the account
-  (`task worker:versions` lists uploaded version ids for the production
-  Worker; canary preconditions fail safe without ids).
+- **The canary → rollback cycle was exercised end-to-end on staging**, via
+  the same `ENV=`-parameterized tasks that drive production
+  (notme-c0a37e's deploy/rollback evidence clause):
+  `wrangler versions upload --env staging` → version
+  `d0cc333f` uploaded carrying no traffic → `task worker:canary NEW=d0cc333f
+  OLD=f4f2468c PCT=20 ENV=staging` → split confirmed in
+  `wrangler deployments list` (20%/80%) with all 12 verify checks green
+  *during* the split → `task worker:promote NEW=f4f2468c ENV=staging` →
+  100% back on the old id, 12/12 green. Rollback is the promote command
+  pointed at the old id, demonstrated, not asserted. Preconditions were
+  confirmed to fail safe when a version id is omitted.
 - `task node:preflight` closes notme-8bea0d: the release path now fails
   before install with explicit remediation on an unsupported local Node
   (reproduced + fixed on v25.9.0; CI pins Node 22 and is unaffected).

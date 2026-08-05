@@ -252,33 +252,43 @@ tasks:
       - task: worker:deploy-staging
       - task: worker:verify-staging
 
+  # ENV selects the wrangler environment: unset = production, ENV=staging =
+  # the staging Worker. The SAME three tasks drive both, so the canary path
+  # rehearsed on staging is literally the one that promotes production —
+  # rather than a staging rehearsal of a different command (same reasoning as
+  # worker:verify's AUTH_BASE/SITE_BASE).
   worker:versions:
-    desc: List uploaded production versions (ids for canary/promote/rollback)
+    desc: "List uploaded versions — ids for canary/promote/rollback ([ENV=staging])"
     dir: worker
+    vars:
+      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
     cmds:
-      - pnpm exec wrangler versions list
+      - pnpm exec wrangler versions list {{.ENV_FLAG}}
 
   worker:canary:
-    desc: "Split production traffic: NEW=<version-id> OLD=<version-id> [PCT=10]"
+    desc: "Split traffic: NEW=<version-id> OLD=<version-id> [PCT=10] [ENV=staging]"
     dir: worker
     vars:
       PCT: '{{.PCT | default "10"}}'
+      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
     preconditions:
       - sh: test -n "{{.NEW}}"
         msg: "NEW=<version-id> is required (task worker:versions to list)"
       - sh: test -n "{{.OLD}}"
         msg: "OLD=<version-id> is required — the id traffic falls back to"
     cmds:
-      - pnpm exec wrangler versions deploy "{{.NEW}}@{{.PCT}}%" "{{.OLD}}@{{sub 100 (atoi .PCT)}}%" --yes
+      - pnpm exec wrangler versions deploy "{{.NEW}}@{{.PCT}}%" "{{.OLD}}@{{sub 100 (atoi .PCT)}}%" {{.ENV_FLAG}} --yes
 
   worker:promote:
-    desc: "Route 100% of production traffic to NEW=<version-id>"
+    desc: "Route 100% of traffic to NEW=<version-id> ([ENV=staging])"
     dir: worker
+    vars:
+      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
     preconditions:
       - sh: test -n "{{.NEW}}"
         msg: "NEW=<version-id> is required (task worker:versions to list)"
     cmds:
-      - pnpm exec wrangler versions deploy "{{.NEW}}@100%" --yes
+      - pnpm exec wrangler versions deploy "{{.NEW}}@100%" {{.ENV_FLAG}} --yes
 
   docs:check:
     desc: Verify doc claims against code
