@@ -332,6 +332,42 @@ tasks:
       # unnoticed for three PRs (notme-28959a).
       - pnpm exec tsx scripts/check-self-pins.ts
 
+  action:bundle-check:
+    desc: Rebuild action/dist from source and fail if it differs from what is committed
+    # action/dist/index.js is a BUILD ARTIFACT COMMITTED TO GIT, because
+    # `uses: agentic-research/notme/action@<sha>` executes the checked-in
+    # bundle directly — GitHub does not build it. So the bundle is what runs,
+    # and its sources are only a claim about what runs.
+    #
+    # That gap is not hypothetical here. A pnpm override pinning undici away
+    # from three advisories sat inert for weeks while the committed bundle
+    # still carried the vulnerable copy (notme-28959a): the config looked
+    # correct, `pnpm audit` was clean, and the artifact two repos actually
+    # executed was not. Nothing rebuilt the bundle, so nothing noticed.
+    #
+    # This gate closes that by making the committed artifact reproducible from
+    # its sources on every PR. It is deliberately a DIFF and not a rebuild-and-
+    # commit: a job that silently fixes the bundle would hide the fact that
+    # someone pushed sources and artifact out of step, which is the signal
+    # worth having.
+    deps: [deps:install]
+    cmds:
+      - pnpm --filter ./action run build
+      - |
+        if ! git diff --quiet -- action/dist/index.js; then
+          echo "::error file=action/dist/index.js::action/dist is stale — rebuild it and commit the result"
+          echo
+          echo "The committed bundle does not match its sources. This artifact is"
+          echo "what 'uses: agentic-research/notme/action@<sha>' actually executes,"
+          echo "so a stale bundle ships code nobody reviewed in this PR."
+          echo
+          echo "Fix:  cd action && npm run build && git add -f action/dist/index.js"
+          echo
+          git --no-pager diff --stat -- action/dist/index.js
+          exit 1
+        fi
+        echo "action/dist matches its sources."
+
   ship:
     desc: "Safe path: preflight → install → check → docs → preview → verify instructions"
     cmds:

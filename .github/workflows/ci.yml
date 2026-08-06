@@ -72,6 +72,15 @@ jobs:
 
       - run: task worker:install
       - run: task worker:audit
+
+      # `worker:audit` reads the LOCKFILE; this reads the ARTIFACT. They can
+      # disagree, and did: a pnpm override pinning undici away from three
+      # advisories sat inert while the committed action bundle still carried
+      # the vulnerable copy (notme-28959a). Audit was green throughout, because
+      # audit never looks at action/dist/index.js — which is the file
+      # `uses: agentic-research/notme/action@<sha>` actually executes.
+      - run: task action:bundle-check
+
       - run: task worker:check
       - run: task docs:check
 
