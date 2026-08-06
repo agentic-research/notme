@@ -140,7 +140,16 @@ describe("RPC surface is an allow-list, not an accident", () => {
       // unauthenticated. A leaked stub therefore gains nothing a public GET
       // does not already give, and it exposes no private material, no minting
       // and no mutation.
-    ).toBe(42);
+      //
+      // 42 → 43: getBootstrapState (notme-addef9). Reviewed and SAFER than
+      // what it displaces. It is a pure read returning one of three words —
+      // closed, armed, unconfigured — and carries no code in any variant.
+      // The method it removes from the unauthenticated path,
+      // getOrCreateBootstrapCode, MINTS an admin credential as a side effect
+      // of being called; this one cannot. A leaked stub learns only whether
+      // an authority has an administrator, which /auth/passkey/status
+      // already answers publicly.
+    ).toBe(43);
   });
 });
 

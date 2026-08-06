@@ -36,6 +36,16 @@ interface SigningAuthorityEnv {
   NOTME_KEY_STORAGE?: string;
   NOTME_KEK_SECRET?: string;
   /**
+   * Operator-set first-boot secret (notme-addef9). A SECRET, never a `[vars]`
+   * entry — it grants `authorityManage`, and vars are readable from the
+   * dashboard and printed in deploy output.
+   *
+   * Its purpose is that setting it requires control of the DEPLOYMENT, where
+   * the mechanism it replaces required only the ability to send an
+   * unauthenticated HTTP request and read a log.
+   */
+  BOOTSTRAP_CODE?: string;
+  /**
    * This deployment's authority origin. Tokens minted here carry it as `iss`
    * (notme-28baf2) — a DO that hardcoded the issuer made staging assert the
    * production one while signing with the staging key.
@@ -84,6 +94,36 @@ export function caSubjectForEnv(env: { SIGNET_AUTHORITY_URL?: string }): string 
 export type BootstrapState =
   | { status: "issued"; code: string }
   | { status: "closed" };
+
+/**
+ * The operator-set bootstrap secret, or null.
+ *
+ * Trimmed and length-checked: `wrangler secret put` with an empty or
+ * whitespace value would otherwise arm an authority with a secret that a
+ * caller could guess by sending nothing. A minimum length matters because
+ * this value grants `authorityManage` — the review of notme-976385 already
+ * established that a bootstrap credential is an admin credential.
+ */
+function bootstrapSecret(env: { BOOTSTRAP_CODE?: string }): string | null {
+  const raw = env.BOOTSTRAP_CODE?.trim();
+  return raw && raw.length >= 16 ? raw : null;
+}
+
+/**
+ * What a caller may learn about bootstrap WITHOUT causing anything to happen
+ * (notme-addef9).
+ *
+ * Deliberately carries no code in any variant. This is the answer given to an
+ * unauthenticated request, and the whole point of the split is that asking
+ * cannot produce a credential.
+ */
+export type BootstrapReadState =
+  /** An authenticator exists; bootstrap is over. */
+  | { status: "closed" }
+  /** No authenticator, and no operator has armed one. Nobody can bootstrap. */
+  | { status: "unconfigured" }
+  /** No authenticator, and a bootstrap secret is set. Present it to register. */
+  | { status: "armed" };
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
@@ -1671,6 +1711,40 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return (federated[0]?.c ?? 0) > 0;
   }
 
+  /**
+   * Report bootstrap state WITHOUT minting anything (notme-addef9).
+   *
+   * THE DEFECT THIS REPLACES: the public registration route called
+   * `getOrCreateBootstrapCode()`, so the first unauthenticated request to a
+   * fresh authority CAUSED an admin credential to be minted and logged. The
+   * trigger was therefore never the deployer — any stranger could cause the
+   * mint, and since notme-976385 made regeneration possible while no
+   * authenticator exists, could cause it repeatedly, choosing the moment a
+   * credential appeared in the log.
+   *
+   * The security review judged that acceptable because the code never crosses
+   * the HTTP boundary, so a network-only attacker gains nothing and the
+   * exposure is to whoever reads Workers Logs. That reasoning holds. It was
+   * still a side channel serving as the PRIMARY onboarding path, in a repo
+   * whose entire thesis is no long-lived secret on disk and attestation
+   * instead of stored credentials — and this cycle showed the logs are not
+   * even reliably readable (`wrangler tail` returned nothing for a
+   * known-good 200 in production).
+   *
+   * So: reads are reads. Minting moves behind an operator action — setting
+   * `BOOTSTRAP_CODE`, which requires control of the deployment rather than
+   * merely the ability to send an HTTP request.
+   */
+  async getBootstrapState(): Promise<BootstrapReadState> {
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema } = await import("./auth/principals");
+    if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
+      return { status: "closed" };
+    }
+    // `armed` reports only that a secret EXISTS, never its value or length.
+    return bootstrapSecret(this.env) ? { status: "armed" } : { status: "unconfigured" };
+  }
+
   async getOrCreateBootstrapCode(): Promise<BootstrapState> {
     // Only the IMPORTS are hoisted, not the predicate. `await import(...)`
     // is a yield point, and one between reading `used` and the DELETE/INSERT
@@ -1774,6 +1848,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const { ensurePrincipalSchema } = await import("./auth/principals");
     if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
       return false;
+    }
+
+    // PREFERRED PATH: an operator-set secret (notme-addef9). Checked before
+    // the stored code because it is the one that requires control of the
+    // DEPLOYMENT rather than the ability to read a log, and because on a
+    // fresh authority no stored code exists at all — the public route no
+    // longer mints one.
+    //
+    // Compared timing-safe: this grants authorityManage, so a comparison that
+    // leaked position would let a caller recover it byte by byte.
+    const secret = bootstrapSecret(this.env);
+    if (secret) {
+      const { timingSafeEqual } = await import("./auth/timing-safe");
+      if (await timingSafeEqual(code, secret)) return true;
+      // Fall through rather than returning false. An authority can hold BOTH
+      // an operator secret and a legacy stored code (armed deliberately via
+      // getOrCreateBootstrapCode before this change), and refusing the stored
+      // one here would strand it.
     }
 
     this.ctx.storage.sql.exec(`

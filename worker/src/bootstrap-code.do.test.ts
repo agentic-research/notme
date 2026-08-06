@@ -345,11 +345,21 @@ describe("first-boot 401 must not send operators after a code that was never min
     );
   }
 
-  it("tells the deployer to check the logs when a code WAS minted", async () => {
+  it("tells an UNCONFIGURED authority how to arm itself — and never says 'logs'", async () => {
+    // Was: "check Worker logs (wrangler tail)". That message is gone with the
+    // mechanism behind it (notme-addef9). An unauthenticated request no longer
+    // MINTS anything, so there is no code in a log to go and read — and this
+    // cycle proved the logs are not reliably readable anyway (`wrangler tail`
+    // returned nothing for a known-good 200 in production).
+    //
+    // Asserting the absence of /log/i as well as the presence of the new
+    // instruction: a message that named both paths would leave operators
+    // hunting for a credential that was never created.
     const res = await registerOptions("default");
     expect(res.status).toBe(401);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toMatch(/log/i);
+    expect(body.error).toMatch(/BOOTSTRAP_CODE/);
+    expect(body.error).not.toMatch(/log/i);
   });
 
   it("says the authority already has an administrator when bootstrap is CLOSED", async () => {

@@ -824,19 +824,38 @@ async function handlePasskey(
       // First user requires bootstrap code (proves deployer ownership)
       // Everyone else can register freely — gets bridgeCert scope only
       if (result.isFirstUser && !body.bootstrapCode) {
-        // Branch on the state rather than calling for the side effect. The
-        // "closed" case logs nothing, so the old unconditional message sent
-        // operators hunting for a code that was never minted (notme-addef9).
-        const bootstrap = await authority.getOrCreateBootstrapCode();
-        return bootstrap.status === "issued"
-          ? jsonErr(
-              "bootstrap code required — check Worker logs (wrangler tail)",
+        // A READ, not a mint (notme-addef9). This route is unauthenticated,
+        // so calling getOrCreateBootstrapCode() here meant any stranger's
+        // first request caused an admin credential to be minted and logged —
+        // the trigger was never the deployer, and it could be repeated at a
+        // moment of the caller's choosing.
+        //
+        // Each branch says what the operator should actually DO, and none of
+        // them says "read a secret out of the logs". That path was both the
+        // wrong posture for this repo and unreliable in practice: `wrangler
+        // tail` produced nothing for a known-good 200 in production this
+        // cycle, so the documented recovery could simply fail.
+        const bootstrap = await authority.getBootstrapState();
+        switch (bootstrap.status) {
+          case "armed":
+            return jsonErr(
+              "bootstrap code required — supply the BOOTSTRAP_CODE this deployment was configured with",
               401,
-            )
-          : jsonErr(
+            );
+          case "unconfigured":
+            // Fail closed AND fail informative. An authority nobody can
+            // bootstrap is a recoverable operator error; one that silently
+            // mints a credential into a log is not.
+            return jsonErr(
+              "this authority has no administrator and no bootstrap secret — the deployer must set BOOTSTRAP_CODE (wrangler secret put BOOTSTRAP_CODE) and retry, or bootstrap via GitHub OIDC at /cert/gha",
+              401,
+            );
+          case "closed":
+            return jsonErr(
               "this authority already has an administrator — sign in with a passkey, or ask an admin for an invite",
               401,
             );
+        }
       }
       if (result.isFirstUser) {
         const valid = await authority.consumeBootstrapCode(body.bootstrapCode!);
