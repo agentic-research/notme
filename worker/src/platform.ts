@@ -70,15 +70,55 @@ export function detectKeyStorage(env: Record<string, unknown>): KeyStorageMode {
  * cleartext while the operator believes it is sealed — the exact false sense
  * of security the previous throw existed to prevent.
  */
+/**
+ * Minimum KEK secret length, in characters — ADR-007 §169's "at least 32 hex
+ * characters (128 bits of entropy)".
+ *
+ * The floor is on LENGTH, never on content. An entropy heuristic over an
+ * operator's passphrase is a guess, and one that rejects a legitimate
+ * high-entropy secret is worse than no check at all: the operator's fix is
+ * then to choose a WORSE secret that happens to satisfy the heuristic.
+ */
+const MIN_KEK_SECRET_CHARS = 32;
+
 export function validateKeyStorageConfig(
   mode: KeyStorageMode,
   kekSecret?: string | undefined,
 ): void {
-  if (mode === "encrypted" && !kekSecret) {
+  if (mode !== "encrypted") return;
+
+  if (!kekSecret) {
     throw new Error(
       "FATAL: NOTME_KEY_STORAGE=encrypted but NOTME_KEK_SECRET is unset.\n" +
         "Set the secret, or use NOTME_KEY_STORAGE=ephemeral (local/CI) or " +
         "cf-managed (CF encryption at rest only, key stored as plaintext JWK).\n" +
+        "See docs/design/007-secretless-local-proxy.md.",
+    );
+  }
+
+  // ADR-007 §169 specified this check, and 007-secretless-plan.md §149
+  // specified its test. Neither shipped — this is the one finding in the
+  // documentation audit where the DOCUMENT was right and the implementation
+  // regressed (notme-bed754).
+  //
+  // Why it is not a nicety: `deriveKek` refuses only an EMPTY secret, so
+  // NOTME_KEK_SECRET=weak derives a perfectly usable AES-GCM key and the
+  // authority boots reporting encrypted storage. The operator gets the
+  // APPEARANCE of a sealed CA master key with none of the strength, and
+  // PBKDF2 over a four-character input is brute-forceable offline by anyone
+  // who obtains the ciphertext. A false sense of sealing is the specific
+  // harm the unset-secret throw above already exists to prevent.
+  //
+  // Trimmed before measuring: `wrangler secret put` from a file or a shell
+  // heredoc trivially carries a trailing newline, and letting an invisible
+  // character satisfy an entropy floor is the least debuggable way to fail
+  // this check.
+  if (kekSecret.trim().length < MIN_KEK_SECRET_CHARS) {
+    throw new Error(
+      `FATAL: NOTME_KEK_SECRET must be at least 128 bits (${MIN_KEK_SECRET_CHARS} hex chars).\n` +
+        "It seals the CA master key at rest; a short secret is brute-forceable " +
+        "offline by anyone who obtains the ciphertext.\n" +
+        "Generate one with: openssl rand -hex 32\n" +
         "See docs/design/007-secretless-local-proxy.md.",
     );
   }
