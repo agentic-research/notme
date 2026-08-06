@@ -393,6 +393,17 @@ tasks:
         fi
         echo "action/dist matches its sources."
 
+  worker:await-convergence:
+    desc: "Block until the deployed build reports EXPECT=<sha> ([AUTH_BASE=..] [TIMEOUT=180])"
+    # Promotion is NOT immediate. Measured 2026-08-06: after wrangler reported
+    # 100% on a new version, live traffic ALTERNATED between old and new for
+    # about a minute before settling. worker:verify retries ~10s, shorter than
+    # that window — so ship-prod's deploy→verify could pass against the OLD
+    # build. This closes that gap. See scripts/await-convergence.ts.
+    deps: [deps:install]
+    cmds:
+      - pnpm exec tsx scripts/await-convergence.ts
+
   ship:
     desc: "Safe path: preflight → install → check → docs → preview → verify instructions"
     cmds:
@@ -419,6 +430,9 @@ tasks:
       - task: worker:check
       - task: docs:check
       - task: worker:deploy
+      # Between deploy and verify, because a verify that runs during
+      # convergence can pass against the build being replaced (notme-9f2f79).
+      - task: worker:await-convergence
       - task: worker:verify
 
   worker:build-local:
