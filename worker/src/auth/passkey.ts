@@ -120,7 +120,16 @@ export async function verifyRegistration(
   // Get stored challenge
   const challenges = sql
     .exec(
-      "SELECT challenge FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
+      // Same 5-minute window the AUTHENTICATION lookup enforces below.
+      // Without it a registration challenge stayed valid until the one-hour
+      // sweep — a twelve-fold longer replay window than its sibling, and an
+      // asymmetry between two functions that should agree rather than a
+      // deliberate choice (notme-addef9, audit N5).
+      //
+      // ORDER BY created_at DESC because the select is keyed on user_id and
+      // several challenges can exist: without it the row chosen is arbitrary,
+      // so a stale one could win over the fresh one the caller just requested.
+      "SELECT challenge FROM passkey_challenges WHERE user_id = ? AND type = 'registration' AND created_at > datetime('now', '-5 minutes') ORDER BY created_at DESC",
       userId,
     )
     .toArray() as Array<{ challenge: string }>;
