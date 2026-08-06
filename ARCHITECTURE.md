@@ -16,79 +16,161 @@ Key storage differs by environment: ephemeral (in-memory only, local/CI), cf-man
 
 ## Subsystems
 
-```
-worker.ts                    HTTP routing + CORS + host enforcement
-├── src/signing-authority.ts   SigningAuthority DO — CA key, cert/token minting, passkey state
-│   ├── src/auth/token.ts        JWT mint + verify (Ed25519, 5-min TTL)
-│   ├── src/auth/passkey.ts      WebAuthn registration + authentication
-│   ├── src/auth/principals.ts   Principal/capability/invite management
-│   ├── src/auth/connections.ts  Federated identity linking
-│   ├── src/auth/timing-safe.ts  HMAC-based constant-time comparison
-│   └── src/cert-authority.ts    X.509 bridge cert generation (@peculiar/x509)
-├── src/cert-exchange.ts       Generalized proof → cert pair or token exchange
-├── src/auth/dpop.ts           DPoP proof validation (ES256, RFC 9449)
-├── src/auth/dpop-handler.ts   /token endpoint handler + JWKS builder
-├── src/auth/verify-proof.ts   OIDC + X.509 proof verification (trusted issuer allowlist)
-├── src/auth/session.ts        HMAC session cookies (24h TTL)
-├── src/gha-oidc.ts            GitHub Actions OIDC validation (RS256, Zod schema)
-├── src/platform.ts            Platform abstraction (CacheStore, key storage mode, ED25519)
-└── src/revocation.ts          RevocationAuthority DO — epoch-based CA rotation
+```mermaid
+graph TD
+    classDef entry fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#000
+    classDef kernel fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#000
+    classDef auth fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px,color:#000
+    classDef sep fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px,color:#000
 
-packages/dpop/src/index.ts               Shared SDK — base64url, validateClaims, computeJwkThumbprint
-schema/identity.capnp         Cap'n Proto type definitions (CABundle, GHAClaims, etc.)
-gen/go/                       Go bindings from capnp
+    W["<b>worker.ts</b><br/>HTTP routing, CORS, host enforcement"]:::entry
 
-vault/                        Separate Worker — credential vault (HKDF + AES-GCM envelope encryption)
-action/src/index.ts           GHA action — OIDC → access token (zero secrets)
-packages/                     Container image pipeline (melange + apko, 40MB OCI)
-proxy/src/main.rs             Rust mTLS forward proxy — workerd → bridge cert → upstream.
-                              The bridge cert private key lives only in this process's
-                              memory; workerd Workers call fetch() normally and the proxy
-                              attaches the client cert during the TLS handshake. Listens
-                              on TCP or unix:/path (UDS, owner-only 0600 perms).
+    SA["<b>signing-authority.ts</b><br/>SigningAuthority DO — CA key,<br/>cert/token minting, passkey state<br/><i>the security kernel</i>"]:::kernel
+    RA["<b>revocation.ts</b><br/>RevocationAuthority DO —<br/>epoch rotation, seqno rollback"]:::kernel
+
+    CA["cert-authority.ts<br/>X.509 generation (@peculiar/x509)"]:::auth
+    CX["cert-exchange.ts<br/>proof → cert pair or token"]:::auth
+    POP["auth/pop.ts<br/>proof-of-possession, one verifier<br/>for all three cert routes"]:::auth
+    SC["auth/scope-chain.ts<br/>scopes ⊆ parent — the AUTHORITY bound"]:::auth
+    CK["auth/correlation-key.ts<br/>&lt;principal&gt;/&lt;bridge&gt;/&lt;task&gt;"]:::auth
+    TOK["auth/token.ts + dpop.ts + dpop-handler.ts<br/>Ed25519 JWT, DPoP (RFC 9449), JWKS"]:::auth
+    PK["auth/passkey.ts + session.ts<br/>WebAuthn, HMAC session cookies"]:::auth
+    PR["auth/principals.ts + connections.ts<br/>capabilities, invites, federated identity"]:::auth
+    VP["auth/verify-proof.ts + gha-oidc.ts<br/>OIDC/X.509 proofs, issuer allowlist"]:::auth
+    RC["receipts/<br/>Interlace commitment — canonical CBOR,<br/>validate-then-sign"]:::auth
+    PF["platform.ts<br/>CacheStore, key storage mode, ED25519"]:::auth
+
+    PX["proxy/src/main.rs<br/>Rust mTLS forward proxy —<br/>holds the bridge key in memory"]:::sep
+    AC["action/src/index.ts<br/>GHA action, zero secrets"]:::sep
+    VA["vault/<br/>separate Worker — HKDF + AES-GCM"]:::sep
+    SDK["packages/dpop<br/>shared SDK"]:::sep
+    SCH["schema/identity.capnp → gen/go/<br/>Cap'n Proto + Go bindings"]:::sep
+
+    W --> SA
+    W --> RA
+    W --> CX
+    W --> TOK
+    W --> VP
+    W --> PF
+    SA --> CA
+    SA --> PK
+    SA --> PR
+    SA --> RC
+    CX --> CA
+    CX --> POP
+    W --> POP
+    CX --> SC
+    RC -.->|carries| CK
+    CA -.->|binding| CK
+    AC -->|OIDC + PoP| W
+    PX -->|mTLS| W
+    TOK -.-> SDK
+    AC -.-> SDK
+    SCH -.-> RA
 ```
+
+The DOs are the security kernel: private keys are generated inside `SigningAuthority` and never leave it. Everything else is routing, validation, or encoding.
 
 ## Data flow
 
-### Authentication → token issuance
+### GHA CI flow — OIDC to bridge cert
 
-```
-Agent authenticates (passkey, GHA OIDC, bootstrap code)
-  → worker.ts routes to handler
-    → proof verified (verify-proof.ts or gha-oidc.ts)
-      → SigningAuthority DO mints access token (Ed25519, 5-min TTL)
-        → signing key never leaves DO process memory (extractable:false)
-          → DPoP-bound token returned to agent (proof-of-possession, not bearer)
-```
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as GHA runner
+    participant A as action/src/index.ts
+    participant W as worker.ts
+    participant P as auth/pop.ts
+    participant DO as SigningAuthority DO
 
-### GHA CI flow
-
-```
-GHA runner requests OIDC token (audience: notme.bot)
-  → action/src/index.ts POSTs to /cert/gha with OIDC JWT + DPoP proof
-    → worker.ts validates: RS256 signature, audience, owner allowlist, JTI replay
-      → validates DPoP proof, computes JWK thumbprint
-        → SigningAuthority.mintDPoPToken(jkt) — signs inside DO, binds to caller's key
-          → action outputs: notme_url + notme_token (DPoP-bound, useless without proof key)
+    R->>A: OIDC token (audience notme.bot)
+    A->>A: generate P-256 + Ed25519 keypairs<br/>(extractable:false — private keys never leave)
+    Note over A: proofs sign the binding PRE-IMAGE,<br/>never its digest — WebCrypto ECDSA<br/>hashes internally (notme-a011d2)
+    A->>W: POST /cert/gha — OIDC JWT + SPKIs + PoP proofs
+    W->>W: RS256 signature, audience, owner allowlist, JTI replay
+    W->>P: verifyPopProofs(bindingInput, ...)
+    P-->>W: ok, binding: pre-image | digest
+    W->>DO: mint cert pair
+    DO->>DO: sign inside the DO — CA key never exported
+    DO-->>W: mTLS cert + signing cert (shared binding extension)
+    W-->>A: cert pair + WIMSE identity + expiry
+    A-->>R: certs only — no private key ever written to $GITHUB_OUTPUT
 ```
 
 ### Key lifecycle (ephemeral mode)
 
+```mermaid
+graph LR
+    classDef step fill:#e8f5e9,stroke:#2e7d32,color:#000
+    classDef proof fill:#fff3e0,stroke:#ef6c00,color:#000
+
+    A["workerd starts"]:::step --> B["first request hits<br/>SigningAuthority DO"]:::step
+    B --> C["generateKey('Ed25519',<br/>extractable: false)"]:::step
+    C --> D["key lives in BoringSSL,<br/>not the V8 heap"]:::step
+    D --> E["SQLite holds public SPKI<br/>for JWKS; private_jwk = ''"]:::step
+    E --> F["strings on the .sqlite file<br/>finds no private key — nothing to leak"]:::proof
+    E --> G["workerd exits<br/>→ key dies"]:::step
 ```
-workerd starts
-  → first request hits SigningAuthority DO
-    → crypto.subtle.generateKey("Ed25519", extractable:false)
-      → key lives in BoringSSL, not V8 heap
-        → public SPKI stored in SQLite (for JWKS), private_jwk = "" (empty)
-          → cat *.sqlite | strings | grep '"d"' → nothing
-            → workerd exits → key dies
+
+### Delegation chain — the target shape
+
+`ADR-008` specifies three tiers. Only the outer two are built; the middle tier is unimplemented, which is why task-scoped revocation has no unit (`notme-600df1`, `notme-77a024`).
+
+```mermaid
+graph TD
+    classDef built fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000
+    classDef gap fill:#ffebee,stroke:#c62828,stroke-width:2px,stroke-dasharray:5 4,color:#000
+
+    ROOT["<b>root CA</b><br/>CA=true, pathlen=1<br/>keyCertSign, cRLSign"]:::built
+    BRIDGE["<b>orchestrator bridge</b> — the MACHINE<br/>CA=true, pathlen=0, keyCertSign<br/><i>NOT BUILT — every mint stamps CA=false</i>"]:::gap
+    TASK["<b>agent session</b> — the TASK<br/>CA=false (leaf), digitalSignature<br/><i>no producer until the tier above exists</i>"]:::gap
+    LEAF["<b>bridge cert pair</b> (today)<br/>CA=false — mTLS + signing<br/>issued directly by the root"]:::built
+
+    ROOT -->|"issues today"| LEAF
+    ROOT -.->|"pathlen budget<br/>allocated, unspent"| BRIDGE
+    BRIDGE -.->|"machine delegates<br/>to each task"| TASK
+
+    SCOPES["auth/scope-chain.ts<br/>scopes ⊆ parent<br/><b>AUTHORITY</b> bound (cooperative)"]:::built
+    PATH["pathLenConstraint<br/>RFC 5280 §6.1.4<br/><b>DEPTH</b> bound (intrinsic)"]:::built
+    NAMES["nameConstraints<br/>ADR-008 §299<br/><b>NAMESPACE</b> bound — NOT BUILT"]:::gap
+
+    SCOPES -.-> BRIDGE
+    PATH -.-> BRIDGE
+    NAMES -.-> BRIDGE
 ```
+
+The three bounds are independent and none substitutes for another: scopes bound what a credential may **do**, pathlen bounds how far it may **pass that on**, nameConstraints bounds which identities it may **name**.
 
 ## Security model
 
-**Two enforcement planes:**
-- **Local plane** (workerd) — holds credentials, enforces scope before requests leave
-- **Edge plane** (CF WAF / auth.notme.bot) — validates independently, rate limits, revocation
+**Two enforcement planes**, and the bridge cert is the contract between them — each validates independently, so neither has to trust the other:
+
+```mermaid
+graph LR
+    classDef local fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#000
+    classDef edge fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    classDef seam fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#000
+
+    subgraph LP["LOCAL PLANE (workerd + proxy)"]
+        AG["agent Worker<br/>no globalOutbound —<br/>cannot fetch() at all"]:::local
+        PXY["notme-proxy<br/>holds bridge cert + key<br/>in process memory"]:::local
+        AG -->|service binding only| PXY
+    end
+
+    CERT["<b>bridge cert</b><br/>the seam"]:::seam
+
+    subgraph EP["EDGE PLANE (auth.notme.bot)"]
+        WAF["CF WAF + rate limiters"]:::edge
+        VER["signature, epoch, TTL, scope"]:::edge
+        REV["revocation — epoch + seqno"]:::edge
+    end
+
+    PXY -->|attaches on outbound TLS| CERT
+    CERT --> WAF --> VER --> REV
+```
+
+Because the agent has no `globalOutbound` (ADR-009) and the proxy performs every outbound request, the proxy is a chokepoint the agent cannot route around — which is what lets it stamp an unforgeable correlation key, the way journald attaches `_SYSTEMD_UNIT` rather than trusting a process to report its own.
 
 **Secretless invariants** (verified by adversarial tests):
 1. No plaintext private key on disk
@@ -117,28 +199,33 @@ Detection is automatic via `NOTME_KEY_STORAGE` env var and `detectKeyStorage()`.
 
 | File | Lines | What |
 |------|-------|------|
-| `worker/worker.ts` | ~2100 | HTTP fetch handler (monolith — split planned via notme-9f51fa) |
-| `worker/src/signing-authority.ts` | ~780 | SigningAuthority DO — the security kernel |
-| `worker/src/platform.ts` | ~200 | Platform abstraction + MemoryCache + ED25519 typing constant |
-| `packages/dpop` | ~580 | Shared JWT/crypto SDK |
-| `vault/src/vault.ts` | ~270 | Credential vault DO |
-| `action/src/index.ts` | ~180 | GHA action |
-| `proxy/src/main.rs` | ~390 | mTLS forward proxy (TCP + UDS listen) |
+| `worker/worker.ts` | ~3350 | HTTP fetch handler (monolith — split planned via notme-9f51fa) |
+| `worker/src/signing-authority.ts` | ~2110 | SigningAuthority DO — the security kernel |
+| `proxy/src/main.rs` | ~1030 | mTLS forward proxy (TCP + UDS listen) |
+| `packages/dpop/src/index.ts` | ~1100 | Shared JWT/crypto SDK |
+| `worker/src/platform.ts` | ~210 | Platform abstraction + MemoryCache + ED25519 typing constant |
+| `action/src/index.ts` | ~190 | GHA action |
 
 ## Testing
 
 ```bash
-cd worker && npx vitest run    # 329 tests (unit + adversarial + shared-SDK)
-cd worker && npm run test:do   # 18 real-Durable-Object tests (vitest-pool-workers)
+cd worker && npx vitest run    # 526 tests, 38 files (unit + adversarial + shared-SDK)
+cd worker && npm run test:do   # 122 real-Durable-Object tests, 15 files (vitest-pool-workers)
 bash test-local.sh             # workerd smoke test (endpoints + invariant #1)
-bash test-e2e.sh               # Playwright e2e with virtual authenticator (11 contract tests)
+bash test-e2e.sh               # Playwright e2e with virtual authenticator (contract tests)
 cd ../proxy && cargo test      # Rust tests (listen-addr parser, UDS bind, perms, round-trip)
+task worker:verify             # live endpoint checks against production or staging
 ```
 
 Test categories (worker):
-- **Adversarial** (35 tests): key extraction, token forgery, confused deputy, DPoP injection, JTI replay, scope escalation, error message leaks, mode downgrade
-- **Real-DO** (18 tests, vitest-pool-workers): SigningAuthority rotation grace window + RevocationAuthority seqno rollback/isolation + checkRevocation — boot real workerd + DO SQLite via `runInDurableObject` (`npm run test:do`)
-- **Contract** (11 tests, e2e): discovery shape, JWKS fields, CA cert PEM, error response codes, passkey registration + authenticated access
-- **Unit** (237 worker + 57 shared-SDK): signing, token mint/verify, DPoP, sessions, connections, passkeys (incl. challenge session-binding + bootstrap timing-safe), routes, platform detection
+- **Adversarial**: key extraction, token forgery, confused deputy, DPoP injection, JTI replay, scope escalation, error-message leaks, mode downgrade
+- **Real-DO** (vitest-pool-workers): boots real workerd + DO SQLite via `runInDurableObject` — rotation grace window, seqno rollback/isolation, `checkRevocation`, bootstrap, cert minting
+- **Contract** (e2e): discovery shape, JWKS fields, CA cert PEM, error codes, passkey registration + authenticated access
+- **Unit**: signing, token mint/verify, DPoP, sessions, connections, passkeys, routes, platform detection, canonical CBOR
+
+Two conventions worth knowing before reading the suite:
+
+- **`it.fails` marks a gap, not a bug.** `delegation-depth.do.test.ts` asserts the middle delegation tier is still missing, so it goes red the moment someone builds it — that is the signal to delete the `.fails`. A `todo` would sit inert and tell nobody. These show as "expected fail" in the DO run.
+- **Some fixtures are deliberately foreign.** `pop-preimage.test.ts` and the hand-encoder in `receipt-commitment.test.ts` build inputs WITHOUT the code under test, because a fixture built by the encoder it validates is a fixed point rather than a conformance check. Both existing bugs of that shape — the double-hashed PoP and the float64 CBOR timestamp — survived review precisely because their tests were self-consistent.
 
 Threat-model coverage is enumerated in `worker/THREAT_MODEL.md` — each row links to the test that defends it.
