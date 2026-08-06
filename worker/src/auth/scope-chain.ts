@@ -13,22 +13,56 @@
  * existed only in the test — coverage of nothing. This file is that rule as
  * production code, so those tests bind to something that runs.
  *
- * ── WHY THE RULE IS THE WHOLE SAFETY ARGUMENT FOR DEPTH ──
- * The risk in a delegated chain is not how DEEP it goes; it is whether each
- * step is allowed to gain authority. Every catastrophic PKI failure of this
- * class — DigiNotar, TÜRKTRUST, ANSSI — was an intermediate issuing beyond
- * what it should have, not a chain that was too long.
+ * ── WHAT THIS BOUNDS, AND WHAT IT EMPHATICALLY DOES NOT ──
+ * The subset rule makes AUTHORITY monotone non-increasing: no chain, at any
+ * depth, can exceed the root grant. That is the macaroon/Biscuit property, and
+ * it is why unbounded attenuation is safe for authority.
  *
- * If every step must strictly narrow, depth bounds ITSELF: a chain can only
- * run as long as the scope set can still be meaningfully subdivided, and a
- * monotonically decreasing chain in a finite lattice terminates on its own.
- * That is why this file exists and why there is no tier number anywhere in it
- * — the lattice does the bounding, so nothing has to count levels. It is the
- * same reason macaroons and Biscuit permit unbounded attenuation safely.
+ * IT DOES NOT BOUND DEPTH. An earlier version of this comment claimed it did —
+ * "monotone narrowing means depth bounds itself" — and that is false three
+ * times over. Recording why, because the mistake is seductive:
  *
- * The namespace half of the same argument is `nameConstraints` (ADR-008 §299,
- * RFC 5280 §4.2.1.10), which is still unimplemented; scopes alone bound what a
- * credential may DO, not which identities it may name.
+ *   1. Equality passes (deliberately — see below), so the relation is
+ *      REFLEXIVE, hence a preorder, hence never well-founded. The constant
+ *      chain S, S, S, … is an admissible infinite descent.
+ *   2. Even forbidding equality only bounds a chain at |S|+1 — a depth limit
+ *      set accidentally by whoever last added a scope string. That is not a
+ *      formalisation of anything.
+ *   3. The lattice is not staying finite. Once scopes are hierarchical
+ *      (`sign:git` → `sign:git:repo` → …), which is the direction
+ *      nameConstraints-style namespacing points, infinite STRICTLY decreasing
+ *      chains exist too.
+ *
+ * The macaroon/Biscuit comparison actually proves the opposite of what it was
+ * cited for: both permit unbounded attenuation precisely BECAUSE authority
+ * cannot grow, and both then bound depth SEPARATELY and explicitly — Biscuit
+ * with block-count limits, macaroon deployments with caveat caps — because
+ * chain length is a verification-cost problem even when authority is safe.
+ *
+ * ── DEPTH IS AN INDEPENDENT DIMENSION WITH ITS OWN MECHANISM ──
+ * Terminating a chain whose scopes may stay equal requires some OTHER
+ * component to strictly decrease. That is a rank function into a well-founded
+ * set, and X.509 already carries it: `pathLenConstraint`. RFC 5280 §6.1.4(l)
+ * and (m) are a loop variant — a budget decremented at each non-self-issued
+ * intermediate and min'd with each cert's own constraint. Chains terminate
+ * because ℕ has no infinite descent, not because the scope lattice is finite.
+ *
+ * SPKI/SDSI (RFC 2693) carries the degenerate case: a boolean delegation bit.
+ * notme's two-hop design IS that boolean — the bridge may delegate, the task
+ * may not — so nothing here needs inventing.
+ *
+ * THE ENFORCEMENT ASYMMETRY IS THE REASON TO KEEP BOTH. ADR-008 is explicit
+ * that the scope-subset check is COOPERATIVE: relying parties MUST perform it
+ * and nothing compels them to. `pathLenConstraint` is INTRINSIC — every
+ * conformant X.509 validator enforces it without being asked. So the weaker
+ * mechanism here does not make the stronger one redundant; they bound
+ * different things. This file is the AUTHORITY bound.
+ * `delegation-depth.do.test.ts` pins the DEPTH bound.
+ *
+ * The namespace bound is the third dimension: `nameConstraints` (ADR-008 §299,
+ * RFC 5280 §4.2.1.10), still unimplemented. Scopes bound what a credential may
+ * DO, pathlen bounds how far it may pass that on, and neither bounds which
+ * identities it may NAME.
  */
 
 /**
