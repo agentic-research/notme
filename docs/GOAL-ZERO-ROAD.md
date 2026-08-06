@@ -168,7 +168,7 @@ Do these while Phase 0 is out for decision. None touch the contested naming.
 
 | Work | Bead | Why now |
 |---|---|---|
-| **`worker:verify` convergence gate** | `notme-9f2f79` | **Weakest link in every deploy today.** Verify retries ~10s; convergence takes ~60s, so a verify immediately after promotion can pass against the OLD build |
+| ~~`worker:verify` convergence gate~~ **DONE** | `notme-9f2f79` | `task worker:await-convergence` now sits between deploy and verify in `ship-prod`; N consecutive samples, fails rather than warns |
 | Delete ADR-018's canary phase, rewrite as promote → converge → verify → rollback | `notme-9f2f79` | Targeting proven not to work; keeping the ceremony is worse than removing it |
 | Trust material signed by the release pipeline's Sigstore identity | `notme-8e8836` | Second half of (D)'s foundation; independent of naming |
 | OIDC attestation as the *documented* default first boot | `notme-addef9` | Code half shipped; this is docs + the fallback story |
