@@ -419,23 +419,51 @@ bundle, pull-based, that `isBundleStale()` refuses once older than
 5-minute-fresh epoch revocation; one that cannot has **TTL-only**, and TTL is
 the whole of its protection.
 
-**This is a fail-open/fail-closed decision nobody has made, and it must be
-made explicitly**, because the two answers are both defensible and lead
-somewhere different:
+**This is two decisions, not one — an earlier draft of this ADR conflated
+them**, and cloister has already answered the first.
 
-- **Fail closed** — refuse to verify without a fresh bundle. Correct for a
-  high-assurance boundary, and it makes air-gapped verification impossible,
-  which contradicts the archival-verification goal (`cloister-ad7b5a`).
-- **Fail open to TTL-only** — accept a valid, unexpired chain with no bundle,
-  and say so in the verification result rather than silently. Correct for
-  archival and cross-organisation use, where reaching the issuer's revocation
-  infrastructure is not something a relying party can assume.
+**ENFORCEMENT (live request path): FAIL CLOSED. Decided and shipped by
+cloister, not open to notme.** Per cloister ADR-0053, `resolveCABundle` throws
+`CaUnavailableError` → JSON-RPC `-32005` when there is no anchor. The only
+"off" is `CLOISTER_MODE=dev` with no authority at all; every other
+configuration enforces, including "no authority", which enforces and then fails
+closed at bundle resolution. The request fails **loudly, with a code naming the
+cause** — not degraded verification, not skipped verification.
 
-The second is probably right, and it carries an obligation: **the verification
-result must record which mode it used.** A verdict that does not distinguish
-"checked against a fresh bundle" from "TTL-only, no bundle reachable" is
-exactly the kind of green signal this repo keeps finding — one that asserts a
-property nothing verified.
+That is the correct answer for an enforcement boundary, and notme does not get
+to choose it: it is cloister's boundary.
+
+**ARCHIVAL / AUDIT (verifying evidence after the fact): still open, and cannot
+be fail-closed.** An auditor checking a six-month-old receipt, or an
+air-gapped verifier, cannot reach a fresh bundle by construction. Fail-closed
+there does not mean "secure", it means "archival verification is impossible",
+which contradicts `cloister-ad7b5a`. This role must degrade to **TTL-only plus
+whatever transparency evidence exists** — and it carries an obligation: **the
+verification result must record which mode it used.** A verdict that does not
+distinguish "checked against a fresh bundle" from "TTL-only, no bundle
+reachable" is exactly the green signal this repo keeps finding — one asserting
+a property nothing verified.
+
+This maps onto the auditor-versus-acceptor split: an **auditor** proves
+attribution and integrity over historical evidence; an **enforcer** decides
+whether to admit a live request. Different jobs, different freshness needs, and
+only the second can afford to fail closed.
+
+#### The cost cloister has accepted, and what it obliges notme to do
+
+Cloister was explicit about the trade: **notme's availability is now cloister's
+availability.** They fail closed rather than degrade, so a notme outage is a
+cloister outage. They judged that correct against the alternative — a leaked
+master key forging every lease retroactively — and it is. But it prices notme's
+uptime as a hard dependency of another system, which was not previously stated
+anywhere.
+
+The immediate consequence is a constraint on `notme-41d0d3` (CA master key
+encrypted at rest): **enabling the KEK envelope requires its recovery path to
+be exercised first.** If the KEK source is unreachable, cloister does not
+degrade, it stops. A key-encryption change that looks like a local hardening
+improvement is, through this coupling, a potential outage in a downstream
+system.
 
 **Cross-organisation federation sharpens this into an argument for short TTLs.**
 A relying party at another organisation cannot poll a peer authority's

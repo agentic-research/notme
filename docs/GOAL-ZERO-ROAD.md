@@ -27,7 +27,20 @@ expects to find in it.
 | **0.1** | **Adopt ADR-019?** Flip Status to `accepted` | repo owner | criteria (B), (C); registration policy | low — it is a proposal, reversible |
 | **0.2** | **What is a "bridge cert"?** (`signet-9dfb44`) | **signet** + notme | D4 middle tier, and therefore (C) | **high** — a rename after shipping breaks consumers |
 | **0.3** | **Criterion (A) scope** — defer 7 named beads? (see below) | repo owner | closing (A) at all | **low** — the disputed set is 7 beads |
-| **0.4** | **Fail open or closed** when no revocation bundle is reachable? | notme + cloister | (D), archival verification | medium — changes what a verifier may claim |
+| ~~0.4~~ | ~~Fail open or closed with no bundle~~ — **RESOLVED for enforcement** by cloister ADR-0053 (fail closed, shipped). Still open for *archival/audit* only | cloister (done) / notme | (D), archival verification | — |
+
+**0.4 came back while this was being written.** Cloister has decided and
+shipped fail-closed for the *enforcement* path: no anchor → `CaUnavailableError`
+→ JSON-RPC `-32005`, loudly, with a code naming the cause. That was never
+notme's decision to make — it is cloister's boundary. What remains open is only
+the *archival/audit* role, which cannot fail closed without making historical
+verification impossible.
+
+The cost cloister named and accepted: **notme's availability is now cloister's
+availability.** That prices notme uptime as a hard dependency of a downstream
+system, and it adds a prerequisite to `notme-41d0d3` — the CA-key envelope
+cannot be enabled until its recovery path has been *exercised*, because an
+unreachable KEK stops cloister rather than degrading it.
 
 **0.2 is the long pole** and it is waiting on another repo. File it, chase it,
 and do not start D4 until it answers. Recommended position: notme renames
@@ -67,13 +80,35 @@ So the real question is narrow: **do the four substrate-research beads
 (`32c72f`, `e005a8`, `ce0903`, `d82673`), the two infra-migration beads
 (`3e22e0`, `3dac49`), and the CAS-release ADR (`e7e1cf`) block a release?**
 
-**Recommendation: no — defer all seven explicitly, with reasons.** Criterion
-(A) permits "deliberately deferred", and that is exactly what these are.
-Research beads have no release-blocking property by construction; the
-`notme/auth/` migration is a separate initiative; the CAS-release ADR is a
-distribution design, not a release gate. What (A) forbids is *silence* — a bead
-sitting open with nobody having decided. Writing the deferral reason on each is
-maybe an hour of work and it closes 0.3 outright.
+**Recommendation: defer all seven — but EXTRACT one question from `e7e1cf`
+first.** Criterion (A) permits "deliberately deferred", and that is what these
+are. Research beads have no release-blocking property by construction; the
+`notme/auth/` migration is a separate initiative. What (A) forbids is
+*silence* — a bead sitting open with nobody having decided.
+
+**`notme-e7e1cf` is not cleanly deferrable, and checking it is what caught
+this.** It proposes a predicate type URI `https://notme.bot/action-release/v1`,
+describes it as *"mirrors the existing APAS predicate"*, builds an in-toto
+Statement v1 with canonical CBOR for the DSSE PAE, and carries an unresolved
+question in its own body:
+
+> *"Where does the predicate type registry actually live? notme/docs?
+> signet/docs/apas? A new repo?"*
+
+That question is **shared**, not local. The acceptance-predicate work
+(`notme-8eb592`) will hit it independently, and two predicate types designed
+without a registry convention will collide or diverge. It is also a
+**compose-do-not-invent** question in ADR-020's sense: a predicate type minted
+under `notme.bot` puts vocabulary in notme's namespace when APAS — signet's
+document — is where predicate types already live.
+
+So: defer the CAS-release *implementation*, and lift the registry question out
+to ADR-020 as an open question, where the acceptance work will see it.
+
+**One softer note.** `notme-d82673` (identity-aware network gateway) is a
+*consumer* of the delegation model rather than a definer of it, so deferring it
+is safe — but if 0.2 changes the bridge naming, its assumptions move with it.
+Worth re-reading it after 0.2 lands rather than treating the deferral as final.
 
 That leaves criterion (A) as **31 release-surface P0/P1 beads**, most of them
 narrow bugs, several of which this cycle has already fixed without closing.
