@@ -85,6 +85,17 @@ organization *to* an agent. This is delegation, not impersonation — RFC 8693's
 `sub`/`act` split models it already.
 → ADR-019 Decision.
 
+**3.5 An agent saying "done" is submission, not completion.**
+Five claims hide behind the word: delegation (may attempt), promise
+(undertakes), submission (claims finished), verification (evidence meets the
+predicate), acceptance (it is done). Only the last is a *declarative* and only
+an authority can perform it, so acceptance cannot be self-signed. Acceptance
+needs no new credential type — it is a grant scoped `accept:<taskHash>`, which
+closes the "who authorised the verifier" recursion. Note the trap: **CI is
+often not an independent verifier**, because it executes configuration from the
+repository under test.
+→ ADR-019 "Task completion is a grant", `notme-9f84e6`.
+
 ---
 
 ## 4. Deployed and settled

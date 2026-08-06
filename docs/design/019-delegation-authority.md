@@ -287,6 +287,76 @@ revocation epochs, a CRL distribution point, OCSP, or trust-bundle refresh is
 delegated to Y at time T, for purpose P" is a materially stronger record than
 "a cert was issued."
 
+### Task completion is a grant, not a new object
+
+A grant authorizes an attempt; it does not settle whether the work is done.
+Five distinct claims hide behind the word "done", and collapsing any two is a
+defect:
+
+| Claim | Who makes it | Speech act |
+|---|---|---|
+| **delegation** — you may attempt this | grantor | directive |
+| **promise** — you undertake this exact task | actor | commissive |
+| **submission** — the work is finished | actor | commissive |
+| **verification** — the evidence satisfies the predicate | verifier | assertive |
+| **acceptance** — it is done | task authority | **declarative** |
+
+**An agent's `end_turn`, clean exit, or "done" message is only SUBMISSION.**
+Only an authority can perform a declarative, which is why acceptance cannot be
+self-signed — the same reasoning APAS already applies to orchestrator
+self-attestation. In Promise Theory terms an agent can promise its own
+behaviour and never impose an obligation on another, so the verifier must make
+its own separate promise to evaluate.
+
+**Acceptance needs no new credential type.** It is a grant with
+`scopes: ["accept:<taskHash>"]`, inheriting `grant_id`, `parent_grant_id`,
+expiry and `delegable` from D3. That closes a recursion a standalone
+`verifierPolicy` field would leave open — *who authorised the verifier* — and
+makes "who may accept" revocable by the same mechanism as everything else.
+
+Three constraints that follow, and are easy to get wrong:
+
+1. **The verifier must sit outside the actor's blast radius.** CI passing
+   against a commit digest looks like independent evidence and often is not:
+   CI is itself an agent executing configuration from the repository under
+   test. If the workflow definition is within the actor's write scope, CI is
+   self-attestation with extra steps — the same defect class as a workflow
+   whose outputs were structurally always empty, and an action that pinned
+   itself. Qualification is checkable and should be a stated precondition.
+2. **A close condition is either machine-evaluable or human-judged, and must
+   say which.** Hashing a predicate commits to its *wording*; it does not make
+   it evaluable. Most interesting conditions are human judgement wearing a
+   machine-checkable costume, and the distinction must be forced at authoring
+   time rather than discovered at verification time.
+3. **Liveness predicates are not settled by a signature.** "The SLO held for 24
+   hours" is continuously falsifiable, so acceptance carries a validity window
+   and is itself a lease — `submitted → verified → accepted` stops being
+   monotonic. Either exclude liveness predicates or say so.
+
+**Enforcement is a short lease, never "valid until done."** A credential whose
+lifetime is defined by task state requires every verifier to know that state —
+the same error as assuming a recorded revocation invalidates a chain someone
+already holds. Instead: minutes-long credentials, a controller that renews only
+while the task is active, and acceptance stops the renewal. Immediate
+termination still needs online revocation or an introspecting tool boundary.
+
+**Where this lives.** An acceptance attestation is structurally a receipt: a
+signed statement about an event with derived-not-received fields.
+`ReceiptSigner` already carries the master key, canonical CBOR, and the
+validate-then-sign discipline that refuses caller-supplied bytes. The
+`delegation` field on the commitment is the **attribution** half; acceptance is
+the **satisfaction** half over the same surface.
+
+**Open, and it should be settled before building:** in-toto **layouts** already
+express "these steps, these expected materials and products, and these
+functionary keys may sign each step" — a task contract and verifier policy in
+one signed artifact, with `in-toto-verify` as the evaluator. It is CNCF and
+already in the SLSA ecosystem. The honest question is not "what object is
+missing" but **what APAS adds that a layout does not** — plausibly the
+delegation chain, the represented principal, and an actor that was itself
+delegated to mid-execution, none of which in-toto's functionary model covers.
+Extending that model is a stronger position than a parallel format.
+
 **Federation** is a separate, horizontal axis and is out of scope here. notme
 already emits trust-domain-qualified identities; the accept side is missing.
 SPIFFE Federation is the model. Cross-signing is worse here because it makes a
@@ -329,6 +399,10 @@ it as a machine that inherits a human's identity.
    chain still validates to notme's root — putting notme in the revocation path
    without being in the issuance path. Stated here so it is argued before it is
    built.
+6. **Does APAS extend in-toto layouts or stand parallel to them?** See "Task
+   completion is a grant". This is a standardisation-strategy question as much
+   as a technical one, and it should be answered before an acceptance
+   attestation is specified.
 
 ## Adopting this
 
