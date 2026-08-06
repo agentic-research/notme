@@ -68,7 +68,7 @@ const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigne
 export const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
 const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
 export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
-const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
+export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
 const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
 

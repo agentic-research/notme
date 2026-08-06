@@ -1906,7 +1906,17 @@ export default {
           // stolen OIDC token issued for a different app, which would silently
           // re-route the victim's later notme.bot OIDC login into the
           // attacker's principal. X.509 path ignores the audience arg.
-          identity = await verifyProof(typedProof, caCertPem, "notme.bot");
+          // The authority's CURRENT epoch, so a cert issued before a
+          // rotation is refused. Read from the DO rather than cached: a
+          // rotation that took effect between requests must take effect
+          // HERE, which is the whole point of the lever (notme-77a024).
+          const { epoch: currentEpoch } = await authority.getReceiptFacts();
+          identity = await verifyProof(
+            typedProof,
+            caCertPem,
+            "notme.bot",
+            currentEpoch,
+          );
         } catch (e: any) {
           return jsonErr("proof verification failed: " + e.message, 401);
         }
