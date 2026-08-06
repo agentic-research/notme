@@ -189,6 +189,34 @@ Content-Type: application/json
 
 Where `binding_payload = SHA-256(mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt))`.
 
+> **CORRECTION (2026-08-06, `notme-bd68f2`).** The outer `SHA-256(…)` is wrong,
+> in both this definition and the sequence diagram above. **Signers must sign
+> the concatenation itself — the pre-image — never its digest.** The normative
+> encoding is:
+>
+> ```
+> binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)
+> ```
+>
+> signed directly with each private key. `worker/src/auth/pop.ts` is the single
+> verifier for all three cert routes and is normative; the construction is at
+> `worker/worker.ts:715-741` (`/cert/gha`), `worker.ts:2251-2266`
+> (`/cert/passkey`) and `worker/src/cert-exchange.ts:224-228` (`/cert`).
+>
+> **Why it matters to a cross-language implementer:** WebCrypto ECDSA hashes
+> its input internally. Passing a digest therefore signs
+> `SHA-256(SHA-256(x))`, and **no Go signer could ever produce a matching
+> signature.** That was the `notme-a011d2` P0 (GOAL-ZERO-STATUS §4). An
+> implementation built from the original text above interoperates with
+> nothing.
+>
+> A migration window is live: the verifier still accepts the digest encoding
+> behind `ACCEPT_LEGACY_DIGEST_BINDING` and reports `binding: "digest"` when it
+> does (`pop.ts:81`). That flag is scheduled for removal once the action pin
+> moves past `0d2312f` and nothing reports `"digest"` — so the encoding
+> described above is not merely wrong, it is being withdrawn. Build against the
+> pre-image.
+
 Each proof is a signature over the same binding payload, proving:
 - The caller holds the P-256 private key
 - The caller holds the Ed25519 private key
