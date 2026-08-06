@@ -34,7 +34,7 @@ const cborDecoder = new Decoder({
   tagUint8Array: false,
 });
 
-/** The eight fields RECEIPTS.md §2.1 defines. No more, no fewer. */
+/** The eight fields RECEIPTS.md §2.1 defines. Always present. */
 const REQUIRED_KEYS = [
   "actor_fp",
   "body_hash",
@@ -45,6 +45,31 @@ const REQUIRED_KEYS = [
   "status",
   "timestamp_ms",
 ] as const;
+
+/**
+ * The one OPTIONAL field, and the only key admissible beyond the eight
+ * (notme-9f84e6).
+ *
+ * `delegation` carries the UTF-8 correlation key — `<principal>/<bridge>/
+ * <task>`, see auth/correlation-key.ts — so a receipt can answer WHO WAS
+ * ACTING UNDER WHOSE DELEGATION. Every one of the eight required fields
+ * describes what was ASKED or which authority ANSWERED; none names the acting
+ * principal, so today a receipt proves a request happened and cannot say on
+ * whose behalf.
+ *
+ * OPTIONAL RATHER THAN ADDED TO THE SCHEMA, deliberately. cloister's verifier
+ * implements the same 0.2.0 eight-key shape, so minting nine-key commitments
+ * unconditionally would invalidate every receipt for every existing verifier —
+ * a unilateral break of a spec another repo owns. The caller OPTS IN by
+ * sending the field, which puts the compatibility decision with the party that
+ * knows what its verifier understands. An old verifier receiving a nine-key
+ * commitment fails closed on key count, so the failure direction is safe.
+ *
+ * It is a byte string, not text, because canonical-cbor.ts encodes only uints
+ * and byte strings and its header requires it stay that small. UTF-8 preserves
+ * the prefix-matching the key's shape exists for.
+ */
+const OPTIONAL_KEY = "delegation";
 
 /** Minimum `nonce` length per RECEIPTS.md ("bytes-16+"). */
 const MIN_NONCE_BYTES = 16;
@@ -84,6 +109,7 @@ export type CommitmentErrorCode =
   // — caller disagrees with the authority about the authority —
   | "ACTOR_FP_MISMATCH"
   | "EPOCH_MISMATCH" // RETRYABLE: re-read receiptFacts(), retry ONCE
+  | "DELEGATION_MISMATCH" // also: authority has no delegation to check against
   // — bytes are not the canonical encoding of the validated structure —
   | "NOT_CANONICAL";
 
@@ -186,6 +212,16 @@ export interface CommitmentFacts {
    * bound is testable without faking time globally.
    */
   nowMs: number;
+  /**
+   * The delegation this request is being made under, UTF-8, as the authority
+   * derived it from the presented credential — never from the request body.
+   *
+   * Absent when the authority cannot determine one. A commitment CLAIMING a
+   * delegation is then refused rather than signed: an attribution nobody
+   * verified is worse than no attribution, because a false one is evidence
+   * while a missing one is only a gap.
+   */
+  delegation?: Uint8Array;
 }
 
 /**
@@ -232,18 +268,38 @@ export function validateCommitment(
     fail("NOT_A_MAP", "commitment must be a CBOR map");
   }
 
-  // Exactly the eight keys. An extra key would be signed-but-unspecified
-  // data — a place to park bytes a verifier ignores and something else
-  // interprets.
-  if (decoded.size !== REQUIRED_KEYS.length) {
+  // The eight required keys, plus AT MOST the one optional key — by name.
+  //
+  // The original rule was "exactly eight", on the reasoning that an extra key
+  // is signed-but-unspecified data: a place to park bytes a verifier ignores
+  // and something else interprets. That reasoning is intact and is why the
+  // ninth is admitted only under a known name whose value is then checked
+  // against the authority's own view. A ninth key called anything else still
+  // fails, because the loop below finds a required key missing.
+  if (
+    decoded.size !== REQUIRED_KEYS.length &&
+    decoded.size !== REQUIRED_KEYS.length + 1
+  ) {
     fail(
       "WRONG_KEY_COUNT",
-      `commitment must have exactly ${REQUIRED_KEYS.length} keys, got ${decoded.size}`,
+      `commitment must have ${REQUIRED_KEYS.length} keys, or ${REQUIRED_KEYS.length + 1} with "${OPTIONAL_KEY}", got ${decoded.size}`,
     );
   }
   for (const key of REQUIRED_KEYS) {
     if (!decoded.has(key))
       fail("MISSING_KEY", `commitment is missing "${key}"`);
+  }
+  const carriesDelegation = decoded.size === REQUIRED_KEYS.length + 1;
+  if (carriesDelegation && !decoded.has(OPTIONAL_KEY)) {
+    // Nine keys with all eight required ones present means the ninth has an
+    // unrecognised name. Reported as WRONG_KEY_COUNT, which is the code this
+    // input produced before `delegation` existed — these codes are a wire
+    // contract, and a consumer branching on "extra key" should not have to
+    // learn a new code because an unrelated optional field was added.
+    fail(
+      "WRONG_KEY_COUNT",
+      `commitment's ninth key must be "${OPTIONAL_KEY}"`,
+    );
   }
 
   const nonce = requireBytes(decoded, "nonce");
@@ -303,15 +359,44 @@ export function validateCommitment(
     );
   }
 
+  // `delegation` is caller-SENT but authority-CHECKED, for the same reason as
+  // actor_fp: it must be sent, because byte-equality means notme can only sign
+  // bytes the caller already produced; and it must be checked, because a
+  // delegation a caller could assert freely would let it attribute its actions
+  // to another principal and get a master-key signature saying so.
+  let delegation: Uint8Array | undefined;
+  if (carriesDelegation) {
+    delegation = requireBytes(decoded, OPTIONAL_KEY);
+    if (!facts.delegation) {
+      // Fail closed. An authority with nothing to compare against cannot
+      // verify the attribution, so it must not sign it.
+      fail(
+        "DELEGATION_MISMATCH",
+        'commitment claims a "delegation" but this authority derived none for the request',
+      );
+    }
+    if (!bytesEqual(delegation, facts.delegation)) {
+      fail(
+        "DELEGATION_MISMATCH",
+        '"delegation" does not match the delegation this authority derived from the presented credential',
+      );
+    }
+  }
+
   // Re-encode from the validated values. Key insertion order here is the
   // RFC 8949 §4.2 canonical order (length-then-bytewise over the encoded
   // keys), which the equality check below then proves against the input.
+  // "delegation" is 10 bytes, so it sorts after "body_hash" (9) and before
+  // "headers_hash" (12) under length-then-bytewise ordering.
   const canonical: ReadonlyArray<readonly [string, CborValue]> = [
     ["epoch", { uint: epoch }],
     ["nonce", { bytes: nonce }],
     ["status", { uint: status }],
     ["actor_fp", { bytes: actorFp }],
     ["body_hash", { bytes: bodyHash }],
+    ...(delegation
+      ? ([["delegation", { bytes: delegation }]] as const)
+      : ([] as const)),
     ["headers_hash", { bytes: headersHash }],
     ["request_hash", { bytes: requestHash }],
     ["timestamp_ms", { uint: timestampMs }],
