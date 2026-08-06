@@ -138,6 +138,80 @@ exactly the accountability gap this ADR exists to close, and it is why the GHA
 path needs the represented principal added rather than merely a new URI shape.
 Case 1 has no implementation at all, because it needs the middle tier (D4).
 
+### "BRIDGE CERT" MEANS FOUR DIFFERENT THINGS — resolve before building D4
+
+Four documents in this stack use the term, and they do not agree. Signet's own
+ADR-004 already flags this, carrying a Terminology note: *"Bridge certificate
+is used in two contexts in this codebase."* Adding APAS and notme makes four.
+
+| # | Document | What "bridge cert" is | Position in chain |
+|---|---|---|---|
+| 1 | signet ADR-004 (target) | ephemeral, single-use, binds a public identity's verified **properties** to an anonymous session's ephemeral key — a *privacy* mechanism | **leaf** |
+| 2 | signet ADR-004 (as-built) / ADR-006 | MCP client identity cert, email CN, 24h TTL | leaf |
+| 3 | APAS §3.4 | *"The bridge cert IS the dispatch's identity"* — short-lived, **per-dispatch** | **leaf** |
+| 4 | notme ADR-008 / this ADR | the **machine** tier, `CA=true pathlen=0`, mints task certs beneath it | **intermediate** |
+
+**Three of the four put the bridge at the LEAF. notme puts it in the middle.**
+
+### The resolution: the models agree, the vocabulary is offset by one tier
+
+signet ADR-004 also defines a **delegate certificate**: chains to the public
+root, `EKU: id-kp-signet-bridge-delegate`, and *"enables local bridge cert
+issuance without public root online."* That is precisely what D4 wants the
+middle tier for — a machine that mints locally with no round trip.
+
+Line the two up:
+
+```
+signet:  public root  →  DELEGATE (intermediate)  →  BRIDGE (leaf, per-session)
+notme:   root         →  BRIDGE   (intermediate)  →  TASK   (leaf, per-task)
+```
+
+**Structurally identical. Same depth, same shape, same purpose per tier.** The
+only disagreement is which tier the word "bridge" names. signet's *delegate* is
+notme's *bridge*; signet's *bridge* is notme's *task*.
+
+APAS agrees with signet — bridge as the per-dispatch leaf — so **notme is the
+outlier, two documents to one.**
+
+Signet also states a constraint notme must honour either way: *"Relying parties
+MUST accept exactly one intermediate certificate (the delegate) between the
+public root and the bridge certificate. This prevents downgrade attacks."* That
+is `pathlen=1` at the root, and it matches ADR-008's budget — but it also means
+a notme chain of `root → bridge → task` presents **one intermediate** to a
+signet relying party only if notme's bridge occupies the delegate slot. Adding a
+further tier would break signet's verifier.
+
+### Two options, both requiring a cross-repo decision
+
+**A — notme adopts signet's names.** Rename the proposed middle tier to
+*delegate* and the leaf to *bridge*. Correct by majority and keeps notme's
+chain verifiable by signet relying parties unchanged. **Expensive:** the
+`bridgeCert` scope, `mintBridgeCertPair`, ADR-008 and the deployed cert profile
+all carry the current name.
+
+**B — the ecosystem adopts notme's names**, and signet/APAS rename. Cheaper in
+notme, more expensive elsewhere, and contradicts two documents that already
+agree with each other.
+
+A is more likely right. Either way the decision is signet's as much as notme's,
+and it must land **before** D4's middle tier is built, because the tier's name
+determines what every consumer's verifier expects to find in it.
+
+### Also: "actor" collides
+
+This ADR's D1 defines *actor* as the key-holder — which is APAS's **Identity**.
+APAS's **Actor** is the agent *persona* (`dev-agent`, `staging-agent`), a
+definition rather than a running instance, and this ADR does not model persona
+at all. Same word, different referent, one stack.
+
+### Stale documentation to report upstream
+
+signet ADR-004's implementation note describes the deployed certs as carrying
+*"the user's email as CN, Clerk subject ID in an extension … 24-hour TTL."*
+notme has since moved to passkeys with `principalId` and a 5-minute TTL, and
+there is no Clerk. The note is describing a deployment that no longer exists.
+
 ### D2 — Identity names a stable subject; kind and assurance are claims
 
 The URI carries the subject and nothing else:
@@ -452,6 +526,13 @@ it as a machine that inherits a human's identity.
    chain still validates to notme's root — putting notme in the revocation path
    without being in the issuance path. Stated here so it is argued before it is
    built.
+7. **How is the APAS conflict resolved?** APAS says the bridge cert IS the
+   per-dispatch identity; D4 treats it as a longer-lived machine tier that
+   mints per-task credentials. And "actor" names different things in the two
+   documents — APAS's Actor is a persona/definition, this ADR's actor is the
+   key-holder (APAS's Identity). Blocks the middle tier, and is signet's call
+   as much as notme's. See "CONFLICT WITH APAS" above.
+
 6. **Does APAS extend in-toto layouts or stand parallel to them?** See "Task
    completion is a grant". This is a standardisation-strategy question as much
    as a technical one, and it should be answered before an acceptance
