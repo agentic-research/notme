@@ -25,7 +25,7 @@ expects to find in it.
 | # | Decision | Owner | Unblocks | Cost of deciding wrong |
 |---|---|---|---|---|
 | **0.1** | **Adopt ADR-019?** Flip Status to `accepted` | repo owner | criteria (B), (C); registration policy | low — it is a proposal, reversible |
-| **0.2** | **What is a "bridge cert"?** (`signet-9dfb44`) | **signet** + notme | D4 middle tier, and therefore (C) | **high** — a rename after shipping breaks consumers |
+| **0.2** | **What is a "bridge cert"?** (`signet-9dfb44`, `signet-a4881c`) | **signet** + notme | D4 middle tier, and therefore (C) | **medium** — re-rated down; no protocol break, but a signed value + a schema TypeID |
 | **0.3** | **Criterion (A) scope** — defer 7 named beads? (see below) | repo owner | closing (A) at all | **low** — the disputed set is 7 beads |
 | ~~0.4~~ | ~~Fail open or closed with no bundle~~ — **RESOLVED for enforcement** by cloister ADR-0053 (fail closed, shipped). Still open for *archival/audit* only | cloister (done) / notme | (D), archival verification | — |
 
@@ -42,11 +42,58 @@ system, and it adds a prerequisite to `notme-41d0d3` — the CA-key envelope
 cannot be enabled until its recovery path has been *exercised*, because an
 unreachable KEK stops cloister rather than degrading it.
 
-**0.2 is the long pole** and it is waiting on another repo. File it, chase it,
-and do not start D4 until it answers. Recommended position: notme renames
-(`bridge` → `delegate` for the intermediate, `task` → `bridge` for the leaf),
-because signet ADR-004 and APAS already agree with each other and signet has an
-EKU assigned.
+### 0.2 — RE-RATED, and the naming answer changed
+
+Signet came back (`signet-a4881c`) with two things that change this item.
+
+**The wire contract does not use the word.** `/cert/gha` returns
+`{"certificates": {"mtls", "signing"}, "identity", "scopes"}` — already precise,
+already the right words. So the rename is **not a protocol break**, and 0.2
+should not be modelled as a risky change gating all of Phase 2. That re-rating
+is correct and this document had it wrong.
+
+**But "low — a day of documentation" understates it in two places**, both
+verified here:
+
+1. **`bridgeCert` is a SIGNED VALUE.** It is a scope, and scopes are DER-encoded
+   into the cert at `OID_SCOPES` (`cert-authority.ts:325`). Certificates already
+   issued carry it permanently and cannot be rewritten. Any verifier matching on
+   it must accept both names during the overlap — the same dual-accept migration
+   shape as `ACCEPT_LEGACY_DIGEST_BINDING`, which is now a known, cheap pattern
+   here. It also appears in `@notme/contract` (`BRIDGE_CERT`), the generated TS
+   and Go enums, and the public api-docs.
+2. **`BridgeCertResult` is a Cap'n Proto struct** (`schema/identity.capnp:62`)
+   with a stable derived TypeID (`0x8b5e0c952601cb1f`). Cap'n Proto derives
+   TypeIDs from the qualified name, so renaming the struct **changes the
+   TypeID** — a schema break for any typed consumer. Mitigating: `gen/go` has no
+   in-repo consumers and its disposition is already an open question
+   (`notme-ea5c65`), and `@notme/contract` is `private: true`, so the blast
+   radius is smaller than it looks. It is not zero.
+
+So: **medium, not high, and not low.** No protocol break; a signed-value
+migration plus a schema decision. It should not gate Phase 2.
+
+**The naming answer also changed, and signet corrected its own earlier term.**
+"Bridge CA" is *already taken* — the Federal Bridge CA is the canonical example,
+and it means cross-certification between otherwise-unrelated PKIs: a peer trust
+broker, not a subordinate within one hierarchy. Anyone with a PKI background
+reads "bridge" as the federation concept, which is a thing notme is *not* doing
+here. That collision is worse than the internal one, because it misleads
+outward.
+
+For an artifact that is `IsCA: true, MaxPathLen: 0` the standard term is
+**Issuing CA** — precise, and it states in the name both that it may issue and
+that nothing further may follow it. `Subordinate CA` (CA/Browser Forum) and
+`Intermediate CA` are the more familiar alternatives. `delegated` — this
+document's earlier suggestion, taken from signet's own ADR-004 EKU — is **not**
+standard PKI; the actual X.509 delegation construct is the RFC 3820 proxy
+certificate, which carries grid-computing baggage and thin library support.
+
+**Recommended: `Issuing CA` for the CA-shaped artifact, `enrollment certificate
+pair` (members: `mTLS certificate`, `signing certificate`) for what `/cert/gha`
+returns.** One consequence to hand back to signet: adopting this makes their own
+EKU name `id-kp-signet-bridge-delegate` a misnomer. The OID is opaque so nothing
+breaks, but the documentation name should move with it.
 
 ### 0.3 in detail — the disputed set is 7 beads, not 70
 

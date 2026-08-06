@@ -184,19 +184,44 @@ further tier would break signet's verifier.
 
 ### Two options, both requiring a cross-repo decision
 
-**A — notme adopts signet's names.** Rename the proposed middle tier to
-*delegate* and the leaf to *bridge*. Correct by majority and keeps notme's
-chain verifiable by signet relying parties unchanged. **Expensive:** the
-`bridgeCert` scope, `mintBridgeCertPair`, ADR-008 and the deployed cert profile
-all carry the current name.
+**RESOLVED IN DIRECTION by signet (`signet-a4881c`): drop "bridge" entirely.**
 
-**B — the ecosystem adopts notme's names**, and signet/APAS rename. Cheaper in
-notme, more expensive elsewhere, and contradicts two documents that already
-agree with each other.
+"Bridge CA" is already an industry term — the Federal Bridge CA is canonical —
+and it means **cross-certification between otherwise-unrelated PKIs**: a peer
+trust broker, not a subordinate inside one hierarchy. So the collision is not
+merely internal; anyone with a PKI background reads "bridge" as the federation
+concept, which is precisely the *other* axis this ADR keeps separate. That
+outward collision is worse than the four-way internal one.
 
-A is more likely right. Either way the decision is signet's as much as notme's,
-and it must land **before** D4's middle tier is built, because the tier's name
-determines what every consumer's verifier expects to find in it.
+For an artifact that is `IsCA: true, MaxPathLen: 0`, the standard term is
+**Issuing CA** — it states in the name both that it may issue and that nothing
+further may follow it. `Subordinate CA` (CA/Browser Forum) and `Intermediate
+CA` are more familiar alternatives. An earlier draft of this ADR proposed
+*delegate*, taken from signet's own ADR-004 EKU; signet has since corrected
+that — `delegated` is not standard PKI, and the actual X.509 delegation
+construct is the RFC 3820 proxy certificate, which carries grid-computing
+baggage and thin library support.
+
+**Proposed vocabulary:** `Issuing CA` for the CA-shaped tier; `enrollment
+certificate pair` (members `mTLS certificate` and `signing certificate`) for
+what `/cert/gha` returns, matching the wire fields that are already correct.
+
+**Cost, verified rather than assumed.** The JSON wire format never uses the
+word — `{"certificates": {"mtls", "signing"}, …}` is already precise — so this
+is **not a protocol break**. Two surfaces do carry it, and both are smaller
+than they look but not free:
+
+- `bridgeCert` is a **scope, DER-encoded into every certificate** at
+  `OID_SCOPES`. Issued certs carry it permanently, so verifiers must accept
+  both names during the overlap — the same dual-accept pattern as
+  `ACCEPT_LEGACY_DIGEST_BINDING`.
+- `BridgeCertResult` is a **Cap'n Proto struct** whose TypeID derives from its
+  name, so renaming changes the TypeID. Mitigated by `gen/go` having no in-repo
+  consumers (`notme-ea5c65`) and `@notme/contract` being `private: true`.
+
+One item to hand back: adopting this makes signet's own EKU name
+`id-kp-signet-bridge-delegate` a misnomer. The OID is opaque, so nothing
+breaks, but the documentation name should move with it.
 
 ### Also: "actor" collides
 
