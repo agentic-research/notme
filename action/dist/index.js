@@ -21676,16 +21676,15 @@ async function run() {
     Buffer.from(signingSpki),
     Buffer.from(oidcHash)
   ]);
-  const bindingPayload = await wc.subtle.digest("SHA-256", bindingInput);
   const mtlsProof = await wc.subtle.sign(
     { name: "ECDSA", hash: "SHA-256" },
     mtlsKeypair.privateKey,
-    bindingPayload
+    bindingInput
   );
   const signingProof = await wc.subtle.sign(
     { name: "Ed25519" },
     signingKeypair.privateKey,
-    bindingPayload
+    bindingInput
   );
   const certUrl = `${authorityUrl}/cert/gha`;
   core.info(`exchanging OIDC + PoP proofs at ${certUrl}`);

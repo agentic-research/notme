@@ -95,8 +95,9 @@ async function mintRequest(cookie: string) {
     new Uint8Array(sessionHash),
     mtlsSpki.byteLength + signingSpki.byteLength,
   );
-  const binding = await crypto.subtle.digest("SHA-256", input);
-
+  // Sign the PRE-IMAGE, not its digest (notme-a011d2). WebCrypto ECDSA
+  // applies SHA-256 itself, so signing a digest here would produce a proof
+  // over two hashes that only another WebCrypto caller could reproduce.
   return {
     public_keys: {
       mtls: pem(mtlsSpki, "PUBLIC KEY"),
@@ -108,7 +109,7 @@ async function mintRequest(cookie: string) {
           await crypto.subtle.sign(
             { name: "ECDSA", hash: "SHA-256" },
             mtls.privateKey,
-            binding,
+            input,
           ),
         ),
       ),
@@ -117,7 +118,7 @@ async function mintRequest(cookie: string) {
           await crypto.subtle.sign(
             { name: "Ed25519" },
             signing.privateKey,
-            binding,
+            input,
           ),
         ),
       ),

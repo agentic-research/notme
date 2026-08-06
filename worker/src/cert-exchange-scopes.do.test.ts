@@ -76,8 +76,7 @@ async function mintRequest() {
   const input = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
   input.set(new Uint8Array(mtlsSpki), 0);
   input.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
-  const binding = await crypto.subtle.digest("SHA-256", input);
-
+  // Sign the PRE-IMAGE, not its digest (notme-a011d2).
   return {
     public_keys: { mtls: pem(mtlsSpki), signing: pem(signingSpki) },
     proofs: {
@@ -86,7 +85,7 @@ async function mintRequest() {
           await crypto.subtle.sign(
             { name: "ECDSA", hash: "SHA-256" },
             mtls.privateKey,
-            binding,
+            input,
           ),
         ),
       ),
@@ -95,7 +94,7 @@ async function mintRequest() {
           await crypto.subtle.sign(
             { name: "Ed25519" },
             signing.privateKey,
-            binding,
+            input,
           ),
         ),
       ),

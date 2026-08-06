@@ -9,7 +9,7 @@
 //
 // Schema-driven: input/output types from gen/ts/identity.ts (generated from identity.capnp).
 
-import { ED25519 } from "./platform";
+import { verifyPopProofs } from "./auth/pop";
 
 // Types from the schema (would import from gen/ts/identity.ts, but
 // we keep it simple and define the wire format inline to avoid
@@ -224,28 +224,13 @@ export async function handleCertExchange(
     const bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
     bindingInput.set(new Uint8Array(mtlsSpki), 0);
     bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
-    const bindingPayload = await crypto.subtle.digest("SHA-256", bindingInput);
-
-    // Verify P-256 PoP
-    try {
-      const proofBytes = Uint8Array.from(atob(body.proofs.mtls.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-      const valid = await crypto.subtle.verify(
-        { name: "ECDSA", hash: "SHA-256" }, mtlsPubKey, proofBytes, bindingPayload,
+    // PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
+    const pop = await verifyPopProofs(bindingInput, mtlsPubKey, signingPubKey, body.proofs);
+    if (!pop.ok) {
+      return Response.json(
+        { error: `${pop.algorithm} proof-of-possession failed` },
+        { status: 401 },
       );
-      if (!valid) return Response.json({ error: "P-256 proof-of-possession failed" }, { status: 401 });
-    } catch (e: any) {
-      return Response.json({ error: "P-256 proof error: " + e.message }, { status: 401 });
-    }
-
-    // Verify Ed25519 PoP
-    try {
-      const proofBytes = Uint8Array.from(atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-      const valid = await crypto.subtle.verify(
-        ED25519, signingPubKey, proofBytes, bindingPayload,
-      );
-      if (!valid) return Response.json({ error: "Ed25519 proof-of-possession failed" }, { status: 401 });
-    } catch (e: any) {
-      return Response.json({ error: "Ed25519 proof error: " + e.message }, { status: 401 });
     }
 
     const { wimseTrustDomain } = await import("../worker");

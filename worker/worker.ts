@@ -55,6 +55,7 @@ const DENIED_HOSTS = new Set([
 // without pulling in cloudflare:workers via worker.ts.
 import { getAllowedAudiences } from "./src/allowed-audiences";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
+import { verifyPopProofs } from "./src/auth/pop";
 
 function isDeniedDestination(url: string): boolean {
   try {
@@ -730,41 +731,15 @@ async function handleCertGHA(
     new Uint8Array(oidcHash),
     mtlsSpki.byteLength + signingSpki.byteLength,
   );
-  const bindingPayload = await crypto.subtle.digest("SHA-256", bindingInput);
-
-  // Verify PoP: caller must have signed the binding payload with both keys
-  // P-256 proof (ES256)
-  try {
-    const proofBytes = Uint8Array.from(
-      atob(body.proofs.mtls.replace(/-/g, "+").replace(/_/g, "/")),
-      (c) => c.charCodeAt(0),
-    );
-    const valid = await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" },
-      mtlsPubKey,
-      proofBytes,
-      bindingPayload,
-    );
-    if (!valid) return jsonErr("P-256 proof-of-possession failed", 401);
-  } catch (e: any) {
-    return jsonErr(`P-256 proof verification error: ${e.message}`, 401);
-  }
-
-  // Ed25519 proof
-  try {
-    const proofBytes = Uint8Array.from(
-      atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")),
-      (c) => c.charCodeAt(0),
-    );
-    const valid = await crypto.subtle.verify(
-      ED25519,
-      signingPubKey,
-      proofBytes,
-      bindingPayload,
-    );
-    if (!valid) return jsonErr("Ed25519 proof-of-possession failed", 401);
-  } catch (e: any) {
-    return jsonErr(`Ed25519 proof verification error: ${e.message}`, 401);
+  // Verify PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
+  const pop = await verifyPopProofs(
+    bindingInput,
+    mtlsPubKey,
+    signingPubKey,
+    body.proofs,
+  );
+  if (!pop.ok) {
+    return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
   }
 
   // Build WIMSE identity URI
@@ -2282,40 +2257,15 @@ export default {
             new Uint8Array(sessionHash),
             mtlsSpki.byteLength + signingSpki.byteLength,
           );
-          const bindingPayload = await crypto.subtle.digest(
-            "SHA-256",
+          // PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
+          const pop = await verifyPopProofs(
             bindingInput,
+            mtlsPubKey,
+            signingPubKey,
+            body.proofs,
           );
-
-          const b64uToBytes = (s: string) =>
-            Uint8Array.from(
-              atob(s.replace(/-/g, "+").replace(/_/g, "/")),
-              (c) => c.charCodeAt(0),
-            );
-          try {
-            const ok = await crypto.subtle.verify(
-              { name: "ECDSA", hash: "SHA-256" },
-              mtlsPubKey,
-              b64uToBytes(body.proofs.mtls),
-              bindingPayload,
-            );
-            if (!ok) return jsonErr("P-256 proof-of-possession failed", 401);
-          } catch (e: any) {
-            return jsonErr(`P-256 proof verification error: ${e.message}`, 401);
-          }
-          try {
-            const ok = await crypto.subtle.verify(
-              ED25519,
-              signingPubKey,
-              b64uToBytes(body.proofs.signing),
-              bindingPayload,
-            );
-            if (!ok) return jsonErr("Ed25519 proof-of-possession failed", 401);
-          } catch (e: any) {
-            return jsonErr(
-              `Ed25519 proof verification error: ${e.message}`,
-              401,
-            );
+          if (!pop.ok) {
+            return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
           }
 
           const { certScopesForSession } =
