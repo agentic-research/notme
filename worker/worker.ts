@@ -1955,6 +1955,58 @@ export default {
 
       // ── Invites: create + redeem ──
 
+      // GET  /admin/alarm-health        — is the bundle-refresh alarm alive?
+      // POST /admin/alarm-health/reset  — clear the circuit breaker, re-arm
+      //
+      // The alarm republishes the CA bundle every BUNDLE_REFRESH_MS. It has a
+      // circuit breaker that stops re-arming after repeated failures, and
+      // recovery requires resetAlarmHealth() — which was an RPC method with NO
+      // ROUTE, so the documented recovery procedure could not be invoked at
+      // all. Production ran with a dead alarm for 130 days and served a bundle
+      // every conformant consumer rejected (notme-77a024).
+      //
+      // authorityManage-gated, not public: alarm health leaks operational
+      // state (how long the authority has been running, whether it is
+      // failing), and reset re-arms a timer on the DO holding the CA key.
+      if (pathname === "/admin/alarm-health" || pathname === "/admin/alarm-health/reset") {
+        const isReset = pathname.endsWith("/reset");
+        // AUTH BEFORE METHOD, deliberately. Answering 405 first tells an
+        // unauthenticated caller the path exists — a free confirmation that
+        // this authority has an admin surface, on the object holding the CA
+        // key. Every rejection an anonymous caller can reach is a 401.
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        if (!cookie) return jsonErr("sign in first", 401);
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const sessionSecret = await authority.getSessionSecret();
+        const session = await verifySessionCookie(cookie, sessionSecret);
+        if (!session) return jsonErr("invalid session", 401);
+        if (!(session.scopes ?? []).includes("authorityManage")) {
+          return jsonErr("authorityManage scope required", 403);
+        }
+        // Method check now that the caller is known to be an admin.
+        if (request.method !== (isReset ? "POST" : "GET")) {
+          return jsonErr("method not allowed", 405);
+        }
+
+        if (isReset) {
+          const result = await authority.resetAlarmHealth();
+          // Return health ALONGSIDE the reset result. An operator who resets
+          // needs to see the outcome without a second call — and `rearmed`
+          // is the field that matters: clearing the counter without re-arming
+          // looks like recovery while the bundle goes on rotting.
+          return Response.json({
+            ...result,
+            health: await authority.getAlarmHealth(),
+          });
+        }
+        return Response.json(await authority.getAlarmHealth());
+      }
+
       // POST /invites — create an invite (requires authorityManage scope)
       if (pathname === "/invites" && request.method === "POST") {
         const cookie = parseCookie(
