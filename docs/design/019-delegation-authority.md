@@ -404,6 +404,32 @@ it as a machine that inherits a human's identity.
    as a technical one, and it should be answered before an acceptance
    attestation is specified.
 
+   **External alignment, checked 2026-08-06.** NIST's NCCoE concept paper
+   *"Accelerating the Adoption of Software and AI Agent Identity and
+   Authorization"* (Feb 2026) frames agent identity across four dimensions —
+   identification, authorization, auditing, and **non-repudiation**, the last
+   defined as *"accountability that links agent actions to the human authority
+   that sanctioned them."* That is this ADR's subject, named by an external
+   body.
+
+   Its proposed stack is OAuth 2.0/OIDC (with RAR, PAR and **DPoP**),
+   SCIM, SPIFFE/SPIRE and ABAC. notme already implements the load-bearing
+   pieces — DPoP per ADR-006, and WIMSE-shaped identities. **But that stack
+   does not close the non-repudiation dimension it names**: OAuth binds
+   delegation at authorization time and retains nothing after; SPIFFE issues a
+   workload identity with no delegation chain at all. Neither yields a durable
+   signed record of "agent A did X under grant G from human H" — which is what
+   D3's grant object and `notme-9f84e6`'s correlation key are for.
+
+   So two independent bodies now describe the same hole from opposite sides:
+   in-toto has the verifier-policy machinery and no delegation model; NIST
+   names the delegation requirement and proposes standards that don't carry it.
+   Positioning this work as *extending* both beats standing parallel to either.
+   Relevant timing: CAISI's AI Agent Interoperability Profile is planned for
+   Q4 2026; COSAiS overlays for single- and multi-agent systems remain in
+   development. These are voluntary frameworks — they bind through procurement
+   flow-down, not by their own force. Recorded in full on `notme-907299`.
+
 ## Adopting this
 
 Change **Status** to `accepted`. That satisfies `notme-bed754` criterion (B)
