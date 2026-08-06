@@ -109,6 +109,34 @@ The closed loop currently works (JSON ↔ JSON within notme), so a sudden swap r
 
 **Decision (2026-05-10):** **(B) hard-cutover.** notme is currently pre-production; no persistent JSON-canonical signed bundles in any production KV need preserving. The 4-minute alarm cycle bounds the unverifiable-bundle window during deploy; revocation checks fail closed during that window (per `revocation.ts::isBundleStale`), which is the same fail-closed behavior they'd take on any bundle staleness anyway.
 
+> **CORRECTION (2026-08-06, `notme-a040c1`).** The second half of that
+> sentence cites a mitigation that no request path exercises. `isBundleStale`
+> has one caller — `checkRevocation`, in the same file — and `checkRevocation`
+> has **no production caller at all**: `worker.ts` never imports
+> `src/revocation.ts` (it re-exports the `RevocationAuthority` class only so
+> wrangler can bind the DO) and never references `env.REVOCATION`. The one
+> production consumer of the cached bundle, `ensureCurrentCABundle`
+> (`worker/src/internal-ca-bundle.ts:17-35`), `JSON.parse`s the KV value with
+> no signature, seqno or staleness check.
+>
+> So during the 4-minute window this paragraph reasons about, no revocation
+> check runs at all — neither fail-closed nor fail-open. **The decision may
+> still be right on its other ground** (pre-production, no persistent bundles
+> to preserve); this correction removes only the safety argument, not the
+> conclusion. Two details for anyone revisiting the (A)/(B) choice for a
+> production deployment, which the next paragraph explicitly anticipates:
+>
+> 1. Were the verifier wired, "fail closed on any bundle staleness" would hold
+>    for a *present-but-stale* bundle and not for an *absent* one —
+>    `checkRevocation` fails open when KV holds no bundle, pinned by
+>    `revocation.do.test.ts:198`.
+> 2. The timing half of the argument is sound: `BUNDLE_REFRESH_MS` (4 min)
+>    remains strictly under `BUNDLE_MAX_AGE_MS` (5 min), a dependency
+>    documented at `worker/src/signing-authority.ts:88`.
+>
+> The wiring gap itself is `notme-8d3018`; choosing the revocation mechanism
+> is `notme-77a024`.
+
 If/when notme has production deployments with persistent signed bundles that pre-date this migration, switch to strategy (A) before bumping CBOR alignment further. The CABundle `signatureFormat` discriminant remains a future option (deferred to a follow-on ADR or a re-revisited (A) path); not implemented in this landing.
 
 ### Cross-runtime fixture suite
