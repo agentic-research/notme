@@ -127,7 +127,57 @@ describe("PoP binding pre-image (notme-a011d2)", () => {
         mtls: FIXTURE.mtlsProof,
         signing: FIXTURE.signingProof,
       }),
-    ).resolves.toEqual({ ok: true });
+    ).resolves.toEqual({ ok: true, binding: "pre-image" });
+  });
+
+  it("still accepts a pre-fix signer, and reports it as legacy", async () => {
+    // The migration window. The Worker and the action ship separately — the
+    // workflow pins the action at a commit SHA — so the corrected verifier
+    // must land before the corrected signer reaches every caller.
+    //
+    // `binding: "digest"` is the whole point: it is the signal that says when
+    // the window can close. If this only asserted `ok: true`, a legacy caller
+    // would be indistinguishable from a fixed one and the transitional branch
+    // would never be safely removable.
+    const { verifyPopProofs } = await import("../auth/pop");
+    const { bindingInput } = await fixtureBinding();
+
+    const mtls = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const signing = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+
+    // Sign the DIGEST — exactly what the pre-fix action did.
+    const legacyMessage = await crypto.subtle.digest("SHA-256", bindingInput);
+    const b64u = (b: ArrayBuffer) =>
+      btoa(String.fromCharCode(...new Uint8Array(b)))
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+
+    const result = await verifyPopProofs(
+      bindingInput,
+      mtls.publicKey,
+      signing.publicKey,
+      {
+        mtls: b64u(
+          await crypto.subtle.sign(
+            { name: "ECDSA", hash: "SHA-256" },
+            mtls.privateKey,
+            legacyMessage,
+          ),
+        ),
+        signing: b64u(
+          await crypto.subtle.sign(ED25519, signing.privateKey, legacyMessage),
+        ),
+      },
+    );
+    expect(result).toEqual({ ok: true, binding: "digest" });
   });
 
   it("rejects a proof over the wrong binding, and names which key failed", async () => {

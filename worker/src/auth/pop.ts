@@ -44,9 +44,41 @@ export interface PopProofs {
 }
 
 export type PopResult =
-  | { ok: true }
+  /**
+   * `binding` reports WHICH encoding matched. "digest" means the caller is a
+   * pre-fix signer still covering SHA-256(bindingInput); it is accepted during
+   * the migration window below and is worth logging, because the window closes
+   * when that count reaches zero.
+   */
+  | { ok: true; binding: "pre-image" | "digest" }
   /** Which key failed, so the caller can say so without re-deriving it. */
   | { ok: false; algorithm: "P-256" | "Ed25519" };
+
+/**
+ * TRANSITIONAL: also accept proofs over SHA-256(bindingInput) — the pre-fix
+ * encoding (notme-a011d2).
+ *
+ * WHY THIS EXISTS RATHER THAN A CLEAN CUT. The signer and the verifier ship
+ * in different places: the Worker deploys from this repo, while
+ * `.github/workflows/gha-identity.yml` pins `agentic-research/notme/action`
+ * at a COMMIT SHA. Deploying the corrected verifier alone breaks that pinned
+ * action; bumping the pin alone breaks it against the old verifier. The two
+ * can only cross together, and the pin bump cannot land before the
+ * goalzero→main merge — so a flag day would mean either a broken window or
+ * holding signet's release behind an unrelated merge gate.
+ *
+ * WHY IT IS SAFE. Both encodings are deterministic functions of the same two
+ * public keys, proved by the same private keys. Accepting either does not let
+ * a caller assert anything it could not already assert with the other; there
+ * is no cross-protocol confusion, because neither message is meaningful input
+ * to any other verifier in this system. What it costs is one extra verify on
+ * the failure path, and an ambiguity that must not become permanent.
+ *
+ * REMOVAL — notme-a011d2 tracks it. Delete this constant and the second
+ * attempt in `verifyPopProofs` once the action pin is bumped past
+ * 0d2312f and no request has reported `binding: "digest"`.
+ */
+const ACCEPT_LEGACY_DIGEST_BINDING = true;
 
 const ED25519 = { name: "Ed25519" } as const;
 
@@ -108,24 +140,41 @@ export async function verifyPopProofs(
     },
   ];
 
+  // Computed lazily and only if the pre-image attempt fails, so a conformant
+  // caller never pays for the legacy path.
+  let digest: ArrayBuffer | undefined;
+  let sawLegacy = false;
+
   for (const check of checks) {
     const bytes = decodeProof(check.proof);
     if (!bytes) return { ok: false, algorithm: check.algorithm };
-    let valid: boolean;
-    try {
-      valid = await crypto.subtle.verify(
-        check.params,
-        check.key,
-        bytes,
-        bindingInput,
-      );
-    } catch {
-      // A key/signature shape WebCrypto rejects outright — same disposition as
-      // a signature that simply does not match.
+
+    // `verify` throws on a key/signature shape WebCrypto rejects outright —
+    // the same disposition as a signature that simply does not match.
+    const attempt = async (message: BufferSource) => {
+      try {
+        return await crypto.subtle.verify(
+          check.params,
+          check.key,
+          bytes,
+          message,
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    if (await attempt(bindingInput)) continue;
+
+    if (!ACCEPT_LEGACY_DIGEST_BINDING) {
       return { ok: false, algorithm: check.algorithm };
     }
-    if (!valid) return { ok: false, algorithm: check.algorithm };
+    digest ??= await crypto.subtle.digest("SHA-256", bindingInput);
+    if (!(await attempt(digest))) {
+      return { ok: false, algorithm: check.algorithm };
+    }
+    sawLegacy = true;
   }
 
-  return { ok: true };
+  return { ok: true, binding: sawLegacy ? "digest" : "pre-image" };
 }
