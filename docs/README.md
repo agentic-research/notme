@@ -14,6 +14,7 @@ architecture decision records for notme.
 | **009** | [identity-gated runtime](design/009-identity-gated-runtime.md) | accepted | workerd config pattern: agent Worker has no `globalOutbound`, talks to notme Worker via service binding only; agent cannot `fetch()` | `worker/config.capnp`, `worker/worker.ts` (`AuthService`) |
 | **018** | [goal zero promotion](design/018-goal-zero-promotion.md) | accepted | staging Worker (own DOs/CA, no VPC) → version-id canary via gradual deployments → 100% promote; rollback = promote the old id; per-phase gates + release evidence bundle | `worker/wrangler.toml.example` (`[env.staging]`), `Taskfile.yml` (`ship-staging`, `worker:canary`, `worker:promote`), `worker/worker.ts` (`authorityHostFromEnv`) |
 | **019** | [typed principals + bounded delegation](design/019-delegation-authority.md) | **proposed** | humans, agents, workloads and organizations are all stable principals; a credential names the key-holding ACTOR, any REPRESENTED principal, and the GRANT CHAIN. Ceremony/attestation/runtime/task are attributes, not identity (RFC 8693 delegation, not impersonation). Depth is bounded by a rank function (`pathLenConstraint`), NOT by scope narrowing. Corrects ADR-008 §299: URI `nameConstraints` bind the HOST, not the path, so the namespace bound is absent | `worker/src/auth/scope-chain.ts`, `worker/src/auth/correlation-key.ts`, `worker/src/delegation-depth.do.test.ts`, `worker/src/receipts/commitment.ts` |
+| **020** | [compose, do not invent](design/020-compose-do-not-invent.md) | **proposed** | notme composes standardized certs, attestations, capabilities and content references and makes the graph walkable OFFLINE by a party that does not trust notme; it introduces no new signing algorithm, token, hash-chain, task store or completion state machine, and is never required as a verifier of statements it did not issue — but DOES own grant lifecycle, because that is revocation. Split out of ADR-019 D6 | `worker/src/receipts/`, `worker/src/auth/correlation-key.ts`, `docs/design/019-delegation-authority.md` |
 
 statuses come from each ADR's own header. 007 and 009 don't carry an explicit status field — labelled "accepted" here based on shipped code. 005 was promoted from "proposed" to "accepted" in this PR (the principal model has shipped at `worker/src/auth/principals.ts`).
 
@@ -33,6 +34,7 @@ graph TD
     A008["008 bridge cert + CSR + WIMSE<br/>(P-256 + Ed25519 cert pair)"]:::accepted
     A009["009 identity-gated runtime<br/>(workerd service bindings)"]:::accepted
     A019["019 typed principals + bounded delegation<br/>(actor · represented · grant chain)"]:::proposed
+    A020["020 compose, do not invent<br/>(no new primitives; walkable offline)"]:::proposed
 
     SIG004["signet ADR-004<br/>bridge certs (parent design)"]:::external
     SIG002["signet ADR-002<br/>protocol spec"]:::external
@@ -55,7 +57,10 @@ graph TD
     A005 --> A019
     A008 -->|"pathlen table, unbuilt middle tier"| A019
     A019 -.->|"answers Q1/Q2 of"| CL0066
+    A019 --> A020
+    A014 -.->|"receipts are a composed layer"| A020
     CL0066["cloister ADR-0066<br/>what does a WIMSE URI name?"]:::external
+    A014["014 receipt signing"]:::accepted
 ```
 
 key edges:

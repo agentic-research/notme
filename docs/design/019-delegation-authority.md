@@ -108,6 +108,36 @@ what authority should be granted.** The grantor for a CI-obtained credential is
 whoever configured the policy that maps an attested identity to scopes — an
 organization principal, not GitHub.
 
+### The three cases this must represent
+
+There are exactly three shapes, and `represented_principal` is what
+distinguishes them. It is worth writing out because the model was arrived at
+from the delegated case and must not quietly assume it.
+
+| Case | actor | represented_principal | Example |
+|---|---|---|---|
+| **human → agent** | agent | **human** | an agent doing work I authorized, unattended |
+| **human** | human | *absent* | a person acting directly, for themselves |
+| **agent (m2m)** | agent | **organization** | CI, a scheduled job, a service calling a service |
+
+The third is the one that repays attention. "Machine to machine" reads like
+*no* represented principal, but an agent acting m2m is almost never acting for
+itself — it exercises authority an ORGANIZATION granted through policy. So the
+represented principal is an `organization` principal, which is why D2's
+`principal_kind` includes it. Genuine self-authority (`represented_principal`
+absent, actor is a machine) exists but is rarer than it looks, and stating it
+as the default is how accountability gets lost.
+
+**The model covers all three; the code covers one and a half.**
+`/cert/passkey` is case 2 and works, modulo the ceremony-varying identity
+(`notme-77438b`). `/cert/gha` is case 3 and carries **no represented principal
+at all**: `worker.ts:746` builds the identity from `repository_owner` and the
+repo name, and mints with `subject: claims.sub` and `scopes: ["bridgeCert"]` —
+so the cert says *what ran*, never *whose authority it ran under*. That is
+exactly the accountability gap this ADR exists to close, and it is why the GHA
+path needs the represented principal added rather than merely a new URI shape.
+Case 1 has no implementation at all, because it needs the middle tier (D4).
+
 ### D2 — Identity names a stable subject; kind and assurance are claims
 
 The URI carries the subject and nothing else:
@@ -365,66 +395,26 @@ this ADR exists to preserve.
 
 ## D6 — Compose, do not invent
 
-> notme MUST represent delegation by **composing** standardized certificates,
+**Moved to [ADR-020](020-compose-do-not-invent.md).** The composition
+constraint binds work far beyond the identity decision — transparency,
+attestation, receipts, acceptance — so it is argued and adopted on its own
+rather than as a clause of this ADR. Summarised here because the decisions
+below depend on it:
+
+> notme MUST represent delegation by COMPOSING standardized certificates,
 > attestations, capabilities and content references, and MUST make the
-> resulting graph **walkable offline by a party that does not trust notme**.
->
-> It MUST NOT introduce a new signing algorithm, authorization token,
-> hash-chain format, task store, or task-completion state machine, and MUST
-> NOT be required as a verifier of any statement it did not issue.
->
-> It MUST own the lifecycle of the credentials and grants it issues, because
-> that is revocation.
+> resulting graph walkable offline by a party that does not trust notme. It
+> MUST NOT introduce a new signing algorithm, authorization token, hash-chain
+> format, task store, or task-completion state machine, and MUST NOT be
+> required as a verifier of any statement it did not issue. It MUST own the
+> lifecycle of the credentials and grants it issues, because that is
+> revocation.
 
-This is not a new constraint so much as an extension of one APAS already
-states. APAS §3.4: *"APAS does not define its own key format — it delegates to
-that role's existing specifications."* The spec references DSSE and in-toto
-throughout. D6 applies the same discipline to notme.
-
-The composition, with each layer owned elsewhere:
-
-| Layer | Answers | Standard | Owner |
-|---|---|---|---|
-| X.509 path (root → bridge → task) | who may act, and how far it may pass that on | RFC 5280 | notme |
-| APAS statement (DSSE / in-toto) | the bounded obligation: revision, constraints, predicate, acceptor | DSSE, in-toto | signet |
-| Capability references | permitted actions and resources | signet | signet |
-| Content addresses | task, inputs, outputs, verification roots | LLO | ley-line |
-| Interlace receipts | that execution was admitted | ADR-014 / RECEIPTS.md | cloister |
-| Acceptance statement | whether the evidence satisfies the predicate | **does not exist** | — |
-
-**Keep the certificate compact.** Issuer and subject keys, ownership linkage,
-validity, delegation budget, scope attenuation, key binding, and a *digest* of
-the task statement. Rich semantics belong in the signed statement, not the
-cert: certificates are poor containers for them (size, parsing surface,
-revocation granularity), and every field added to a cert is a field every
-X.509 verifier must tolerate.
-
-### Two clarifications this constraint needs, or it is wrong
-
-**Composition surface is not verification surface.** An earlier phrasing had
-notme "present and verify" the whole graph. Verifying it would defeat criterion
-(D): a third party verifying *without trusting notme at the moment of the
-check* cannot be achieved by trusting notme's verification instead of its
-issuance — that is the same dependency wearing a different hat. notme makes the
-graph walkable; each verifier walks the parts it cares about. There is a
-practical argument too: verifying everything would require notme to understand
-DSSE, in-toto, LLO addressing, Interlace receipts and capability semantics, so
-a format change in any of five systems would break the authority.
-
-**Task state is not grant state.** "No completion state machine" is right about
-*tasks* — `submitted → verified → accepted` belongs to rosary or the human, not
-here. It must not be read as forbidding **grant** state, because grant
-lifecycle *is* revocation, and criterion (C) requires it. notme owns
-issued → revoked for what it issues, and nothing else.
-
-### The unresolved joint: DSSE ↔ X.509
-
-DSSE signatures carry `keyid` and `sig`; in-toto references subjects by digest;
-the certificate path yields a key carrying a WIMSE identity. **Nothing yet
-binds "this DSSE keyid is that certificate's subject key."** Sigstore solves it
-by embedding the certificate in the bundle. Until this is pinned, "the bridge
-or task key signs that statement" has no wire format, and it is the first thing
-an implementer hits. See `notme-9f84e6` and the acceptance bead.
+Two consequences load-bearing for THIS ADR: the grant object of D3 is
+permitted (grant lifecycle is revocation, not task state), and the acceptance
+statement of "Task completion is a grant" must be expressible in DSSE/in-toto
+rather than a notme format. ADR-020 also records the unresolved DSSE↔X.509
+binding that blocks both.
 
 ## Alternatives considered
 
