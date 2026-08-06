@@ -261,6 +261,25 @@ Note `remaining_delegation_depth` sits in the grant payload *and*
 first is enforced by anything reading the grant, the second by every conformant
 X.509 validator whether or not it understands grants.
 
+**PRECEDENCE, because redundancy without a rule is ambiguity.** The two can
+disagree — a grant reissued with a lower depth against a certificate minted
+earlier, or a capability grant expressing `delegation_depth: 0` alongside a
+certificate whose `pathLenConstraint` permits one more hop.
+
+> **The more restrictive value wins, always, and a verifier that can read only
+> one of them is still correct.**
+
+That property is what makes the redundancy safe rather than merely duplicated:
+an X.509 validator ignorant of grants enforces `pathLenConstraint` and cannot
+be tricked into accepting a deeper chain, while a grant reader that cannot
+parse certificates enforces the grant's depth. Neither can be *widened* by the
+other. The failure mode this forbids is a design where the grant is treated as
+authoritative and a permissive certificate is issued "because the grant will
+catch it" — a verifier that only does path validation would then accept the
+deeper chain.
+
+The same rule governs scopes and validity windows: intersection, never union.
+
 ### D4 — Depth is bounded by a rank function, not by scope narrowing
 
 ADR-008 already specifies three tiers and `notme-20f88b` widened the root to
@@ -386,6 +405,44 @@ answer is **TTL-only for anything finer than an epoch**, and the ADR says so
 rather than implying the hierarchy above already works. Choosing among signed
 revocation epochs, a CRL distribution point, OCSP, or trust-bundle refresh is
 `notme-77a024`'s remaining work.
+
+#### "Offline verification" and "not revoked" cannot both be fully true
+
+Downstream descriptions of Interlace verification say it runs **offline**
+against the published notme root, and *also* list "not revoked" among the local
+checks. Both cannot hold at once: an offline verifier's revocation data is
+stale by definition.
+
+What notme actually offers is not offline but **loosely coupled** — a signed
+bundle, pull-based, that `isBundleStale()` refuses once older than
+`BUNDLE_MAX_AGE_MS` (5 minutes). So a verifier that can reach the bundle has
+5-minute-fresh epoch revocation; one that cannot has **TTL-only**, and TTL is
+the whole of its protection.
+
+**This is a fail-open/fail-closed decision nobody has made, and it must be
+made explicitly**, because the two answers are both defensible and lead
+somewhere different:
+
+- **Fail closed** — refuse to verify without a fresh bundle. Correct for a
+  high-assurance boundary, and it makes air-gapped verification impossible,
+  which contradicts the archival-verification goal (`cloister-ad7b5a`).
+- **Fail open to TTL-only** — accept a valid, unexpired chain with no bundle,
+  and say so in the verification result rather than silently. Correct for
+  archival and cross-organisation use, where reaching the issuer's revocation
+  infrastructure is not something a relying party can assume.
+
+The second is probably right, and it carries an obligation: **the verification
+result must record which mode it used.** A verdict that does not distinguish
+"checked against a fresh bundle" from "TTL-only, no bundle reachable" is
+exactly the kind of green signal this repo keeps finding — one that asserts a
+property nothing verified.
+
+**Cross-organisation federation sharpens this into an argument for short TTLs.**
+A relying party at another organisation cannot poll a peer authority's
+revocation infrastructure per request, and should not be able to. There,
+ephemerality *is* the revocation mechanism rather than a convenience — which is
+a far stronger justification for a 5-minute credential than any currently
+written down.
 
 **Issuance transparency (`notme-907299`)** gains a subject worth logging: "X
 delegated to Y at time T, for purpose P" is a materially stronger record than
@@ -524,8 +581,27 @@ it as a machine that inherits a human's identity.
 5. **Does the middle tier mint at notme or sign locally?** With
    `CA=true, pathlen=0` the machine can sign locally with no round trip and the
    chain still validates to notme's root — putting notme in the revocation path
-   without being in the issuance path. Stated here so it is argued before it is
-   built.
+   without being in the issuance path.
+
+   **"Derives or obtains" is not an answer**, and downstream descriptions have
+   started using that phrasing as though the choice were an implementation
+   detail. It is not; the two differ in every property that matters:
+
+   | | Signs locally | Obtains from notme |
+   |---|---|---|
+   | round trip | none — works offline | required per task |
+   | notme's record of the task credential | **none** | complete |
+   | task-scoped revocation | impossible by construction | possible |
+   | issuance transparency (`notme-907299`) | covers hop 1 only | covers both |
+   | availability coupling | machine survives notme outage | tasks stop |
+
+   Local signing is what ADR-007's proxy already enables and what
+   cross-organisation use needs. Obtaining from notme is what criteria (C) and
+   (D) want. The resolution this ADR assumes is **locally signed, asynchronously
+   recorded** — notme in the revocation path without being in the issuance
+   path — but that requires the machine to publish what it minted, which is a
+   liveness dependency nobody has specified. Until it is written down, the
+   answer is genuinely open.
 7. **How is the APAS conflict resolved?** APAS says the bridge cert IS the
    per-dispatch identity; D4 treats it as a longer-lived machine tier that
    mints per-task credentials. And "actor" names different things in the two
