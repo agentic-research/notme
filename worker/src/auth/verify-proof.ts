@@ -254,7 +254,19 @@ export async function verifyX509(
   if (cert.notAfter < new Date()) throw new Error("cert expired");
   if (cert.notBefore > new Date()) throw new Error("cert not yet valid");
 
+  // Verify cert was signed by the CA — THE critical check.
+  // Without this, any self-signed cert with valid dates would pass.
+  const caCert = new X509Certificate(caPublicKeyPem);
+  const signatureValid = await cert.verify({ publicKey: caCert.publicKey });
+  if (!signatureValid) throw new Error("cert signature invalid — not signed by trusted CA");
+
   // ── Epoch check: the emergency revocation lever, finally wired ──
+  //
+  // AFTER the signature check, deliberately. Everything here interprets the
+  // certificate's CONTENTS, and contents are only meaningful once the cert
+  // is known to be ours. Checking the epoch first also handed an
+  // unauthenticated caller an oracle: submit a forged cert with a guessed
+  // epoch and the error message distinguishes a right guess from a wrong one.
   //
   // ADR-008 §418: "increment the CA epoch. All certs signed with the previous
   // epoch are immediately invalid." §420: "if cert.epoch < bundle.epoch, the
@@ -277,12 +289,6 @@ export async function verifyX509(
       `cert epoch ${epoch} does not match authority epoch ${currentEpoch} — revoked by rotation`,
     );
   }
-
-  // Verify cert was signed by the CA — THE critical check.
-  // Without this, any self-signed cert with valid dates would pass.
-  const caCert = new X509Certificate(caPublicKeyPem);
-  const signatureValid = await cert.verify({ publicKey: caCert.publicKey });
-  if (!signatureValid) throw new Error("cert signature invalid — not signed by trusted CA");
 
   // Extract subject CN
   const subject = cert.subjectName.getField("CN")?.[0] ?? cert.subject;
