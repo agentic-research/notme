@@ -2,135 +2,170 @@
 @doc-check
 @endpoints: POST /cert, POST /cert/gha, POST /cert/passkey
 -->
-# ADR-019: What notme's identities name — a delegation authority
+# ADR-019: Typed principals and bounded delegation
 
 **Status:** proposed
 **Beads:** `notme-600df1` (this decision), `notme-77438b` (ceremony-varying identity), `notme-2c4209` (registration policy), `notme-77a024` (revocation unit), `notme-acc822` (chain constraints), `notme-9f84e6` (correlation key)
 **Answers:** cloister ADR-0066 Q1 and Q2
 **Serves:** `notme-bed754` criterion (B); unblocks (C) and (D)
+**Supersedes within this ADR:** an earlier draft argued notme names "delegated authority exercised unattended". That was a category error and is corrected below.
 
 ## Context
 
 Cloister's ADR-0066 asks notme to say what its identities name, offering two
 readings: a **human authority bootstrapping workload identity**, or a
-**workload authority**. Cloister can bind its own acceptance criteria
-unilaterally; it cannot bind notme's naming, so the question came here.
+**workload authority**. Cloister binds its own acceptance criteria; it cannot
+bind notme's naming, so the question came here.
 
-Answering it as posed would leave the actual defect unfixed, because the
-dichotomy assumes the authority names one kind of thing. notme demonstrably
-names two already:
+The dichotomy is too small, because notme already names two different kinds of
+thing in the same URI position:
 
 | Route | Identity emitted | What the slot after the domain holds |
 |---|---|---|
-| `POST /cert/gha` | `wimse://<domain>/gha/<owner>/<repo>` (`worker.ts:746`) | a **workload class**, then what is running |
+| `POST /cert/gha` | `wimse://<domain>/gha/<owner>/<repo>` (`worker.ts:746`) | a **platform attestation mechanism**, then what is running |
 | `POST /cert/passkey` | `wimse://<domain>/<authMethod>/<principalId>` (`worker.ts:2307`) | an **authentication ceremony**, then a UUID |
 | `POST /cert` | same shape as above (`cert-exchange.ts:244`) | same |
 
 A verifier reading `/gha/` and `/passkey/` finds two different *kinds* of fact
-in the same position. The identity cannot say which it is.
+in the same position, and neither is the subject.
 
-### The defect this produces today
+### The live defect
 
 `worker.ts:2307` interpolates the session's auth method beside a **stable**
 principal id. `/join` issues a session with `authMethod: "invite"`
 (`worker.ts:1997`); passkey login issues one with `authMethod: "passkey"`
-(`worker.ts:885`, `:929`) — **for the same principal**. So one human who joins
-by invite and later authenticates with a passkey mints **two different
-identities for one subject**. A field that should be stable across
-authentications varies by authentication (`notme-77438b`).
+(`worker.ts:885`, `:929`) — **for the same principal**. One human who joins by
+invite and later authenticates with a passkey mints **two different identities
+for one subject** (`notme-77438b`).
 
 This is downstream of `notme-ebc9af`, which replaced a hardcoded `authMethod`
 with the real one. That fix was correct — a stable lie is worse than visible
-instability, because the lie is trusted precisely because nothing contradicts
-it — but it made the modelling defect *observable* rather than relieving it.
+instability — but it made the modelling defect *observable* rather than
+relieving it.
 
-### What the agent case adds
+### What notme already records and discards
 
-In a system where humans and agents both operate, the interesting principal is
-neither a human nor a workload. It is **delegated authority exercised
-unattended**: an agent acting with authority a human granted, without that
-human present, for a bounded piece of work.
-
-That is what the hardcoded 5-minute TTL at the session-cert path is implicitly
-modelling — a credential scoped to roughly the length of a task, because
-nothing else bounds it. Note the asymmetry that already exists and is nowhere
-stated: the GHA (workload) TTL is configurable via `GHA_CERT_TTL_MS`, while the
-session (human-ceremony) TTL is hardcoded. The code already treats the two
-cases differently while the naming treats them the same.
-
-### The finding that makes this concrete
-
-**notme already records delegation and discards it at the credential
-boundary.** Three columns exist today: `principals.created_by`,
-`capability_grants.granted_by`, `invites.created_by`. Storage knows who granted
-what to whom. The certificate carries the principal and its scopes and
-**nothing about the grant** — so when an agent acts, the cert says "principal
-X, scopes Y" and no verifier can learn "on behalf of human Z, granted at time
-T". Accountability does not survive the handoff, which in an agent world is the
-handoff that matters most.
+`principals.created_by`, `capability_grants.granted_by`, `invites.created_by`.
+Storage knows who granted what to whom. The certificate carries the principal
+and its scopes and **nothing about the grant**, so when an agent acts, no
+verifier can learn on whose behalf. Accountability does not survive the
+handoff, which in an agent world is the handoff that matters most.
 
 ## Decision
 
-**notme is a delegation authority.** It names subjects, records what *kind*
-each subject is, and mints short-lived credentials that carry the delegation
-chain they were minted under.
+> **notme is an authority for typed principals and bounded delegation.**
+> Humans, agents, workloads, and organizations may have stable principal
+> identities. A delegated credential identifies the key-holding **actor**, any
+> **represented principal**, and the **grant chain** authorizing the action.
+> Authentication ceremony, platform attestation, runtime, and task are
+> credential or execution attributes — **not substitutes for stable identity**.
 
-Cloister's D2 reading — "human authority bootstrapping workload identity" —
-describes the *dominant flow* correctly and is the right reading of
-`cloister-f2338f`. It is wrong as a statement of the authority's nature,
-because it has nothing to say about the hop that happens after bootstrap.
+### The entities, and why the earlier draft was wrong
 
-### The chain is two hops, with different granters
-
-> The bridge delegates the human to the machine. And the machine delegates to
-> each task.
-
-| Hop | Granter | Subject | Credential | Built? |
-|---|---|---|---|---|
-| 1 | human (passkey ceremony) or platform (GHA OIDC attestation) | **machine** | bridge cert | **yes** |
-| 2 | machine | **task** | task cert | **no** |
-
-Hop 2 does not exist. There is no route that accepts a bridge *certificate* as
-authorization to mint anything; every mint path is gated on a **session**.
-`certMint` is granted to the bootstrap principal (`cert-exchange.ts:140`),
-excluded from certs by policy, and **checked nowhere** — the vocabulary
-anticipated hop 2 and the implementation never arrived.
-
-### D1 — The identity names a stable subject, not the ceremony
-
-The advertised identity MUST NOT vary with how a principal authenticated.
-`authMethod` describes the *credential*, not the *subject*, and belongs in an
-extension — where it already is (`OID_AUTH_METHOD`).
-
-### D2 — The kind is explicit, and each kind is attested appropriately
-
-A human identity's assurance comes from a human-presence ceremony; a workload
-identity's comes from platform attestation. These are different assurance
-types, and a verifier must be able to tell them apart **without parsing a
-ceremony name out of a path**. Proposed shapes, to be argued:
+An earlier draft said "the interesting principal is delegated authority
+exercised unattended," and described the bridge as delegating *the human to the
+machine*. Both are category errors. **Delegated authority is not a principal**
+— the agent is the principal, and delegation is the *relationship* that gives
+that agent authority. A bridge does not delegate a human; it delegates *some
+authority from* a human or organization *to* an agent.
 
 ```
-wimse://notme.bot/human/<principalId>
-wimse://notme.bot/workload/gha/<owner>/<repo>
-wimse://notme.bot/agent/<principalId>      + a delegation extension
+human H ── grant G ──▶ agent A ── executes ──▶ task T
+                         │
+                         └── runs within workload / runtime W
 ```
 
-### D3 — Delegation is representable in the credential
+- **Human and agent are stable principals.** Both are independently
+  identifiable and independently accountable.
+- **The grant** says what A may do on behalf of H.
+- **The workload** says where and how A is running.
+- **The task** says what bounded work A is performing.
+- **The credential** binds these facts to the key being used.
 
-A granting subject and a grant time, sourced from data notme already stores.
-This is the agent-world requirement and the one currently missing entirely.
+This is **delegation, not impersonation**: the actor retains its own identity
+while acting for another subject. RFC 8693 §4.1 draws the same distinction and
+represents it with separate subject (`sub`) and actor (`act`) information, with
+`act` nestable to express a chain. notme should not invent a different shape
+for a problem OAuth token exchange already models.
 
-### D4 — Delegation depth is bounded by a budget, not by scope narrowing
+### D1 — Seven roles, named separately
 
-ADR-008 §"BasicConstraints and path length" already specifies the three tiers,
-and `notme-20f88b` widened the root to `pathlen=1` for exactly this reason.
-The middle tier was never built: `cert-authority.ts` stamps `CA=false` on every
-cert notme mints, so **the authority issues two levels while its root
-advertises room for three**.
+Conflating any two of these is how the current design went wrong.
 
-An earlier draft of this ADR argued that monotone scope narrowing made depth
-bound itself, so no tier needed formalising. **That was wrong**, and the
-correction matters:
+| Role | Who | Notes |
+|---|---|---|
+| **actor** | the agent holding and exercising the credential | the subject of the certificate |
+| **represented_principal** | human or organization on whose behalf it acts | absent for un-delegated workloads |
+| **grantor** | the principal or policy authority that issued the grant | **not** the attester |
+| **attester** | GitHub OIDC, passkey authenticator, TPM | asserts *facts*; does not decide authority |
+| **issuer** | notme, or a delegated bridge CA | mints the credential |
+| **runtime** | the workload carrying the agent | where it runs |
+| **task** | bounded execution context | what work is in scope |
+
+The prior draft's table listed the platform as a *granter* for the GHA path.
+That is wrong: **GitHub attests facts about a workflow run; it does not decide
+what authority should be granted.** The grantor for a CI-obtained credential is
+whoever configured the policy that maps an attested identity to scopes — an
+organization principal, not GitHub.
+
+### D2 — Identity names a stable subject; kind and assurance are claims
+
+The URI carries the subject and nothing else:
+
+```
+wimse://notme.bot/principal/<stable-id>
+```
+
+with signed extensions carrying:
+
+```
+principal_kind  = human | agent | workload | organization
+authentication  = passkey | invite | …          (how a human proved presence)
+attestation     = gha-oidc | tpm | …            (how a workload was attested)
+```
+
+An earlier draft proposed `wimse://notme.bot/workload/gha/<owner>/<repo>`.
+That repeats the very defect it was fixing: **GHA is how the workload was
+attested, not what the workload is.** Kind and assurance mechanism are
+different axes and must not share a slot.
+
+### D3 — The grant is a first-class object with a defined payload
+
+The prior draft required only a granting subject and a grant time. That is not
+enough to authorize anything. The minimum useful grant:
+
+```
+grant_id
+actor_principal
+represented_principal
+parent_grant_id              ← what makes it a chain
+scopes
+audience / resources
+purpose or goal_hash         ← what makes it task-scoped
+issued_at / expires_at
+delegable                    ← may the actor delegate onward at all
+remaining_delegation_depth   ← the rank function, carried in the payload
+```
+
+**A five-minute TTL is only a time bound.** It does not make a credential
+task-scoped, and the earlier claim that the TTL was "implicitly modelling task
+scope" was wishful. `purpose`/`goal_hash` is what scopes a credential to work;
+`expires_at` merely stops it outliving the work.
+
+Note `remaining_delegation_depth` sits in the grant payload *and*
+`pathLenConstraint` sits in the certificate. That redundancy is deliberate: the
+first is enforced by anything reading the grant, the second by every conformant
+X.509 validator whether or not it understands grants.
+
+### D4 — Depth is bounded by a rank function, not by scope narrowing
+
+ADR-008 already specifies three tiers and `notme-20f88b` widened the root to
+`pathlen=1` for exactly this. The middle tier was never built:
+`cert-authority.ts` stamps `CA=false` on every cert notme mints, so **the
+authority issues two levels while its root advertises room for three.**
+
+An earlier draft argued that monotone scope narrowing made depth bound itself.
+**That was wrong:**
 
 - `verifyScopeChain` accepts equality by design, so the relation is reflexive,
   hence a preorder, hence never well-founded — the constant chain admits
@@ -141,134 +176,162 @@ correction matters:
   *strictly* decreasing chains exist too.
 - Macaroons and Biscuit permit unbounded attenuation **because** authority
   cannot grow, and both bound depth **separately** — Biscuit by block count,
-  macaroon deployments by caveat cap — since chain length is a
-  verification-cost problem even when authority is safe.
+  macaroon deployments by caveat cap.
 
 Terminating a chain whose scopes may stay equal requires another component that
-strictly decreases: a rank function into a well-founded set. X.509 carries it
-already. RFC 5280 §6.1.4(l)–(m) is a loop variant, and chains terminate because
-ℕ has no infinite descent. SPKI/SDSI (RFC 2693) carries the degenerate case as
-a boolean delegation bit — which **is** this two-hop design.
+strictly decreases: a rank function into a well-founded set. RFC 5280 §6.1.4(l)–(m)
+is exactly that — a loop variant, decremented and min'd along the path. Chains
+terminate because ℕ has no infinite descent. RFC 2693's boolean delegation bit
+is the degenerate case, and `delegable` above is that bit.
 
-**So the tier IS formalised, as a relative budget, never an absolute number.**
+**So the tier IS formalised — as a relative budget, never an absolute number.**
 A certificate sits at different absolute depths under different trust anchors,
-so an absolute tier is not well-defined per certificate; "remaining hops below
-me" is cert-local and anchor-independent, which is why RFC 5280 composes it by
-decrement-and-min. Two caveats to carry: §6.1.4(l) does **not** decrement for
-self-issued certificates, so pathlen bounds distinct *organisational* tiers
-rather than literal chain length; and §6.1.1 excludes the anchor's own
-certificate from path processing (RFC 5937 makes applying anchor constraints
-optional), so a root's pathlen is enforced when it appears as an intermediate
-and typically ignored when it is the anchor.
+so an absolute tier is not well-defined per certificate.
 
-### D5 — Three independent bounds, none substituting for another
+Two caveats: §6.1.4(l) does **not** decrement for self-issued certificates, so
+pathlen bounds distinct *organisational* tiers rather than literal chain
+length; and §6.1.1 excludes the anchor's own certificate from path processing
+(RFC 5937 makes applying anchor constraints optional), so a root's pathlen is
+enforced when it appears as an intermediate and typically ignored when it is
+the anchor.
+
+### D5 — Three bounds, with honest enforcement labels
 
 | Bound | Mechanism | Enforcement | Built? |
 |---|---|---|---|
-| **Authority** — what a credential may *do* | `scopes ⊆ parent` (`auth/scope-chain.ts`) | **cooperative** — relying parties MUST, nothing compels them | yes |
-| **Depth** — how far it may *pass that on* | `pathLenConstraint` | **intrinsic** — every conformant validator | root only; middle tier missing |
-| **Namespace** — which identities it may *name* | `nameConstraints` (ADR-008 §299) | **intrinsic** | **no** |
+| **Authority** — what a credential may *do* | `scopes ⊆ parent` (`auth/scope-chain.ts`) | **cooperative** — relying parties MUST; nothing compels them | yes |
+| **Depth** — how far it may *pass that on* | `pathLenConstraint` + `remaining_delegation_depth` | **intrinsic** for pathlen | root only; middle tier missing |
+| **Namespace** — which identities it may *name* | see below — **not** URI `nameConstraints` | **cooperative** unless hosts are split | no |
 
-The enforcement asymmetry is why all three are needed: the weaker cooperative
-mechanism does not make the stronger intrinsic ones redundant.
+**The namespace bound cannot be done the way ADR-008 §299 says.** That section
+proposes `permittedSubtrees: URI:wimse://notme.bot/agent/*`. RFC 5280 §4.2.1.10
+is explicit: *"For URIs, the constraint applies to the host part of the name.
+The constraint MUST be specified as a fully qualified domain name and MAY
+specify a host or a domain."* **Path segments are not constrained.** A
+conformant validator will happily accept `wimse://notme.bot/anything` under
+that constraint.
+
+Constraining kinds therefore requires one of:
+
+1. **Distinct constrained hosts** — `agents.notme.bot`, `workloads.notme.bot`.
+   The only option enforced intrinsically by stock validators, at the cost of
+   putting kind back into the name.
+2. **An `otherName` with a registered OID**, constrained via
+   `permittedSubtrees` on that `otherName` type. Standards-shaped, needs the
+   PEN (`notme-229dc3`).
+3. **A custom critical extension plus a validator that understands it.** Marking
+   it critical makes non-understanding verifiers *reject* rather than ignore —
+   which is safe, but means it is enforced by notme's own verifier, not by
+   everyone's.
+
+This is an open question, not a decision. ADR-008 §299 should be corrected
+regardless of which is chosen.
 
 ## What follows, already built
 
-- `auth/scope-chain.ts` — the authority bound, in production, applied at
-  `certScopesForSession`, with the six previously-orphaned attenuation tests
-  now bound to it.
-- `delegation-depth.do.test.ts` — the depth gap pinned as `it.fails`, so it
-  goes red the moment hop 2 lands.
+- `auth/scope-chain.ts` — the authority bound, applied at
+  `certScopesForSession`, with six previously-orphaned attenuation tests now
+  bound to it.
+- `delegation-depth.do.test.ts` — the depth gap pinned as `it.fails`, going red
+  the moment the middle tier lands.
 - `auth/correlation-key.ts` — `<principal>/<bridge>/<task>`, keyed on the
-  **stable principal** and the **pair binding** (not a serial: a bridge is two
-  certs with two independent serials, so no serial names it).
+  stable principal and the pair binding (not a serial: a bridge is two certs
+  with two independent serials, so no serial names it).
 - `receipts/commitment.ts` — an optional ninth `delegation` field, verified
-  against what the authority derived, refused when it cannot verify it.
-  Proposed to cloister as `cloister-c10ff2`; inert until they adopt it.
+  against what the authority derived. Proposed to cloister as
+  `cloister-c10ff2`; inert until adopted.
 
 ## What it requires that is not built
 
-1. **The middle tier** — a mint path producing `CA=true, pathlen=0,
-   keyCertSign`. This is the whole of hop 2.
-2. **`nameConstraints`** on any CA=true cert. Blocked on (1): there is nothing
-   to constrain until an intermediate exists.
-3. **A task-credential producer**, which is what gives the correlation key its
-   third segment and the receipt field a value.
-4. **`OID` for the delegation extension**, inheriting `notme-229dc3`'s
-   placeholder-PEN blocker *and* its live arc collision with cloister.
+1. **The grant as a stored, referenceable object** with the D3 payload. Today
+   there are three `*_by` columns and no grant identity.
+2. **The middle tier** — a mint path producing `CA=true, pathlen=0`.
+3. **A namespace mechanism**, per D5's open question.
+4. **A task-credential producer**, which gives the correlation key its third
+   segment and the receipt field a value. Note the subject of a task credential
+   should be the **agent or agent instance**, with `task_id`/`goal_hash` as
+   bounded context — a task is execution context, not an entity capable of
+   holding a key, unless it genuinely generates and controls its own.
+5. **An OID arc** (`notme-229dc3`), which also has a live collision with
+   cloister's Interlace extensions.
 
 ## Consequences
 
-**Registration policy (`notme-2c4209`)** follows from D2 rather than from an
-inline comment: if identities are typed, "may a stranger register" becomes
-"which kinds may self-register", which is answerable per kind instead of
-globally.
+**Registration policy (`notme-2c4209`)** follows from D2: "may a stranger
+register" becomes "which *kinds* may self-register", answerable per kind.
 
-**The revocation unit (`notme-77a024`)** is a delegation. The hierarchy falls
-out and is exactly the granularity between "wait out the TTL" and "revoke
-everything":
+**The revocation unit (`notme-77a024`)** is a grant. The hierarchy:
 
 ```
-revoke a PRINCIPAL → every machine and every task under it falls
-revoke a BRIDGE    → that machine's tasks fall; sibling bridges survive
-revoke a TASK      → only that task
+revoke a PRINCIPAL → every grant naming it as actor or represented falls
+revoke a GRANT     → every credential minted under it, and its child grants
+revoke a TASK      → only that bounded context
 ```
 
-Note this needs no new mechanism for the subtree case: revoking a bridge cert
-fails every task cert beneath it **by issuer**, which is intrinsic path
-validation. What the correlation record adds is *enumeration* — answering what
-a revocation affected, which is an incident-response question.
+**This does not happen by itself, and the mechanism must be named.** Revoking a
+bridge collapses descendant validation *only when verifiers receive and enforce
+fresh revocation state.* RFC 5280 requires status be determined via CRLs, OCSP,
+or an out-of-band mechanism — and that information still has to reach the
+verifier. Recording "revoked" inside notme does not intrinsically invalidate an
+offline chain someone already holds.
 
-**Issuance transparency (`notme-907299`)** gains a subject worth logging. A log
-of "a cert was issued" is weaker than a log of "X delegated to Y at time T".
+What notme has today is **epoch-based bundle revocation** (`revocation.ts`):
+coarse (a whole issuance class), pull-based, and gated on `BUNDLE_MAX_AGE_MS`.
+There is no CRL, no OCSP, and no per-credential status. So the honest current
+answer is **TTL-only for anything finer than an epoch**, and the ADR says so
+rather than implying the hierarchy above already works. Choosing among signed
+revocation epochs, a CRL distribution point, OCSP, or trust-bundle refresh is
+`notme-77a024`'s remaining work.
 
-**Federation** is a *separate axis* and is deliberately out of scope here.
-Delegation depth is vertical; two organisations each running an authority is
-horizontal. notme already emits trust-domain-qualified identities
-(`wimseTrustDomain`), which is the hard part; what is missing is the accept
-side. SPIFFE Federation is the model to copy. Cross-signing is the X.509
-alternative and is worse here, because it makes a foreign root
-indistinguishable from a local one in the chain — destroying the attribution
+**Issuance transparency (`notme-907299`)** gains a subject worth logging: "X
+delegated to Y at time T, for purpose P" is a materially stronger record than
+"a cert was issued."
+
+**Federation** is a separate, horizontal axis and is out of scope here. notme
+already emits trust-domain-qualified identities; the accept side is missing.
+SPIFFE Federation is the model. Cross-signing is worse here because it makes a
+foreign root indistinguishable from a local one, destroying the attribution
 this ADR exists to preserve.
 
 ## Alternatives considered
 
 **A — "Human authority bootstrapping workload identity"** (cloister's D2).
 Describes the dominant flow correctly. Rejected as the authority's *nature*: it
-says nothing about hop 2, so adopting it resolves the naming and leaves the
-revocation unit unbuildable.
+says nothing about what happens after bootstrap, so adopting it resolves the
+naming and leaves the revocation unit unbuildable.
 
-**B — "Workload authority"** (SPIFFE-shaped). Rejected: it would make
-`/cert/passkey` the anomaly, when the passkey ceremony is the root of trust for
+**B — "Workload authority"** (SPIFFE-shaped). Rejected: it makes
+`/cert/passkey` the anomaly, when that ceremony is the root of trust for
 everything notme issues outside CI.
 
-**C — Delegation authority** (chosen). Subsumes both: hop 1 is exactly A, and
-the model additionally names hop 2, which A and B are both silent about.
+**C — Typed principals and bounded delegation** (chosen). Subsumes both, and
+additionally names the agent as an accountable principal rather than treating
+it as a machine that inherits a human's identity.
 
-**D — Do nothing, document the current shape as intended.** Rejected because
-the shape is not self-consistent: `notme-77438b` is a live defect under any
-reading, and `gen/go/verify/identity.go` already carries a "never split this
-string" comment — a symptom treatment for exactly this cause.
+**D — Do nothing, document the current shape as intended.** Rejected:
+`notme-77438b` is a live defect under any reading, and
+`gen/go/verify/identity.go` already carries a "never split this string" comment
+— a symptom treatment for exactly this cause.
 
 ## Open questions
 
 1. **Addition or cut?** Changing the session-minted URI shape is a *blocking*
-   cross-repo change per ADR-018's compatibility matrix. Cloister's ADR-0066 D4
-   (they decline to parse WIMSE segments at all) and D5 (they will consume an
-   alongside identity) mean this can land as an **addition**. Signet has not
-   been asked.
-2. **What kinds exist?** `human` / `workload` / `agent` is a taxonomy decision
-   that should be made once rather than grown.
-3. **Does hop 2 mint at notme or sign locally?** With the bridge at
-   `CA=true, pathlen=0` the machine can sign task certs locally with no round
-   trip and the chain still validates to notme's root — offline and edge run
-   the identical check. notme is then in the *revocation* path without being in
-   the *issuance* path, which is the resolution this ADR assumes. It should be
-   stated explicitly before hop 2 is built.
+   cross-repo change per ADR-018's matrix. Cloister's D4 (they decline to parse
+   WIMSE segments) and D5 (they will consume an alongside identity) permit an
+   **addition**. **Signet has not been asked.**
+2. **Which namespace mechanism** — distinct hosts, `otherName`, or a custom
+   critical extension (D5).
+3. **Which revocation mechanism** reaches verifiers (Consequences, above).
+4. **Is `agent` a kind, or a role a principal plays?** The taxonomy should be
+   settled once rather than grown.
+5. **Does the middle tier mint at notme or sign locally?** With
+   `CA=true, pathlen=0` the machine can sign locally with no round trip and the
+   chain still validates to notme's root — putting notme in the revocation path
+   without being in the issuance path. Stated here so it is argued before it is
+   built.
 
 ## Adopting this
 
-Change **Status** to `accepted` and this ADR satisfies `notme-bed754`
-criterion (B) for the recorded-answer half. The code half of (B) —
-`notme-77438b`, the ceremony-varying identity — is a separate change gated on
-open question 1.
+Change **Status** to `accepted`. That satisfies `notme-bed754` criterion (B)
+for the recorded-answer half only. The code half — `notme-77438b` — is a
+separate change gated on open question 1.

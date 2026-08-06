@@ -298,13 +298,44 @@ Scopes are encoded as ASN.1 `SEQUENCE OF UTF8String`, not comma-delimited string
 
 ### nameConstraints (defense-in-depth)
 
-Orchestrator bridge certs SHOULD include nameConstraints restricting the URI SAN namespace of subordinate certs:
+> **CORRECTION (2026-08-06, ADR-019 D5).** The mechanism described below does
+> not work as written, and was never implemented. It is retained rather than
+> deleted because ADRs are append-only and because other documents cite it.
+> **Do not build against it.**
+
+The original text proposed that orchestrator bridge certs restrict the URI SAN
+namespace of subordinate certs:
 
 ```
-permittedSubtrees: URI:wimse://notme.bot/agent/*
+permittedSubtrees: URI:wimse://notme.bot/agent/*      ← DOES NOT WORK
 ```
 
-This provides automatic namespace scoping enforced by any conformant X.509 path validator (RFC 5280 Section 4.2.1.10), independent of the custom scope extension.
+and claimed this is "enforced by any conformant X.509 path validator (RFC 5280
+Section 4.2.1.10)".
+
+**URI name constraints do not constrain paths.** RFC 5280 §4.2.1.10 states:
+*"For URIs, the constraint applies to the host part of the name. The constraint
+MUST be specified as a fully qualified domain name and MAY specify a host or a
+domain."* A constraint of `notme.bot` is satisfied by
+`wimse://notme.bot/anything`, so the `/agent/` segment is not scoped at all. A
+conformant validator does exactly the right thing and it is not what this
+section assumed.
+
+Constraining the namespace requires one of three mechanisms, none free:
+
+1. **Distinct constrained hosts** (`agents.notme.bot`, `workloads.notme.bot`) —
+   the only option enforced intrinsically by stock validators, at the cost of
+   encoding kind into the name again.
+2. **An `otherName` with a registered OID**, constrained via `permittedSubtrees`
+   on that `otherName` type. Blocked on `notme-229dc3` (PEN).
+3. **A custom critical extension plus a validator that understands it.**
+   Criticality makes non-understanding verifiers *reject* rather than ignore,
+   which is safe — but enforcement then lives in notme's verifier, not
+   everyone's.
+
+Choosing among these is an open question on ADR-019. Until then the namespace
+bound is **absent**, not merely unimplemented, and no document should describe
+it as defence-in-depth that exists.
 
 ## Authentication paths
 
