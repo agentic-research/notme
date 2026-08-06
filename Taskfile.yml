@@ -88,13 +88,31 @@ tasks:
     desc: Upload new version without routing traffic to it
     dir: worker
     cmds:
-      - pnpm exec wrangler versions upload
+      # Stamp the build so the deployed Worker can say WHICH build it is
+      # (notme-9f2f79). Deploys here are manual, so without this the git tree
+      # does not settle what is running and a consumer waiting on a fix can
+      # only ask. Read back at GET /.well-known/version.
+      #
+      # A --var binding rather than a generated source file: a generated file
+      # would change every commit, which makes reproducibility gates like
+      # action:bundle-check meaningless, and would need gitignoring — putting
+      # the value outside review.
+      - pnpm exec wrangler versions upload --var BUILD_SHA:$(git rev-parse HEAD)
 
   worker:deploy:
     desc: Deploy to production (use ship for the safe path)
     dir: worker
     cmds:
-      - pnpm exec wrangler deploy
+      # Stamp the build so the deployed Worker can say WHICH build it is
+      # (notme-9f2f79). Deploys here are manual, so without this the git tree
+      # does not settle what is running and a consumer waiting on a fix can
+      # only ask. Read back at GET /.well-known/version.
+      #
+      # A --var binding rather than a generated source file: a generated file
+      # would change every commit, which makes reproducibility gates like
+      # action:bundle-check meaningless, and would need gitignoring — putting
+      # the value outside review.
+      - pnpm exec wrangler deploy --var BUILD_SHA:$(git rev-parse HEAD)
 
   worker:rollback:
     desc: Roll back to previous version
@@ -167,6 +185,13 @@ tasks:
         # the newly deployed handler instead of the previous version's cache.
         check_request "ca-bundle" "GET" "${AUTH_BASE}/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE" "200" "BEGIN CERTIFICATE"
         check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
+        # The deployed build must be able to NAME ITSELF. Asserting
+        # "stamped":true rather than merely a 200: an endpoint that always
+        # answered "unknown" would pass a liveness check while telling a
+        # consumer nothing, which is the state that made signet's "no positive
+        # evidence" objection correct (notme-9f2f79). No nonce — it is
+        # no-store, so there is no cache entry to bypass.
+        check_request "build-version" "GET" "${AUTH_BASE}/.well-known/version" "200" '"stamped":true'
         # Expect the environment's own authority host in the docs page — a
         # staging deploy that renders production URLs is a config leak, not
         # a pass. Nonce for the same reason as ca-bundle: Cache API entries
@@ -254,7 +279,7 @@ tasks:
     desc: Deploy to the staging Worker (notme-bot-staging, isolated state)
     dir: worker
     cmds:
-      - pnpm exec wrangler deploy --env staging
+      - pnpm exec wrangler deploy --env staging --var BUILD_SHA:$(git rev-parse HEAD)
 
   worker:verify-staging:
     desc: Smoke test staging endpoints (same checks as production verify)

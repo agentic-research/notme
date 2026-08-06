@@ -56,6 +56,7 @@ const DENIED_HOSTS = new Set([
 import { getAllowedAudiences } from "./src/allowed-audiences";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
+import { buildInfo } from "./src/build-version";
 
 function isDeniedDestination(url: string): boolean {
   try {
@@ -1629,6 +1630,37 @@ export default {
     // ── /health liveness probe ──
     // Host-agnostic, no auth, no DO access. Cloister + container orchestrators
     // (cluster.capnp notme-identity bundle) poll this on :8788/health.
+    // GET /.well-known/version — which BUILD is serving this request
+    // (notme-9f2f79, and signet's "no positive evidence" objection).
+    //
+    // Deploys here are manual, so the git tree does not settle what is
+    // running. Before this, a consumer waiting on a fix had no way to confirm
+    // it shipped except to ask, and "there is no positive evidence" was a fair
+    // description. `/health` says `ok`; nothing else served was derived from
+    // the build.
+    //
+    // It is also the discriminator ADR-018's canary gate needs. That gate
+    // failed twice by silently reporting the OLD version's behaviour, and an
+    // earlier attempt used the JWKS `kid` — which cannot work, because `kid`
+    // is stored Durable Object state rather than something the build
+    // determines, so two different builds serve the same value.
+    //
+    // Unauthenticated and uncached, like /health: the commit of a public repo
+    // is not a secret, and a cached answer would defeat the entire purpose on
+    // the request after a deploy.
+    //
+    // Answered before host canonicalization for the same reason as /health —
+    // probes from bare-IP or in-cluster hosts must get an answer, not a 301.
+    if (pathname === "/.well-known/version") {
+      return Response.json(buildInfo(env), {
+        status: 200,
+        headers: {
+          "Cache-Control": "no-store",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
     // Must respond before any host-canonicalization redirect so probes from
     // bare-IP / pod-IP / docker bridge hosts get a 200 instead of a 301.
     if (pathname === "/health" || pathname === "/healthz") {
