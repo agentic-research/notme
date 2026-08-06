@@ -376,15 +376,17 @@
 }</div>
           <div class="ep-label">response</div>
           <div class="ep-response">{
-  "certificate": "-----BEGIN CERTIFICATE-----\n...",
-  "private_key": "-----BEGIN PRIVATE KEY-----\n...",
+  "certificates": {
+    "mtls":    "-----BEGIN CERTIFICATE-----\n...",
+    "signing": "-----BEGIN CERTIFICATE-----\n..."
+  },
+  "identity": "wimse://notme.bot/passkey/a1b2c3d4-...",
+  "scopes": ["bridgeCert"],
   "expires_at": 1711670400,
   "subject": "a1b2c3d4-...",
-  "authority": { "epoch": 1, "key_id": "3b8b237e" },
-  "principal_id": "a1b2c3d4-...",
-  "scopes": ["bridgeCert"],
-  "auth_method": "passkey"
+  "binding": "9f86d081..."
 }</div>
+          <div class="ep-note"><strong>notme never sends a private key.</strong> The caller generates both keypairs locally with <code>extractable: false</code> and proves possession; only certificates come back. Earlier revisions of this page showed a <code>private_key</code> field &mdash; no endpoint has ever returned one.</div>
           <div class="ep-note">Proof types: session (passkey cookie), oidc (any JWT), bootstrap (deployer code). Scopes are intersected with the principal's capability grants.</div>
         </div>
       </div>
@@ -407,14 +409,19 @@
           </p>
           <div class="ep-label">request</div>
           <div class="ep-example">
-            curl -X POST https://auth.notme.bot/cert/gha \ -H "Authorization:
-            Bearer ${TOKEN}"
+            curl -X POST https://auth.notme.bot/cert/gha \
+              -H "Content-Type: application/json" \
+              -d '{"oidc_token":"&lt;GHA OIDC JWT&gt;",
+                   "public_keys":{"mtls":"&lt;P-256 SPKI PEM&gt;","signing":"&lt;Ed25519 SPKI PEM&gt;"},
+                   "proofs":{"mtls":"&lt;base64url&gt;","signing":"&lt;base64url&gt;"}}'
           </div>
           <div class="ep-label">response</div>
           <div class="ep-response">
-            { "certificate": "-----BEGIN CERTIFICATE-----\n...", "private_key":
-            "-----BEGIN PRIVATE KEY-----\n...", "expires_at": 1711670400,
-            "subject": "repo:agentic-research/signet:ref:refs/heads/main",
+            { "certificates": { "mtls": "-----BEGIN CERTIFICATE-----\n...",
+            "signing": "-----BEGIN CERTIFICATE-----\n..." }, "identity":
+            "wimse://notme.bot/gha/agentic-research/signet", "scopes":
+            ["bridgeCert"], "expires_at": 1711670400, "subject":
+            "repo:agentic-research/signet:ref:refs/heads/main",
             "claims": { "repository": "agentic-research/signet", "ref":
             "refs/heads/main", "sha": "abc123...", "actor": "github-actions",
             "workflow": "ci.yml", "run_id": "12345", "event_name": "push" } }
