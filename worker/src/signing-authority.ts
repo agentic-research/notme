@@ -363,6 +363,21 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }> {
     if (this.#signingKey && this.#verifyKey) {
       const kid = this.#getKeyId();
+      // ARM THE ALARM ON THE WARM PATH TOO (notme-4896d8).
+      //
+      // scheduleNextRefresh() lived only at the END of this method, after the
+      // cold-start key load. This early return skips it — so on any isolate
+      // that already held the key in memory, the bundle-refresh alarm was
+      // never scheduled. Production measured totalFires: 0 with the circuit
+      // breaker CLOSED: the alarm had never fired in the object's entire
+      // history, which is why the published CA bundle sat unrefreshed for 130
+      // days (notme-77a024).
+      //
+      // Safe to call here because scheduleNextRefresh() checks getAlarm()
+      // before setAlarm() — the idempotence THREAT_MODEL.md:52 requires
+      // against compounding alarms (the 20-trillion-DO-reads cautionary
+      // tale). Calling it on every warm hit is a no-op once one is pending.
+      await this.scheduleNextRefresh();
       return {
         signingKey: this.#signingKey,
         verifyKey: this.#verifyKey,
@@ -1846,6 +1861,41 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // since gained a way in.
     const { ensurePasskeySchema } = await import("./auth/passkey");
     const { ensurePrincipalSchema } = await import("./auth/principals");
+    // ── OPERATOR SECRET OUTRANKS THE AUTHENTICATOR GATE (notme-4838ae) ──
+    //
+    // Checked BEFORE #hasAuthenticator, deliberately, and this is a security
+    // decision rather than an ordering detail.
+    //
+    // Every other path to authorityManage is gated on isFirstUser, and both
+    // bootstrap paths were gated on "no authenticator exists". So once ANY
+    // passkey was registered, losing the last admin credential left the
+    // authority permanently ungovernable — no invites, no grants, no
+    // rotation, no alarm reset. The CA kept issuing certificates and could
+    // not be administered. Found live on production 2026-08-06.
+    //
+    // Setting BOOTSTRAP_CODE requires control of the DEPLOYMENT, which is
+    // strictly STRONGER than holding a passkey: that operator can already
+    // redeploy the Worker, rebind KV, or replace this Durable Object
+    // outright. Refusing them admin protected nothing — it only turned
+    // "recover" into "brick".
+    //
+    // This does NOT reopen notme-976385. That gate exists because a code was
+    // MINTED INTO WORKER LOGS BY AN UNAUTHENTICATED STRANGER'S REQUEST — a
+    // mechanism removed in notme-addef9. The stored-code path below keeps the
+    // gate; only an explicitly-set secret bypasses it.
+    //
+    // LOUD, because silent admin acquisition is the thing the gate guarded.
+    const operatorSecret = bootstrapSecret(this.env);
+    if (operatorSecret) {
+      const { timingSafeEqual } = await import("./auth/timing-safe");
+      if (await timingSafeEqual(code, operatorSecret)) {
+        console.warn(
+          "[bootstrap] ADMIN RECOVERY: operator secret accepted while authenticators exist (notme-4838ae)",
+        );
+        return true;
+      }
+    }
+
     if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
       return false;
     }

@@ -88,18 +88,22 @@ describe("bootstrap trigger (notme-addef9)", () => {
     expect(await storedCodeCount(stub)).toBe(0);
   });
 
-  it('reports "unconfigured" when the operator has set no bootstrap secret', async () => {
-    // Fail closed AND fail informative. An authority nobody can bootstrap is
-    // a recoverable operator error; one that silently mints a credential into
-    // a log the operator may not be able to read is not.
-    const stub = authority("bootstrap-trigger-unconfigured");
+  it('reports "armed" when the operator HAS set a bootstrap secret', async () => {
+    // The test env binds BOOTSTRAP_CODE (see vitest.workers.config.mts), so
+    // this authority is armed. `armed` reports only that a secret EXISTS —
+    // never its value or length.
+    //
+    // The "unconfigured" branch is covered by bootstrapSecret()'s validation:
+    // absent, empty, whitespace-only and under-length all yield null, and the
+    // consume tests below prove an unconfigured authority accepts nothing.
+    const stub = authority("bootstrap-trigger-armed");
     const state = await runInDurableObject(stub, (auth) =>
       (auth as SigningAuthority).getBootstrapState(),
     );
-    expect(state).toEqual({ status: "unconfigured" });
+    expect(state).toEqual({ status: "armed" });
   });
 
-  it("refuses any code while unconfigured, including the empty string", async () => {
+  it("refuses a WRONG code even when armed, including the empty string", async () => {
     // The dangerous shape: if an unset secret compared equal to an absent or
     // empty submitted code, an unconfigured authority would hand admin to the
     // first caller who sent nothing at all.
@@ -109,7 +113,59 @@ describe("bootstrap trigger (notme-addef9)", () => {
         await runInDurableObject(stub, (auth) =>
           (auth as SigningAuthority).consumeBootstrapCode(attempt),
         ),
-        `accepted ${JSON.stringify(attempt)} on an unconfigured authority`,
+        `accepted ${JSON.stringify(attempt)}`,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("admin recovery via operator secret (notme-4838ae)", () => {
+  // Every path to authorityManage was gated on isFirstUser or "no
+  // authenticator exists", so losing the last admin credential left the
+  // authority permanently ungovernable. Setting BOOTSTRAP_CODE requires
+  // control of the DEPLOYMENT — strictly stronger than holding a passkey —
+  // so it now outranks that gate.
+  const SECRET = "r".repeat(40);
+
+  /** Give the authority a registered passkey, closing the ordinary path. */
+  async function withAuthenticator(name: string) {
+    const stub = authority(name);
+    await runInDurableObject(stub, async (auth) => {
+      const sql = (auth as unknown as { ctx: { storage: { sql: any } } }).ctx
+        .storage.sql;
+      const { ensurePasskeySchema } = await import("./auth/passkey");
+      ensurePasskeySchema(sql);
+      sql.exec(
+        "INSERT OR IGNORE INTO passkey_credentials (credential_id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)",
+        "existing-admin",
+        "existing-user",
+        "AAAA",
+        0,
+        "[]",
+      );
+    });
+    return stub;
+  }
+
+  it("accepts the operator secret EVEN WITH an authenticator present", async () => {
+    // The fix. Before this the authority was unrecoverable at this point.
+    const stub = await withAuthenticator("recovery-allowed");
+    const ok = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).consumeBootstrapCode(SECRET),
+    );
+    expect(ok, "operator secret refused — authority is unrecoverable").toBe(true);
+  });
+
+  it("still refuses a WRONG secret with an authenticator present", async () => {
+    // The bypass must be the secret, not the code path. A near-miss must not
+    // inherit the recovery power.
+    const stub = await withAuthenticator("recovery-wrong");
+    for (const bad of ["", "r".repeat(39), "s".repeat(40), "guess"]) {
+      expect(
+        await runInDurableObject(stub, (auth) =>
+          (auth as SigningAuthority).consumeBootstrapCode(bad),
+        ),
+        `accepted ${JSON.stringify(bad)}`,
       ).toBe(false);
     }
   });
