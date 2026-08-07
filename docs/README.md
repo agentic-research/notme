@@ -2,6 +2,14 @@
 
 architecture decision records for notme.
 
+## flows
+
+[`FLOWS.md`](FLOWS.md) — the eight paths that matter, as a cheat sheet: CI and
+human enrollment, first boot, admin recovery, third-party verification,
+revocation, bundle publication, and deploy. Each says what is live, what is
+unwired, and the gotcha that bit us. Structure lives in
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md); rationale lives in the ADRs below.
+
 ## adr index
 
 | # | title | status | one-line decision | code / files |

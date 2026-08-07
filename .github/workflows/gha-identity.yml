@@ -134,7 +134,7 @@ jobs:
         # the pinned action/ TREE against the default branch and fails with the
         # SHA to use. Do not hand-maintain this comment's accuracy — the check
         # is what keeps the pin honest.
-        uses: agentic-research/notme/action@3ee929284133e8ed767f687520b51957a2e42029 # newest main commit touching action/
+        uses: agentic-research/notme/action@0d2312fe9ccc2e1cb710fba6d4dad71f531dfbee # newest main commit touching action/
         with:
           audience: ${{ inputs.bridge_audience }}
           authority_url: https://auth.notme.bot
