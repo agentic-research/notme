@@ -1,0 +1,135 @@
+<!--
+  _invite.html — create an invite without opening devtools.
+
+  WHY THIS EXISTS: POST /invites was API-only. The only way to grant anyone
+  authority was a fetch() pasted into a browser console, so in practice nobody
+  did it — and an authority with exactly one admin credential is one lost
+  laptop away from being ungovernable (notme-4838ae, found live).
+
+  Recovery for that case now exists via BOOTSTRAP_CODE, but prevention is
+  better than recovery, and prevention that requires devtools is not
+  prevention. This page is the mitigation, not decoration.
+
+  Served only to a session holding authorityManage — the route checks before
+  the asset is fetched, so an unprivileged caller never sees the form.
+-->
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>notme — create an invite</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    max-width: 34rem; margin: 3rem auto; padding: 0 1.25rem;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+  .sub { opacity: .65; margin: 0 0 2rem; font-size: .9rem; }
+  fieldset { border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+             border-radius: 8px; padding: 1rem 1.15rem; margin: 0 0 1.25rem; }
+  legend { padding: 0 .4rem; font-size: .8rem; text-transform: uppercase;
+           letter-spacing: .06em; opacity: .7; }
+  label { display: flex; gap: .6rem; align-items: flex-start; margin: .55rem 0; }
+  label span small { display: block; opacity: .6; font-size: .82rem; }
+  input[type=number] { width: 6rem; }
+  button { font: inherit; padding: .55rem 1.1rem; border-radius: 7px;
+           border: 1px solid currentColor; background: transparent;
+           cursor: pointer; }
+  button[disabled] { opacity: .5; cursor: progress; }
+  #out { margin-top: 1.5rem; }
+  code, #link { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: .85rem; word-break: break-all; }
+  #link { display: block; padding: .8rem; border-radius: 7px;
+          border: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
+  .warn { border-left: 3px solid #c62828; padding-left: .8rem; opacity: .85;
+          font-size: .88rem; }
+  .err { color: #c62828; }
+</style>
+
+<h1>Create an invite</h1>
+<p class="sub">
+  Grants scopes to a new principal. You can only grant what you already hold.
+</p>
+
+<form id="f">
+  <fieldset>
+    <legend>Scopes</legend>
+    <label>
+      <input type="checkbox" name="s" value="bridgeCert" checked disabled />
+      <span>bridgeCert<small>Mint certificates. Always granted.</small></span>
+    </label>
+    <label>
+      <input type="checkbox" name="s" value="authorityManage" />
+      <span>authorityManage<small>Administer this authority — invite others,
+      read alarm health, rotate.</small></span>
+    </label>
+    <label>
+      <input type="checkbox" name="s" value="certMint" />
+      <span>certMint<small>Reserved. Currently enforced nowhere
+      (notme-600df1).</small></span>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Validity</legend>
+    <label style="align-items:center">
+      <input type="number" id="ttl" value="24" min="1" max="168" />
+      <span>hours until the invite expires</span>
+    </label>
+  </fieldset>
+
+  <p class="warn">
+    A second <strong>authorityManage</strong> credential is the fix for a
+    single-admin authority. Prefer a hardware key or a different machine —
+    two credentials in one place is one credential.
+  </p>
+
+  <button type="submit">Create invite</button>
+</form>
+
+<div id="out"></div>
+
+<script>
+  const f = document.getElementById("f");
+  const out = document.getElementById("out");
+
+  f.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = f.querySelector("button");
+    btn.disabled = true;
+    out.textContent = "";
+
+    // bridgeCert is always included: the checkbox is disabled, so it does not
+    // appear in the form data, and an invite granting nothing is useless.
+    const scopes = ["bridgeCert", ...[...f.querySelectorAll("input[name=s]:checked")]
+      .map((i) => i.value).filter((v) => v !== "bridgeCert")];
+    const ttl = Number(document.getElementById("ttl").value) * 3600;
+
+    try {
+      const res = await fetch("/invites", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scopes, ttl }),
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        // Surface the server's own message. canGrant() refuses a scope the
+        // granter does not hold, and that reason is worth reading verbatim.
+        out.innerHTML =
+          '<p class="err">' + (body.error ?? res.status) + "</p>";
+        return;
+      }
+      const code = body.code ?? body.invite ?? body.token ?? "";
+      const url = new URL("/join", location.origin);
+      if (code) url.searchParams.set("code", code);
+      out.innerHTML =
+        "<p>Send this to the person you are inviting. It expires, and it is " +
+        "single-use.</p><span id='link'></span>" +
+        "<p class='sub'>Scopes: <code>" + scopes.join(", ") + "</code></p>";
+      document.getElementById("link").textContent = url.toString();
+    } catch (err) {
+      out.innerHTML = '<p class="err">' + err.message + "</p>";
+    } finally {
+      btn.disabled = false;
+    }
+  });
+</script>

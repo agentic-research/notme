@@ -2008,6 +2008,36 @@ export default {
       }
 
       // POST /invites — create an invite (requires authorityManage scope)
+      // GET /invites — the form. authorityManage-gated BEFORE the asset is
+      // served, so an unprivileged caller never sees it.
+      //
+      // POST /invites was API-only, so the only way to grant anyone authority
+      // was a fetch() pasted into a devtools console. In practice that means
+      // nobody does it — and an authority with one admin credential is one
+      // lost laptop from ungovernable (notme-4838ae, found live). Recovery
+      // exists now via BOOTSTRAP_CODE, but prevention that requires devtools
+      // is not prevention.
+      if ((pathname === "/invites" || pathname === "/invites/") && request.method === "GET") {
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        if (!cookie) return jsonErr("sign in first", 401);
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const session = await verifySessionCookie(
+          cookie,
+          await authority.getSessionSecret(),
+        );
+        if (!session) return jsonErr("invalid session", 401);
+        if (!(session.scopes ?? []).includes("authorityManage")) {
+          return jsonErr("authorityManage scope required", 403);
+        }
+        const baseUrl = env.SITE_URL || "https://notme.bot";
+        return env.ASSETS.fetch(new Request(`${baseUrl}/_invite`));
+      }
+
       if (pathname === "/invites" && request.method === "POST") {
         const cookie = parseCookie(
           request.headers.get("cookie") || "",
