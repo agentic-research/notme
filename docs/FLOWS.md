@@ -106,7 +106,23 @@ permanently ungovernable (`notme-4838ae`).
 
 ---
 
-## 5. Authority checks — continuity, freshness, possession
+## 5. Provenance — prove who produced an artifact
+
+```bash
+./scripts/demo-provenance.sh          # --pause to step through it live
+```
+
+Four commands as an outsider: download a public artifact from another repo's
+release, read the identity off its certificate, check the authority's key
+against an anchor you pinned in advance, and verify the private key signed it.
+No credential, no issuer software.
+
+The credential in that chain **expired five minutes after it was issued** —
+which is why `openssl verify` needs `-no_check_time`. Say that out loud before
+anyone asks: the signature outlives the credential, and that is what makes
+short-lived identity usable for provenance at all.
+
+## 5b. Authority checks — continuity, freshness, possession
 
 ```bash
 ./scripts/check-authority.sh --spki <sha256> [--leaf agent-cert.pem]
