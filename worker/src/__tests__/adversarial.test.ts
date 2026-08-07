@@ -5,6 +5,7 @@ import { timingSafeEqual } from "../auth/timing-safe";
 import { verifyOIDC } from "../auth/verify-proof";
 import { validateDpopProof } from "../auth/dpop";
 import { MemoryCache, detectKeyStorage, validateKeyStorageConfig } from "../platform";
+import { verifyScopeChain } from "../auth/scope-chain";
 
 /**
  * adversarial.test.ts — Verify key extraction invariants + adversarial token invariants.
@@ -645,10 +646,9 @@ describe("adversarial: mode detection", () => {
 // ── Scope attenuation (008 — monotonic restriction) ─────────────────────────
 
 describe("adversarial: scope attenuation", () => {
-  function verifyScopeChain(parentScopes: string[], childScopes: string[]): boolean {
-    return childScopes.every(s => parentScopes.includes(s));
-  }
-
+  // Imported, NOT redefined. These six tests previously exercised a local
+  // one-line helper, so they asserted a real property of a function that
+  // existed only here and touched nothing production runs (notme-acc822).
   it("child scopes ⊆ parent scopes — valid narrowing", () => {
     expect(verifyScopeChain(
       ["bridgeCert", "certMint", "sign:git"],
@@ -684,5 +684,47 @@ describe("adversarial: scope attenuation", () => {
 
   it("empty child scopes — always valid (maximally restricted)", () => {
     expect(verifyScopeChain(["bridgeCert", "certMint"], [])).toBe(true);
+  });
+});
+
+// ── The chain rule on the one delegation step notme performs today ──────────
+
+describe("adversarial: certScopesForSession never widens (notme-acc822)", () => {
+  // verifyScopeChain is tested above against hand-picked pairs. This asserts
+  // the same rule as a PROPERTY of the real narrowing function over every
+  // subset of the scopes that actually exist, rather than over examples
+  // someone chose — which is the difference between "the cases I thought of
+  // hold" and "no input widens".
+  //
+  // It passes today because an intersection cannot grow. That is precisely
+  // what makes it worth having: the guarantee currently lives in the shape of
+  // one expression, and nothing else would notice if that expression changed
+  // to a union, a merge with defaults, or a lookup that falls back on miss.
+  const UNIVERSE = [
+    "bridgeCert",
+    "certMint",
+    "authorityManage",
+    "sign:git",
+    "sign:attestation",
+  ];
+
+  it("returns a subset of the session's scopes for every possible session", async () => {
+    const { certScopesForSession } = await import("../auth/passkey-cert-scopes");
+
+    // All 2^5 subsets — exhaustive over the real scope vocabulary, so this is
+    // a proof for this universe rather than a sample of it.
+    for (let mask = 0; mask < 1 << UNIVERSE.length; mask++) {
+      const session = UNIVERSE.filter((_, i) => mask & (1 << i));
+      const granted = certScopesForSession(session);
+      expect(
+        verifyScopeChain(session, granted),
+        `session [${session}] minted a cert carrying [${granted}]`,
+      ).toBe(true);
+    }
+  });
+
+  it("an undefined session grants nothing", async () => {
+    const { certScopesForSession } = await import("../auth/passkey-cert-scopes");
+    expect(certScopesForSession(undefined)).toEqual([]);
   });
 });

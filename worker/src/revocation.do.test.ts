@@ -289,3 +289,79 @@ describe("checkRevocation", () => {
     if (result.revoked) expect(result.reason).toBe("bundle_stale");
   });
 });
+
+// ── The rotation grace window, exercised through the production door ─────────
+//
+// signing-authority.do.test.ts proves rotate() REPUBLISHES the previous key
+// and sets prevKeyId — i.e. that the bundle carries the material a grace
+// window needs. It never asks the question the material exists to answer:
+// is a token signed by the previous key actually accepted after a rotation?
+//
+// It is not, and cannot be. rotate() increments epoch and replaces the key in
+// one statement (signing-authority.ts, `UPDATE state SET epoch = epoch + 1`),
+// so a token minted before the rotation carries BOTH the old keyId and the old
+// epoch — and checkRevocation's epoch check (step 5) rejects it before the
+// prevKeyId check (step 6) can admit it. The grace window built for
+// notme-b49020 / notme-54f84b guards a branch no token can enter.
+//
+// These tests pin the ACTUAL behavior rather than the intended behavior, so
+// the gap is visible instead of implied by a green test one file over. They
+// are expected to FAIL when notme-77a024's decision is implemented — either
+// rotate() stops bumping epoch (making the window reachable) or the window is
+// removed as dead. Failing then is the point: whoever implements it must
+// update these deliberately rather than inherit a misleading pass.
+describe("rotation grace window is currently UNREACHABLE (notme-77a024)", () => {
+  it("rejects a pre-rotation token on epoch, never reaching the prevKeyId check", async () => {
+    // The post-rotation bundle: new key current, old key republished as prev —
+    // exactly what signing-authority.do.test.ts proves rotate() produces.
+    const bundle = makeBundle({
+      seqno: 300,
+      epoch: 2, // rotate() bumped it
+      keyId: "key002",
+      prevKeyId: "key001",
+      keys: {
+        key001: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        key002: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      },
+    });
+    bundle.signature = await signBundle(bundle);
+    await env.CA_BUNDLE_CACHE.put("bundle:current", JSON.stringify(bundle));
+
+    // A token minted just before the rotation: previous key, previous epoch.
+    // This is the exact token the grace window exists to keep working.
+    const result = await checkRevocation(
+      { keyId: "key001", epoch: 1 },
+      env,
+      rootPublicKeyB64,
+    );
+
+    expect(result.revoked).toBe(true);
+    // epoch_mismatch, NOT unknown_key — proving it died at step 5 and the
+    // republished prevKeyId at step 6 was never consulted.
+    expect((result as { reason: string }).reason).toBe("epoch_mismatch");
+  });
+
+  it("would accept that same token if the epoch had not moved — the window works once epoch is decoupled", async () => {
+    // Same bundle, same prevKeyId, epoch left alone. This isolates the cause:
+    // the grace window itself is correct; the epoch bump is what defeats it.
+    const bundle = makeBundle({
+      seqno: 301,
+      epoch: 1, // rotate() did NOT bump it
+      keyId: "key002",
+      prevKeyId: "key001",
+      keys: {
+        key001: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        key002: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      },
+    });
+    bundle.signature = await signBundle(bundle);
+    await env.CA_BUNDLE_CACHE.put("bundle:current", JSON.stringify(bundle));
+
+    const result = await checkRevocation(
+      { keyId: "key001", epoch: 1 },
+      env,
+      rootPublicKeyB64,
+    );
+    expect(result.revoked).toBe(false);
+  });
+});

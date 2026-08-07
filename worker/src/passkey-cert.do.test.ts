@@ -17,6 +17,13 @@ import { createSessionCookie } from "./auth/session";
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
 
+// The WIMSE trust domain is DERIVED from SITE_URL, not a literal — a
+// staging or local authority must not mint identities that name production
+// (notme-1532eb). These tests drive the worker in its local configuration,
+// so the expected domain is this origin's host, and asserting the literal
+// "notme.bot" here would pin exactly the confusion the derivation removes.
+const TRUST_DOMAIN = new URL(ORIGIN).host;
+
 function b64u(b: Uint8Array): string {
   return btoa(String.fromCharCode(...b))
     .replace(/\+/g, "-")
@@ -29,13 +36,16 @@ function pem(spki: ArrayBuffer, label: string): string {
   return `-----BEGIN ${label}-----\n${b64.match(/.{1,64}/g)!.join("\n")}\n-----END ${label}-----`;
 }
 
-async function sessionCookie(scopes: string[]): Promise<string> {
+async function sessionCookie(
+  scopes: string[],
+  authMethod = "passkey",
+): Promise<string> {
   const stub = env.SIGNING_AUTHORITY.get(
     env.SIGNING_AUTHORITY.idFromName("default"),
   );
   const secret = await stub.getSessionSecret();
   return createSessionCookie(
-    { principalId: "principal-passkey-test", scopes, authMethod: "passkey" },
+    { principalId: "principal-passkey-test", scopes, authMethod },
     secret,
   );
 }
@@ -85,8 +95,9 @@ async function mintRequest(cookie: string) {
     new Uint8Array(sessionHash),
     mtlsSpki.byteLength + signingSpki.byteLength,
   );
-  const binding = await crypto.subtle.digest("SHA-256", input);
-
+  // Sign the PRE-IMAGE, not its digest (notme-a011d2). WebCrypto ECDSA
+  // applies SHA-256 itself, so signing a digest here would produce a proof
+  // over two hashes that only another WebCrypto caller could reproduce.
   return {
     public_keys: {
       mtls: pem(mtlsSpki, "PUBLIC KEY"),
@@ -98,7 +109,7 @@ async function mintRequest(cookie: string) {
           await crypto.subtle.sign(
             { name: "ECDSA", hash: "SHA-256" },
             mtls.privateKey,
-            binding,
+            input,
           ),
         ),
       ),
@@ -107,7 +118,7 @@ async function mintRequest(cookie: string) {
           await crypto.subtle.sign(
             { name: "Ed25519" },
             signing.privateKey,
-            binding,
+            input,
           ),
         ),
       ),
@@ -138,7 +149,7 @@ describe("POST /cert/passkey", () => {
     expect(body.certificates.mtls).toContain("BEGIN CERTIFICATE");
     expect(body.certificates.signing).toContain("BEGIN CERTIFICATE");
     expect(body.identity).toBe(
-      "wimse://notme.bot/passkey/principal-passkey-test",
+      `wimse://${TRUST_DOMAIN}/passkey/principal-passkey-test`,
     );
     expect(body.auth_method).toBe("passkey");
     expect(body.expires_at).toBeGreaterThan(0);
@@ -216,6 +227,60 @@ describe("POST /cert/passkey", () => {
     const req = await mintRequest(cookie);
     expect((await post({ public_keys: req.public_keys }, cookie)).status).toBe(
       400,
+    );
+  });
+});
+
+describe("authMethod provenance (notme-ebc9af)", () => {
+  // The route accepts ANY valid session — /join sets authMethod "invite",
+  // /auth/oidc/login sets "oidc:<issuer>" — but used to stamp every minted
+  // cert authMethod:"passkey" and a wimse://…/passkey/… identity. A verifier
+  // reading such a cert concluded a human touched a passkey when none did.
+  // The cert must DERIVE its provenance from the session that authorized it.
+
+  it("an invite-authed session mints a cert that says invite, not passkey", async () => {
+    const cookie = await sessionCookie(["bridgeCert"], "invite");
+    const res = await post(await mintRequest(cookie), cookie);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.auth_method).toBe("invite");
+    expect(body.identity).toBe(
+      `wimse://${TRUST_DOMAIN}/invite/principal-passkey-test`,
+    );
+    expect(body.identity).not.toContain("/passkey/");
+  });
+
+  it("refuses a session with no authMethod rather than stamping a placeholder", async () => {
+    // verifySessionCookie JSON.parses the payload with no shape validation,
+    // so a future issuer that forgets authMethod would reach the mint with
+    // undefined. Defaulting to "passkey" would re-create the exact lie
+    // notme-ebc9af fixed; stamping String(undefined) puts the literal
+    // "undefined" in a certificate. Fail closed instead.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("default"),
+    );
+    const secret = await stub.getSessionSecret();
+    const cookie = await createSessionCookie(
+      { principalId: "principal-passkey-test", scopes: ["bridgeCert"] } as any,
+      secret,
+    );
+    const res = await post(await mintRequest(cookie), cookie);
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    const body = (await res.json()) as any;
+    expect(JSON.stringify(body)).not.toContain("undefined");
+  });
+
+  it("an oidc session's cert carries the issuer-qualified method, URI-encoded", async () => {
+    const method = "oidc:https://accounts.example";
+    const cookie = await sessionCookie(["bridgeCert"], method);
+    const res = await post(await mintRequest(cookie), cookie);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.auth_method).toBe(method);
+    // The identity URI's method segment must stay a SINGLE path segment —
+    // ':' and '/' in the issuer are percent-encoded, not structural.
+    expect(body.identity).toBe(
+      `wimse://${TRUST_DOMAIN}/${encodeURIComponent(method)}/principal-passkey-test`,
     );
   });
 });

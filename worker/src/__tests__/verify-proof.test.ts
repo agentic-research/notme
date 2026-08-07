@@ -11,6 +11,10 @@
 
 import { describe, expect, it, beforeAll } from "vitest";
 import { verifyOIDC, verifyProof, selectVerifyingKey } from "../auth/verify-proof";
+import { OID_EPOCH } from "../cert-authority";
+
+/** The epoch stamped into this suite's leaf cert. */
+const TEST_EPOCH = 1;
 
 // Build a minimal JWT (header.payload.sig) with the given audience claim.
 // Signature is junk — we only care that the audience check fires before
@@ -236,6 +240,12 @@ describe("oidc.x509.ca-pem-shape", () => {
     });
     caCertPem = caCert.toString("pem");
 
+    // Carries OID_EPOCH because verifyX509 now REFUSES a cert that cannot be
+    // checked against rotation (notme-77a024). This suite is about the CA-PEM
+    // SHAPE, so the cert is made epoch-bearing rather than the epoch check
+    // relaxed — weakening a revocation control to keep an unrelated test green
+    // is how controls get lost.
+    const { Extension } = await import("@peculiar/x509");
     const leafCert = await X509CertificateGenerator.create({
       subject: "CN=test-principal",
       issuer: "CN=test-ca",
@@ -245,6 +255,10 @@ describe("oidc.x509.ca-pem-shape", () => {
       publicKey: leaf.publicKey,
       signingKey: ca.privateKey,
       serialNumber: "02",
+      extensions: [
+        // DER INTEGER 1 — matches TEST_EPOCH below.
+        new Extension(OID_EPOCH, false, new Uint8Array([0x02, 0x01, 0x01])),
+      ],
     });
     leafCertPem = leafCert.toString("pem");
 
@@ -267,6 +281,7 @@ describe("oidc.x509.ca-pem-shape", () => {
       { type: "x509", cert: leafCertPem },
       caCertPem,
       "notme.bot",
+      TEST_EPOCH,
     );
     expect(identity.type).toBe("x509");
     expect(identity.subject).toBe("test-principal");
@@ -277,7 +292,12 @@ describe("oidc.x509.ca-pem-shape", () => {
     // Passing SPKI there throws inside `new X509Certificate(...)` with
     // a recognisable parse error — the bug class rosary-9b7d67 fixed.
     await expect(
-      verifyProof({ type: "x509", cert: leafCertPem }, caSpkiPem, "notme.bot"),
+      verifyProof(
+        { type: "x509", cert: leafCertPem },
+        caSpkiPem,
+        "notme.bot",
+        TEST_EPOCH,
+      ),
     ).rejects.toThrow();
   });
 });

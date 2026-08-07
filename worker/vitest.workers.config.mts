@@ -29,6 +29,13 @@ export default defineConfig({
         // bindings inline precisely to avoid loading wrangler.toml (see above),
         // so the date is duplicated here. If you bump it there, bump it here.
         compatibilityDate: "2026-03-01",
+        bindings: {
+          // The operator-set admin-recovery secret (notme-4838ae). Bound here
+          // so the recovery path can be exercised at all — it is the ONLY way
+          // back into an authority whose last admin credential is lost, and an
+          // untested recovery path is the thing that bricked it.
+          BOOTSTRAP_CODE: "r".repeat(40),
+        },
         durableObjects: {
           // SQLite-backed per wrangler.toml migration v2 (new_sqlite_classes).
           SIGNING_AUTHORITY: {

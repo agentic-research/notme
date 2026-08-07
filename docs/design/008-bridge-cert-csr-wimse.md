@@ -75,6 +75,35 @@ Format: `wimse://{trust-domain}/{context}/{identity}`
 
 The trust domain is a FQDN. The path is scoped within the trust domain. This follows `draft-ietf-wimse-arch-02` Section 3.1 and is compatible with SPIFFE ID conventions.
 
+#### `{context}` encoding, and which copy is canonical
+
+For session-minted certs the `{context}` segment is the session's auth
+method, and it is **percent-encoded** so an issuer-qualified method stays a
+single path segment:
+
+```
+wimse://notme.bot/invite/<principal>
+wimse://notme.bot/oidc%3Ahttps%3A%2F%2Fissuer/<principal>
+```
+
+The same fact also rides in the `authMethod` extension (OID `.1.5` below),
+**raw and unencoded**. That asymmetry is deliberate — a URI path segment must
+not contain `/` or `:`, while the extension is length-delimited DER where
+percent-encoding would only add a "literal `%` or escape?" ambiguity.
+
+**The extension is canonical for comparison; the URI's context segment is
+display and routing only.** A verifier authorizing on auth method must read
+`authMethod`. The obvious cross-check — splitting the URI path and comparing
+it to the extension — reads as a tamper signal and fails on every OIDC cert,
+because the two are one fact in two encodings. This is stated on the Go
+verifier's `Identity.URI` / `Identity.AuthMethod` fields
+(`gen/go/verify/identity.go`), which is what external consumers actually
+read.
+
+Both values are DERIVED from the authenticating session rather than asserted
+by the minting route, so a cert issued from an invite-authenticated session
+says `invite` even though the route is named `/cert/passkey` (notme-ebc9af).
+
 ### Where the identity lives
 
 | Context | Carrier |
@@ -159,6 +188,34 @@ Content-Type: application/json
 ```
 
 Where `binding_payload = SHA-256(mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt))`.
+
+> **CORRECTION (2026-08-06, `notme-bd68f2`).** The outer `SHA-256(…)` is wrong,
+> in both this definition and the sequence diagram above. **Signers must sign
+> the concatenation itself — the pre-image — never its digest.** The normative
+> encoding is:
+>
+> ```
+> binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)
+> ```
+>
+> signed directly with each private key. `worker/src/auth/pop.ts` is the single
+> verifier for all three cert routes and is normative; the construction is at
+> `worker/worker.ts:715-741` (`/cert/gha`), `worker.ts:2251-2266`
+> (`/cert/passkey`) and `worker/src/cert-exchange.ts:224-228` (`/cert`).
+>
+> **Why it matters to a cross-language implementer:** WebCrypto ECDSA hashes
+> its input internally. Passing a digest therefore signs
+> `SHA-256(SHA-256(x))`, and **no Go signer could ever produce a matching
+> signature.** That was the `notme-a011d2` P0 (GOAL-ZERO-STATUS §4). An
+> implementation built from the original text above interoperates with
+> nothing.
+>
+> A migration window is live: the verifier still accepts the digest encoding
+> behind `ACCEPT_LEGACY_DIGEST_BINDING` and reports `binding: "digest"` when it
+> does (`pop.ts:81`). That flag is scheduled for removal once the action pin
+> moves past `0d2312f` and nothing reports `"digest"` — so the encoding
+> described above is not merely wrong, it is being withdrawn. Build against the
+> pre-image.
 
 Each proof is a signature over the same binding payload, proving:
 - The caller holds the P-256 private key
@@ -269,13 +326,44 @@ Scopes are encoded as ASN.1 `SEQUENCE OF UTF8String`, not comma-delimited string
 
 ### nameConstraints (defense-in-depth)
 
-Orchestrator bridge certs SHOULD include nameConstraints restricting the URI SAN namespace of subordinate certs:
+> **CORRECTION (2026-08-06, ADR-019 D5).** The mechanism described below does
+> not work as written, and was never implemented. It is retained rather than
+> deleted because ADRs are append-only and because other documents cite it.
+> **Do not build against it.**
+
+The original text proposed that orchestrator bridge certs restrict the URI SAN
+namespace of subordinate certs:
 
 ```
-permittedSubtrees: URI:wimse://notme.bot/agent/*
+permittedSubtrees: URI:wimse://notme.bot/agent/*      ← DOES NOT WORK
 ```
 
-This provides automatic namespace scoping enforced by any conformant X.509 path validator (RFC 5280 Section 4.2.1.10), independent of the custom scope extension.
+and claimed this is "enforced by any conformant X.509 path validator (RFC 5280
+Section 4.2.1.10)".
+
+**URI name constraints do not constrain paths.** RFC 5280 §4.2.1.10 states:
+*"For URIs, the constraint applies to the host part of the name. The constraint
+MUST be specified as a fully qualified domain name and MAY specify a host or a
+domain."* A constraint of `notme.bot` is satisfied by
+`wimse://notme.bot/anything`, so the `/agent/` segment is not scoped at all. A
+conformant validator does exactly the right thing and it is not what this
+section assumed.
+
+Constraining the namespace requires one of three mechanisms, none free:
+
+1. **Distinct constrained hosts** (`agents.notme.bot`, `workloads.notme.bot`) —
+   the only option enforced intrinsically by stock validators, at the cost of
+   encoding kind into the name again.
+2. **An `otherName` with a registered OID**, constrained via `permittedSubtrees`
+   on that `otherName` type. Blocked on `notme-229dc3` (PEN).
+3. **A custom critical extension plus a validator that understands it.**
+   Criticality makes non-understanding verifiers *reject* rather than ignore,
+   which is safe — but enforcement then lives in notme's verifier, not
+   everyone's.
+
+Choosing among these is an open question on ADR-019. Until then the namespace
+bound is **absent**, not merely unimplemented, and no document should describe
+it as defence-in-depth that exists.
 
 ## Authentication paths
 
@@ -373,6 +461,15 @@ graph LR
 1. The CA certificate (fetched once from `/.well-known/ca-bundle.pem`, cached)
 2. Standard X.509 client cert validation (built into every TLS library)
 3. Its own authorization policy (map identities/scopes to access rules)
+
+> **Pin the root out of band.** Step 1 fetches the CA over TLS from the same
+> host that issued the credential, and the root is self-signed — so on its own
+> that fetch *establishes* trust rather than confirming it. [`trust/`](../../trust/README.md)
+> commits the root certificate and its SPKI SHA-256 so a consumer can pin
+> through git, a channel distributed independently of `auth.notme.bot`, and
+> notice a substituted root instead of accepting it silently. What that still
+> does not cover — issuance transparency and revocation — is notme-907299 and
+> notme-77a024.
 
 **A service does NOT need:**
 - workerd or the notme Worker

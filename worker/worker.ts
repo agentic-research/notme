@@ -27,7 +27,7 @@ import { ED25519, type Platform } from "./src/platform";
 // No HTTP, no public URL, no CORS, no tokens needed.
 
 // ── Held credentials type ─────────────────────────────────────────────────
-// Per-RPC-session — stored on `this.heldCerts` so concurrent / sequential
+// Per-RPC-session — stored on `this.#heldCerts` so concurrent / sequential
 // callers never see each other's principals. See contract test
 // "authenticate must not leak credentials across RPC sessions".
 type HeldCerts = {
@@ -55,6 +55,8 @@ const DENIED_HOSTS = new Set([
 // without pulling in cloudflare:workers via worker.ts.
 import { getAllowedAudiences } from "./src/allowed-audiences";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
+import { verifyPopProofs } from "./src/auth/pop";
+import { buildInfo } from "./src/build-version";
 
 function isDeniedDestination(url: string): boolean {
   try {
@@ -267,7 +269,13 @@ export class AuthService extends WorkerEntrypoint<any> {
   // RPC-session-scoped credentials. WorkerEntrypoint creates a fresh `this`
   // per RPC session in workerd, so this field is naturally per-caller.
   // DO NOT hoist to module scope — see notme/worker review Finding 1.
-  private heldCerts: HeldCerts | null = null;
+  // `#`-private, NOT TypeScript `private`: this class is RPC-reachable, and
+  // TS `private` is erased at build time, so the field would stay readable on
+  // any stub someone obtains. The runtime mitigations are real — workerd gives
+  // a fresh `this` per RPC session, so a caller sees only their own, and
+  // CryptoKeys are not structured-cloneable — but they are properties of the
+  // RUNTIME, not of the declaration (notme-2154b8).
+  #heldCerts: HeldCerts | null = null;
 
   /**
    * ECMAScript #private, NOT TypeScript `private`.
@@ -373,7 +381,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     // Clear first: if verification throws, the session must not keep whatever
     // it held before. Re-authenticating with a bad cert would otherwise leave
     // the previous identity in place and look like it succeeded.
-    this.heldCerts = null;
+    this.#heldCerts = null;
 
     const derived = await deriveCredentialsFromCerts(
       creds.signingCert,
@@ -381,7 +389,7 @@ export class AuthService extends WorkerEntrypoint<any> {
       caPublicKeyPem,
     );
 
-    this.heldCerts = {
+    this.#heldCerts = {
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
       mtlsKey: creds.mtlsKey,
@@ -406,10 +414,10 @@ export class AuthService extends WorkerEntrypoint<any> {
     headers: Record<string, string>;
     body: string;
   }> {
-    if (!this.heldCerts) {
+    if (!this.#heldCerts) {
       throw new Error("not authenticated — call authenticate() first");
     }
-    if (this.heldCerts.expiresAt <= Math.floor(Date.now() / 1000)) {
+    if (this.#heldCerts.expiresAt <= Math.floor(Date.now() / 1000)) {
       throw new Error("credentials expired — re-authenticate");
     }
 
@@ -421,7 +429,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     }
 
     // Scope check
-    if (!this.heldCerts.scopes.includes("bridgeCert")) {
+    if (!this.#heldCerts.scopes.includes("bridgeCert")) {
       throw new Error("scope insufficient — bridgeCert required for proxy");
     }
 
@@ -444,7 +452,7 @@ export class AuthService extends WorkerEntrypoint<any> {
       JSON.stringify({
         ts: new Date().toISOString(),
         type: "proxy",
-        identity: this.heldCerts.identity,
+        identity: this.#heldCerts.identity,
         destination: request.url,
         method: request.method || "GET",
         scope_checked: "bridgeCert",
@@ -469,7 +477,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     certificate: string;
     identity: string;
   }> {
-    if (!this.heldCerts) {
+    if (!this.#heldCerts) {
       throw new Error("not authenticated — call authenticate() first");
     }
 
@@ -478,7 +486,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     const hasSignScope =
       format === "raw"
         ? true // raw signing doesn't require a specific scope
-        : this.heldCerts.scopes.some((s) => signingScopes.includes(s));
+        : this.#heldCerts.scopes.some((s) => signingScopes.includes(s));
     if (!hasSignScope) {
       throw new Error(
         `scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`,
@@ -487,7 +495,7 @@ export class AuthService extends WorkerEntrypoint<any> {
 
     const signature = await crypto.subtle.sign(
       ED25519,
-      this.heldCerts.signingKey,
+      this.#heldCerts.signingKey,
       payload,
     );
 
@@ -501,21 +509,21 @@ export class AuthService extends WorkerEntrypoint<any> {
       JSON.stringify({
         ts: new Date().toISOString(),
         type: "sign",
-        identity: this.heldCerts.identity,
+        identity: this.#heldCerts.identity,
         format,
         payload_hash: `sha256:${payloadHash}`,
         scope_checked:
           format === "raw"
             ? "none"
-            : signingScopes.find((s) => this.heldCerts!.scopes.includes(s)),
+            : signingScopes.find((s) => this.#heldCerts!.scopes.includes(s)),
         allowed: true,
       }),
     );
 
     return {
       signature,
-      certificate: this.heldCerts.signingCert,
-      identity: this.heldCerts.identity,
+      certificate: this.#heldCerts.signingCert,
+      identity: this.#heldCerts.identity,
     };
   }
 
@@ -527,7 +535,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     expires_at: number;
     authenticated: boolean;
   }> {
-    if (!this.heldCerts) {
+    if (!this.#heldCerts) {
       return {
         identity: "",
         scopes: [],
@@ -537,13 +545,13 @@ export class AuthService extends WorkerEntrypoint<any> {
       };
     }
     return {
-      identity: this.heldCerts.identity,
-      scopes: this.heldCerts.scopes,
+      identity: this.#heldCerts.identity,
+      scopes: this.#heldCerts.scopes,
       certificates: {
-        mtls: this.heldCerts.mtlsCert,
-        signing: this.heldCerts.signingCert,
+        mtls: this.#heldCerts.mtlsCert,
+        signing: this.#heldCerts.signingCert,
       },
-      expires_at: this.heldCerts.expiresAt,
+      expires_at: this.#heldCerts.expiresAt,
       authenticated: true,
     };
   }
@@ -571,12 +579,24 @@ function getConfig(env: any) {
     rateLimitKvTtlSeconds: Number(env.RATE_LIMIT_KV_TTL_SECONDS ?? 3600),
   };
 }
-function getAllowedOwners(env: any): Set<string> {
-  const raw: string = env.GHA_ALLOWED_OWNERS ?? "agentic-research";
+/**
+ * GitHub owners permitted to exchange an OIDC token for a bridge cert.
+ *
+ * NO DEFAULT — an unset or empty value yields the empty set, which refuses
+ * every exchange. It previously defaulted to "agentic-research", so a
+ * deployment that DELETED the variable silently re-supplied the production
+ * org: staging could mint certs for production's org precisely because its
+ * config said nothing (notme-1532eb). An authority that has not declared
+ * whose workflows it trusts must trust none.
+ */
+export function getAllowedOwners(env: {
+  GHA_ALLOWED_OWNERS?: string;
+}): Set<string> {
+  const raw: string = env.GHA_ALLOWED_OWNERS ?? "";
   return new Set(
     raw
       .split(",")
-      .map((s: string) => s.trim().toLowerCase())
+      .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
   );
 }
@@ -712,45 +732,19 @@ async function handleCertGHA(
     new Uint8Array(oidcHash),
     mtlsSpki.byteLength + signingSpki.byteLength,
   );
-  const bindingPayload = await crypto.subtle.digest("SHA-256", bindingInput);
-
-  // Verify PoP: caller must have signed the binding payload with both keys
-  // P-256 proof (ES256)
-  try {
-    const proofBytes = Uint8Array.from(
-      atob(body.proofs.mtls.replace(/-/g, "+").replace(/_/g, "/")),
-      (c) => c.charCodeAt(0),
-    );
-    const valid = await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" },
-      mtlsPubKey,
-      proofBytes,
-      bindingPayload,
-    );
-    if (!valid) return jsonErr("P-256 proof-of-possession failed", 401);
-  } catch (e: any) {
-    return jsonErr(`P-256 proof verification error: ${e.message}`, 401);
-  }
-
-  // Ed25519 proof
-  try {
-    const proofBytes = Uint8Array.from(
-      atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")),
-      (c) => c.charCodeAt(0),
-    );
-    const valid = await crypto.subtle.verify(
-      ED25519,
-      signingPubKey,
-      proofBytes,
-      bindingPayload,
-    );
-    if (!valid) return jsonErr("Ed25519 proof-of-possession failed", 401);
-  } catch (e: any) {
-    return jsonErr(`Ed25519 proof verification error: ${e.message}`, 401);
+  // Verify PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
+  const pop = await verifyPopProofs(
+    bindingInput,
+    mtlsPubKey,
+    signingPubKey,
+    body.proofs,
+  );
+  if (!pop.ok) {
+    return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
   }
 
   // Build WIMSE identity URI
-  const identity = `wimse://notme.bot/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
+  const identity = `wimse://${wimseTrustDomain(env)}/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
 
   // Mint cert pair — both certs signed by CA, both carry the same identity + scopes
   let result;
@@ -830,11 +824,38 @@ async function handlePasskey(
       // First user requires bootstrap code (proves deployer ownership)
       // Everyone else can register freely — gets bridgeCert scope only
       if (result.isFirstUser && !body.bootstrapCode) {
-        await authority.getOrCreateBootstrapCode();
-        return jsonErr(
-          "bootstrap code required — check Worker logs (wrangler tail)",
-          401,
-        );
+        // A READ, not a mint (notme-addef9). This route is unauthenticated,
+        // so calling getOrCreateBootstrapCode() here meant any stranger's
+        // first request caused an admin credential to be minted and logged —
+        // the trigger was never the deployer, and it could be repeated at a
+        // moment of the caller's choosing.
+        //
+        // Each branch says what the operator should actually DO, and none of
+        // them says "read a secret out of the logs". That path was both the
+        // wrong posture for this repo and unreliable in practice: `wrangler
+        // tail` produced nothing for a known-good 200 in production this
+        // cycle, so the documented recovery could simply fail.
+        const bootstrap = await authority.getBootstrapState();
+        switch (bootstrap.status) {
+          case "armed":
+            return jsonErr(
+              "bootstrap code required — supply the BOOTSTRAP_CODE this deployment was configured with",
+              401,
+            );
+          case "unconfigured":
+            // Fail closed AND fail informative. An authority nobody can
+            // bootstrap is a recoverable operator error; one that silently
+            // mints a credential into a log is not.
+            return jsonErr(
+              "this authority has no administrator and no bootstrap secret — the deployer must set BOOTSTRAP_CODE (wrangler secret put BOOTSTRAP_CODE) and retry, or bootstrap via GitHub OIDC at /cert/gha",
+              401,
+            );
+          case "closed":
+            return jsonErr(
+              "this authority already has an administrator — sign in with a passkey, or ask an admin for an invite",
+              401,
+            );
+        }
       }
       if (result.isFirstUser) {
         const valid = await authority.consumeBootstrapCode(body.bootstrapCode!);
@@ -1434,6 +1455,70 @@ function getSubdomain(host: string): string | null {
   return match?.[1] ?? null;
 }
 
+// The authority surface is selected by hostname. `auth.notme.bot` stays the
+// hardcoded production match (sub === "auth"); SIGNET_AUTHORITY_URL
+// additionally selects the surface on whatever host it names, so a staging
+// worker (env.staging routes auth-staging.notme.bot with
+// SIGNET_AUTHORITY_URL=https://auth-staging.notme.bot) serves the authority
+// from config alone. Malformed values resolve to null rather than throwing
+// inside the fetch path — the hardcoded match still works when this returns
+// null.
+export function authorityHostFromEnv(
+  signetAuthorityUrl: string | undefined,
+): string | null {
+  if (!signetAuthorityUrl) return null;
+  try {
+    const u = new URL(signetAuthorityUrl);
+    // Hostless schemes (file:, data:, about:, mailto:) parse fine and yield
+    // host "". Returning that would collapse the caller's `host ===
+    // authorityHost` check into `host === ""`, which the bare-IP health-probe
+    // path deliberately permits — a fail-OPEN guard. Require http(s) and a
+    // non-empty host so a malformed value fails closed.
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    return u.host || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The WIMSE trust domain every minted identity is scoped to.
+ *
+ * Derived from SITE_URL, NOT a literal. The literal is why a
+ * staging-minted cert was byte-identical to a production one in the only
+ * field a verifier reads by name: staging has its own CA key but named
+ * itself `wimse://notme.bot/...` all the same, so any consumer that trusts
+ * the trust-domain string — rather than pinning the exact CA key — could be
+ * handed a staging cert asserting a production identity.
+ *
+ * Production is unaffected: SITE_URL is https://notme.bot, so this returns
+ * "notme.bot", exactly the literal it replaces. Staging returns
+ * "staging.notme.bot", which makes every name-based verifier fail closed
+ * without needing to know staging exists.
+ */
+export function wimseTrustDomain(env: { SITE_URL?: string }): string {
+  // ABSENT and MALFORMED are treated differently, deliberately. Absent means
+  // "no environment configured", whose documented default is production —
+  // the value every mint site hardcoded before this existed. Malformed means
+  // the operator configured SOMETHING and got it wrong, and silently
+  // resolving that to the production trust domain would reintroduce exactly
+  // the staging-impersonates-production defect this function removes. So it
+  // throws, and the mint fails, rather than minting under a domain nobody
+  // chose. (authorityHostFromEnv fails closed for the same reason; the two
+  // were briefly inconsistent.)
+  if (!env.SITE_URL) return "notme.bot";
+  const u = new URL(env.SITE_URL); // throws on malformed — intentional
+  if (u.protocol !== "https:" && u.protocol !== "http:") {
+    throw new TypeError(
+      `SITE_URL must be http(s) to derive a WIMSE trust domain; got ${u.protocol}`,
+    );
+  }
+  if (!u.host) {
+    throw new TypeError("SITE_URL has no host; cannot derive a trust domain");
+  }
+  return u.host;
+}
+
 // ── CF Edge Cache helpers ──
 // With run_worker_first = true, responses constructed in the Worker bypass CF
 // edge cache entirely. We use the Cache API to store and serve them at the edge.
@@ -1564,6 +1649,37 @@ export default {
     // ── /health liveness probe ──
     // Host-agnostic, no auth, no DO access. Cloister + container orchestrators
     // (cluster.capnp notme-identity bundle) poll this on :8788/health.
+    // GET /.well-known/version — which BUILD is serving this request
+    // (notme-9f2f79, and signet's "no positive evidence" objection).
+    //
+    // Deploys here are manual, so the git tree does not settle what is
+    // running. Before this, a consumer waiting on a fix had no way to confirm
+    // it shipped except to ask, and "there is no positive evidence" was a fair
+    // description. `/health` says `ok`; nothing else served was derived from
+    // the build.
+    //
+    // It is also the discriminator ADR-018's canary gate needs. That gate
+    // failed twice by silently reporting the OLD version's behaviour, and an
+    // earlier attempt used the JWKS `kid` — which cannot work, because `kid`
+    // is stored Durable Object state rather than something the build
+    // determines, so two different builds serve the same value.
+    //
+    // Unauthenticated and uncached, like /health: the commit of a public repo
+    // is not a secret, and a cached answer would defeat the entire purpose on
+    // the request after a deploy.
+    //
+    // Answered before host canonicalization for the same reason as /health —
+    // probes from bare-IP or in-cluster hosts must get an answer, not a 301.
+    if (pathname === "/.well-known/version") {
+      return Response.json(buildInfo(env), {
+        status: 200,
+        headers: {
+          "Cache-Control": "no-store",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
     // Must respond before any host-canonicalization redirect so probes from
     // bare-IP / pod-IP / docker bridge hosts get a 200 instead of a 301.
     if (pathname === "/health" || pathname === "/healthz") {
@@ -1635,7 +1751,12 @@ export default {
     }
 
     // ── auth.notme.bot — signet identity authority ──
-    if (sub === "auth" || isLocal) {
+    // Also matched by SIGNET_AUTHORITY_URL's host, so non-production
+    // environments (auth-staging.notme.bot) select the authority surface
+    // without a code change. In production the var names auth.notme.bot,
+    // which sub === "auth" already matches — no behavior change.
+    const authorityHost = authorityHostFromEnv(env.SIGNET_AUTHORITY_URL);
+    if (sub === "auth" || isLocal || (authorityHost !== null && host === authorityHost)) {
       const authorityUrl: string =
         env.SIGNET_AUTHORITY_URL || "https://auth.notme.bot";
       const siteUrl: string = env.SITE_URL || "https://notme.bot";
@@ -1698,7 +1819,24 @@ export default {
         );
         const headers = new Headers(resp.headers);
         headers.set("Cache-Control", "public, max-age=3600");
-        const result = new Response(resp.body, {
+        // The asset hardcodes the production authority host. On any other
+        // environment (staging), rewrite it so the docs describe the host
+        // actually serving them — worker:verify treats a production URL
+        // rendered on staging as a config leak.
+        let body: BodyInit | null = resp.body;
+        if (
+          resp.ok &&
+          authorityHost !== null &&
+          authorityHost !== "auth.notme.bot"
+        ) {
+          const html = await resp.text();
+          body = html.replaceAll("auth.notme.bot", authorityHost);
+          // Stale after rewriting: length changed, and text() already
+          // decoded any content-encoding.
+          headers.delete("Content-Length");
+          headers.delete("Content-Encoding");
+        }
+        const result = new Response(body, {
           status: resp.status,
           statusText: resp.statusText,
           headers,
@@ -1768,7 +1906,17 @@ export default {
           // stolen OIDC token issued for a different app, which would silently
           // re-route the victim's later notme.bot OIDC login into the
           // attacker's principal. X.509 path ignores the audience arg.
-          identity = await verifyProof(typedProof, caCertPem, "notme.bot");
+          // The authority's CURRENT epoch, so a cert issued before a
+          // rotation is refused. Read from the DO rather than cached: a
+          // rotation that took effect between requests must take effect
+          // HERE, which is the whole point of the lever (notme-77a024).
+          const { epoch: currentEpoch } = await authority.getReceiptFacts();
+          identity = await verifyProof(
+            typedProof,
+            caCertPem,
+            "notme.bot",
+            currentEpoch,
+          );
         } catch (e: any) {
           return jsonErr("proof verification failed: " + e.message, 401);
         }
@@ -1806,6 +1954,58 @@ export default {
       }
 
       // ── Invites: create + redeem ──
+
+      // GET  /admin/alarm-health        — is the bundle-refresh alarm alive?
+      // POST /admin/alarm-health/reset  — clear the circuit breaker, re-arm
+      //
+      // The alarm republishes the CA bundle every BUNDLE_REFRESH_MS. It has a
+      // circuit breaker that stops re-arming after repeated failures, and
+      // recovery requires resetAlarmHealth() — which was an RPC method with NO
+      // ROUTE, so the documented recovery procedure could not be invoked at
+      // all. Production ran with a dead alarm for 130 days and served a bundle
+      // every conformant consumer rejected (notme-77a024).
+      //
+      // authorityManage-gated, not public: alarm health leaks operational
+      // state (how long the authority has been running, whether it is
+      // failing), and reset re-arms a timer on the DO holding the CA key.
+      if (pathname === "/admin/alarm-health" || pathname === "/admin/alarm-health/reset") {
+        const isReset = pathname.endsWith("/reset");
+        // AUTH BEFORE METHOD, deliberately. Answering 405 first tells an
+        // unauthenticated caller the path exists — a free confirmation that
+        // this authority has an admin surface, on the object holding the CA
+        // key. Every rejection an anonymous caller can reach is a 401.
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        if (!cookie) return jsonErr("sign in first", 401);
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const sessionSecret = await authority.getSessionSecret();
+        const session = await verifySessionCookie(cookie, sessionSecret);
+        if (!session) return jsonErr("invalid session", 401);
+        if (!(session.scopes ?? []).includes("authorityManage")) {
+          return jsonErr("authorityManage scope required", 403);
+        }
+        // Method check now that the caller is known to be an admin.
+        if (request.method !== (isReset ? "POST" : "GET")) {
+          return jsonErr("method not allowed", 405);
+        }
+
+        if (isReset) {
+          const result = await authority.resetAlarmHealth();
+          // Return health ALONGSIDE the reset result. An operator who resets
+          // needs to see the outcome without a second call — and `rearmed`
+          // is the field that matters: clearing the counter without re-arming
+          // looks like recovery while the bundle goes on rotting.
+          return Response.json({
+            ...result,
+            health: await authority.getAlarmHealth(),
+          });
+        }
+        return Response.json(await authority.getAlarmHealth());
+      }
 
       // POST /invites — create an invite (requires authorityManage scope)
       if (pathname === "/invites" && request.method === "POST") {
@@ -2060,7 +2260,13 @@ export default {
         return handleCertExchange(request, env);
       }
 
-      // POST /cert/passkey — passkey session → bridge cert pair.
+      // POST /cert/passkey — authenticated session → bridge cert pair.
+      //
+      // Named for its primary caller, but it accepts ANY valid session —
+      // passkey, invite (/join), or OIDC (/auth/oidc/login) — and the minted
+      // cert's authMethod + wimse identity are DERIVED from the session's
+      // authMethod, so the cert never claims an authenticator the session
+      // didn't use (notme-ebc9af).
       //
       // The passkey analogue of /cert/gha, and near-identical to it: verify an
       // authenticator, prove possession of the submitted keys, mint the pair.
@@ -2164,40 +2370,15 @@ export default {
             new Uint8Array(sessionHash),
             mtlsSpki.byteLength + signingSpki.byteLength,
           );
-          const bindingPayload = await crypto.subtle.digest(
-            "SHA-256",
+          // PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
+          const pop = await verifyPopProofs(
             bindingInput,
+            mtlsPubKey,
+            signingPubKey,
+            body.proofs,
           );
-
-          const b64uToBytes = (s: string) =>
-            Uint8Array.from(
-              atob(s.replace(/-/g, "+").replace(/_/g, "/")),
-              (c) => c.charCodeAt(0),
-            );
-          try {
-            const ok = await crypto.subtle.verify(
-              { name: "ECDSA", hash: "SHA-256" },
-              mtlsPubKey,
-              b64uToBytes(body.proofs.mtls),
-              bindingPayload,
-            );
-            if (!ok) return jsonErr("P-256 proof-of-possession failed", 401);
-          } catch (e: any) {
-            return jsonErr(`P-256 proof verification error: ${e.message}`, 401);
-          }
-          try {
-            const ok = await crypto.subtle.verify(
-              ED25519,
-              signingPubKey,
-              b64uToBytes(body.proofs.signing),
-              bindingPayload,
-            );
-            if (!ok) return jsonErr("Ed25519 proof-of-possession failed", 401);
-          } catch (e: any) {
-            return jsonErr(
-              `Ed25519 proof verification error: ${e.message}`,
-              401,
-            );
+          if (!pop.ok) {
+            return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
           }
 
           const { certScopesForSession } =
@@ -2213,13 +2394,34 @@ export default {
             );
           }
 
+          // Provenance is DERIVED from the session, never asserted by the
+          // route: /join sets authMethod "invite" and /auth/oidc/login sets
+          // "oidc:<issuer>", and this route accepts those sessions — so a
+          // hardcoded "passkey" told verifiers a human touched an
+          // authenticator when none did (notme-ebc9af). encodeURIComponent
+          // keeps an issuer-qualified method one URI path segment.
+          //
+          // Validated, not defaulted. verifySessionCookie JSON.parses its
+          // payload with no shape check, so a future issuer that omits
+          // authMethod would otherwise reach the mint as undefined —
+          // stamping the literal "undefined" into a certificate's identity
+          // and extension. Defaulting to "passkey" would be worse: it
+          // re-creates the exact lie notme-ebc9af fixed. A cert that cannot
+          // state its provenance honestly must not be minted.
+          const sessionAuthMethod = session.authMethod;
+          if (
+            typeof sessionAuthMethod !== "string" ||
+            sessionAuthMethod.length === 0
+          ) {
+            return jsonErr("session carries no authMethod", 401);
+          }
           const result = await authority.mintBridgeCertPair({
             subject: session.principalId,
-            identity: `wimse://notme.bot/passkey/${session.principalId}`,
+            identity: `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
             mtlsPublicKeyPem: body.public_keys.mtls,
             signingPublicKeyPem: body.public_keys.signing,
             scopes,
-            authMethod: "passkey",
+            authMethod: sessionAuthMethod,
             ttlMs: 5 * 60 * 1000,
           });
 
@@ -2234,7 +2436,7 @@ export default {
           return Response.json({
             ...result,
             principal_id: session.principalId,
-            auth_method: "passkey",
+            auth_method: sessionAuthMethod,
           });
         } catch (e: any) {
           return jsonErr("passkey cert error: " + e.message, 500);
@@ -2790,6 +2992,44 @@ export default {
       }
 
       // GET /.well-known/jwks.json — Ed25519 public key for token verification
+      // GET /.well-known/epochs.json — every epoch's signing key, current
+      // and retired, so a THIRD PARTY can verify history rather than only the
+      // present (notme-a0cff4).
+      //
+      // jwks.json answers "which key is live now", which is all a verifier of
+      // a FRESH token needs. An auditor holding a receipt or certificate that
+      // names epoch N needs the key that signed THAT epoch — and notme has
+      // retained retired keys since PR #64 (rotate() archives before
+      // deleting) while offering no way to read them. Cloister could only
+      // archive epochs it happened to observe by polling, so a rotation
+      // between polls left that epoch unresolvable even though notme held the
+      // key: the repudiation risk notme-acd503 describes.
+      //
+      // Unauthenticated by design, like jwks.json and the discovery document:
+      // this is public key material, and an auditor is not a principal.
+      // Requiring a credential to verify history would defeat the point.
+      if (pathname === "/.well-known/epochs.json") {
+        const cached = await cacheMatch(request);
+        if (cached) return cached;
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const epochs = await authority.listEpochKeys();
+        const resp = Response.json(
+          { epochs },
+          {
+            headers: {
+              // Short max-age: a rotation adds an entry, and an auditor
+              // fetching just after one should not be told the epoch is
+              // unknown. The set only ever grows, so a stale copy is
+              // incomplete rather than wrong.
+              "Cache-Control": "public, max-age=60",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+        return cachePut(request, resp);
+      }
+
       if (pathname === "/.well-known/jwks.json") {
         const cached = await cacheMatch(request);
         if (cached) return cached;
@@ -2962,20 +3202,51 @@ export default {
       }
 
       // Proxy everything else to signet via VPC tunnel (requires VPC_AUTH binding)
+      //
+      // The tunnel fetch is awaited inside a try so a REJECTION lands here
+      // instead of escaping the handler. Unawaited, it propagated and every
+      // unmatched path under the authority host answered with Cloudflare's
+      // error 1101 — a Worker exception, not a routing answer (notme-cb0354,
+      // live in production 2026-08-05 while known routes were healthy).
+      // Staging cannot catch this: with no VPC_AUTH binding it takes the 503
+      // fallthrough below, so the environments diverge exactly at this branch
+      // and a green staging run says nothing about this path.
+      //
+      // The 404 body is CONSTANT deliberately. From here a dead tunnel and a
+      // path that was never routable are the same event — the fetch fails
+      // identically for both — so the honest distinction is unavailable, and
+      // manufacturing one would leak the authority's private route table to
+      // unauthenticated callers. The cause goes to the log, where an operator
+      // can tell an outage from a typo; the caller learns only that nothing
+      // answers here.
       if (env.VPC_AUTH) {
         const originUrl = `http://localhost${pathname}${url.search}`;
-        return env.VPC_AUTH.fetch(
-          new Request(originUrl, {
-            method: request.method,
-            headers: request.headers,
-            body: request.body,
-          }),
-        );
+        try {
+          return await env.VPC_AUTH.fetch(
+            new Request(originUrl, {
+              method: request.method,
+              headers: request.headers,
+              body: request.body,
+            }),
+          );
+        } catch (vpcErr: any) {
+          console.error("[vpc-auth] proxy failed:", pathname, vpcErr?.message);
+          return Response.json({ error: "not_found" }, { status: 404 });
+        }
       }
-      return Response.json(
-        { error: "auth.notme.bot not yet configured" },
-        { status: 503 },
-      );
+      // Same constant 404 as the VPC-failure branch above, deliberately.
+      //
+      // This used to answer 503 "auth.notme.bot not yet configured", which
+      // made an unmatched path mean two different things depending on whether
+      // a VPC binding happened to exist — so the verify check that is correct
+      // for production failed on staging the moment it was added, and the two
+      // environments disagreed about a response an auditor might rely on.
+      //
+      // It also disclosed deployment state to unauthenticated callers. From
+      // the caller's side the path simply does not resolve; whether an
+      // operator has configured a tunnel is not their business, and is not a
+      // fact worth handing to a stranger.
+      return Response.json({ error: "not_found" }, { status: 404 });
     }
 
     // /auth → canonical URL is auth.notme.bot (302 so BYO deploys can override)

@@ -29,6 +29,8 @@
  * someone notices immediately.
  */
 
+import { escalatedScopes, verifyScopeChain } from "./scope-chain";
+
 /**
  * Scopes a bridge cert minted from a passkey session may carry.
  *
@@ -58,5 +60,25 @@ export function certScopesForSession(
   sessionScopes: readonly string[] | undefined,
 ): string[] {
   const held = new Set(sessionScopes ?? []);
-  return [...CERT_ELIGIBLE_SCOPES].filter((s) => held.has(s));
+  const granted = [...CERT_ELIGIBLE_SCOPES].filter((s) => held.has(s));
+
+  // Postcondition, checked rather than asserted in prose (notme-acc822).
+  //
+  // Property 1 above — "the result is a SUBSET of the session's scopes" — is
+  // guaranteed by CONSTRUCTION today, because an intersection cannot grow.
+  // That is exactly why it is worth checking: the guarantee lives in the
+  // shape of the expression, not in anything that would notice if the
+  // expression changed. Swap the filter for a union, a merge with a default
+  // set, or a lookup that falls back on miss, and a session would silently
+  // mint a cert carrying authority it never held.
+  //
+  // This is also the ONLY delegation step notme performs today, so it is the
+  // one place ADR-008's `cert.scopes ⊆ parent.scopes` can be enforced on live
+  // traffic rather than waiting for the orchestrator tier to exist.
+  if (!verifyScopeChain([...held], granted)) {
+    throw new Error(
+      `scope escalation: cert would carry ${escalatedScopes([...held], granted).join(", ")} not held by the session`,
+    );
+  }
+  return granted;
 }

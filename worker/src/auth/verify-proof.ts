@@ -3,6 +3,7 @@
 
 import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
 import { base64urlDecode } from "@agentic-research/dpop";
+import { OID_EPOCH } from "../cert-authority";
 
 export interface VerifiedIdentity {
   type: "oidc" | "x509";
@@ -208,9 +209,43 @@ export async function verifyOIDC(
 
 // ── X.509 verification (cert signed by known CA) ──
 
+/**
+ * Read the CA epoch a certificate was issued under, or null if it carries none.
+ *
+ * The extension is a DER INTEGER written by `cert-authority.ts` at OID_EPOCH.
+ * Parsed here rather than trusted from elsewhere, because the epoch is the
+ * value the revocation decision turns on.
+ */
+export function certEpoch(cert: {
+  getExtension(oid: string): { value: ArrayBuffer } | null;
+}): number | null {
+  const ext = cert.getExtension(OID_EPOCH);
+  if (!ext) return null;
+  const der = new Uint8Array(ext.value);
+  // DER INTEGER: 0x02 <len> <big-endian bytes>. Lengths here are single-byte;
+  // an epoch needing a long-form length would be astronomically large and is
+  // refused rather than mis-parsed.
+  if (der.length < 3 || der[0] !== 0x02) return null;
+  const len = der[1]!;
+  if (len === 0 || len > 6 || der.length < 2 + len) return null;
+  let n = 0;
+  for (let i = 0; i < len; i++) n = n * 256 + der[2 + i]!;
+  return n;
+}
+
 export async function verifyX509(
   certPem: string,
   caPublicKeyPem: string,
+  /**
+   * The authority's CURRENT epoch. REQUIRED, deliberately.
+   *
+   * A verifier that does not know the current epoch cannot make a revocation
+   * decision, so it must refuse rather than skip. An optional parameter would
+   * reproduce this repo's most common defect — a control that silently does
+   * nothing when unwired — which is exactly how `checkRevocation` came to have
+   * zero call sites while two documents claimed revocation worked.
+   */
+  currentEpoch: number,
 ): Promise<VerifiedIdentity> {
   const { X509Certificate } = await import("@peculiar/x509");
   const cert = new X509Certificate(certPem);
@@ -224,6 +259,36 @@ export async function verifyX509(
   const caCert = new X509Certificate(caPublicKeyPem);
   const signatureValid = await cert.verify({ publicKey: caCert.publicKey });
   if (!signatureValid) throw new Error("cert signature invalid — not signed by trusted CA");
+
+  // ── Epoch check: the emergency revocation lever, finally wired ──
+  //
+  // AFTER the signature check, deliberately. Everything here interprets the
+  // certificate's CONTENTS, and contents are only meaningful once the cert
+  // is known to be ours. Checking the epoch first also handed an
+  // unauthenticated caller an oracle: submit a forged cert with a guessed
+  // epoch and the error message distinguishes a right guess from a wrong one.
+  //
+  // ADR-008 §418: "increment the CA epoch. All certs signed with the previous
+  // epoch are immediately invalid." §420: "if cert.epoch < bundle.epoch, the
+  // cert is REJECTED. The grace window (if any) is a deployment-time
+  // configuration, not a protocol-level default."
+  //
+  // Until now OID_EPOCH was WRITTEN into every cert and READ NOWHERE, so
+  // rotate() bumped a number nothing compared and the documented lever did
+  // nothing (notme-77a024).
+  //
+  // Strict `!==`, not `<`. A cert from a FUTURE epoch is not a rotation case:
+  // it is forged, or from another authority. Accepting it would let anyone who
+  // could influence that field outrun every future rotation at once.
+  const epoch = certEpoch(cert);
+  if (epoch === null) {
+    throw new Error("cert carries no epoch — cannot be checked against rotation");
+  }
+  if (epoch !== currentEpoch) {
+    throw new Error(
+      `cert epoch ${epoch} does not match authority epoch ${currentEpoch} — revoked by rotation`,
+    );
+  }
 
   // Extract subject CN
   const subject = cert.subjectName.getField("CN")?.[0] ?? cert.subject;
@@ -242,6 +307,8 @@ export async function verifyProof(
   proof: Proof,
   caPublicKeyPem: string | undefined,
   expectedAudience: string | string[],
+  /** Authority's current epoch — required for the x509 path. See verifyX509. */
+  currentEpoch?: number,
 ): Promise<VerifiedIdentity> {
   if (proof.type === "oidc") {
     return verifyOIDC(proof.token, expectedAudience);
@@ -252,7 +319,12 @@ export async function verifyProof(
     // still take it as a required argument so callers can't accidentally
     // route a token-issuing flow through this function without one.
     void expectedAudience; // intent in IR, not just prose
-    return verifyX509(proof.cert, caPublicKeyPem);
+    // Fail closed: a caller that did not supply the epoch cannot have its
+    // certificate checked against rotation, and must not be given a pass.
+    if (currentEpoch === undefined) {
+      throw new Error("current epoch required for x509 verification");
+    }
+    return verifyX509(proof.cert, caPublicKeyPem, currentEpoch);
   }
   // Exhaustiveness: if Proof gains a new variant, the line below fails to
   // typecheck (proof would no longer be `never` here). Runtime read covers

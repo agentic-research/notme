@@ -76,6 +76,30 @@ Implement the standard authorization-code flow (currently absent: `/authorize`
 renders HTML, issues no code; no PKCE) and mint an ephemeral, nonce-bound
 `id_token` carrying `cnf.jwk` (the holder's dispatch key). RPs:
 
+> **CORRECTION (2026-08-06, `notme-be5691`).** The parenthetical is out of
+> date, and so are the three other places this ADR calls the code flow or PKCE
+> unbuilt (§"security model" 4, §"What flips in code", and the
+> `code_challenge_methods_supported` note). **ADR-013 shipped both**, Accepted
+> 2026-08-03: `POST /authorize/code` (`worker/worker.ts:2449`) issues a
+> single-use PKCE-bound code and `POST /authorize/redeem` (`:2542`) exchanges
+> it, with `code_challenge_method` required to be `S256`.
+> `createAuthorizationCode` / `redeemAuthorizationCode` are at
+> `worker/src/signing-authority.ts:1024` / `:1090`, single-use enforced by
+> `DELETE … RETURNING` plus `changes()`.
+>
+> One consequence for this ADR's argument: `code_challenge_methods_supported`
+> is framed here as gated on PKCE existing. It is not. It is withheld by
+> **policy**, because the flow is first-party by construction — the exact-host
+> `ALLOWED_REDIRECT_HOSTS` allowlist is the only client registry there is.
+> `src/as-metadata.ts` has since split `FORBIDDEN_METADATA_FIELDS` into
+> `UNTRUE_METADATA_FIELDS` (:177) and `FIRST_PARTY_WITHHELD_FIELDS` (:215)
+> precisely to keep that distinction from collapsing again.
+>
+> `as-metadata.ts:201-206` names this failure mode directly: *"twice now a
+> comment justified a policy choice with a truth claim … that ADR-013
+> falsified, pointing the next reader at work that was already done."* This
+> ADR was the third instance.
+
 - **naive RP** verifies signature + `iss`/`aud`/`nonce`/`exp` → standard OIDC.
 - **PoP-aware RP** additionally checks `cnf` and demands a proof of the key.
 
@@ -196,7 +220,34 @@ consumers" to "asserts identity to arbitrary RPs." What must be modelled:
    miscited `platform.ts` as the machinery; `platform.ts`'s `MemoryCache` is
    only the local-workerd TTL *store* that backs the ledger, KV in prod —
    store, not logic) — and (b) any
-   notme-facing PoP proofs, which already ride that ledger. Mint a `jti` into
+   notme-facing PoP proofs, which already ride that ledger.
+
+   > **CORRECTION (2026-08-06, `notme-be5691`).** Both cited symbols are gone,
+   > and the "corrected" citation in the Review verdict below is itself wrong.
+   > **`checkJtiReplay` and `storeJti` do not exist anywhere in the source** —
+   > `git grep` and `rg` each return exactly one hit repo-wide: this line.
+   > `worker/src/auth/dpop-handler.ts` is now 37 lines exporting only
+   > `JwkPublicKey` and `buildJwksResponse`; its header records that
+   > `handleToken` was deleted as never-live (`notme-e73c64`).
+   > `worker/src/auth/dpop.ts` only *extracts* `jti` and does no replay
+   > tracking.
+   >
+   > The real machinery is **`SigningAuthority.mintDPoPTokenOnce`**
+   > (`worker/src/signing-authority.ts:641`), called inline at
+   > `worker/worker.ts:2838` — a synchronous `INSERT OR IGNORE` plus
+   > `changes()` inside the singleton DO. That is not a split check-then-store
+   > ledger; `notme-1bd2dd` (closed 2026-07-24, three days after this ADR was
+   > written) replaced the split pattern precisely *because* check-then-store
+   > is not atomic across edge nodes. So the "reuse the jti-ledger pattern"
+   > advice points at a shape that was deliberately removed.
+   >
+   > Authorization-code single-use is in fact already implemented, and not via
+   > this ledger: `redeemAuthorizationCode`
+   > (`worker/src/signing-authority.ts:1090`) uses `DELETE … RETURNING` plus
+   > `changes()`. See the related correction on §"Options A" — the code flow
+   > and PKCE this ADR describes as unbuilt shipped in ADR-013.
+
+   Mint a `jti` into
    every id_token anyway: it costs nothing and gives audit logs a stable
    token identity.
 4. **Code flow + PKCE.** Option A/C need the code flow notme lacks. PKCE

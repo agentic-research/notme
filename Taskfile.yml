@@ -88,13 +88,31 @@ tasks:
     desc: Upload new version without routing traffic to it
     dir: worker
     cmds:
-      - pnpm exec wrangler versions upload
+      # Stamp the build so the deployed Worker can say WHICH build it is
+      # (notme-9f2f79). Deploys here are manual, so without this the git tree
+      # does not settle what is running and a consumer waiting on a fix can
+      # only ask. Read back at GET /.well-known/version.
+      #
+      # A --var binding rather than a generated source file: a generated file
+      # would change every commit, which makes reproducibility gates like
+      # action:bundle-check meaningless, and would need gitignoring — putting
+      # the value outside review.
+      - pnpm exec wrangler versions upload --var BUILD_SHA:$(git rev-parse HEAD)
 
   worker:deploy:
     desc: Deploy to production (use ship for the safe path)
     dir: worker
     cmds:
-      - pnpm exec wrangler deploy
+      # Stamp the build so the deployed Worker can say WHICH build it is
+      # (notme-9f2f79). Deploys here are manual, so without this the git tree
+      # does not settle what is running and a consumer waiting on a fix can
+      # only ask. Read back at GET /.well-known/version.
+      #
+      # A --var binding rather than a generated source file: a generated file
+      # would change every commit, which makes reproducibility gates like
+      # action:bundle-check meaningless, and would need gitignoring — putting
+      # the value outside review.
+      - pnpm exec wrangler deploy --var BUILD_SHA:$(git rev-parse HEAD)
 
   worker:rollback:
     desc: Roll back to previous version
@@ -104,9 +122,18 @@ tasks:
 
   worker:verify:
     desc: Smoke test live endpoints with bounded deployment-convergence retries
+    # AUTH_BASE / SITE_BASE default to production; `worker:verify-staging`
+    # passes the staging hosts so both environments share ONE definition of
+    # "the service works" instead of a staging copy that drifts.
+    vars:
+      AUTH_BASE: '{{.AUTH_BASE | default "https://auth.notme.bot"}}'
+      SITE_BASE: '{{.SITE_BASE | default "https://notme.bot"}}'
     cmds:
       - |
         FAIL=0
+        AUTH_BASE="{{.AUTH_BASE}}"
+        SITE_BASE="{{.SITE_BASE}}"
+        AUTH_HOST="${AUTH_BASE#https://}"
         VERIFY_NONCE="$(date +%s)"
         MAX_ATTEMPTS=5
         RETRY_DELAY_SECONDS=2
@@ -150,26 +177,165 @@ tasks:
           FAIL=1
         }
 
-        echo "=== auth.notme.bot ==="
-        check_request "landing" "GET" "https://auth.notme.bot/" "200" "identity authority"
-        check_request "login" "GET" "https://auth.notme.bot/login" "200" "passkey"
-        check_request "discovery" "GET" "https://auth.notme.bot/.well-known/signet-authority.json" "200" '"issuer"'
+        echo "=== ${AUTH_HOST} ==="
+        check_request "landing" "GET" "${AUTH_BASE}/" "200" "identity authority"
+        check_request "login" "GET" "${AUTH_BASE}/login" "200" "passkey"
+        check_request "discovery" "GET" "${AUTH_BASE}/.well-known/signet-authority.json" "200" '"issuer"'
         # Cache API entries survive Worker deployments. A unique query checks
         # the newly deployed handler instead of the previous version's cache.
-        check_request "ca-bundle" "GET" "https://auth.notme.bot/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE" "200" "BEGIN CERTIFICATE"
-        check_request "jwks" "GET" "https://auth.notme.bot/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
-        check_request "api-docs" "GET" "https://auth.notme.bot/api/docs" "200" "auth.notme.bot"
-        check_request "passkey-status" "GET" "https://auth.notme.bot/auth/passkey/status" "401" '"error":"unauthorized"'
-        check_request "authorize" "GET" "https://auth.notme.bot/authorize" "400" '"error":"redirect_uri required"'
-        check_request "token" "POST" "https://auth.notme.bot/token" "400" '"error":"dpop_proof_required"' '{"audience":"https://test"}'
+        check_request "ca-bundle" "GET" "${AUTH_BASE}/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE" "200" "BEGIN CERTIFICATE"
+        check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
+        # The deployed build must be able to NAME ITSELF. Asserting
+        # "stamped":true rather than merely a 200: an endpoint that always
+        # answered "unknown" would pass a liveness check while telling a
+        # consumer nothing, which is the state that made signet's "no positive
+        # evidence" objection correct (notme-9f2f79). No nonce — it is
+        # no-store, so there is no cache entry to bypass.
+        check_request "build-version" "GET" "${AUTH_BASE}/.well-known/version" "200" '"stamped":true'
+        # Expect the environment's own authority host in the docs page — a
+        # staging deploy that renders production URLs is a config leak, not
+        # a pass. Nonce for the same reason as ca-bundle: Cache API entries
+        # survive deployments, and this handler cachePuts with max-age=3600.
+        check_request "api-docs" "GET" "${AUTH_BASE}/api/docs?verify=$VERIFY_NONCE" "200" "${AUTH_HOST}"
+        check_request "passkey-status" "GET" "${AUTH_BASE}/auth/passkey/status" "401" '"error":"unauthorized"'
+        check_request "authorize" "GET" "${AUTH_BASE}/authorize" "400" '"error":"redirect_uri required"'
+        check_request "token" "POST" "${AUTH_BASE}/token" "400" '"error":"dpop_proof_required"' '{"audience":"https://test"}'
+        # Every check above names a route that exists. Nothing covered the
+        # fallthrough, which is where notme-cb0354 lived: unmatched paths came
+        # back as error 1101 in production for as long as the VPC tunnel was
+        # unhealthy, and the gate stayed green throughout.
+        #
+        # The body pattern is the Worker's own constant 404, which it returns
+        # when the VPC fetch fails. A HEALTHY tunnel would instead hand back
+        # whatever signet answers for an unknown path, so if this check ever
+        # fails on the pattern rather than the status, read it as "the tunnel
+        # came up" and decide there whether signet's 404 shape is acceptable
+        # to expose — do not just relax the assertion. The status is the part
+        # that must never regress: 1101 surfaces as 500.
+        check_request "unmatched-path" "GET" "${AUTH_BASE}/.well-known/not-a-route-$VERIFY_NONCE" "404" '"error":"not_found"'
 
-        echo "=== notme.bot ==="
-        check_request "homepage" "GET" "https://notme.bot/" "200" "notme"
-        check_request "apas" "GET" "https://notme.bot/apas?verify=$VERIFY_NONCE" "200" "0.2.1-draft"
-        check_request "apas-schema" "GET" "https://notme.bot/provenance/dispatch/v1?verify=$VERIFY_NONCE" "200" '"workItemRef"' "" "application/schema+json"
+        echo "=== ${SITE_BASE#https://} ==="
+        check_request "homepage" "GET" "${SITE_BASE}/" "200" "notme"
+        check_request "apas" "GET" "${SITE_BASE}/apas?verify=$VERIFY_NONCE" "200" "0.2.1-draft"
+        check_request "apas-schema" "GET" "${SITE_BASE}/provenance/dispatch/v1?verify=$VERIFY_NONCE" "200" '"workItemRef"' "" "application/schema+json"
 
         echo "---"
         [ $FAIL -eq 0 ] && echo "All checks passed." || { echo "SOME CHECKS FAILED"; exit 1; }
+
+  node:preflight:
+    desc: Fail fast, with remediation, when local Node can't run the release path
+    # Evaluates the DECLARED range (package.json engines.node) rather than
+    # hardcoding a second copy that would drift. Exists because ship-prod on
+    # an unsupported Node died inside worker:install with a raw
+    # ERR_PNPM_UNSUPPORTED_ENGINE and no next step (notme-8bea0d) — CI never
+    # sees this (workflows pin node 22), only local release runs do.
+    #
+    # SUPPORTED RANGE SYNTAX: `^x.y.z`, `>=x.y.z`, exact `x.y.z`, joined by
+    # `||`. That is deliberately a SUBSET of npm semver, and anything else
+    # (`~`, `x`-ranges, hyphen ranges, prerelease tags) fails CLOSED — an
+    # unrecognized range matches nothing, so the task refuses to run rather
+    # than admitting an untested runtime. If engines.node ever needs syntax
+    # outside that subset, extend this parser or depend on `semver` — do NOT
+    # widen the fallback, because failing open here silently restores the
+    # exact defect this task exists to prevent.
+    cmds:
+      - |
+        node -e '
+          const { engines } = require("./package.json");
+          const want = engines && engines.node;
+          if (!want) { console.error("package.json declares no engines.node — add one (notme-8bea0d)"); process.exit(1); }
+          const v = process.versions.node.split(".").map(Number);
+          const ge = (a, b) => { for (let i = 0; i < 3; i++) { if ((a[i]||0) !== (b[i]||0)) return (a[i]||0) > (b[i]||0); } return true; };
+          const ok = want.split("||").map(s => s.trim()).some(range => {
+            const m = range.match(/^(\^|>=)?(\d+)\.(\d+)\.(\d+)$/);
+            if (!m) return false;
+            const min = [Number(m[2]), Number(m[3]), Number(m[4])];
+            if (m[1] === "^") return v[0] === min[0] && ge(v, min);
+            if (m[1] === ">=") return ge(v, min);
+            return v[0] === min[0] && v[1] === min[1] && v[2] === min[2];
+          });
+          if (!ok) {
+            console.error("Node v" + process.versions.node + " cannot run the release path — package.json engines.node wants: " + want);
+            console.error("Remediation (CI pins Node 22):");
+            console.error("  mise use node@22    # or: nvm use 22");
+            process.exit(1);
+          }
+          console.log("node v" + process.versions.node + " satisfies engines.node (" + want + ")");
+        '
+
+  # --- staging + canary promotion (goal-zero release train) ------------------
+  #
+  # Promotion order: ship-staging (separate Worker, own DOs/KV, no VPC) →
+  # worker:deploy-preview (upload the EXACT production artifact, get a version
+  # id) → worker:canary (gradual deployment, split traffic) → worker:promote
+  # (100% to the version already soaking). Rollback at any point is
+  # worker:canary/promote back to the OLD version id — same mechanism, no
+  # special path. NOTE: a version carrying a new [[migrations]] entry cannot
+  # be split-deployed; Durable Object migrations promote atomically and
+  # deleted-class migrations do not roll back. Check `git diff` on
+  # wrangler.toml migrations before choosing the canary path.
+
+  worker:deploy-staging:
+    desc: Deploy to the staging Worker (notme-bot-staging, isolated state)
+    dir: worker
+    cmds:
+      - pnpm exec wrangler deploy --env staging --var BUILD_SHA:$(git rev-parse HEAD)
+
+  worker:verify-staging:
+    desc: Smoke test staging endpoints (same checks as production verify)
+    cmds:
+      - task: worker:verify
+        vars:
+          AUTH_BASE: "https://auth-staging.notme.bot"
+          SITE_BASE: "https://staging.notme.bot"
+
+  ship-staging:
+    desc: "Staging gate: preflight → install → check → docs → deploy staging → verify staging"
+    cmds:
+      - task: node:preflight
+      - task: worker:install
+      - task: worker:check
+      - task: docs:check
+      - task: worker:deploy-staging
+      - task: worker:verify-staging
+
+  # ENV selects the wrangler environment: unset = production, ENV=staging =
+  # the staging Worker. The SAME three tasks drive both, so the canary path
+  # rehearsed on staging is literally the one that promotes production —
+  # rather than a staging rehearsal of a different command (same reasoning as
+  # worker:verify's AUTH_BASE/SITE_BASE).
+  worker:versions:
+    desc: "List uploaded versions — ids for canary/promote/rollback ([ENV=staging])"
+    dir: worker
+    vars:
+      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
+    cmds:
+      - pnpm exec wrangler versions list {{.ENV_FLAG}}
+
+  worker:canary:
+    desc: "Split traffic: NEW=<version-id> OLD=<version-id> [PCT=10] [ENV=staging]"
+    dir: worker
+    vars:
+      PCT: '{{.PCT | default "10"}}'
+      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
+    preconditions:
+      - sh: test -n "{{.NEW}}"
+        msg: "NEW=<version-id> is required (task worker:versions to list)"
+      - sh: test -n "{{.OLD}}"
+        msg: "OLD=<version-id> is required — the id traffic falls back to"
+    cmds:
+      - pnpm exec wrangler versions deploy "{{.NEW}}@{{.PCT}}%" "{{.OLD}}@{{sub 100 (atoi .PCT)}}%" {{.ENV_FLAG}} --yes
+
+  worker:promote:
+    desc: "Route 100% of traffic to NEW=<version-id> ([ENV=staging])"
+    dir: worker
+    vars:
+      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
+    preconditions:
+      - sh: test -n "{{.NEW}}"
+        msg: "NEW=<version-id> is required (task worker:versions to list)"
+    cmds:
+      - pnpm exec wrangler versions deploy "{{.NEW}}@100%" {{.ENV_FLAG}} --yes
 
   docs:check:
     desc: Verify doc claims against code
@@ -186,27 +352,87 @@ tasks:
     deps: [deps:install]
     cmds:
       - pnpm exec tsx scripts/check-sha-pins.ts
+      # A pin can be correctly SHA-formatted and still serve stale code. For
+      # our OWN action that is the only failure mode that matters, and it went
+      # unnoticed for three PRs (notme-28959a).
+      - pnpm exec tsx scripts/check-self-pins.ts
+
+  action:bundle-check:
+    desc: Rebuild action/dist from source and fail if it differs from what is committed
+    # action/dist/index.js is a BUILD ARTIFACT COMMITTED TO GIT, because
+    # `uses: agentic-research/notme/action@<sha>` executes the checked-in
+    # bundle directly — GitHub does not build it. So the bundle is what runs,
+    # and its sources are only a claim about what runs.
+    #
+    # That gap is not hypothetical here. A pnpm override pinning undici away
+    # from three advisories sat inert for weeks while the committed bundle
+    # still carried the vulnerable copy (notme-28959a): the config looked
+    # correct, `pnpm audit` was clean, and the artifact two repos actually
+    # executed was not. Nothing rebuilt the bundle, so nothing noticed.
+    #
+    # This gate closes that by making the committed artifact reproducible from
+    # its sources on every PR. It is deliberately a DIFF and not a rebuild-and-
+    # commit: a job that silently fixes the bundle would hide the fact that
+    # someone pushed sources and artifact out of step, which is the signal
+    # worth having.
+    deps: [deps:install]
+    cmds:
+      - pnpm --filter ./action run build
+      - |
+        if ! git diff --quiet -- action/dist/index.js; then
+          echo "::error file=action/dist/index.js::action/dist is stale — rebuild it and commit the result"
+          echo
+          echo "The committed bundle does not match its sources. This artifact is"
+          echo "what 'uses: agentic-research/notme/action@<sha>' actually executes,"
+          echo "so a stale bundle ships code nobody reviewed in this PR."
+          echo
+          echo "Fix:  cd action && npm run build && git add -f action/dist/index.js"
+          echo
+          git --no-pager diff --stat -- action/dist/index.js
+          exit 1
+        fi
+        echo "action/dist matches its sources."
+
+  worker:await-convergence:
+    desc: "Block until the deployed build reports EXPECT=<sha> ([AUTH_BASE=..] [TIMEOUT=180])"
+    # Promotion is NOT immediate. Measured 2026-08-06: after wrangler reported
+    # 100% on a new version, live traffic ALTERNATED between old and new for
+    # about a minute before settling. worker:verify retries ~10s, shorter than
+    # that window — so ship-prod's deploy→verify could pass against the OLD
+    # build. This closes that gap. See scripts/await-convergence.ts.
+    deps: [deps:install]
+    cmds:
+      - pnpm exec tsx scripts/await-convergence.ts
 
   ship:
-    desc: "Safe path: install → check → docs → preview → verify instructions"
+    desc: "Safe path: preflight → install → check → docs → preview → verify instructions"
     cmds:
+      - task: node:preflight
       - task: worker:install
       - task: worker:check
       - task: docs:check
       - task: worker:deploy-preview
       - echo ""
-      - echo "Preview version uploaded. To go live:"
-      - echo "  task worker:deploy      # route traffic to new version"
-      - echo "  task worker:verify      # smoke test"
-      - echo "  task worker:rollback    # if something breaks"
+      - echo "Preview version uploaded. To go live (canary path):"
+      - echo "  task worker:versions                   # find NEW/OLD version ids"
+      - echo "  task worker:canary NEW=<id> OLD=<id>   # 10% canary (PCT=n to change)"
+      - echo "  task worker:verify                     # smoke test during soak"
+      - echo "  task worker:promote NEW=<id>           # 100% after soak"
+      - echo "  task worker:promote NEW=<old-id>       # rollback = promote the old id"
+      - echo ""
+      - 'echo "Direct path (skips canary): task worker:deploy && task worker:verify"'
 
   ship-prod:
-    desc: "Full send: install → check → docs → deploy → verify (rollback on failure)"
+    desc: "Full send: preflight → install → check → docs → deploy → verify (rollback on failure)"
     cmds:
+      - task: node:preflight
       - task: worker:install
       - task: worker:check
       - task: docs:check
       - task: worker:deploy
+      # Between deploy and verify, because a verify that runs during
+      # convergence can pass against the build being replaced (notme-9f2f79).
+      - task: worker:await-convergence
       - task: worker:verify
 
   worker:build-local:

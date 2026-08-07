@@ -27,8 +27,6 @@ outputs:
     description: 'WIMSE identity URI (wimse://notme.bot/gha/{owner}/{repo})'
   expires_at:
     description: 'Cert expiry (Unix timestamp)'
-  github_token:
-    description: 'Scoped GitHub token from octo-sts (empty if not requested)'
 runs:
   using: 'node20'
   main: 'dist/index.js'

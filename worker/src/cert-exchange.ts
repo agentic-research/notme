@@ -9,7 +9,7 @@
 //
 // Schema-driven: input/output types from gen/ts/identity.ts (generated from identity.capnp).
 
-import { ED25519 } from "./platform";
+import { verifyPopProofs } from "./auth/pop";
 
 // Types from the schema (would import from gen/ts/identity.ts, but
 // we keep it simple and define the wire format inline to avoid
@@ -97,6 +97,19 @@ export async function handleCertExchange(
     }
     principalId = session.principalId;
     grantedScopes = session.scopes;
+    // Same guard as /cert/passkey (worker.ts): provenance is derived from the
+    // session, and a cert that cannot state it honestly must not be minted.
+    // Defaulting to "passkey" here would launder an invite- or OIDC-authed
+    // session into a cert claiming a human touched an authenticator.
+    if (
+      typeof session.authMethod !== "string" ||
+      session.authMethod.length === 0
+    ) {
+      return Response.json(
+        { error: "session carries no authMethod" },
+        { status: 401 },
+      );
+    }
     authMethod = session.authMethod;
   } else if (body.proof.type === "oidc") {
     // OIDC principal lookup not yet wired to DO RPC.
@@ -126,6 +139,12 @@ export async function handleCertExchange(
     principalId = crypto.randomUUID();
     grantedScopes = ["bridgeCert", "authorityManage", "certMint"];
     authMethod = "bootstrap";
+    // Persist the admin this exchange mints a credential for. Pre-fix,
+    // principalId was local-only: the sole bootstrap code was burned, a live
+    // credential carrying authorityManage+certMint walked away, and the
+    // authority still had ZERO principals — nothing to look up, grant, or
+    // revoke against, and no admin to recover with (notme-92a1b9).
+    await authority.createPrincipalWithCapabilities(principalId, grantedScopes);
   } else {
     // Exhaustiveness: CertExchangeRequest.proof is a discriminated union.
     // If a new variant is added without a branch, the assignment below
@@ -157,6 +176,36 @@ export async function handleCertExchange(
   // ── 008: cert pair if public_keys + proofs provided, else legacy token ──
   if (body.public_keys?.mtls && body.public_keys?.signing &&
       body.proofs?.mtls && body.proofs?.signing) {
+    // A CERTIFICATE may carry less than the session does. auth/
+    // passkey-cert-scopes.ts states the rule and the reason: certMint is "a
+    // delegation the human never agreed to at the touch prompt", and
+    // authorityManage in a long-lived exportable credential removes the
+    // "human present at a browser" property that made granting it
+    // acceptable. /cert/passkey enforced it; this route did not, so the same
+    // admin session yielded a cert carrying both one route over
+    // (notme-18dfd0).
+    //
+    // The rule belongs to the ARTIFACT, not the route — a certificate is
+    // long-lived, exportable and usable off-origin however it was obtained —
+    // so it is applied HERE, on the cert branch, and not to the token branch
+    // below, whose artifact is short-lived and DPoP-bound.
+    //
+    // This also narrows the bootstrap path deliberately. Its principal keeps
+    // authorityManage + certMint (persisted by notme-92a1b9); the CERT it
+    // walks away with does not. Capabilities live on the principal; a cert
+    // carries only what is safe to export.
+    const { certScopesForSession } = await import("./auth/passkey-cert-scopes");
+    const certScopes = certScopesForSession(effectiveScopes);
+    if (certScopes.length === 0) {
+      return Response.json(
+        {
+          error: "none of the requested scopes may be carried by a certificate",
+          requested: requestedScopes,
+          eligible: ["bridgeCert"],
+        },
+        { status: 403 },
+      );
+    }
     // PoP cert pair exchange — verify proofs, issue certs
     const { importPublicKey } = await import("./cert-authority");
     let mtlsPubKey: CryptoKey;
@@ -175,31 +224,24 @@ export async function handleCertExchange(
     const bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
     bindingInput.set(new Uint8Array(mtlsSpki), 0);
     bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
-    const bindingPayload = await crypto.subtle.digest("SHA-256", bindingInput);
-
-    // Verify P-256 PoP
-    try {
-      const proofBytes = Uint8Array.from(atob(body.proofs.mtls.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-      const valid = await crypto.subtle.verify(
-        { name: "ECDSA", hash: "SHA-256" }, mtlsPubKey, proofBytes, bindingPayload,
+    // PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
+    const pop = await verifyPopProofs(bindingInput, mtlsPubKey, signingPubKey, body.proofs);
+    if (!pop.ok) {
+      return Response.json(
+        { error: `${pop.algorithm} proof-of-possession failed` },
+        { status: 401 },
       );
-      if (!valid) return Response.json({ error: "P-256 proof-of-possession failed" }, { status: 401 });
-    } catch (e: any) {
-      return Response.json({ error: "P-256 proof error: " + e.message }, { status: 401 });
     }
 
-    // Verify Ed25519 PoP
-    try {
-      const proofBytes = Uint8Array.from(atob(body.proofs.signing.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-      const valid = await crypto.subtle.verify(
-        ED25519, signingPubKey, proofBytes, bindingPayload,
-      );
-      if (!valid) return Response.json({ error: "Ed25519 proof-of-possession failed" }, { status: 401 });
-    } catch (e: any) {
-      return Response.json({ error: "Ed25519 proof error: " + e.message }, { status: 401 });
-    }
-
-    const identity = `wimse://notme.bot/${authMethod}/${principalId}`;
+    const { wimseTrustDomain } = await import("../worker");
+    // encodeURIComponent, matching /cert/passkey: an issuer-qualified method
+    // ("oidc:https://issuer") contains ':' and '/', which without encoding
+    // split the URI into FIVE path segments instead of three — moving the
+    // subject from index 2 to index 4, so a consumer routing on path position
+    // silently reads the wrong field rather than failing. gen/go/verify's
+    // Identity.URI docs and ADR-008 both state the encoded form as the
+    // contract; this path is why they were not universally true.
+    const identity = `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(authMethod)}/${principalId}`;
 
     let result;
     try {
@@ -208,7 +250,7 @@ export async function handleCertExchange(
         identity,
         mtlsPublicKeyPem: body.public_keys.mtls,
         signingPublicKeyPem: body.public_keys.signing,
-        scopes: effectiveScopes,
+        scopes: certScopes,
         authMethod,
       });
     } catch (e: any) {
@@ -218,7 +260,7 @@ export async function handleCertExchange(
     const response: CertPairExchangeResponse = {
       certificates: result.certificates,
       identity: result.identity,
-      scopes: effectiveScopes,
+      scopes: certScopes,
       expires_at: result.expires_at,
       binding: result.binding,
       authority: result.authority,

@@ -92,3 +92,93 @@ new_classes = ["RevocationAuthority"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["SigningAuthority"]
+
+# ── Staging environment (ADR-018 promotion gate) ─────────────────────────────
+#
+# A fully separate Worker with its OWN Durable Objects — its own
+# SigningAuthority CA key (born in staging), own RevocationAuthority, own KV —
+# so `task ship-staging` exercises the real Worker/DO boundary without
+# touching production state. Deliberate differences from production, each
+# load-bearing:
+#   - No VPC_AUTH binding: worker.ts guards `if (env.VPC_AUTH)`, so staging
+#     falls through to a 503 instead of proxying to the production backend.
+#   - SIGNET_AUTHORITY_URL names the staging authority host;
+#     authorityHostFromEnv() in worker.ts selects the authority surface from
+#     this var, so no code drift between environments.
+#   - Hosts must stay under your zone: worker.ts 301s any other host (e.g.
+#     workers.dev) to the canonical domain before serving anything.
+#
+# Environments do not inherit routes/vars/bindings — everything below is
+# intentionally redeclared. Create the staging KV via:
+#   wrangler kv namespace create CA_BUNDLE_CACHE_STAGING
+[env.staging]
+name = "notme-bot-staging"
+workers_dev = false
+
+[env.staging.observability]
+enabled = true
+
+[env.staging.observability.logs]
+enabled = true
+invocation_logs = true
+
+[[env.staging.routes]]
+pattern = "staging.notme.bot"
+custom_domain = true
+
+[[env.staging.routes]]
+pattern = "auth-staging.notme.bot"
+custom_domain = true
+
+[env.staging.assets]
+directory = "public"
+binding = "ASSETS"
+not_found_handling = "404-page"
+run_worker_first = true
+
+[env.staging.vars]
+SITE_URL = "https://staging.notme.bot"
+SIGNET_AUTHORITY_URL = "https://auth-staging.notme.bot"
+# MUST differ from production. worker.ts refuses every GHA exchange when this
+# is unset (no default), so a staging authority that says nothing trusts
+# nobody rather than silently inheriting production's org (notme-1532eb).
+GHA_ALLOWED_OWNERS = "your-staging-org"
+# MUST be set. Unset falls back to the PRODUCTION audience set in
+# allowed-audiences.ts, which would let staging mint tokens for production's
+# resource servers.
+ALLOWED_AUDIENCES = "https://staging.notme.bot,https://auth-staging.notme.bot"
+
+[[env.staging.kv_namespaces]]
+binding = "CA_BUNDLE_CACHE"
+id = "<your-staging-kv-namespace-id>"
+
+[[env.staging.durable_objects.bindings]]
+name = "SIGNING_AUTHORITY"
+class_name = "SigningAuthority"
+
+[[env.staging.durable_objects.bindings]]
+name = "REVOCATION"
+class_name = "RevocationAuthority"
+
+# Same limits as production — staging exists to exercise the production
+# code path, and an unlimited staging would not.
+[[env.staging.ratelimits]]
+name = "TOKEN_LIMITER"
+namespace_id = "1001"
+  [env.staging.ratelimits.simple]
+  limit = 20
+  period = 60
+
+[[env.staging.ratelimits]]
+name = "CERT_LIMITER"
+namespace_id = "1002"
+  [env.staging.ratelimits.simple]
+  limit = 10
+  period = 60
+
+[[env.staging.ratelimits]]
+name = "PASSKEY_LIMITER"
+namespace_id = "1003"
+  [env.staging.ratelimits.simple]
+  limit = 5
+  period = 60

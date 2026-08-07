@@ -1,6 +1,9 @@
 {
   "private": true,
   "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": "^22.18.0 || ^24.11.0 || >=26.0.0"
+  },
   "devDependencies": {
     "@vitest/coverage-v8": "^4.1.6",
     "ajv": "^8.20.0",

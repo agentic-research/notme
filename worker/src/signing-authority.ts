@@ -35,7 +35,95 @@ interface SigningAuthorityEnv {
   CA_BUNDLE_CACHE?: KVNamespace;
   NOTME_KEY_STORAGE?: string;
   NOTME_KEK_SECRET?: string;
+  /**
+   * Operator-set first-boot secret (notme-addef9). A SECRET, never a `[vars]`
+   * entry — it grants `authorityManage`, and vars are readable from the
+   * dashboard and printed in deploy output.
+   *
+   * Its purpose is that setting it requires control of the DEPLOYMENT, where
+   * the mechanism it replaces required only the ability to send an
+   * unauthenticated HTTP request and read a log.
+   */
+  BOOTSTRAP_CODE?: string;
+  /**
+   * This deployment's authority origin. Tokens minted here carry it as `iss`
+   * (notme-28baf2) — a DO that hardcoded the issuer made staging assert the
+   * production one while signing with the staging key.
+   */
+  SIGNET_AUTHORITY_URL?: string;
 }
+
+/**
+ * The self-signed CA certificate's subject DN.
+ *
+ * Production keeps the exact historical literal, because the CA cert is
+ * generated once per authority and anything pinning the existing subject must
+ * keep matching. A NON-production authority gets its host appended, so a
+ * verifier inspecting the issuing CA can tell the two apart — previously both
+ * environments minted "CN=signet-authority,O=notme" byte-identically, and the
+ * only difference between a staging cert and a production one was which key
+ * signed it (notme-1532eb).
+ *
+ * Takes effect only for NEWLY created authorities: the CA cert is created once
+ * and stored, so an existing staging DO keeps its production-shaped subject
+ * until recreated.
+ */
+export function caSubjectForEnv(env: { SIGNET_AUTHORITY_URL?: string }): string {
+  const PRODUCTION_SUBJECT = "CN=signet-authority,O=notme";
+  if (!env.SIGNET_AUTHORITY_URL) return PRODUCTION_SUBJECT;
+  let host: string;
+  try {
+    host = new URL(env.SIGNET_AUTHORITY_URL).host;
+  } catch {
+    return PRODUCTION_SUBJECT;
+  }
+  if (!host || host === "auth.notme.bot") return PRODUCTION_SUBJECT;
+  return `CN=signet-authority ${host},O=notme`;
+}
+
+/**
+ * Whether a bootstrap code is available, and if so what it is.
+ *
+ * A bare `string | null` let the caller DISCARD the result: worker.ts called
+ * this for its side effect (mint + log) and then answered "bootstrap code
+ * required — check Worker logs" unconditionally. In the closed case nothing
+ * was logged, so an operator was sent to hunt for a UUID that does not exist
+ * (notme-addef9). Making the two states a discriminated union means a caller
+ * has to look at which one it got.
+ */
+export type BootstrapState =
+  | { status: "issued"; code: string }
+  | { status: "closed" };
+
+/**
+ * The operator-set bootstrap secret, or null.
+ *
+ * Trimmed and length-checked: `wrangler secret put` with an empty or
+ * whitespace value would otherwise arm an authority with a secret that a
+ * caller could guess by sending nothing. A minimum length matters because
+ * this value grants `authorityManage` — the review of notme-976385 already
+ * established that a bootstrap credential is an admin credential.
+ */
+function bootstrapSecret(env: { BOOTSTRAP_CODE?: string }): string | null {
+  const raw = env.BOOTSTRAP_CODE?.trim();
+  return raw && raw.length >= 16 ? raw : null;
+}
+
+/**
+ * What a caller may learn about bootstrap WITHOUT causing anything to happen
+ * (notme-addef9).
+ *
+ * Deliberately carries no code in any variant. This is the answer given to an
+ * unauthenticated request, and the whole point of the split is that asking
+ * cannot produce a credential.
+ */
+export type BootstrapReadState =
+  /** An authenticator exists; bootstrap is over. */
+  | { status: "closed" }
+  /** No authenticator, and no operator has armed one. Nobody can bootstrap. */
+  | { status: "unconfigured" }
+  /** No authenticator, and a bootstrap secret is set. Present it to register. */
+  | { status: "armed" };
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
@@ -275,6 +363,21 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }> {
     if (this.#signingKey && this.#verifyKey) {
       const kid = this.#getKeyId();
+      // ARM THE ALARM ON THE WARM PATH TOO (notme-4896d8).
+      //
+      // scheduleNextRefresh() lived only at the END of this method, after the
+      // cold-start key load. This early return skips it — so on any isolate
+      // that already held the key in memory, the bundle-refresh alarm was
+      // never scheduled. Production measured totalFires: 0 with the circuit
+      // breaker CLOSED: the alarm had never fired in the object's entire
+      // history, which is why the published CA bundle sat unrefreshed for 130
+      // days (notme-77a024).
+      //
+      // Safe to call here because scheduleNextRefresh() checks getAlarm()
+      // before setAlarm() — the idempotence THREAT_MODEL.md:52 requires
+      // against compounding alarms (the 20-trillion-DO-reads cautionary
+      // tale). Calling it on every warm hit is a no-op once one is pending.
+      await this.scheduleNextRefresh();
       return {
         signingKey: this.#signingKey,
         verifyKey: this.#verifyKey,
@@ -511,7 +614,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .reduce((s, b) => s + b.toString(16).padStart(2, "0"), "");
 
     const cert = await X509CertificateGenerator.createSelfSigned({
-      name: "CN=signet-authority,O=notme",
+      name: caSubjectForEnv(this.env),
       notBefore: now,
       notAfter,
       signingAlgorithm: ED25519,
@@ -570,8 +673,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     jkt: string; // JWK thumbprint of the DPoP proof key
   }): Promise<string> {
     const { signingKey, keyId } = await this.getOrCreateSigningKey();
-    const { mintAccessToken } = await import("./auth/token");
+    const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
+      issuer: issuerFromEnv(this.env),
       sub: params.sub,
       scope: params.scope,
       audience: params.audience,
@@ -675,6 +779,70 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * than an error: an auditor must be able to distinguish "notme does not have
    * this" from a transport failure.
    */
+  /**
+   * Every epoch's signing key — current and retired — for third-party
+   * historical verification (notme-a0cff4).
+   *
+   * getEpochPublicKey answers for ONE epoch a caller already knows about. An
+   * auditor holding a receipt or cert from an arbitrary epoch, or a consumer
+   * backfilling an archive, needs the SET: cloister previously populated its
+   * epoch index only from what it happened to observe while polling, so a
+   * rotation between polls left that epoch permanently unresolvable even
+   * though notme still held the key.
+   *
+   * Returns PUBLIC key material only, ascending by epoch. Safe to serve
+   * unauthenticated — it is exactly what gets published — which is also why
+   * it is safe on the RPC surface.
+   */
+  async listEpochKeys(): Promise<
+    Array<{
+      epoch: number;
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }>
+  > {
+    this.#ensureSchema();
+
+    const retired = this.ctx.storage.sql
+      .exec(
+        "SELECT epoch, key_id, public_raw, retired_at FROM retired_keys ORDER BY epoch ASC",
+      )
+      .toArray() as Array<{
+      epoch: number;
+      key_id: string;
+      public_raw: string;
+      retired_at: number;
+    }>;
+
+    const out: Array<{
+      epoch: number;
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }> = retired.map((r) => ({
+      epoch: r.epoch,
+      keyId: r.key_id,
+      publicRawB64: r.public_raw,
+      retiredAt: r.retired_at,
+    }));
+
+    // The live epoch is not in retired_keys — it has not been retired.
+    const current = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    const currentEpoch = current[0]?.epoch;
+    if (typeof currentEpoch === "number") {
+      out.push({
+        epoch: currentEpoch,
+        keyId: this.#getKeyId(),
+        publicRawB64: await this.getPublicKeyRawB64(),
+        retiredAt: null,
+      });
+    }
+    return out;
+  }
+
   async getEpochPublicKey(
     epoch: number,
   ): Promise<{
@@ -1036,8 +1204,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     audience: string;
   }): Promise<string> {
     const { signingKey, keyId } = await this.getOrCreateSigningKey();
-    const { mintAccessToken } = await import("./auth/token");
+    const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
+      issuer: issuerFromEnv(this.env),
       sub: params.sub,
       scope: params.scope,
       audience: params.audience,
@@ -1403,6 +1572,36 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   // Reset passkey data — for when credentials are corrupted (e.g. userId mismatch bug)
+  //
+  // THIS IS THE ONLY CREDENTIAL-REMOVAL PATH IN THE WORKER. Nothing else
+  // deletes from passkey_credentials, federated_identities, principals, or
+  // invites. Two invariants currently rest on that being true:
+  //
+  //   1. The known gap in #hasAuthenticator — that it does not count
+  //      outstanding invites — is UNREACHABLE, because reaching "no
+  //      authenticator but a live authorityManage invite" requires losing a
+  //      credential, which requires this method, which requires consuming a
+  //      bootstrap code, which requires already having no authenticator. The
+  //      transition is circular (notme-2131e8). That last step is now
+  //      ENFORCED rather than emergent: consumeBootstrapCode refuses once
+  //      anyone can authenticate. The circularity used to hold only because
+  //      a consumed code stayed consumed, which is a weaker reason.
+  //
+  //      CONSEQUENCE, stated plainly: this method is unreachable on an
+  //      authority that has any authenticator, since it requires consuming a
+  //      code and consumption is now gated. That was ALREADY true by
+  //      accident (the code was already marked used), so nothing regressed —
+  //      but "corrupted credentials" is exactly the case this method claims
+  //      to serve, and corrupted rows still count as an authenticator. The
+  //      dead end is pre-existing and unresolved; it needs an authenticated
+  //      recovery path rather than a code.
+  //   2. Rotating the session secret below is sufficient to revoke sessions,
+  //      because no other route can orphan one.
+  //
+  // ADDING A SECOND CREDENTIAL-REMOVAL PATH — an admin "revoke device"
+  // route, an account deletion, a principal-removal API — BREAKS BOTH. Such
+  // a path must also revoke outstanding invites and rotate the session
+  // secret, or #hasAuthenticator must start counting invites.
   async resetPasskeyData(): Promise<{ deleted: number }> {
     const { ensurePasskeySchema } = await import("./auth/passkey");
     ensurePasskeySchema(this.ctx.storage.sql);
@@ -1413,9 +1612,51 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec("DELETE FROM passkey_credentials");
     this.ctx.storage.sql.exec("DELETE FROM passkey_users");
     this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
+
+    // Rotate the session secret, invalidating every cookie issued before
+    // this reset. Without it a reset revoked NOTHING: the secret was minted
+    // once and never rotated, so sessions survived their credentials for the
+    // full 24h TTL. A deployer who reset while logged in therefore left an
+    // authority with no authenticator but a live admin session — the state
+    // in which getOrCreateBootstrapCode re-arms, mistakenly, for an
+    // authority that still has a working administrator.
+    const rotated = new Uint8Array(32);
+    crypto.getRandomValues(rotated);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_config (
+        id     TEXT PRIMARY KEY DEFAULT 'session',
+        secret TEXT NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO session_config (id, secret) VALUES ('session', ?)",
+      btoa(String.fromCharCode(...rotated)),
+    );
     // Mark bootstrap as used — do NOT delete it.
-    // A new code only appears on fresh DO instantiation, not after reset.
-    // This prevents: know code → reset → new code → reset → infinite wipe loop.
+    //
+    // Since notme-976385 a new code CAN appear after a reset: this wipe
+    // removes every passkey credential, so hasAuthenticator() goes false and
+    // getOrCreateBootstrapCode() re-arms rather than leaving the authority
+    // permanently unadministrable. The wipe-loop this comment used to claim
+    // was structurally impossible is instead bounded by what the loop yields:
+    // the regenerated code never crosses the HTTP boundary (the only caller
+    // discards it and answers 401), so an attacker who knows a burned code
+    // can still only wipe — never read the replacement — and gains no
+    // capability from repeating it.
+    // CREATE IF NOT EXISTS before the UPDATE: on an authority where
+    // getOrCreateBootstrapCode has never run, this table does not exist and
+    // the UPDATE threw SQLITE_ERROR. Masked in practice because the register
+    // flow creates the table first, so only a reset on a genuinely untouched
+    // authority hit it — which is exactly when an operator is least able to
+    // interpret a raw SQL error.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap (
+        id         TEXT PRIMARY KEY DEFAULT 'code',
+        code       TEXT NOT NULL,
+        used       INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
     this.ctx.storage.sql.exec(
       "UPDATE bootstrap SET used = 1 WHERE id = 'code'",
     );
@@ -1426,7 +1667,114 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Generated on first call, deleted after first passkey registration.
   // Only visible to the deployer (via wrangler tail / console).
 
-  async getOrCreateBootstrapCode(): Promise<string | null> {
+  /**
+   * Can anyone actually authenticate to this authority?
+   *
+   * NOT `principalCount`. The primary deployer flow — registerPasskey — writes
+   * `passkey_users` + `passkey_credentials` and never creates a `principals`
+   * row (see worker/src/auth/passkey.ts), so a principals-only predicate
+   * reports "nobody is here" on the exact configuration that means "the
+   * administrator is here", and would re-arm the bootstrap gate for an
+   * authority that already has an admin. Adversarial review of PR #71 caught
+   * this; the first version of bootstrap-code.do.test.ts missed it because
+   * every test established the admin via createPrincipalWithCapabilities,
+   * which is the one path that DOES write principals.
+   *
+   * Conversely a bare `principals` row — which is what POST /cert bootstrap
+   * creates — is a revocation target, not a way in: it carries no credential
+   * and no federated identity, and no HTTP route turns a bridge cert into a
+   * session. Counting it as "someone is here" would strand the deployer with
+   * an authority nobody can interactively administer, which is the very
+   * failure notme-976385 exists to prevent.
+   *
+   * So the predicate is authenticators: a passkey credential, or a linked
+   * federated identity. Session cookies are the third population, handled at
+   * the source instead — resetPasskeyData rotates the session secret, so a
+   * wipe leaves no valid cookie for this to have to count.
+   *
+   * IF YOU ADD A LOGIN PATH, COUNT IT HERE. `findByProvider` in
+   * auth/connections.ts is the near miss to watch: it is a
+   * provider→credential lookup that reads like a login path and is currently
+   * called only from tests. Wiring it to a route makes `connections` a
+   * fourth table this predicate must include.
+   *
+   * Synchronous by construction — the callers' schema-ensure imports are
+   * passed in — so the caller's read-check-write stays free of `await` and
+   * this cannot return a pre-yield snapshot.
+   *
+   * `#`-private, NOT TypeScript `private`: this class is RPC-reachable, and
+   * TS `private` is erased at build time, so a `private` helper stays
+   * callable on any stub someone obtains — a full-CA capability. The
+   * rpc-surface.do.test.ts allow-list caught exactly that on the first
+   * version of this method.
+   */
+  #hasAuthenticator(
+    ensurePasskeySchema: (sql: any) => void,
+    ensurePrincipalSchema: (sql: any) => void,
+  ): boolean {
+    const sql = this.ctx.storage.sql;
+    ensurePasskeySchema(sql);
+    const creds = sql
+      .exec("SELECT COUNT(*) as c FROM passkey_credentials")
+      .toArray() as Array<{ c: number }>;
+    if ((creds[0]?.c ?? 0) > 0) return true;
+
+    ensurePrincipalSchema(sql);
+    const federated = sql
+      .exec("SELECT COUNT(*) as c FROM federated_identities")
+      .toArray() as Array<{ c: number }>;
+    return (federated[0]?.c ?? 0) > 0;
+  }
+
+  /**
+   * Report bootstrap state WITHOUT minting anything (notme-addef9).
+   *
+   * THE DEFECT THIS REPLACES: the public registration route called
+   * `getOrCreateBootstrapCode()`, so the first unauthenticated request to a
+   * fresh authority CAUSED an admin credential to be minted and logged. The
+   * trigger was therefore never the deployer — any stranger could cause the
+   * mint, and since notme-976385 made regeneration possible while no
+   * authenticator exists, could cause it repeatedly, choosing the moment a
+   * credential appeared in the log.
+   *
+   * The security review judged that acceptable because the code never crosses
+   * the HTTP boundary, so a network-only attacker gains nothing and the
+   * exposure is to whoever reads Workers Logs. That reasoning holds. It was
+   * still a side channel serving as the PRIMARY onboarding path, in a repo
+   * whose entire thesis is no long-lived secret on disk and attestation
+   * instead of stored credentials — and this cycle showed the logs are not
+   * even reliably readable (`wrangler tail` returned nothing for a
+   * known-good 200 in production).
+   *
+   * So: reads are reads. Minting moves behind an operator action — setting
+   * `BOOTSTRAP_CODE`, which requires control of the deployment rather than
+   * merely the ability to send an HTTP request.
+   */
+  async getBootstrapState(): Promise<BootstrapReadState> {
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema } = await import("./auth/principals");
+    if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
+      return { status: "closed" };
+    }
+    // `armed` reports only that a secret EXISTS, never its value or length.
+    return bootstrapSecret(this.env) ? { status: "armed" } : { status: "unconfigured" };
+  }
+
+  async getOrCreateBootstrapCode(): Promise<BootstrapState> {
+    // Only the IMPORTS are hoisted, not the predicate. `await import(...)`
+    // is a yield point, and one between reading `used` and the DELETE/INSERT
+    // below let two concurrent callers each regenerate and log a distinct
+    // code, only the last of which is live — two apparently-valid admin
+    // codes in the log at exactly the moment that matters.
+    //
+    // Evaluating the predicate up here instead would trade that for a stale
+    // snapshot: a registration committing between the counts and the resume
+    // would re-arm an authority that just gained an admin. The counts are
+    // synchronous, so running them inline below keeps the whole
+    // read-check-write free of `await` and reads current state.
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema } = await import("./auth/principals");
+
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap (
         id         TEXT PRIMARY KEY DEFAULT 'code',
@@ -1439,15 +1787,42 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .exec("SELECT code, used, created_at FROM bootstrap WHERE id = 'code'")
       .toArray() as Array<{ code: string; used: number; created_at: string }>;
 
+    // Gate BOTH branches, not just the consumed one. An UNUSED code minted
+    // before the first administrator existed stayed redeemable afterwards:
+    // the used-branch check below never ran, so this returned the standing
+    // code to any caller. It is TTL-bounded (15 min) and only ever reaches
+    // the logs, but POST /cert consumes bootstrap codes too and would mint
+    // authorityManage+certMint against one — a credential outliving its
+    // purpose. Once anyone can authenticate, bootstrap is closed, full stop.
+    if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
+      return { status: "closed" };
+    }
+
     if (rows.length > 0) {
-      if (rows[0]!.used) return null;
-      // Expire after 15 minutes
-      const created = new Date(rows[0]!.created_at + "Z").getTime();
-      const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
-      if (Date.now() - created > BOOTSTRAP_TTL_MS) {
+      if (rows[0]!.used) {
+        // A consumed code stays consumed on an authority someone can log in
+        // to. But three routes can burn it (register/options,
+        // /auth/passkey/reset, POST /cert) and only registration establishes
+        // a way in — so an authority could be permanently stranded with no
+        // administrator and no way to ever create one (notme-976385). While
+        // NOBODY can authenticate, regenerate.
+        //
+        // This does not reopen the wipe-loop the reset path guards against:
+        // the new code is a fresh crypto.randomUUID() that never crosses the
+        // HTTP boundary (the caller discards it and answers 401), so knowing
+        // the burned code buys an attacker nothing it did not already have.
+        // Reached only when NOBODY can authenticate (guarded above), so a
+        // consumed code means a stranded authority: regenerate.
         this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
       } else {
-        return rows[0]!.code;
+        // Expire after 15 minutes
+        const created = new Date(rows[0]!.created_at + "Z").getTime();
+        const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
+        if (Date.now() - created > BOOTSTRAP_TTL_MS) {
+          this.ctx.storage.sql.exec("DELETE FROM bootstrap WHERE id = 'code'");
+        } else {
+          return { status: "issued", code: rows[0]!.code };
+        }
       }
     }
 
@@ -1467,10 +1842,82 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         "",
       ].join("\n"),
     );
-    return code;
+    return { status: "issued", code };
   }
 
   async consumeBootstrapCode(code: string): Promise<boolean> {
+    // THE INVARIANT, enforced here as well as at mint: a bootstrap code is
+    // valid ONLY while nobody can authenticate.
+    //
+    // Gating getOrCreateBootstrapCode alone fixed what the authority REPORTS
+    // and left what it ACCEPTS unchanged — a code minted before the first
+    // administrator existed, read from the Worker logs and never redeemed,
+    // stayed consumable afterwards. POST /cert consumes bootstrap codes and
+    // mints authorityManage + certMint, so that was an admin credential
+    // outliving its purpose, bounded only by the 15-minute TTL.
+    //
+    // Mint-side gating cannot cover this: the code was legitimately issued at
+    // a moment when it was valid. Only the consumer knows the authority has
+    // since gained a way in.
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema } = await import("./auth/principals");
+    // ── OPERATOR SECRET OUTRANKS THE AUTHENTICATOR GATE (notme-4838ae) ──
+    //
+    // Checked BEFORE #hasAuthenticator, deliberately, and this is a security
+    // decision rather than an ordering detail.
+    //
+    // Every other path to authorityManage is gated on isFirstUser, and both
+    // bootstrap paths were gated on "no authenticator exists". So once ANY
+    // passkey was registered, losing the last admin credential left the
+    // authority permanently ungovernable — no invites, no grants, no
+    // rotation, no alarm reset. The CA kept issuing certificates and could
+    // not be administered. Found live on production 2026-08-06.
+    //
+    // Setting BOOTSTRAP_CODE requires control of the DEPLOYMENT, which is
+    // strictly STRONGER than holding a passkey: that operator can already
+    // redeploy the Worker, rebind KV, or replace this Durable Object
+    // outright. Refusing them admin protected nothing — it only turned
+    // "recover" into "brick".
+    //
+    // This does NOT reopen notme-976385. That gate exists because a code was
+    // MINTED INTO WORKER LOGS BY AN UNAUTHENTICATED STRANGER'S REQUEST — a
+    // mechanism removed in notme-addef9. The stored-code path below keeps the
+    // gate; only an explicitly-set secret bypasses it.
+    //
+    // LOUD, because silent admin acquisition is the thing the gate guarded.
+    const operatorSecret = bootstrapSecret(this.env);
+    if (operatorSecret) {
+      const { timingSafeEqual } = await import("./auth/timing-safe");
+      if (await timingSafeEqual(code, operatorSecret)) {
+        console.warn(
+          "[bootstrap] ADMIN RECOVERY: operator secret accepted while authenticators exist (notme-4838ae)",
+        );
+        return true;
+      }
+    }
+
+    if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
+      return false;
+    }
+
+    // PREFERRED PATH: an operator-set secret (notme-addef9). Checked before
+    // the stored code because it is the one that requires control of the
+    // DEPLOYMENT rather than the ability to read a log, and because on a
+    // fresh authority no stored code exists at all — the public route no
+    // longer mints one.
+    //
+    // Compared timing-safe: this grants authorityManage, so a comparison that
+    // leaked position would let a caller recover it byte by byte.
+    const secret = bootstrapSecret(this.env);
+    if (secret) {
+      const { timingSafeEqual } = await import("./auth/timing-safe");
+      if (await timingSafeEqual(code, secret)) return true;
+      // Fall through rather than returning false. An authority can hold BOTH
+      // an operator secret and a legacy stored code (armed deliberately via
+      // getOrCreateBootstrapCode before this change), and refusing the stored
+      // one here would strand it.
+    }
+
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap (
         id         TEXT PRIMARY KEY DEFAULT 'code',

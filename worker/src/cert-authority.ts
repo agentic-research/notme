@@ -68,33 +68,41 @@ const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigne
 export const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
 const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
 export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
-const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
+export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
 const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
 
+// ASN.1 definite-length encoding: short form (a single byte) up to 0x7f, long
+// form (0x81 nn, 0x82 nn nn, …) above it.
+//
+// The high bit is the discriminator, so a length of 0x80 or more CANNOT be
+// written as one byte — a parser reads that byte as "a long-form length
+// follows in the next N octets" and then walks off into the value. Getting
+// this wrong does not produce a rejected cert; it produces a SIGNED one whose
+// bytes are malformed, which is the worse failure: it looks issued, it leaves
+// here, and it breaks later in a parser the operator does not control
+// (notme-193368).
+function derLength(n: number): Uint8Array {
+  if (n < 0x80) return new Uint8Array([n]);
+  const bytes: number[] = [];
+  for (let v = n; v > 0; v >>>= 8) bytes.unshift(v & 0xff);
+  return new Uint8Array([0x80 | bytes.length, ...bytes]);
+}
+
+// Wrap a value in its tag and length. Every hand-rolled structure below goes
+// through here so none of them can reintroduce a single-byte length ceiling.
+function derTlv(tag: number, value: Uint8Array): Uint8Array {
+  const len = derLength(value.length);
+  const buf = new Uint8Array(1 + len.length + value.length);
+  buf[0] = tag;
+  buf.set(len, 1);
+  buf.set(value, 1 + len.length);
+  return buf;
+}
+
 // Encode a string as ASN.1 UTF8String DER (tag 0x0C + length + value)
 function derUtf8String(s: string): Uint8Array {
-  const encoded = new TextEncoder().encode(s);
-  const len = encoded.length;
-  if (len < 128) {
-    const buf = new Uint8Array(2 + len);
-    buf[0] = 0x0c;
-    buf[1] = len;
-    buf.set(encoded, 2);
-    return buf;
-  }
-  const lenBytes = len < 256 ? 1 : 2;
-  const buf = new Uint8Array(2 + lenBytes + len);
-  buf[0] = 0x0c;
-  buf[1] = 0x80 | lenBytes;
-  if (lenBytes === 1) {
-    buf[2] = len;
-  } else {
-    buf[2] = (len >> 8) & 0xff;
-    buf[3] = len & 0xff;
-  }
-  buf.set(encoded, 2 + lenBytes);
-  return buf;
+  return derTlv(0x0c, new TextEncoder().encode(s));
 }
 
 async function importMasterKey(pem: string): Promise<CryptoKey> {
@@ -248,20 +256,13 @@ export async function mintGHABridgeCert(
 // Encode ASN.1 SEQUENCE OF UTF8String for scope list
 function derScopeSequence(scopes: string[]): Uint8Array {
   const encoded = scopes.map((s) => derUtf8String(s));
-  const totalLen = encoded.reduce((sum, e) => sum + e.length, 0);
-  // SEQUENCE tag = 0x30
-  const header =
-    totalLen < 128
-      ? new Uint8Array([0x30, totalLen])
-      : new Uint8Array([0x30, 0x81, totalLen]);
-  const buf = new Uint8Array(header.length + totalLen);
-  buf.set(header, 0);
-  let offset = header.length;
+  const body = new Uint8Array(encoded.reduce((sum, e) => sum + e.length, 0));
+  let offset = 0;
   for (const e of encoded) {
-    buf.set(e, offset);
+    body.set(e, offset);
     offset += e.length;
   }
-  return buf;
+  return derTlv(0x30, body); // SEQUENCE
 }
 
 // Encode a 4-byte big-endian integer as ASN.1 INTEGER
@@ -330,13 +331,16 @@ export async function mintBridgeCertPair(
   // SAN URI extension (WIMSE identity)
   // SubjectAltName with URI is handled by @peculiar/x509 via the extensions param
   // We encode it as a custom extension with the URI as a DER-encoded IA5String
-  const sanUri = new TextEncoder().encode(identity);
-  const sanDer = new Uint8Array(2 + 2 + sanUri.length); // SEQUENCE { [6] URI }
-  sanDer[0] = 0x30; // SEQUENCE
-  sanDer[1] = 2 + sanUri.length;
-  sanDer[2] = 0x86; // context [6] = URI (implicit IA5String)
-  sanDer[3] = sanUri.length;
-  sanDer.set(sanUri, 4);
+  //
+  // The identity is caller-influenced and unbounded: notme-ebc9af made its
+  // method segment the session's auth method, and both mint paths
+  // percent-encode it, so an issuer-qualified method spends ~3 bytes per
+  // delimiter. "oidc:https://token.actions.githubusercontent.com" alone lands
+  // near the old single-byte ceiling and a tenant-qualified enterprise issuer
+  // clears it — so this length must be encoded, not assumed. Inner first: the
+  // SEQUENCE's own length depends on how many bytes the [6] header took.
+  const sanUri = derTlv(0x86, new TextEncoder().encode(identity)); // context [6] = URI (implicit IA5String)
+  const sanDer = derTlv(0x30, sanUri); // SEQUENCE { [6] URI }
   const sanExtension = new Extension("2.5.29.17", true, sanDer); // SubjectAltName OID, critical
 
   const serial1 = crypto.getRandomValues(new Uint8Array(16));

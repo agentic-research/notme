@@ -110,20 +110,24 @@ async function run(): Promise<void> {
     Buffer.from(signingSpki),
     Buffer.from(oidcHash),
   ]);
-  const bindingPayload = await wc.subtle.digest("SHA-256", bindingInput);
-
-  // Sign binding payload with P-256 key (ES256)
+  // Both proofs sign the binding PRE-IMAGE, never its digest (notme-a011d2).
+  //
+  // `wc.subtle.sign({name:"ECDSA", hash:"SHA-256"}, …)` applies SHA-256 to
+  // whatever it is given, so signing `SHA-256(bindingInput)` here produced a
+  // signature over two hashes. The Worker verified the same way, so this
+  // round trip passed while no Go or Rust signer could ever match it — those
+  // hash exactly once. Signing the pre-image is what makes the proof mean the
+  // same thing in every language.
   const mtlsProof = await wc.subtle.sign(
     { name: "ECDSA", hash: "SHA-256" },
     mtlsKeypair.privateKey,
-    bindingPayload,
+    bindingInput,
   );
 
-  // Sign binding payload with Ed25519 key
   const signingProof = await wc.subtle.sign(
     { name: "Ed25519" } as any,
     signingKeypair.privateKey,
-    bindingPayload,
+    bindingInput,
   );
 
   // ── Exchange: OIDC + public keys + PoP proofs → cert pair ──
