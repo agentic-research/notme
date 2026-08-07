@@ -46,31 +46,58 @@ async function seedChallenge(name: string, userId: string, ageMinutes: number) {
   return stub;
 }
 
-/** Drive the real verify path and report which failure occurred. */
-async function verifyAndClassify(
-  stub: any,
+/**
+ * Drive the freshness check by calling `verifyRegistration` DIRECTLY, inside
+ * the Durable Object, with the DO's own SQL handle.
+ *
+ * NOT through `stub.passkeyVerifyRegistration(...)`. A DO RPC method that
+ * throws emits the rejection from the DO's isolate as well as through the
+ * caller's promise, and NOTHING the caller does suppresses the first one —
+ * try/catch, a synchronously attached `.catch()`, `expect().rejects`, and
+ * running inside `runInDurableObject` were each measured and each left it
+ * unhandled. The count scaled with the number of throwing calls, which is what
+ * identified the isolate rather than the caller as the source.
+ *
+ * The result was three passing tests and a red run, from the commit that added
+ * this file onward — a green-but-broken signal of exactly the kind this repo
+ * keeps finding.
+ *
+ * WHAT IS LOST BY NOT CROSSING THE RPC BOUNDARY: nothing this file tests.
+ * `passkeyVerifyRegistration` is a three-line passthrough that imports
+ * `verifyRegistration` and forwards its arguments plus `ctx.storage.sql`. All
+ * of the freshness logic under test — the challenge lookup and its window —
+ * lives in `verifyRegistration`, and it is still the real one.
+ */
+async function verifyClassified(
+  stub: ReturnType<typeof env.SIGNING_AUTHORITY.get>,
   userId: string,
 ): Promise<"no-challenge" | "other"> {
-  try {
-    await stub.passkeyVerifyRegistration(
-      userId,
-      "test user",
-      { id: "x", rawId: "x", response: {}, type: "public-key" },
-      "notme.bot",
-      "https://notme.bot",
-    );
-    return "other"; // returned without throwing — not the freshness path
-  } catch (e: any) {
-    return /no pending registration challenge/i.test(e?.message ?? "")
-      ? "no-challenge"
-      : "other";
-  }
+  return runInDurableObject(stub, async (auth) => {
+    const sql = (auth as unknown as { ctx: { storage: { sql: any } } }).ctx
+      .storage.sql;
+    const { verifyRegistration } = await import("./auth/passkey");
+    try {
+      await verifyRegistration(
+        userId,
+        "test user",
+        { id: "x", rawId: "x", response: {}, type: "public-key" } as never,
+        "notme.bot",
+        "https://notme.bot",
+        sql,
+      );
+      return "other" as const; // past the lookup — not the freshness path
+    } catch (e: any) {
+      return /no pending registration challenge/i.test(e?.message ?? "")
+        ? ("no-challenge" as const)
+        : ("other" as const);
+    }
+  });
 }
 
 describe("registration challenge freshness (notme-addef9 / audit N5)", () => {
   it("rejects a registration challenge older than the 5-minute window", async () => {
     const stub = await seedChallenge("chal-stale", "user-stale", 10);
-    expect(await verifyAndClassify(stub, "user-stale")).toBe("no-challenge");
+    expect(await verifyClassified(stub, "user-stale")).toBe("no-challenge");
   });
 
   it("still accepts a FRESH challenge — the window narrows, it does not close", async () => {
@@ -78,15 +105,15 @@ describe("registration challenge freshness (notme-addef9 / audit N5)", () => {
     // attestation code, on the garbage response. If this returned
     // "no-challenge" the fix would have broken registration outright.
     const stub = await seedChallenge("chal-fresh", "user-fresh", 1);
-    expect(await verifyAndClassify(stub, "user-fresh")).toBe("other");
+    expect(await verifyClassified(stub, "user-fresh")).toBe("other");
   });
 
   it("agrees with the authentication sibling's window", async () => {
     // The point is not the exact number, it is that the two lookups use the
     // same one. Just outside it must fail; just inside must not.
     const stale = await seedChallenge("chal-6m", "user-6m", 6);
-    expect(await verifyAndClassify(stale, "user-6m")).toBe("no-challenge");
+    expect(await verifyClassified(stale, "user-6m")).toBe("no-challenge");
     const fresh = await seedChallenge("chal-4m", "user-4m", 4);
-    expect(await verifyAndClassify(fresh, "user-4m")).toBe("other");
+    expect(await verifyClassified(fresh, "user-4m")).toBe("other");
   });
 });

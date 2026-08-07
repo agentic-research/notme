@@ -31,10 +31,12 @@ const HEALTH = `${ORIGIN}/admin/alarm-health`;
 const RESET = `${HEALTH}/reset`;
 
 const call = (url: string, init: RequestInit = {}) =>
-  worker.fetch(new Request(url, init), { ...env, ...LOCAL_ENV } as never, {
-    waitUntil() {},
-    passThroughOnException() {},
-  } as never);
+  // Two args: worker.fetch's signature here takes (request, env) — the
+  // execution context is supplied by the pool.
+  (worker.fetch as (r: Request, e: unknown) => Promise<Response>)(
+    new Request(url, init),
+    { ...env, ...LOCAL_ENV },
+  );
 
 describe("/admin/alarm-health gating (notme-77a024)", () => {
   it("refuses an unauthenticated read", async () => {
