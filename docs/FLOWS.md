@@ -120,12 +120,14 @@ the issuer's code would be circular.
 
 ```mermaid
 graph LR
-    P["pin SPKI hash<br/>OUT OF BAND"] --> F["fetch /.well-known/ca-bundle.pem"]
-    F --> C{"hash matches?"}
-    C -->|yes| V["authority holds the key<br/>you already trusted"]
+    P["anchor supplied by CALLER<br/>--spki &lt;sha256&gt;"] --> F["fetch /.well-known/ca-bundle.pem"]
+    F --> C{"served key<br/>matches anchor?"}
     C -->|no| X["stop"]
-    V --> B["check bundle freshness<br/>< 5 min"]
-    B --> L["chain a leaf:<br/>openssl verify -CAfile"]
+    C -->|yes| V["CONTINUITY<br/>(not possession — a public<br/>cert is public)"]
+    V --> B["bundle freshness &lt; 5 min"]
+    B --> L{"--leaf given?"}
+    L -->|yes| PO["POSSESSION<br/>openssl verify -CAfile<br/>the private key signed it"]
+    L -->|no| SK["skipped — say so,<br/>do not imply it"]
 ```
 
 Pin on **SPKI**, not just the certificate — the *key* is the identity. A
