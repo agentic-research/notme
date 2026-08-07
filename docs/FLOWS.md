@@ -106,11 +106,14 @@ permanently ungovernable (`notme-4838ae`).
 
 ---
 
-## 5. Third-party verification — the claim that matters
+## 5. Authority checks — continuity, freshness, possession
 
 ```bash
-./scripts/verify-as-third-party.sh
+./scripts/check-authority.sh --spki <sha256> [--leaf agent-cert.pem]
 ```
+
+The anchor is **required input**, never a default — a pin shipped inside the
+repository being evaluated is not an anchor, it is a self-reference.
 
 `curl`, `openssl`, `shasum`. No issuer software, because verification requiring
 the issuer's code would be circular.
@@ -128,8 +131,13 @@ graph LR
 Pin on **SPKI**, not just the certificate — the *key* is the identity. A
 re-issued cert over the same key is the same authority; a new key is not.
 
-**Boundary, stated:** the bundle *signature* is Ed25519 over canonical CBOR, so
-verifying it needs a CBOR encoder and therefore software.
+**Boundaries, stated.** Matching the served key against your anchor proves
+CONTINUITY, not possession — a public certificate is public and anyone can
+re-serve it. Only `--leaf` proves possession, by verifying a credential the
+private key actually signed. The bundle *signature* is not checked at all:
+Ed25519 over canonical CBOR needs a CBOR encoder, therefore software, therefore
+a dependency on the issuer's ecosystem. This does **not** discharge Goal Zero
+criterion (D).
 
 ---
 
