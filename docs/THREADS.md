@@ -27,7 +27,7 @@ order:
 | # | Step | Beads | Gated on | Whose move |
 |---|---|---|---|---|
 | A1 | ~~Namespace mechanism decision~~ **DECIDED 2026-08-27: URI-SAN segment-prefix confinement** (RFC 3820's rule on WIMSE URIs; cooperative, honestly labeled; `otherName`+PEN upgrade open) | ADR-019 D5 | — | done |
-| A2 | **Chain-walking verifier** — path validation + `scopes ⊆ parent` + namespace bound; flips the pinned single-hop test in `delegation-depth.do.test.ts` | `notme-acc822` (close signal) | A1 | notme |
+| A2 | ~~Chain-walking verifier~~ **BUILT 2026-08-27** — `auth/verify-chain.ts`: path signatures + pathlen + `scopes ⊆ parent` + prefix confinement, each bound mutation-proven load-bearing; wired at the x509 proof path (`chain` field) | `notme-acc822` | — | done |
 | A3 | **Grant object** — stored, referenceable D3 payload (today: three `*_by` columns, no identity) | ADR-019 req #1 | nothing | notme |
 | A4 | **Revocation unit = the grant** (criterion C) | `notme-77a024` | A3 | notme |
 | A5 | **Task-credential producer** — machine signs task certs; correlation key gets its third segment | `notme-9f84e6` | A2 | notme |

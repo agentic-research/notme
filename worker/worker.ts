@@ -1866,7 +1866,7 @@ export default {
         if (!session) return jsonErr("invalid session", 401);
 
         const body = (await request.json()) as {
-          proof: { type: string; token?: string; cert?: string };
+          proof: { type: string; token?: string; cert?: string; chain?: unknown };
         };
         if (!body.proof?.type) return jsonErr("proof.type required", 400);
 
@@ -1876,7 +1876,7 @@ export default {
         const { verifyProof } = await import("./src/auth/verify-proof");
         type Proof =
           | { type: "oidc"; token: string }
-          | { type: "x509"; cert: string };
+          | { type: "x509"; cert: string; chain?: string[] };
         let typedProof: Proof;
         if (
           body.proof.type === "oidc" &&
@@ -1887,7 +1887,15 @@ export default {
           body.proof.type === "x509" &&
           typeof body.proof.cert === "string"
         ) {
-          typedProof = { type: "x509", cert: body.proof.cert };
+          // Optional intermediates: a cert signed by an Issuing CA tier
+          // (ADR-019 D4) verifies through the chain walker, which enforces
+          // pathlen, scope subsetting and the D5 namespace bound. Filtered
+          // to strings so a malformed array member fails as a bad chain,
+          // never as a type surprise deeper in.
+          const chain = Array.isArray(body.proof.chain)
+            ? body.proof.chain.filter((c: unknown): c is string => typeof c === "string")
+            : undefined;
+          typedProof = { type: "x509", cert: body.proof.cert, chain };
         } else {
           return jsonErr(`unsupported proof.type: ${body.proof.type}`, 400);
         }

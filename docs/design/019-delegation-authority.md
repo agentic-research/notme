@@ -353,7 +353,7 @@ the anchor.
 |---|---|---|---|
 | **Authority** — what a credential may *do* | `scopes ⊆ parent` (`auth/scope-chain.ts`) | **cooperative** — relying parties MUST; nothing compels them | yes |
 | **Depth** — how far it may *pass that on* | `pathLenConstraint` + `remaining_delegation_depth` | **intrinsic** for pathlen | yes — root `pathlen=1`, Issuing CA tier `pathlen=0` (2026-08-27) |
-| **Namespace** — which identities it may *name* | URI-SAN segment-prefix confinement (decided below) | **cooperative** — notme's chain verifier + SDK; labeled honestly, like scopes | decided 2026-08-27; ships with the chain verifier |
+| **Namespace** — which identities it may *name* | URI-SAN segment-prefix confinement (decided below) | **cooperative** — notme's chain verifier + SDK; labeled honestly, like scopes | **built 2026-08-27** — `auth/verify-chain.ts`, mutation-tested |
 
 **The namespace bound cannot be done the way ADR-008 §299 says.** That section
 proposes `permittedSubtrees: URI:wimse://notme.bot/agent/*`. RFC 5280 §4.2.1.10

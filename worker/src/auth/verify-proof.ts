@@ -20,6 +20,12 @@ export interface OIDCProof {
 export interface X509Proof {
   type: "x509";
   cert: string; // PEM
+  /**
+   * Intermediate tier certificates, leaf-side first — present when the cert
+   * was signed by an Issuing CA tier rather than the root (ADR-019 D4).
+   * Absent or empty means root-signed, verified single-hop by verifyX509.
+   */
+  chain?: string[];
 }
 
 export type Proof = OIDCProof | X509Proof;
@@ -323,6 +329,14 @@ export async function verifyProof(
     // certificate checked against rotation, and must not be given a pass.
     if (currentEpoch === undefined) {
       throw new Error("current epoch required for x509 verification");
+    }
+    if (proof.chain && proof.chain.length > 0) {
+      // A tier-signed cert. The chain walker carries the three bounds a
+      // single-hop check cannot: pathlen, scopes ⊆ parent, and the D5
+      // namespace confinement. verifyX509 stays single-hop on purpose —
+      // delegation-depth.do.test.ts pins that split.
+      const { verifyCertChain } = await import("./verify-chain");
+      return verifyCertChain(proof.cert, proof.chain, caPublicKeyPem, currentEpoch);
     }
     return verifyX509(proof.cert, caPublicKeyPem, currentEpoch);
   }
