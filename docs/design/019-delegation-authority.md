@@ -353,7 +353,7 @@ the anchor.
 |---|---|---|---|
 | **Authority** — what a credential may *do* | `scopes ⊆ parent` (`auth/scope-chain.ts`) | **cooperative** — relying parties MUST; nothing compels them | yes |
 | **Depth** — how far it may *pass that on* | `pathLenConstraint` + `remaining_delegation_depth` | **intrinsic** for pathlen | yes — root `pathlen=1`, Issuing CA tier `pathlen=0` (2026-08-27) |
-| **Namespace** — which identities it may *name* | see below — **not** URI `nameConstraints` | **cooperative** unless hosts are split | no |
+| **Namespace** — which identities it may *name* | URI-SAN segment-prefix confinement (decided below) | **cooperative** — notme's chain verifier + SDK; labeled honestly, like scopes | decided 2026-08-27; ships with the chain verifier |
 
 **The namespace bound cannot be done the way ADR-008 §299 says.** That section
 proposes `permittedSubtrees: URI:wimse://notme.bot/agent/*`. RFC 5280 §4.2.1.10
@@ -376,8 +376,34 @@ Constraining kinds therefore requires one of:
    which is safe, but means it is enforced by notme's own verifier, not by
    everyone's.
 
-This is an open question, not a decision. ADR-008 §299 should be corrected
-regardless of which is chosen.
+**DECIDED 2026-08-27: none of the three as primary — the confinement rule
+instead.** A child certificate's identity URI must **segment-prefix-extend**
+its parent's: a tier whose SAN is `wimse://notme.bot/passkey/alice` may only
+issue identities under `wimse://notme.bot/passkey/alice/…`. This is RFC 3820's
+proxy-certificate confinement rule (child subject = parent subject + one
+appended component) transplanted onto WIMSE URIs — the one existing X.509
+delegation standard that solves exactly this, per ADR-020's required question.
+
+Why it beats the three options above: it bounds both threats at once (same
+subtree ⇒ same principal *and* same kind, so Alice's machine can neither name
+Bob nor name a human); it reuses the segment-prefix machinery already shipped
+in `auth/correlation-key.ts` (percent-encoded segments, prefix-closed — never
+string-prefix); and it makes the identity URI and the correlation key the
+same shape, so "what happened under X" and "what X may name" are one closure.
+
+What it costs, stated honestly: enforcement is **cooperative** — notme's
+chain verifier and the SDK enforce it; stock validators see ordinary URI SANs
+and verify signatures and pathlen only. That is the same enforcement class as
+the authority bound (scopes), and strictly better than option 3, which makes
+chains unverifiable by stock tools and so breaks third-party verifiability.
+The **upgrade path stays open**: once the PEN lands (`notme-229dc3`), the same
+subtree relation can be expressed as an `otherName` under our arc constrained
+via `permittedSubtrees` — intrinsic for validators that implement it — after
+measuring how stock openssl actually treats an unrecognized `otherName` form
+in constraints, which must be an experiment, not an assumption.
+
+ADR-008 §299 stands corrected regardless (it already carries the CORRECTION
+block).
 
 ## What follows, already built
 
@@ -400,7 +426,9 @@ regardless of which is chosen.
 1. **The grant as a stored, referenceable object** with the D3 payload. Today
    there are three `*_by` columns and no grant identity.
 2. ~~**The middle tier** — a mint path producing `CA=true, pathlen=0`.~~ Built 2026-08-27: `mintIssuingCaCert` + `POST /cert/issuing-ca`.
-3. **A namespace mechanism**, per D5's open question.
+3. ~~**A namespace mechanism**, per D5's open question.~~ Decided 2026-08-27:
+   segment-prefix confinement on the URI SAN (see D5); built as part of the
+   chain verifier.
 4. **A task-credential producer**, which gives the correlation key its third
    segment and the receipt field a value. Note the subject of a task credential
    should be the **agent or agent instance**, with `task_id`/`goal_hash` as

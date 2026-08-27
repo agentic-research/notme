@@ -166,9 +166,9 @@ describe("chain verification is deliberately unbuilt (ADR-019 D5 gate)", () => {
   // single-hop — leaf against the root key, no path building — so a task
   // cert signed by a machine tier is rejected everywhere in notme today,
   // even on a fully legitimate chain. That is deliberate: a chain-walking
-  // verifier must ship WITH the namespace bound (D5's open question) and the
-  // chain scope rule, or a tier holder could name identities it has no
-  // business naming. This test pins the boundary — the day someone builds
+  // verifier must ship WITH the namespace bound — decided 2026-08-27 as
+  // URI-SAN segment-prefix confinement (ADR-019 D5) — and the chain scope
+  // rule, or a tier holder could name identities it has no business naming. This test pins the boundary — the day someone builds
   // path validation, it fails, and this comment is what they must answer.
   it("REJECTS a task cert signed by the machine tier, even on a legitimate chain", async () => {
     const ca = (await crypto.subtle.generateKey(ED25519, true, [

@@ -26,7 +26,7 @@ order:
 
 | # | Step | Beads | Gated on | Whose move |
 |---|---|---|---|---|
-| A1 | **Namespace mechanism decision** (distinct hosts / `otherName`+PEN / critical extension) | ADR-019 D5 | nothing — a decision | **repo owner** |
+| A1 | ~~Namespace mechanism decision~~ **DECIDED 2026-08-27: URI-SAN segment-prefix confinement** (RFC 3820's rule on WIMSE URIs; cooperative, honestly labeled; `otherName`+PEN upgrade open) | ADR-019 D5 | — | done |
 | A2 | **Chain-walking verifier** — path validation + `scopes ⊆ parent` + namespace bound; flips the pinned single-hop test in `delegation-depth.do.test.ts` | `notme-acc822` (close signal) | A1 | notme |
 | A3 | **Grant object** — stored, referenceable D3 payload (today: three `*_by` columns, no identity) | ADR-019 req #1 | nothing | notme |
 | A4 | **Revocation unit = the grant** (criterion C) | `notme-77a024` | A3 | notme |
@@ -34,8 +34,8 @@ order:
 | A6 | **Delegation in receipts end-to-end** — the ninth commitment key becomes reachable | `notme-c0db9b` + `cloister-c10ff2` | A5 + cloister adoption | both |
 | A7 | Naming follow-through in signet docs (`id-kp-signet-bridge-delegate` is now a misnomer) | `signet-9dfb44` consequence | nothing | signet |
 
-A1 is the only *decision* left on this line; everything after is work. A3→A4
-runs parallel to A1→A2→A5.
+A1 resolved 2026-08-27 — **no decisions remain on this line; everything after
+is work.** A2 is the head of the line; A3→A4 runs parallel to A2→A5.
 
 ## Line B — transparency (the Fulcio/Rekor answer, operationalized)
 
@@ -111,7 +111,7 @@ CAS release distribution (`notme-e765fe` line) · substrate research
 ## The critical path
 
 Same shape Phase 0 had: **the expensive-looking work is cheap and the cheap-looking
-decisions are the gates.** A1 (namespace mechanism) is one decision and it
-gates the whole delegation spine. B1's compose-decision gates transparency.
-ADR-020's two open questions gate acceptance. Everything on Line F can happen
-this week with no decisions at all.
+decisions are the gates.** ~~A1 (namespace mechanism) gates the delegation
+spine~~ — decided 2026-08-27; the spine's head is now A2, pure work. B1's
+compose-decision gates transparency. ADR-020's two open questions gate
+acceptance. Everything on Line F can happen this week with no decisions at all.

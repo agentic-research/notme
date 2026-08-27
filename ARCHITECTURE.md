@@ -133,7 +133,7 @@ graph TD
 
     SCOPES["auth/scope-chain.ts<br/>scopes ⊆ parent<br/><b>AUTHORITY</b> bound (cooperative)"]:::built
     PATH["pathLenConstraint<br/>RFC 5280 §6.1.4<br/><b>DEPTH</b> bound (intrinsic)"]:::built
-    NAMES["nameConstraints<br/>ADR-008 §299<br/><b>NAMESPACE</b> bound — NOT BUILT"]:::gap
+    NAMES["URI-SAN prefix confinement<br/>ADR-019 D5 (decided)<br/><b>NAMESPACE</b> bound — ships with chain verifier"]:::gap
 
     SCOPES -.-> BRIDGE
     PATH -.-> BRIDGE
