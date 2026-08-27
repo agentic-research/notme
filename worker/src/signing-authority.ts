@@ -1279,6 +1279,56 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     };
   }
 
+  /**
+   * Mint the Issuing CA tier (ADR-019 D4): CA=true, pathlen=0, keyCertSign.
+   * Same shape as mintBridgeCertPair — the DO supplies the key and the
+   * epoch, never the policy: WHO may request this and WHAT scopes it may
+   * carry are decided at the route, which is the only caller.
+   */
+  async mintIssuingCa(params: {
+    subject: string;
+    identity: string;
+    publicKeyPem: string;
+    scopes: string[];
+    authMethod: string;
+    ttlMs?: number;
+  }): Promise<
+    import("./cert-authority").IssuingCaCertResult & {
+      authority: { epoch: number; key_id: string };
+    }
+  > {
+    // A leaked stub is already full-CA capability, but an Issuing CA cert is
+    // POST-LEAK PERSISTENCE: it keeps signing task certs after stub access is
+    // lost, for its whole lifetime. Refuse rather than clamp — no legitimate
+    // caller sends a long TTL (the route sends none), so a long TTL is
+    // evidence of misuse, and clamping would hide it.
+    const MAX_ISSUING_TTL_MS = 24 * 60 * 60 * 1000;
+    if (params.ttlMs !== undefined && params.ttlMs > MAX_ISSUING_TTL_MS) {
+      throw new Error(
+        `issuing tier ttl capped at 24h, got ${params.ttlMs}ms`,
+      );
+    }
+    const { signingKey } = await this.getOrCreateSigningKey();
+    const state = await this.getAuthorityState();
+    const { mintIssuingCaCert } = await import("./cert-authority");
+    const result = await mintIssuingCaCert(
+      params.subject,
+      params.identity,
+      params.publicKeyPem,
+      signingKey,
+      {
+        scopes: params.scopes,
+        epoch: state.epoch,
+        authMethod: params.authMethod,
+        ttlMs: params.ttlMs,
+      },
+    );
+    return {
+      ...result,
+      authority: { epoch: state.epoch, key_id: state.keyId },
+    };
+  }
+
   // Current epoch and keyId for embedding in issued certs.
   async getAuthorityState(): Promise<{
     epoch: number;

@@ -4,8 +4,9 @@
 (PR #72) as one release; the branch continues for the next cycle
 **Production:** version `79e5ba12` at 100%, converged on `473f9268`,
 `task worker:verify` 14/14
-**Tests:** run `task worker:test` for current counts; the two deliberate
-`it.fails` in `delegation-depth.do.test.ts` remain the D4 completion signal
+**Tests:** run `task worker:check` for current counts; the two deliberate
+`it.fails` that were the D4 completion signal fired 2026-08-27 and are now
+ordinary passing tests
 **Last updated:** 2026-08-27
 
 Read this before picking up Goal Zero work. It exists because several
@@ -140,8 +141,8 @@ repository under test.
 | Bead | State |
 |---|---|
 | `notme-a011d2`, `notme-718ac0` | **Done on notme's side; blocked on signet.** One rc.3 run closes both. Left open deliberately: "we deployed the fix" ≠ "the path works end to end", and notme cannot mint a GitHub OIDC token for its own endpoint |
-| `notme-9f2f79` | ADR-018's canary gate cannot verify the version it claims to — failed twice, silently *toward* the status quo. Needs a call on whether targeting works on a Free-plan zone; if not, delete the phase rather than keep an unperformable ceremony |
-| `notme-acc822` | Scope half landed. Namespace half is now known-absent (§3.2). Depth half needs the middle tier |
+| `notme-9f2f79` | **Closed 2026-08-27.** Cause confirmed in Cloudflare docs: overrides apply only to versions in the current deployment, silent fallback otherwise. Canary phase deleted from ADR-018; the pipeline is promote → converge → verify |
+| `notme-acc822` | Scope half enforced at every narrowing site (`narrowScopes`, 2026-08-27). Depth half built: Issuing CA tier, `POST /cert/issuing-ca`. Namespace half remains open (§3.2 / ADR-019 D5) |
 | `notme-28959a` | undici in `action/dist` — parked at owner's direction while signet coordinates |
 
 ### Cross-repo, awaiting others
@@ -188,9 +189,10 @@ fixtures built by the encoder under test.
 
 Two conventions follow from these and appear in the suite:
 
-- **`it.fails` marks a gap, not a bug.** `delegation-depth.do.test.ts` asserts
-  the middle tier is *still missing*, so it goes red the moment someone builds
-  it — that is the signal to delete the `.fails`.
+- **`it.fails` marks a gap, not a bug.** `delegation-depth.do.test.ts` used
+  this to assert the middle tier was *still missing*; the tier landed
+  2026-08-27, the polarity flipped on cue, and the `.fails` markers came off —
+  the convention worked exactly as designed.
 - **Some fixtures are deliberately foreign.** `pop-preimage.test.ts` and the
   hand-encoder in `receipt-commitment.test.ts` build inputs *without* the code
   under test, because a fixture built by the encoder it validates is a fixed

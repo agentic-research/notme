@@ -63,7 +63,7 @@ graph TD
     A008 -.->|"signing cert powers APAS"| APAS
     A009 -.->|"runtime composition lives in"| LL
     A005 --> A019
-    A008 -->|"pathlen table, unbuilt middle tier"| A019
+    A008 -->|"pathlen table; Issuing CA tier shipped 2026-08-27"| A019
     A019 -.->|"answers Q1/Q2 of"| CL0066
     A019 --> A020
     A014 -.->|"receipts are a composed layer"| A020

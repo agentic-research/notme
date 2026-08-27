@@ -178,3 +178,25 @@ export async function verifyPopProofs(
 
   return { ok: true, binding: sawLegacy ? "digest" : "pre-image" };
 }
+
+/**
+ * Verify a SINGLE Ed25519 proof-of-possession over the binding pre-image.
+ *
+ * For enrollment paths that submit one key — the issuing-CA tier submits only
+ * the Ed25519 key that will sign task certs (ADR-019 D4), so the pair-shaped
+ * `verifyPopProofs` does not fit.
+ *
+ * Pre-image ONLY, deliberately: `ACCEPT_LEGACY_DIGEST_BINDING` above exists
+ * because old pair-path signers shipped before the encoding was fixed. This
+ * verifier is new alongside a new route, so no legacy signer exists and the
+ * migration window must not leak into a surface that never needed one.
+ */
+export async function verifyEd25519PopProof(
+  bindingInput: BufferSource,
+  publicKey: CryptoKey,
+  proof: string | undefined,
+): Promise<boolean> {
+  const sig = decodeProof(proof);
+  if (!sig) return false;
+  return crypto.subtle.verify(ED25519, publicKey, sig, bindingInput);
+}

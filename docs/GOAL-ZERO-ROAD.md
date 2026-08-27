@@ -185,7 +185,7 @@ Do these while Phase 0 is out for decision. None touch the contested naming.
 
 | Work | Gated on | Notes |
 |---|---|---|
-| **D4 middle tier** (`CA=true, pathlen=0`) | 0.2 | Deleting `it.fails` in `delegation-depth.do.test.ts` is the completion signal |
+| ~~**D4 middle tier**~~ **DONE 2026-08-27** | 0.2 | `mintIssuingCaCert` + `POST /cert/issuing-ca` (certMint-gated); the two `it.fails` fired and came off |
 | `nameConstraints` — or its replacement | 0.2 | URI constraints bind the **host**, not the path (ADR-008 §299 corrected). Needs distinct hosts, an `otherName`, or a critical extension |
 | Revocation unit | 0.1, 0.2 | A grant is the unit; the *mechanism* still needs choosing |
 | Task credential producer | 0.2 | Gives the correlation key its third segment and the receipt field a value |
@@ -246,12 +246,13 @@ the finish line.
 0.3 (2026-08-27), and the convergence gate shipped earlier. The new sequencing
 rule, now that nothing is decision-gated:
 
-1. **Finish the two half-open P0s** — wire `verifyScopeChain` into the
-   remaining mint paths (`notme-acc822`) and rewrite ADR-018's canary section
-   (`notme-9f2f79`). Small, and they close the P0 column.
-2. **D4 middle tier** (`CA=true, pathlen=0`, named `Issuing CA`) — the largest
-   newly-unblocked cluster; deleting the two `it.fails` in
-   `delegation-depth.do.test.ts` is the completion signal.
+1. ~~**Finish the two half-open P0s**~~ **DONE 2026-08-27** — `narrowScopes`
+   enforces the subset rule at every narrowing site (`notme-acc822`, scope
+   half); ADR-018's canary phase is deleted with the cause confirmed
+   (`notme-9f2f79`, closed).
+2. ~~**D4 middle tier**~~ **DONE 2026-08-27** — the Issuing CA tier:
+   `mintIssuingCaCert`, `POST /cert/issuing-ca` (certMint-gated, first
+   enforcement site for that scope), both `it.fails` fired and came off.
 3. **Wire `checkRevocation`** (`notme-8d3018`) — docs already claim it is
    wired, which makes this a live documentation-honesty violation, not just a
    feature gap.

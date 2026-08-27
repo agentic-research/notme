@@ -207,3 +207,45 @@ describe("PoP binding pre-image (notme-a011d2)", () => {
     expect(result).toEqual({ ok: false, algorithm: "P-256" });
   });
 });
+
+describe("verifyEd25519PopProof — single-key PoP for the issuing tier (ADR-019 D4)", () => {
+  // The issuing-CA enrollment submits ONE key (the Ed25519 that will sign
+  // task certs), so the pair-shaped verifyPopProofs does not fit. This
+  // verifier is new alongside a new route, so there are NO legacy signers:
+  // it accepts the pre-image encoding ONLY. The digest case is pinned as a
+  // REJECTION here precisely because the pair verifier still tolerates it —
+  // a migration window must not leak into a surface that never needed one.
+  async function ed25519Pair() {
+    return (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+  }
+  const BINDING = new TextEncoder().encode("issuing-ca binding pre-image");
+
+  function b64(bytes: ArrayBuffer): string {
+    return btoa(String.fromCharCode(...new Uint8Array(bytes)));
+  }
+
+  it("accepts a signature over the binding pre-image", async () => {
+    const { verifyEd25519PopProof } = await import("../auth/pop");
+    const kp = await ed25519Pair();
+    const sig = await crypto.subtle.sign({ name: "Ed25519" }, kp.privateKey, BINDING);
+    expect(await verifyEd25519PopProof(BINDING, kp.publicKey, b64(sig))).toBe(true);
+  });
+
+  it("REJECTS a signature over the digest — no legacy window on a new path", async () => {
+    const { verifyEd25519PopProof } = await import("../auth/pop");
+    const kp = await ed25519Pair();
+    const digest = await crypto.subtle.digest("SHA-256", BINDING);
+    const sig = await crypto.subtle.sign({ name: "Ed25519" }, kp.privateKey, digest);
+    expect(await verifyEd25519PopProof(BINDING, kp.publicKey, b64(sig))).toBe(false);
+  });
+
+  it("treats an absent or undecodable proof as failed, not a crash", async () => {
+    const { verifyEd25519PopProof } = await import("../auth/pop");
+    const kp = await ed25519Pair();
+    expect(await verifyEd25519PopProof(BINDING, kp.publicKey, undefined)).toBe(false);
+    expect(await verifyEd25519PopProof(BINDING, kp.publicKey, "!!!")).toBe(false);
+  });
+});

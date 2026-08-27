@@ -149,7 +149,16 @@ describe("RPC surface is an allow-list, not an accident", () => {
       // of being called; this one cannot. A leaked stub learns only whether
       // an authority has an administrator, which /auth/passkey/status
       // already answers publicly.
-    ).toBe(43);
+      //
+      // 43 → 44: mintIssuingCa (ADR-019 D4). Reviewed: a leaked stub could
+      // already mint arbitrary LEAF certs via mintBridgeCertPair, so the new
+      // capability class is not "can mint" — it is post-leak PERSISTENCE: an
+      // Issuing CA cert keeps signing task certs offline after stub access is
+      // lost. Bounded two ways: the method refuses any TTL over 24h (the
+      // route sends none, so a long TTL is evidence of misuse, not clamped
+      // away), and pathlen=0 means verifiers reject anything a minted tier
+      // tries to issue below itself beyond one hop.
+    ).toBe(44);
   });
 });
 

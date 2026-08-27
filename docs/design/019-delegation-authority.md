@@ -308,9 +308,13 @@ The same rule governs scopes and validity windows: intersection, never union.
 ### D4 — Depth is bounded by a rank function, not by scope narrowing
 
 ADR-008 already specifies three tiers and `notme-20f88b` widened the root to
-`pathlen=1` for exactly this. The middle tier was never built:
-`cert-authority.ts` stamps `CA=false` on every cert notme mints, so **the
-authority issues two levels while its root advertises room for three.**
+`pathlen=1` for exactly this. When this section was written the middle tier
+did not exist — `cert-authority.ts` stamped `CA=false` on every cert, so the
+authority issued two levels while its root advertised room for three. **Built
+2026-08-27** (after adoption and the `signet-9dfb44` naming decision):
+`mintIssuingCaCert` produces the Issuing CA (`CA=true, pathlen=0,
+keyCertSign`), reachable at `POST /cert/issuing-ca`, gated on `certMint` —
+that scope's first enforcement site.
 
 An earlier draft argued that monotone scope narrowing made depth bound itself.
 **That was wrong:**
@@ -348,7 +352,7 @@ the anchor.
 | Bound | Mechanism | Enforcement | Built? |
 |---|---|---|---|
 | **Authority** — what a credential may *do* | `scopes ⊆ parent` (`auth/scope-chain.ts`) | **cooperative** — relying parties MUST; nothing compels them | yes |
-| **Depth** — how far it may *pass that on* | `pathLenConstraint` + `remaining_delegation_depth` | **intrinsic** for pathlen | root only; middle tier missing |
+| **Depth** — how far it may *pass that on* | `pathLenConstraint` + `remaining_delegation_depth` | **intrinsic** for pathlen | yes — root `pathlen=1`, Issuing CA tier `pathlen=0` (2026-08-27) |
 | **Namespace** — which identities it may *name* | see below — **not** URI `nameConstraints` | **cooperative** unless hosts are split | no |
 
 **The namespace bound cannot be done the way ADR-008 §299 says.** That section
@@ -380,8 +384,10 @@ regardless of which is chosen.
 - `auth/scope-chain.ts` — the authority bound, applied at
   `certScopesForSession`, with six previously-orphaned attenuation tests now
   bound to it.
-- `delegation-depth.do.test.ts` — the depth gap pinned as `it.fails`, going red
-  the moment the middle tier lands.
+- `delegation-depth.do.test.ts` — began as `it.fails` pinning the depth gap;
+  the polarity flipped when the tier landed (2026-08-27) and they now stand as
+  normal tests: a mint path produces `CA=true/pathlen=0`, and the root's
+  budget equals the tiers it can issue.
 - `auth/correlation-key.ts` — `<principal>/<bridge>/<task>`, keyed on the
   stable principal and the pair binding (not a serial: a bridge is two certs
   with two independent serials, so no serial names it).
@@ -393,7 +399,7 @@ regardless of which is chosen.
 
 1. **The grant as a stored, referenceable object** with the D3 payload. Today
    there are three `*_by` columns and no grant identity.
-2. **The middle tier** — a mint path producing `CA=true, pathlen=0`.
+2. ~~**The middle tier** — a mint path producing `CA=true, pathlen=0`.~~ Built 2026-08-27: `mintIssuingCaCert` + `POST /cert/issuing-ca`.
 3. **A namespace mechanism**, per D5's open question.
 4. **A task-credential producer**, which gives the correlation key its third
    segment and the receipt field a value. Note the subject of a task credential

@@ -29,6 +29,19 @@ const BASIC_CONSTRAINTS_LEAF = new BasicConstraintsExtension(
   true,
 );
 
+// Issuing-CA tier (ADR-008 §BasicConstraints "orchestrator bridge", named the
+// Issuing CA per signet-9dfb44): CA=true so the holder can sign task certs,
+// pathLenConstraint=0 so nothing it issues can issue in turn. The pathlen is
+// the rank function ADR-019 D4 requires — depth terminates because RFC 5280
+// §6.1.4(l)–(m) decrements it, not because scopes narrow (they may stay
+// equal). Critical per RFC 5280 §4.2.1.9.
+const BASIC_CONSTRAINTS_ISSUING = new BasicConstraintsExtension(true, 0, true);
+
+// keyCertSign ONLY, per ADR-008's tier table. Not digitalSignature: this key
+// signs CERTIFICATES, and a tier that can also sign arbitrary payloads
+// collapses the task/machine distinction the chain exists to draw.
+const ISSUING_KEY_USAGE = new KeyUsagesExtension(KeyUsageFlags.keyCertSign, true);
+
 // mTLS cert: digitalSignature (TLS handshake signing) + keyAgreement
 // (ECDHE in TLS 1.2+); ExtendedKeyUsage clientAuth so validators that
 // enforce EKU on TLS clients accept it.
@@ -403,5 +416,95 @@ export async function mintBridgeCertPair(
     expires_at: Math.floor(expires.getTime() / 1000),
     subject,
     binding: bindingHex,
+  };
+}
+
+/** What `mintIssuingCaCert` returns — one certificate, one tier. */
+export interface IssuingCaCertResult {
+  certificate: string;
+  identity: string;
+  scopes: string[];
+  expires_at: number;
+  subject: string;
+}
+
+/**
+ * Mint the MIDDLE tier: an Issuing CA certificate (`CA=true, pathlen=0`).
+ *
+ * This is hop 1 of ADR-019's chain — the bridge delegates the human to the
+ * MACHINE, and the machine may then sign task certs itself, offline, without
+ * asking this authority per task. pathlen=0 is what makes every task cert
+ * terminal: an X.509 validator enforces the depth cap for us instead of
+ * trusting notme to refuse (delegation-depth.do.test.ts pins both halves).
+ *
+ * Ed25519 only. The chain is Ed25519 end-to-end — root signs this tier, this
+ * tier signs task certs — and accepting a P-256 subject key here would fork
+ * the chain's algorithm story for no caller that exists.
+ *
+ * Scopes carried here BOUND what task certs below may claim: a verifier
+ * applying the chain rule (`scopes ⊆ parent.scopes`, auth/scope-chain.ts)
+ * reads this cert as the parent. The route narrows them from the requesting
+ * session before they reach this function.
+ */
+export async function mintIssuingCaCert(
+  subject: string,
+  identity: string,
+  publicKeyPem: string,
+  signingKey: CryptoKey,
+  opts: {
+    scopes: string[];
+    epoch: number;
+    authMethod: string;
+    ttlMs?: number;
+  },
+): Promise<IssuingCaCertResult> {
+  // Longer-lived than the 5-minute leaves by design (ADR-019 D4: "a
+  // longer-lived machine tier"): the tier must outlive the tasks it signs
+  // for, or every task cert chains to an expired parent at first use.
+  const ttlMs = opts.ttlMs ?? 60 * 60 * 1000;
+  const now = new Date();
+  const expires = new Date(now.getTime() + ttlMs);
+
+  const publicKey = await importPublicKey(publicKeyPem);
+  if (publicKey.algorithm.name !== "Ed25519") {
+    throw new Error(
+      `issuing tier requires an Ed25519 key, got ${publicKey.algorithm.name}`,
+    );
+  }
+
+  const sanUri = derTlv(0x86, new TextEncoder().encode(identity));
+  const sanDer = derTlv(0x30, sanUri);
+  const serial = crypto.getRandomValues(new Uint8Array(16));
+  serial[0] &= 0x7f;
+
+  const cert = await X509CertificateGenerator.create({
+    subject: `CN=${subject},O=notme`,
+    issuer: `CN=signet-authority,O=notme`,
+    notBefore: now,
+    notAfter: expires,
+    signingAlgorithm: ED25519,
+    publicKey,
+    signingKey,
+    serialNumber: Array.from(serial)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join(""),
+    extensions: [
+      BASIC_CONSTRAINTS_ISSUING,
+      ISSUING_KEY_USAGE,
+      new Extension(OID_SUBJECT, false, derUtf8String(subject)),
+      new Extension(OID_ISSUANCE_TIME, false, derUtf8String(now.toISOString())),
+      new Extension(OID_SCOPES, false, derScopeSequence(opts.scopes)),
+      new Extension(OID_EPOCH, false, derInteger(opts.epoch)),
+      new Extension(OID_AUTH_METHOD, false, derUtf8String(opts.authMethod)),
+      new Extension("2.5.29.17", true, sanDer),
+    ],
+  });
+
+  return {
+    certificate: cert.toString("pem"),
+    identity,
+    scopes: opts.scopes,
+    expires_at: Math.floor(expires.getTime() / 1000),
+    subject,
   };
 }

@@ -15,28 +15,33 @@
  *   Agent session       CA=false  (leaf)      digitalSignature <- the TASK
  *
  * The root was widened to pathlen=1 for exactly this (notme-20f88b, closed,
- * "blocks orchestrator→agent delegation"). The middle tier was never built:
- * cert-authority.ts stamps BASIC_CONSTRAINTS_LEAF (CA=false) on every cert
- * notme mints, so the authority issues two levels while its root advertises
- * room for three.
+ * "blocks orchestrator→agent delegation"). The middle tier landed 2026-08-27
+ * as `mintIssuingCaCert` — the Issuing CA per the signet-9dfb44 naming
+ * decision — resolving the fork these tests were written to pin: BUILD the
+ * tier, so a mint path produces CA=true/pathlen=0 and the root's budget of 1
+ * is exactly spent.
  *
- * WHY THAT ASYMMETRY IS THE THING TO TEST, rather than "does hop 2 exist":
- * a pathlen budget is a statement to VERIFIERS about what chains they should
- * accept. The root currently tells every verifier "an intermediate below me is
- * legitimate" while nothing legitimate ever occupies that slot — so the only
- * cert that could ever fill it is one nobody meant to issue. Whichever way the
- * fork is resolved, the budget and the tiers have to agree:
- *
- *   BUILD the tier   -> a mint path produces CA=true/pathlen=0, budget 1 is spent
- *   DROP the tier    -> the root narrows to pathlen=0 and hop 2 lives elsewhere
- *
- * Both exits satisfy these tests. Neither presupposes the design decision,
- * which is why they can be written before it is made.
+ * WHY BUDGET-EQUALS-TIERS IS THE THING TO TEST, rather than "does hop 2
+ * exist": a pathlen budget is a statement to VERIFIERS about what chains they
+ * should accept. Before the tier existed, the root told every verifier "an
+ * intermediate below me is legitimate" while nothing legitimate ever occupied
+ * that slot — so the only cert that could fill it was one nobody meant to
+ * issue. These began as `it.fails` pinning that unbuilt state; the polarity
+ * flipped on 2026-08-27 and the `.fails` markers came off, per the protocol
+ * they were written with.
  */
 import { env, runInDurableObject } from "cloudflare:test";
-import { BasicConstraintsExtension, X509Certificate } from "@peculiar/x509";
+import {
+  BasicConstraintsExtension,
+  X509Certificate,
+  X509CertificateGenerator,
+} from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
-import { mintBridgeCertPair, mintGHABridgeCert } from "./cert-authority";
+import {
+  mintBridgeCertPair,
+  mintGHABridgeCert,
+  mintIssuingCaCert,
+} from "./cert-authority";
 import { ED25519 } from "./platform";
 import type { SigningAuthority } from "./signing-authority";
 
@@ -82,10 +87,23 @@ async function mintEverything(): Promise<X509Certificate[]> {
     ca.privateKey,
   );
 
+  const machine = (await crypto.subtle.generateKey(ED25519, true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const issuing = await mintIssuingCaCert(
+    "machine-under-test",
+    "wimse://notme.bot/passkey/machine-under-test",
+    await spkiToPem(machine.publicKey),
+    ca.privateKey,
+    { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+  );
+
   return [
     new X509Certificate(pair.certificates.mtls),
     new X509Certificate(pair.certificates.signing),
     new X509Certificate(gha.certificate),
+    new X509Certificate(issuing.certificate),
   ];
 }
 
@@ -96,16 +114,10 @@ function intermediateTiers(certs: X509Certificate[]): number {
 }
 
 describe("delegation depth (notme-600df1 / ADR-008 §BasicConstraints)", () => {
-  // `it.fails` rather than `it.todo`: these assert the gap is STILL OPEN, so
-  // they execute on every run and go red the moment hop 2 lands — which is
-  // the signal to delete the `.fails` and let them stand as normal tests. A
-  // todo would sit inert and tell nobody. The unusual polarity is the point:
-  // the unbuilt state is the one being pinned, not the built one.
-  it.fails("issues a machine tier that may delegate to tasks", async () => {
+  it("issues a machine tier that may delegate to tasks", async () => {
     // Hop 2 of the desired outcome. ADR-008 calls this the orchestrator
-    // bridge: CA=true so it can sign task certs, pathlen=0 so a task cannot
-    // sign anything in turn. Today every mint path stamps CA=false, so the
-    // machine cannot delegate and the chain stops one hop short.
+    // bridge, the naming decision calls it the Issuing CA: CA=true so it can
+    // sign task certs, pathlen=0 so a task cannot sign anything in turn.
     const certs = await mintEverything();
     expect(
       intermediateTiers(certs),
@@ -129,7 +141,7 @@ describe("delegation depth (notme-600df1 / ADR-008 §BasicConstraints)", () => {
     }
   });
 
-  it.fails("advertises a pathlen budget equal to the tiers it can issue", async () => {
+  it("advertises a pathlen budget equal to the tiers it can issue", async () => {
     // The asymmetry itself. A budget larger than the tiers that exist tells
     // verifiers to accept an intermediate that notme never legitimately mints.
     const stub = env.SIGNING_AUTHORITY.get(
@@ -148,3 +160,64 @@ describe("delegation depth (notme-600df1 / ADR-008 §BasicConstraints)", () => {
     ).toBe(intermediateTiers(await mintEverything()));
   });
 });
+
+describe("chain verification is deliberately unbuilt (ADR-019 D5 gate)", () => {
+  // The tier can be MINTED; nothing yet ACCEPTS what it signs. verifyX509 is
+  // single-hop — leaf against the root key, no path building — so a task
+  // cert signed by a machine tier is rejected everywhere in notme today,
+  // even on a fully legitimate chain. That is deliberate: a chain-walking
+  // verifier must ship WITH the namespace bound (D5's open question) and the
+  // chain scope rule, or a tier holder could name identities it has no
+  // business naming. This test pins the boundary — the day someone builds
+  // path validation, it fails, and this comment is what they must answer.
+  it("REJECTS a task cert signed by the machine tier, even on a legitimate chain", async () => {
+    const ca = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const machine = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const task = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const taskEd = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+
+    const rootCert = await X509CertificateGenerator.createSelfSigned({
+      name: "CN=signet-authority,O=notme",
+      notBefore: new Date(),
+      notAfter: new Date(Date.now() + 3600_000),
+      signingAlgorithm: ED25519,
+      keys: ca,
+      serialNumber: "01",
+    });
+    await mintIssuingCaCert(
+      "machine-under-test",
+      "wimse://notme.bot/passkey/machine-under-test",
+      await spkiToPem(machine.publicKey),
+      ca.privateKey,
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+    );
+    // Hop 2: the MACHINE signs a task cert — legitimate use of the tier.
+    const taskPair = await mintBridgeCertPair(
+      "task-under-test",
+      "wimse://notme.bot/passkey/task-under-test",
+      await spkiToPem(task.publicKey),
+      await spkiToPem(taskEd.publicKey),
+      machine.privateKey,
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+    );
+
+    const { verifyX509 } = await import("./auth/verify-proof");
+    await expect(
+      verifyX509(taskPair.certificates.mtls, rootCert.toString("pem"), 1),
+    ).rejects.toThrow(/not signed by trusted CA/);
+  });
+});
+

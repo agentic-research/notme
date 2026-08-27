@@ -2473,6 +2473,141 @@ export default {
         }
       }
 
+      // POST /cert/issuing-ca — mint the MIDDLE tier (ADR-019 D4).
+      //
+      // The Issuing CA: CA=true so the holder signs task certs itself,
+      // offline, without asking this authority per task; pathlen=0 so every
+      // task cert is terminal. This is hop 1 of the delegation chain
+      // (human→machine); hop 2 (machine→task) happens client-side, which is
+      // the point of issuing a CA tier at all.
+      //
+      // Gated on certMint — this route is the scope's FIRST enforcement site.
+      // authorityManage deliberately does not suffice: administering the
+      // authority and minting delegation tiers are different powers, and
+      // bootstrap grants both precisely so they can diverge later.
+      //
+      // Scope narrowing is the leaf rule, applied harder: the tier's scopes
+      // bound every task cert below it (chain rule, auth/scope-chain.ts), and
+      // the artifact is long-lived and exportable — so requested scopes pass
+      // narrowScopes(session, requested) then CERT_ELIGIBLE_SCOPES, same as
+      // /cert and /cert/passkey. certMint itself is never carried.
+      if (pathname === "/cert/issuing-ca" && request.method === "POST") {
+        try {
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          if (!cookie) {
+            return Response.json(
+              { error: "session_required" },
+              { status: 401 },
+            );
+          }
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const { verifySessionCookie } = await import("./src/auth/session");
+          const sessionSecret = await authority.getSessionSecret();
+          const session = await verifySessionCookie(cookie, sessionSecret);
+          if (!session) {
+            return Response.json({ error: "invalid_session" }, { status: 401 });
+          }
+          if (!(session.scopes ?? []).includes("certMint")) {
+            return jsonErr("certMint scope required", 403);
+          }
+
+          let body: {
+            public_key?: string;
+            proof?: string;
+            scopes?: string[];
+          } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+          if (!body.public_key) {
+            return jsonErr("public_key required (Ed25519 SPKI PEM)", 400);
+          }
+          if (!body.proof) {
+            return jsonErr(
+              "proof required (Ed25519 signature over the binding payload)",
+              400,
+            );
+          }
+
+          const { importPublicKey } = await import("./src/cert-authority");
+          let publicKey: CryptoKey;
+          try {
+            publicKey = await importPublicKey(body.public_key);
+          } catch (e: any) {
+            return jsonErr("invalid public key: " + e.message, 400);
+          }
+          if (publicKey.algorithm.name !== "Ed25519") {
+            // The tier signs certificates and the chain is Ed25519
+            // end-to-end; mintIssuingCaCert would refuse this anyway, but a
+            // 400 with the reason beats a 500 with a stack trace.
+            return jsonErr("issuing tier requires an Ed25519 key", 400);
+          }
+
+          // Binding = spki || SHA-256(session cookie) — the session term
+          // stops a captured public_key+proof pair being replayed under a
+          // different session, same construction as /cert/passkey. Pre-image
+          // only: this path is new, so no legacy digest window exists.
+          const spki = (await crypto.subtle.exportKey(
+            "spki",
+            publicKey,
+          )) as ArrayBuffer;
+          const cookieHash = await crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(cookie),
+          );
+          const bindingInput = new Uint8Array(spki.byteLength + 32);
+          bindingInput.set(new Uint8Array(spki), 0);
+          bindingInput.set(new Uint8Array(cookieHash), spki.byteLength);
+          const { verifyEd25519PopProof } = await import("./src/auth/pop");
+          if (!(await verifyEd25519PopProof(bindingInput, publicKey, body.proof))) {
+            return jsonErr("Ed25519 proof-of-possession failed", 401);
+          }
+
+          const { narrowScopes } = await import("./src/auth/scope-chain");
+          const { certScopesForSession } = await import(
+            "./src/auth/passkey-cert-scopes"
+          );
+          const scopes = certScopesForSession(
+            narrowScopes(session.scopes ?? [], body.scopes ?? ["bridgeCert"]),
+          );
+          if (scopes.length === 0) {
+            return jsonErr(
+              "no requested scope is cert-eligible and held (need bridgeCert)",
+              403,
+            );
+          }
+
+          const sessionAuthMethod = session.authMethod;
+          if (
+            typeof sessionAuthMethod !== "string" ||
+            sessionAuthMethod.length === 0
+          ) {
+            return jsonErr("session carries no authMethod", 401);
+          }
+
+          const result = await authority.mintIssuingCa({
+            subject: session.principalId,
+            identity: `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
+            publicKeyPem: body.public_key,
+            scopes,
+            authMethod: sessionAuthMethod,
+          });
+          return Response.json({
+            ...result,
+            principal_id: session.principalId,
+            auth_method: sessionAuthMethod,
+          });
+        } catch (e: any) {
+          return jsonErr("issuing-ca error: " + e.message, 500);
+        }
+      }
+
       // POST /cert/gha — GHA OIDC JWT → bridge cert (legacy, kept for compat)
       if (pathname === "/cert/gha") {
         return handleCertGHA(request, env, platform);
