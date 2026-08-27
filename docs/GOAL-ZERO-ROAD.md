@@ -173,7 +173,7 @@ Do these while Phase 0 is out for decision. None touch the contested naming.
 | Work | Bead | Why now |
 |---|---|---|
 | ~~`worker:verify` convergence gate~~ **DONE** | `notme-9f2f79` | `task worker:await-convergence` now sits between deploy and verify in `ship-prod`; N consecutive samples, fails rather than warns |
-| Delete ADR-018's canary phase, rewrite as promote → converge → verify → rollback | `notme-9f2f79` | Targeting proven not to work; keeping the ceremony is worse than removing it |
+| ~~Delete ADR-018's canary phase, rewrite as promote → converge → verify → rollback~~ **DONE 2026-08-27** | `notme-9f2f79` | Cause confirmed against Cloudflare docs: overrides apply only to versions in the CURRENT deployment, silent fallback otherwise — the pre-promotion probe was outside the tool's contract |
 | Trust material signed by the release pipeline's Sigstore identity | `notme-8e8836` | Second half of (D)'s foundation; independent of naming |
 | OIDC attestation as the *documented* default first boot | `notme-addef9` | Code half shipped; this is docs + the fallback story |
 | Represented principal on `/cert/gha` | `notme-600df1` | The m2m path records *what ran*, never *whose authority*. Additive, no rename involved |
