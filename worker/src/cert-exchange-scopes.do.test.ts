@@ -180,3 +180,33 @@ describe("POST /cert honours CERT_ELIGIBLE_SCOPES (notme-18dfd0)", () => {
     expect(body.scopes).toEqual(["bridgeCert"]);
   });
 });
+
+// ── The OTHER artifact this route mints ─────────────────────────────────────
+
+describe("POST /cert token branch narrows through the same rule (notme-acc822)", () => {
+  // The cert branch narrows twice (session ∩ request, then
+  // CERT_ELIGIBLE_SCOPES). The token branch has only the first narrowing —
+  // and until narrowScopes, that step was a bare filter whose subset
+  // guarantee lived in the shape of the expression. This pins the behaviour
+  // on the artifact itself: replace the narrowing with a pass-through and the
+  // signed token carries authorityManage, and this fails.
+  it("a token never carries scopes the session lacks", async () => {
+    const cookie = await adminSession(["bridgeCert"]);
+    const res = await postCert(
+      {
+        proof: { type: "session" },
+        scopes: ["bridgeCert", "authorityManage", "certMint"],
+        // no public_keys/proofs → the legacy token branch
+      },
+      cookie,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { scopes: string[]; token: string };
+    expect(body.scopes).toEqual(["bridgeCert"]);
+    // The claim inside the SIGNED artifact, not just the response envelope.
+    const payload = JSON.parse(
+      atob(body.token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")),
+    );
+    expect(payload.scope).toBe("bridgeCert");
+  });
+});

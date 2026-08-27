@@ -100,3 +100,36 @@ export function escalatedScopes(
   const parent = new Set(parentScopes);
   return [...new Set(childScopes)].filter((s) => !parent.has(s));
 }
+
+/**
+ * Narrow a requested scope set to what the holder actually has.
+ *
+ * The ENFORCEMENT form of `verifyScopeChain`: that function answers whether a
+ * chain narrows; this one performs the narrowing wherever a request meets a
+ * holder's scopes, and is the single place ADR-008's `cert.scopes ⊆
+ * parent.scopes` rule turns requests into grants (notme-acc822).
+ *
+ * Requested order is kept and duplicates are dropped — results feed
+ * signatures and response bodies, where a set that reorders or repeats is a
+ * diffing headache. An empty result is returned, not thrown: whether "you
+ * asked only for things you lack" is a 403 or a silent no-op is the caller's
+ * policy, and both callers today refuse on empty.
+ *
+ * The postcondition throw is a tripwire, unreachable while the body is an
+ * intersection. It exists because the guarantee otherwise lives in the shape
+ * of one expression — swap the filter for a union, a merge with defaults, or
+ * a lookup that falls back on miss, and nothing else would notice.
+ */
+export function narrowScopes(
+  heldScopes: readonly string[],
+  requestedScopes: readonly string[],
+): string[] {
+  const held = new Set(heldScopes);
+  const granted = [...new Set(requestedScopes)].filter((s) => held.has(s));
+  if (!verifyScopeChain(heldScopes, granted)) {
+    throw new Error(
+      `scope escalation: narrowing produced ${escalatedScopes(heldScopes, granted).join(", ")} not held`,
+    );
+  }
+  return granted;
+}

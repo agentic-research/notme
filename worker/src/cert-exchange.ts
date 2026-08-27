@@ -159,9 +159,13 @@ export async function handleCertExchange(
 
   // ── Check requested scopes against granted ──
 
-  const effectiveScopes = requestedScopes.filter((s) =>
-    grantedScopes.includes(s),
-  );
+  // narrowScopes rather than a bare filter: the intersection is the same, but
+  // the subset postcondition is CHECKED, so an edit that lets the result
+  // exceed grantedScopes fails here instead of minting (notme-acc822). Both
+  // artifacts downstream inherit it — the cert branch narrows further through
+  // certScopesForSession, the token branch carries this set as-is.
+  const { narrowScopes } = await import("./auth/scope-chain");
+  const effectiveScopes = narrowScopes(grantedScopes, requestedScopes);
   if (effectiveScopes.length === 0) {
     return Response.json(
       {

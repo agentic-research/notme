@@ -9,6 +9,8 @@
 // NOTE: sql.exec() below is SQLite's query method on the Durable Object,
 // NOT child_process.exec(). This is safe — all parameters are bound, not interpolated.
 
+import { verifyScopeChain } from "./scope-chain";
+
 export interface Principal {
   principalId: string;
   displayName?: string;
@@ -150,7 +152,15 @@ export function getCapabilities(sql: any, principalId: string): string[] {
 }
 
 export function canGrant(grantorScopes: string[], scope: string): boolean {
-  return grantorScopes.includes("authorityManage") && grantorScopes.includes(scope);
+  // Two separate requirements: authorityManage says the grantor may grant AT
+  // ALL; the chain rule says a grant may only carry what the grantor holds.
+  // The second is ADR-008's subset rule, so it goes through the same function
+  // every other narrowing site uses rather than a private includes() —
+  // one predicate, one place to get it wrong (notme-acc822).
+  return (
+    grantorScopes.includes("authorityManage") &&
+    verifyScopeChain(grantorScopes, [scope])
+  );
 }
 
 // ── Federated Identities ──

@@ -5,7 +5,7 @@ import { timingSafeEqual } from "../auth/timing-safe";
 import { verifyOIDC } from "../auth/verify-proof";
 import { validateDpopProof } from "../auth/dpop";
 import { MemoryCache, detectKeyStorage, validateKeyStorageConfig } from "../platform";
-import { verifyScopeChain } from "../auth/scope-chain";
+import { narrowScopes, verifyScopeChain } from "../auth/scope-chain";
 
 /**
  * adversarial.test.ts — Verify key extraction invariants + adversarial token invariants.
@@ -684,6 +684,44 @@ describe("adversarial: scope attenuation", () => {
 
   it("empty child scopes — always valid (maximally restricted)", () => {
     expect(verifyScopeChain(["bridgeCert", "certMint"], [])).toBe(true);
+  });
+});
+
+describe("adversarial: narrowScopes — enforcement form of the subset rule (notme-acc822)", () => {
+  // verifyScopeChain above ANSWERS whether a chain narrows; this is the
+  // function that PERFORMS the narrowing wherever a request meets a holder's
+  // scopes. cert-exchange.ts previously did this with a bare
+  // `requested.filter(s => granted.includes(s))` — correct, but the guarantee
+  // lived in the shape of one expression, with nothing to notice if it became
+  // a union or a fallback-on-miss. These tests fail the moment the result can
+  // exceed what is held, however the implementation changes.
+  it("drops requested scopes the holder lacks", () => {
+    expect(narrowScopes(["bridgeCert"], ["bridgeCert", "authorityManage"]))
+      .toEqual(["bridgeCert"]);
+  });
+
+  it("keeps requested order and deduplicates", () => {
+    expect(narrowScopes(
+      ["sign:git", "bridgeCert", "certMint"],
+      ["certMint", "bridgeCert", "certMint"],
+    )).toEqual(["certMint", "bridgeCert"]);
+  });
+
+  it("no overlap narrows to nothing — refusal is the caller's decision", () => {
+    expect(narrowScopes(["bridgeCert"], ["authorityManage"])).toEqual([]);
+    expect(narrowScopes([], ["bridgeCert"])).toEqual([]);
+  });
+
+  it("result always satisfies the chain rule against what is held", () => {
+    const cases: Array<[string[], string[]]> = [
+      [["bridgeCert"], ["bridgeCert", "certMint", "authorityManage"]],
+      [[], ["bridgeCert"]],
+      [["a", "b", "c"], ["c", "z", "a"]],
+      [["bridgeCert", "certMint"], []],
+    ];
+    for (const [held, requested] of cases) {
+      expect(verifyScopeChain(held, narrowScopes(held, requested))).toBe(true);
+    }
   });
 });
 
