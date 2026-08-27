@@ -1,4 +1,5 @@
 import type { Platform } from "./platform";
+import { isBundleStale } from "./revocation";
 import type { CABundle } from "./revocation";
 
 const CURRENT_BUNDLE_CACHE_KEY = "bundle:current";
@@ -33,7 +34,17 @@ export async function ensureCurrentCABundle(
   const existingBundle = await platform.cache.get(CURRENT_BUNDLE_CACHE_KEY);
   if (existingBundle) {
     try {
-      return JSON.parse(existingBundle) as CABundle;
+      const cached = JSON.parse(existingBundle) as CABundle;
+      // Staleness is checked AT THE READ, not just assumed from the TTL.
+      // The 130-day incident needed two failures to line up — a dead refresh
+      // alarm and a TTL-less put — and both are fixed, and both could
+      // regress. This gate is the third, independent safeguard: a bundle
+      // that somehow survives past the staleness window is refused here and
+      // regenerated, so the serving path cannot hand out a fossil whatever
+      // the cache layer does (notme-8d3018).
+      if (!isBundleStale(cached)) {
+        return cached;
+      }
     } catch {
       // Regenerate below; a malformed cache entry should not pin the endpoint down.
     }

@@ -1,6 +1,6 @@
 # Architecture
 
-notme is an identity authority that gives AI agents their own cryptographic identity — scoped, ephemeral, revocable, distinct from the human who deployed them.
+notme is an identity authority that gives AI agents their own cryptographic identity — scoped, ephemeral, revocable at the rotation lever (per-credential revocation is an open design, `notme-77a024`), distinct from the human who deployed them.
 
 ## Deployment targets
 
@@ -162,13 +162,26 @@ graph LR
 
     subgraph EP["EDGE PLANE (auth.notme.bot)"]
         WAF["CF WAF + rate limiters"]:::edge
-        VER["signature, epoch, TTL, scope"]:::edge
-        REV["revocation — epoch + seqno"]:::edge
+        VER["signature, TTL, scope,<br/>epoch (live DO read)"]:::edge
+        REV["revocation bundle —<br/>published, staleness-gated<br/>at the read path"]:::edge
     end
 
+    EXT["external verifiers<br/>checkRevocation (SDK):<br/>signature · seqno · epoch · kid"]:::seam
+
     PXY -->|attaches on outbound TLS| CERT
-    CERT --> WAF --> VER --> REV
+    CERT --> WAF --> VER
+    REV -->|"/internal/ca-bundle"| EXT
 ```
+
+The per-request chain at the edge ends at VER — every cert verification reads
+the authority's **current epoch live from the DO**, which is strictly stronger
+than any bundle check could be in-process. The bundle (REV) is not a
+per-request step: it is what the edge **publishes** so verifiers that cannot
+reach the DO — resource servers, the local proxy, offline auditors — can make
+the same revocation decision from signed, staleness-bounded state. Those
+consumers run `checkRevocation` from the SDK; nothing in this worker calls it,
+by design, and `worker/THREAT_MODEL.md` §3 labels which defence is enforced
+where.
 
 Because the agent has no `globalOutbound` (ADR-009) and the proxy performs every outbound request, the proxy is a chokepoint the agent cannot route around — which is what lets it stamp an unforgeable correlation key, the way journald attaches `_SYSTEMD_UNIT` rather than trusting a process to report its own.
 

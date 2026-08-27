@@ -46,8 +46,15 @@ function makeHarness(
 
 describe("internal CA bundle endpoint", () => {
   it("returns the cached signed CABundle without touching the authority", async () => {
+    // FRESH issuedAt: since the staleness gate landed, a cache hit only
+    // short-circuits for a bundle inside the window — which is this test's
+    // actual claim. sampleBundle's 2025 timestamp would (correctly) regenerate.
+    const freshCached = {
+      ...sampleBundle,
+      issuedAt: Math.floor(Date.now() / 1000),
+    };
     const { env, platform, cache, authority } = makeHarness({
-      cached: JSON.stringify(sampleBundle),
+      cached: JSON.stringify(freshCached),
     });
 
     const response = await handleInternalCABundle(
@@ -59,7 +66,7 @@ describe("internal CA bundle endpoint", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("application/json");
     expect(response.headers.get("cache-control")).toBe("no-store");
-    await expect(response.json()).resolves.toEqual(sampleBundle);
+    await expect(response.json()).resolves.toEqual(freshCached);
     expect(cache.get).toHaveBeenCalledWith("bundle:current");
     expect(authority.generateBundle).not.toHaveBeenCalled();
     expect(cache.put).not.toHaveBeenCalled();
@@ -107,6 +114,30 @@ describe("internal CA bundle endpoint", () => {
       // because a silently-dropped TTL restores the original bug exactly.
       { expirationTtl: 60 },
     );
+  });
+
+  it("regenerates when the cached bundle is STALE — the read path is the third safeguard", async () => {
+    // The 130-day incident (notme-77a024) needed two failures to line up: a
+    // dead refresh alarm AND a TTL-less KV write. Both are fixed, and both
+    // could regress. This gate is the third, independent one: even a bundle
+    // that somehow survives in cache past the staleness window is refused AT
+    // THE READ and regenerated — the serving path can no longer hand out a
+    // fossil, whatever the cache layer does (notme-8d3018).
+    const fresh: CABundle = {
+      ...sampleBundle,
+      seqno: 3,
+      issuedAt: Math.floor(Date.now() / 1000),
+    };
+    const { env, platform, authority, cache } = makeHarness({
+      cached: JSON.stringify(sampleBundle), // issuedAt 2025 — long stale
+      generated: fresh,
+    });
+
+    const bundle = await ensureCurrentCABundle(env, platform);
+
+    expect(authority.generateBundle).toHaveBeenCalledTimes(1);
+    expect(bundle).toEqual(fresh);
+    expect(cache.put).toHaveBeenCalled();
   });
 
   it("rejects non-GET methods before reaching storage", async () => {
