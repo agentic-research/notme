@@ -6,6 +6,10 @@ are. This says **what order to do things in, and who has to decide what.**
 Written 2026-08-06. Production is `2f0b1598`, `worker:verify` 14/14, 101
 commits ahead of `main` on `goalzero`.
 
+**Updated 2026-08-27:** the release merged to `main` (PR #72, 2026-08-07) and
+Phase 0 decisions 0.1–0.3 are now resolved — see the table. Phase 2 is
+unblocked.
+
 ---
 
 ## The shape of the problem
@@ -24,9 +28,9 @@ expects to find in it.
 
 | # | Decision | Owner | Unblocks | Cost of deciding wrong |
 |---|---|---|---|---|
-| **0.1** | **Adopt ADR-019?** Flip Status to `accepted` | repo owner | criteria (B), (C); registration policy | low — it is a proposal, reversible |
-| **0.2** | **What is a "bridge cert"?** (`signet-9dfb44`, `signet-a4881c`) | **signet** + notme | D4 middle tier, and therefore (C) | **medium** — re-rated down; no protocol break, but a signed value + a schema TypeID |
-| **0.3** | **Criterion (A) scope** — defer 7 named beads? (see below) | repo owner | closing (A) at all | **low** — the disputed set is 7 beads |
+| ~~0.1~~ | ~~Adopt ADR-019?~~ — **RESOLVED 2026-08-27: adopted.** Satisfies (B)'s recorded-answer half; the code half (`notme-77438b`) stays gated on ADR-019 open question 1 | repo owner (done) | criteria (B), (C); registration policy | — |
+| ~~0.2~~ | ~~What is a "bridge cert"?~~ — **RESOLVED 2026-08-27: `Issuing CA`** for the CA-shaped artifact, **enrollment certificate pair** for what `/cert/gha` returns. Recorded on `signet-9dfb44`; the signed-value migration follows the dual-accept shape, not a rename-in-place | signet + notme (done) | D4 middle tier, and therefore (C) | — |
+| ~~0.3~~ | ~~Criterion (A) scope~~ — **RESOLVED 2026-08-27: all 7 deferred**, each with its reason recorded on the bead; `notme-e7e1cf`'s registry question lifted to ADR-020 open question 4 | repo owner (done) | closing (A) at all | — |
 | ~~0.4~~ | ~~Fail open or closed with no bundle~~ — **RESOLVED for enforcement** by cloister ADR-0053 (fail closed, shipped). Still open for *archival/audit* only | cloister (done) / notme | (D), archival verification | — |
 
 **0.4 came back while this was being written.** Cloister has decided and
@@ -238,9 +242,16 @@ the finish line.
 
 ## Sequencing rule
 
-If only one thing happens next, make it **0.2** — chase signet on the naming.
-It is the only blocker that another repo owns, it has the highest cost of
-being wrong, and it gates the largest cluster of downstream work.
+~~If only one thing happens next, make it **0.2**~~ — done, along with 0.1 and
+0.3 (2026-08-27), and the convergence gate shipped earlier. The new sequencing
+rule, now that nothing is decision-gated:
 
-If two things happen, add the **`worker:verify` convergence gate**: it is small,
-unblocked, and until it lands every deploy's green light is partly luck.
+1. **Finish the two half-open P0s** — wire `verifyScopeChain` into the
+   remaining mint paths (`notme-acc822`) and rewrite ADR-018's canary section
+   (`notme-9f2f79`). Small, and they close the P0 column.
+2. **D4 middle tier** (`CA=true, pathlen=0`, named `Issuing CA`) — the largest
+   newly-unblocked cluster; deleting the two `it.fails` in
+   `delegation-depth.do.test.ts` is the completion signal.
+3. **Wire `checkRevocation`** (`notme-8d3018`) — docs already claim it is
+   wired, which makes this a live documentation-honesty violation, not just a
+   feature gap.

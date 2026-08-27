@@ -163,3 +163,13 @@ answer — it is the cost being moved from notme onto every consumer.
 3. **Does this ADR bind signet and cloister**, or only notme? It is written as
    notme's constraint; the layer table asserts ownership that those repos
    should confirm rather than inherit.
+4. **Where does the predicate-type registry live?** Lifted from `notme-e7e1cf`
+   (CAS-release ADR, deferred): a predicate type minted under `notme.bot` puts
+   vocabulary in notme's namespace when APAS — signet's document — is where
+   predicate types already live. The acceptance-predicate work (`notme-8eb592`)
+   will hit the same question independently; two predicate types designed
+   without a registry convention will collide or diverge. Candidates:
+   `signet/docs/apas` (where the existing predicate lives), `notme/docs`, or a
+   dedicated registry doc. This ADR's own test applies: in-toto's
+   `predicateType` URI convention is the standard — the open part is only
+   *whose namespace* the URIs live under.

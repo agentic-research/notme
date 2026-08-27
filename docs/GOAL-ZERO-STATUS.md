@@ -1,9 +1,12 @@
 # Goal Zero — status and orientation
 
-**Epic:** `notme-bed754` · **Branch:** `goalzero` (87 commits ahead of `main`, PR #70)
-**Production:** version `91b54069` at 100%, `task worker:verify` 13/13
-**Tests:** 526 unit (38 files) + 120 real-DO (15 files) + 2 deliberate `it.fails`
-**Last updated:** 2026-08-06
+**Epic:** `notme-bed754` · **Branch:** `goalzero` — merged to `main` 2026-08-07
+(PR #72) as one release; the branch continues for the next cycle
+**Production:** version `79e5ba12` at 100%, converged on `473f9268`,
+`task worker:verify` 14/14
+**Tests:** run `task worker:test` for current counts; the two deliberate
+`it.fails` in `delegation-depth.do.test.ts` remain the D4 completion signal
+**Last updated:** 2026-08-27
 
 Read this before picking up Goal Zero work. It exists because several
 conclusions in this repo were *reached, then corrected*, and a fresh reader who
@@ -18,9 +21,9 @@ unknown security-critical failures**. Five criteria:
 
 | | Criterion | State |
 |---|---|---|
-| **A** | Every P0/P1 closed, linked, or deliberately deferred; runtime contracts exercised; artifacts have provenance; no schema/build drift; cross-repo smoke recorded | partial — see §5 |
-| **B** | The authority states what it names; identity no longer varies with auth ceremony; registration policy follows from that | **ADR written (`proposed`), code half open** |
-| **C** | A revocation unit exists between "wait out the TTL" and "revoke everything" | open, blocked on B |
+| **A** | Every P0/P1 closed, linked, or deliberately deferred; runtime contracts exercised; artifacts have provenance; no schema/build drift; cross-repo smoke recorded | partial — scope settled 2026-08-27: the 7 disputed beads are deferred with recorded reasons, leaving the release-surface P0/P1 set; see §5 |
+| **B** | The authority states what it names; identity no longer varies with auth ceremony; registration policy follows from that | **ADR-019 accepted 2026-08-27**; code half open (`notme-77438b`) |
+| **C** | A revocation unit exists between "wait out the TTL" and "revoke everything" | open — **unblocked 2026-08-27** (ADR-019 accepted, naming decided on `signet-9dfb44`) |
 | **D** | A third party can verify without trusting notme at the moment of the check | open, half done |
 | **E** | First boot needs no secret from the logs and cannot be triggered by a stranger | open |
 
@@ -34,8 +37,8 @@ the stronger property. This clause has already done real work — see §3.
 
 `feature → goalzero` is the happy path: merge freely, no ceremony.
 `goalzero → PR → main` is **one** release, and scrutiny happens once, at that
-gate. PR #70 is the accumulating release PR. Do not open per-feature PRs to
-`main`.
+gate. The first release merged 2026-08-07 (PR #72); `goalzero` continues
+accumulating the next one. Do not open per-feature PRs to `main`.
 
 Consequence worth knowing: anything requiring a change on `main` — notably the
 self-pin in `.github/workflows/gha-identity.yml:137`, which pins

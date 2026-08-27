@@ -4,7 +4,7 @@
 -->
 # ADR-019: Typed principals and bounded delegation
 
-**Status:** proposed
+**Status:** accepted (2026-08-27)
 **Beads:** `notme-600df1` (this decision), `notme-77438b` (ceremony-varying identity), `notme-2c4209` (registration policy), `notme-77a024` (revocation unit), `notme-acc822` (chain constraints), `notme-9f84e6` (correlation key)
 **Answers:** cloister ADR-0066 Q1 and Q2
 **Serves:** `notme-bed754` criterion (B); unblocks (C) and (D)
