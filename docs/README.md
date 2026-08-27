@@ -4,6 +4,10 @@ architecture decision records for notme.
 
 ## flows
 
+[`THREADS.md`](THREADS.md) — the cross-repo order of operations: how notme,
+signet and cloister's open work actually relates (from the beads' own
+citations), seven threads, and which decisions gate which lines.
+
 [`FLOWS.md`](FLOWS.md) — the eight paths that matter, as a cheat sheet: CI and
 human enrollment, first boot, admin recovery, third-party verification,
 revocation, bundle publication, and deploy. Each says what is live, what is
