@@ -46,7 +46,7 @@ encode the order:
 
 | # | Step | Beads | Gated on |
 |---|---|---|---|
-| B1 | **Issuance log** — compose Rekor / CT-style log / witnessed checkpoint (candidates recorded on the bead) | `notme-907299` | a compose-decision, then build |
+| B1 | ~~Issuance log — compose-decision~~ **DECIDED 2026-08-28: a Static CT API log, composed from Cloudflare's `azul`** (Workers + DO + R2). Real SCTs, so signet's `--ctfe` path is buildable; public Rekor would record issuance but cannot satisfy SCT verification. Checkpoint key pinned out of band (B2). Build: spike azul → `notme-ct` Worker + R2 → SCTs at every mint path → key via signed trust material | `notme-907299` | build |
 | B2 | External trust anchor — pipeline-signed trust material, out-of-band pinning discipline | `notme-8e8836` | parallel to B1 |
 | B3 | **SCT enforcement at signet's verifier** — the flag flip that makes B1 compulsory; signet has it measured and filed | `signet-c0d32e` | **explicitly blocked on B1** |
 
@@ -115,5 +115,5 @@ CAS release distribution (`notme-e765fe` line) · substrate research
 Same shape Phase 0 had: **the expensive-looking work is cheap and the cheap-looking
 decisions are the gates.** ~~A1 (namespace mechanism) gates the delegation
 spine~~ — decided 2026-08-27; the spine's head is now A2, pure work. B1's
-compose-decision gates transparency. ADR-020's two open questions gate
-acceptance. Everything on Line F can happen this week with no decisions at all.
+~~compose-decision gates transparency~~ — decided 2026-08-28 (Static CT via
+azul); Line B is now build. ADR-020's two open questions gate acceptance. Everything on Line F can happen this week with no decisions at all.

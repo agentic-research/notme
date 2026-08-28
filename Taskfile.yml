@@ -184,6 +184,20 @@ tasks:
         # Cache API entries survive Worker deployments. A unique query checks
         # the newly deployed handler instead of the previous version's cache.
         check_request "ca-bundle" "GET" "${AUTH_BASE}/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE" "200" "BEGIN CERTIFICATE"
+        # The SERVED root must carry the budget the code mints. Production
+        # served pathlen:0 for five months after the code moved to pathlen=1,
+        # because the DO's cache check asked only whether BasicConstraints
+        # existed (notme-1b1db4). Every Issuing CA tier minted under that root
+        # was unverifiable by any stock validator, and every test passed —
+        # against a fresh test root. This reads the LIVE root, not a fixture.
+        ROOT_PATHLEN=$(curl -s "${AUTH_BASE}/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE-pl" \
+          | openssl x509 -noout -text 2>/dev/null | grep -o 'pathlen:[0-9]*' | cut -d: -f2)
+        if [ "$ROOT_PATHLEN" = "1" ]; then
+          echo "✓ root-pathlen (served root admits one intermediate tier)"
+        else
+          echo "✗ root-pathlen: served root has pathlen '${ROOT_PATHLEN:-none}', code mints 1 — Issuing CA tiers cannot verify"
+          FAIL=1
+        fi
         check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
         # The deployed build must be able to NAME ITSELF. Asserting
         # "stamped":true rather than merely a 200: an endpoint that always

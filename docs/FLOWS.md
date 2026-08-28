@@ -98,6 +98,16 @@ certificates alone.
 Names chain as well as keys (RFC 5280 §6.1.3); the walker checks both, and
 the first chain-test fixtures were lying about it without anyone noticing.
 
+**Gotcha, worse:** the root the authority SERVES must carry the budget the
+code MINTS. Production served `pathlen:0` for five months after the code moved
+to `pathlen=1`, because the DO's cache check asked only whether
+BasicConstraints *existed* — so every Issuing CA tier minted in production was
+unverifiable by any stock validator, while every test passed against a fresh
+test root (`notme-1b1db4`). The DO now re-issues under the same key when the
+served budget disagrees (no rotation, nothing in flight breaks), and
+`worker:verify` reads the LIVE root's pathlen. Check yours:
+`openssl x509 -in <(curl -s https://auth.notme.bot/.well-known/ca-bundle.pem) -noout -text | grep pathlen`.
+
 ---
 
 ## 3. First boot — how an authority gets its first admin

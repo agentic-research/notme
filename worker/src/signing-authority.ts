@@ -192,6 +192,14 @@ export type DelegatedJwtSignResult =
     }
   | { ok: false; code: DelegatedJwtErrorCode; message: string };
 
+/**
+ * The root's pathLenConstraint: room for exactly ONE intermediate tier
+ * (CA → Issuing CA → task; ADR-008 §BasicConstraints, ADR-019 D4). The
+ * served root must carry this value, not just "some BasicConstraints" —
+ * getCACertificatePem re-issues under the same key when it does not.
+ */
+const CA_PATH_LEN = 1;
+
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #initialized = false;
   #signingKey: CryptoKey | null = null;
@@ -592,13 +600,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       cached[0]!.key_id === currentKeyId &&
       cached[0]!.pem.includes("BEGIN CERTIFICATE")
     ) {
-      // Check if cached cert has BasicConstraints by looking for the extension marker
-      // If it was generated without extensions (v1), regenerate
+      // The cached cert must carry the budget the CODE mints, not merely a
+      // BasicConstraints extension. The previous check asked only whether
+      // the extension existed (the v1→v2 guard) — so when 9c75d93 moved the
+      // root to pathlen=1, production kept serving its March-2026 pathlen:0
+      // cert for five months, and every Issuing CA tier minted under it was
+      // unverifiable by any stock validator (notme-1b1db4). Re-issuing here
+      // is safe and non-destructive: same key, same epoch — leaves verify by
+      // key, so nothing in flight is invalidated.
       try {
-        const { X509Certificate } = await import("@peculiar/x509");
+        const { X509Certificate, BasicConstraintsExtension } = await import(
+          "@peculiar/x509"
+        );
         const x = new X509Certificate(cached[0]!.pem);
-        const bc = x.getExtension("2.5.29.19"); // BasicConstraints OID
-        if (bc) return cached[0]!.pem;
+        const bc = x.getExtension(BasicConstraintsExtension);
+        if (bc?.ca && bc.pathLength === CA_PATH_LEN) return cached[0]!.pem;
+        console.warn(
+          `[ca] cached root has pathlen ${bc?.pathLength ?? "none"}, code mints ${CA_PATH_LEN} — re-issuing under the same key`,
+        );
       } catch {
         /* regenerate */
       }
@@ -621,7 +640,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       keys: { privateKey: signingKey, publicKey: verifyKey },
       serialNumber: serial,
       extensions: [
-        new BasicConstraintsExtension(true, 1, true), // pathlen=1: CA → orchestrator → agent
+        new BasicConstraintsExtension(true, CA_PATH_LEN, true),
         new KeyUsagesExtension(
           KeyUsageFlags.keyCertSign | KeyUsageFlags.cRLSign,
           true,

@@ -221,3 +221,58 @@ describe("chain verification is deliberately unbuilt (ADR-019 D5 gate)", () => {
   });
 });
 
+
+describe("the SERVED root's budget matches the code's (notme-1b1db4)", () => {
+  // Production served CA:TRUE, pathlen:0 for five months after the code
+  // moved to pathlen=1 (9c75d93). getCACertificatePem's cache check asked
+  // only whether BasicConstraints EXISTED — the v1→v2 regenerate guard —
+  // so a v2 cert with the wrong budget was cached forever, and the D4 budget
+  // test above passed against a fresh test root that production never had.
+  // This test plants exactly production's condition and asserts the DO
+  // heals it: same key, re-issued cert, no rotation.
+  it("re-issues a cached root whose pathlen disagrees with the code — same key, no rotation", async () => {
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("stale-root-pathlen"),
+    );
+    const before = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const state = await a.getAuthorityState();
+      // Plant a pathlen:0 self-signed cert under the CURRENT key, as March
+      // 2026 production did.
+      const { signingKey, verifyKey } = await a.getOrCreateSigningKey();
+      const stale = await X509CertificateGenerator.createSelfSigned({
+        name: "CN=signet-authority,O=notme",
+        notBefore: new Date(Date.now() - 86_400_000),
+        notAfter: new Date(Date.now() + 86_400_000 * 3650),
+        signingAlgorithm: ED25519,
+        keys: { privateKey: signingKey, publicKey: verifyKey },
+        serialNumber: "0a",
+        extensions: [new BasicConstraintsExtension(true, 0, true)],
+      });
+      await a.getCACertificatePem(); // ensure the table exists
+      a["ctx"].storage.sql.exec("DELETE FROM ca_cert WHERE id = 'cert'");
+      a["ctx"].storage.sql.exec(
+        "INSERT INTO ca_cert (id, pem, key_id) VALUES ('cert', ?, ?)",
+        stale.toString("pem"),
+        state.keyId,
+      );
+      return { epoch: state.epoch, keyId: state.keyId, spki: await spkiToPem(verifyKey) };
+    });
+
+    const pem = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).getCACertificatePem(),
+    );
+    const served = new X509Certificate(pem);
+    expect(served.getExtension(BasicConstraintsExtension)?.pathLength).toBe(1);
+
+    // Healing must not rotate: same epoch, same key.
+    const after = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const s = await a.getAuthorityState();
+      const { verifyKey } = await a.getOrCreateSigningKey();
+      return { epoch: s.epoch, keyId: s.keyId, spki: await spkiToPem(verifyKey) };
+    });
+    expect(after).toEqual(before);
+    expect(await spkiToPem(await served.publicKey.export())).toBe(before.spki);
+  });
+});

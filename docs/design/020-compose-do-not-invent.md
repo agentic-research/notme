@@ -112,7 +112,9 @@ Recorded because each was proposed at some point in the design conversation:
 - A notme-specific task store or bead mirror. rosary owns task state.
 - A "promise token" or bespoke completion credential. Acceptance is a grant
   (ADR-019), expressed with the credentials that already exist.
-- A notme hash-chain or transparency format of its own invention.
+- A notme hash-chain or transparency format of its own invention. (Applied
+  2026-08-28: issuance transparency is a Static CT API log composed from
+  Cloudflare's `azul`, not a notme log format — `notme-907299`.)
   `notme-907299` targets the **Static CT API** — tiled, existing tooling — not
   RFC 6962, whose logs shut down 2026-02-28, and not something new.
 - A parallel attestation format alongside in-toto. The gap in-toto leaves is
