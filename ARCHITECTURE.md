@@ -1,6 +1,6 @@
 # Architecture
 
-notme is an identity authority that gives AI agents their own cryptographic identity — scoped, ephemeral, revocable at the rotation lever (per-credential revocation is an open design, `notme-77a024`), distinct from the human who deployed them.
+notme is an identity authority that gives AI agents their own cryptographic identity — scoped, ephemeral, revocable per grant (`POST /principals/:id/revoke`, effective on the next request) or per generation (rotation), distinct from the human who deployed them.
 
 ## Deployment targets
 

@@ -60,9 +60,17 @@ export function ensurePrincipalSchema(sql: any): void {
       granted_at   TEXT NOT NULL DEFAULT (datetime('now')),
       expires_at   TEXT,
       revoked_at   TEXT,
+      revoked_by   TEXT,
       UNIQUE(principal_id, scope)
     )
   `);
+  // Existing authorities predate revoked_by. SQLite has no ADD COLUMN IF NOT
+  // EXISTS; the duplicate-column error is the "already migrated" signal.
+  try {
+    sql.exec("ALTER TABLE capability_grants ADD COLUMN revoked_by TEXT");
+  } catch {
+    /* column exists */
+  }
   sql.exec(`
     CREATE TABLE IF NOT EXISTS federated_identities (
       id            TEXT PRIMARY KEY,
@@ -140,6 +148,59 @@ export function grantCapability(
     "INSERT OR REPLACE INTO capability_grants (id, principal_id, scope, granted_by, expires_at) VALUES (?, ?, ?, ?, ?)",
     id, principalId, scope, grantedBy ?? null, expiresAt ?? null,
   );
+}
+
+/**
+ * Revoke one grant. The grant is the revocation UNIT (notme-77a024, ADR-019
+ * D3): finer than rotation, which voids every credential ever issued, and a
+ * decision rather than expiry, which is automatic. Returns whether a LIVE
+ * grant was revoked — idempotent, and honest about no-ops so an operator
+ * revoking the wrong scope is told, not reassured.
+ */
+export function revokeCapability(
+  sql: any, principalId: string, scope: string, revokedBy?: string,
+): { revoked: boolean } {
+  ensurePrincipalSchema(sql);
+  const before = sql.exec(
+    "SELECT COUNT(*) AS c FROM capability_grants WHERE principal_id = ? AND scope = ? AND revoked_at IS NULL",
+    principalId, scope,
+  ).toArray() as Array<{ c: number }>;
+  if ((before[0]?.c ?? 0) === 0) return { revoked: false };
+  sql.exec(
+    "UPDATE capability_grants SET revoked_at = datetime('now'), revoked_by = ? WHERE principal_id = ? AND scope = ? AND revoked_at IS NULL",
+    revokedBy ?? null, principalId, scope,
+  );
+  return { revoked: true };
+}
+
+export interface Grant {
+  id: string;
+  principalId: string;
+  scope: string;
+  grantedBy: string | null;
+  grantedAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  revokedBy: string | null;
+}
+
+/** Every grant ever made to a principal, revoked ones included — the audit view. */
+export function listGrants(sql: any, principalId: string): Grant[] {
+  ensurePrincipalSchema(sql);
+  const rows = sql.exec(
+    "SELECT id, principal_id, scope, granted_by, granted_at, expires_at, revoked_at, revoked_by FROM capability_grants WHERE principal_id = ? ORDER BY granted_at",
+    principalId,
+  ).toArray() as Array<Record<string, string | null>>;
+  return rows.map((r) => ({
+    id: r.id!,
+    principalId: r.principal_id!,
+    scope: r.scope!,
+    grantedBy: r.granted_by ?? null,
+    grantedAt: r.granted_at!,
+    expiresAt: r.expires_at ?? null,
+    revokedAt: r.revoked_at ?? null,
+    revokedBy: r.revoked_by ?? null,
+  }));
 }
 
 export function getCapabilities(sql: any, principalId: string): string[] {

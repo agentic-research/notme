@@ -1569,6 +1569,48 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return getCapabilities(this.ctx.storage.sql, principalId);
   }
 
+  /** Revoke one grant — the revocation unit (notme-77a024). */
+  async revokeCapability(
+    principalId: string,
+    scope: string,
+    revokedBy?: string,
+  ): Promise<{ revoked: boolean }> {
+    const { revokeCapability } = await import("./auth/principals");
+    return revokeCapability(this.ctx.storage.sql, principalId, scope, revokedBy);
+  }
+
+  async listGrants(
+    principalId: string,
+  ): Promise<import("./auth/principals").Grant[]> {
+    const { listGrants } = await import("./auth/principals");
+    return listGrants(this.ctx.storage.sql, principalId);
+  }
+
+  /**
+   * Make a passkey user a principal with GRANTS, so its authority has one
+   * source and one revoke path. Idempotent: an existing principal keeps its
+   * grants exactly (a returning admin whose authorityManage was revoked must
+   * NOT get it back by logging in again — that is what the bead's finding (b)
+   * was). Only a principal with no row at all is created, and only then does
+   * `isFirstUser` decide whether the admin scopes are granted.
+   */
+  async ensurePasskeyPrincipal(
+    principalId: string,
+    isFirstUser: boolean,
+  ): Promise<string[]> {
+    const { getPrincipal, getCapabilities } = await import("./auth/principals");
+    if (!getPrincipal(this.ctx.storage.sql, principalId)) {
+      await this.createPrincipalWithCapabilities(
+        principalId,
+        isFirstUser
+          ? ["bridgeCert", "authorityManage", "certMint"]
+          : ["bridgeCert"],
+        "passkey-registration",
+      );
+    }
+    return getCapabilities(this.ctx.storage.sql, principalId);
+  }
+
   async linkFederatedId(
     principalId: string,
     provider: string,

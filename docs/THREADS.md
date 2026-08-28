@@ -28,8 +28,8 @@ order:
 |---|---|---|---|---|
 | A1 | ~~Namespace mechanism decision~~ **DECIDED 2026-08-27: URI-SAN segment-prefix confinement** (RFC 3820's rule on WIMSE URIs; cooperative, honestly labeled; `otherName`+PEN upgrade open) | ADR-019 D5 | — | done |
 | A2 | ~~Chain-walking verifier~~ **BUILT 2026-08-27** — `auth/verify-chain.ts`: path signatures + pathlen + `scopes ⊆ parent` + prefix confinement, each bound mutation-proven load-bearing; wired at the x509 proof path (`chain` field) | `notme-acc822` | — | done |
-| A3 | **Grant object** — stored, referenceable D3 payload (today: three `*_by` columns, no identity) | ADR-019 req #1 | nothing | notme |
-| A4 | **Revocation unit = the grant** (criterion C) | `notme-77a024` | A3 | notme |
+| A3 | ~~Grant object~~ **BUILT 2026-08-28** — grants are objects with id, granter, timestamps, revoker (`listGrants`); D3's fuller payload (`parent_grant_id`, `goal_hash`, `delegable`) lands with A5 | ADR-019 req #1 | — | done |
+| A4 | ~~Revocation unit = the grant~~ **BUILT 2026-08-28** — `POST /principals/:id/revoke`; every authority gate reads the grant store live; passkey users are principals with grants (criterion C met) | `notme-77a024` | — | done |
 | A5 | **Task-credential producer** — machine signs task certs; correlation key gets its third segment | `notme-9f84e6` | A2 | notme |
 | A6 | **Delegation in receipts end-to-end** — the ninth commitment key becomes reachable | `notme-c0db9b` + `cloister-c10ff2` | A5 + cloister adoption | both |
 | A7 | Naming follow-through in signet docs (`id-kp-signet-bridge-delegate` is now a misnomer) | `signet-9dfb44` consequence | nothing | signet |

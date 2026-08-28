@@ -892,11 +892,14 @@ async function handlePasskey(
         return jsonErr("registration verification failed", 400);
       }
 
-      // Scopes derived server-side from admin status — NEVER from client body.
-      // Client-supplied body.scopes is intentionally ignored (scope escalation vector).
-      const scopes = result.isAdmin
-        ? ["bridgeCert", "authorityManage", "certMint"]
-        : ["bridgeCert"];
+      // Scopes come from the GRANT STORE — never from the client body (scope
+      // escalation vector) and no longer from the is_admin bit alone. The
+      // passkey user becomes a principal with grants here, so its authority
+      // has one source and one revoke path (notme-77a024 finding b).
+      const scopes = await authority.ensurePasskeyPrincipal(
+        body.userId,
+        result.isAdmin,
+      );
 
       // Issue session immediately after registration
       const { createSessionCookie } = await import("./src/auth/session");
@@ -941,10 +944,14 @@ async function handlePasskey(
       }
       const { createSessionCookie } = await import("./src/auth/session");
       const sessionSecret = await authority.getSessionSecret();
-      // Principal model: userId is the principalId, scopes from capabilities
-      const scopes = result.isAdmin
-        ? ["bridgeCert", "authorityManage", "certMint"]
-        : ["bridgeCert"];
+      // Principal model: userId is the principalId, scopes from the grant
+      // store. A user registered before grants existed is enrolled on first
+      // login (is_admin decides ONLY then); after that, revoking a grant is
+      // what changes the answer here — logging in again does not restore it.
+      const scopes = await authority.ensurePasskeyPrincipal(
+        result.userId,
+        result.isAdmin,
+      );
       const cookie = await createSessionCookie(
         { principalId: result.userId, scopes, authMethod: "passkey" },
         sessionSecret,
@@ -1993,7 +2000,10 @@ export default {
         const sessionSecret = await authority.getSessionSecret();
         const session = await verifySessionCookie(cookie, sessionSecret);
         if (!session) return jsonErr("invalid session", 401);
-        if (!(session.scopes ?? []).includes("authorityManage")) {
+        // LIVE against the grant store — a revoked grant shuts this door on
+        // the next request, not when the cookie expires (notme-77a024).
+        const { liveScopes } = await import("./src/auth/session");
+        if (!(await liveScopes(session, authority)).includes("authorityManage")) {
           return jsonErr("authorityManage scope required", 403);
         }
         // Method check now that the caller is known to be an admin.
@@ -2039,7 +2049,8 @@ export default {
           await authority.getSessionSecret(),
         );
         if (!session) return jsonErr("invalid session", 401);
-        if (!(session.scopes ?? []).includes("authorityManage")) {
+        const { liveScopes } = await import("./src/auth/session");
+        if (!(await liveScopes(session, authority)).includes("authorityManage")) {
           return jsonErr("authorityManage scope required", 403);
         }
         const baseUrl = env.SITE_URL || "https://notme.bot";
@@ -2058,7 +2069,12 @@ export default {
         const sessionSecret = await authority.getSessionSecret();
         const session = await verifySessionCookie(cookie, sessionSecret);
         if (!session) return jsonErr("invalid session", 401);
-        if (!(session.scopes ?? []).includes("authorityManage")) {
+        // LIVE scopes feed BOTH the gate and canGrant below: a granter whose
+        // own authority was revoked must not be able to pass it on from a
+        // cookie that still remembers it (notme-77a024).
+        const { liveScopes } = await import("./src/auth/session");
+        const granterScopes = await liveScopes(session, authority);
+        if (!granterScopes.includes("authorityManage")) {
           return jsonErr("authorityManage scope required", 403);
         }
 
@@ -2071,7 +2087,6 @@ export default {
         // the specific scope being granted. canGrant() is the single source
         // of truth for the predicate (was duplicated inline pre-rosary-8119d0).
         const { canGrant } = await import("./src/auth/principals");
-        const granterScopes = session.scopes ?? [];
         for (const s of scopes) {
           if (!canGrant(granterScopes, s)) {
             return jsonErr(`cannot grant scope you don't have: ${s}`, 403);
@@ -2090,6 +2105,67 @@ export default {
           expiresAt: invite.expiresAt,
           scopes,
         });
+      }
+
+      // POST /principals/:id/revoke — revoke one grant (notme-77a024).
+      //
+      // The revocation UNIT, finally: finer than rotation (every credential
+      // ever issued), a decision rather than expiry. Takes effect on the
+      // target's next request because every authority gate reads liveScopes.
+      //
+      // Self-revocation of authorityManage is refused: an authority whose
+      // last admin revoked themselves is ungovernable again (notme-4838ae),
+      // and BOOTSTRAP_CODE recovery should be the deliberate path, not the
+      // consequence of a mis-click.
+      {
+        const m = /^\/principals\/([^/]+)\/revoke$/.exec(pathname);
+        if (m && request.method === "POST") {
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          if (!cookie) return jsonErr("sign in first", 401);
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const { verifySessionCookie, liveScopes } = await import(
+            "./src/auth/session"
+          );
+          const session = await verifySessionCookie(
+            cookie,
+            await authority.getSessionSecret(),
+          );
+          if (!session) return jsonErr("invalid session", 401);
+          if (!(await liveScopes(session, authority)).includes("authorityManage")) {
+            return jsonErr("authorityManage scope required", 403);
+          }
+          const target = decodeURIComponent(m[1]!);
+          let body: { scope?: string } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+          if (!body.scope) return jsonErr("scope required", 400);
+          if (target === session.principalId && body.scope === "authorityManage") {
+            return jsonErr(
+              "refusing to revoke your own authorityManage — invite a second admin first",
+              409,
+            );
+          }
+          const result = await authority.revokeCapability(
+            target,
+            body.scope,
+            session.principalId,
+          );
+          console.log(
+            `[revoke] principal=${target} scope=${body.scope} by=${session.principalId} revoked=${result.revoked}`,
+          );
+          return Response.json({
+            revoked: result.revoked,
+            principal_id: target,
+            scope: body.scope,
+          });
+        }
       }
 
       // GET /join?t=<token> — redeem an invite (shows registration page)
@@ -2260,11 +2336,12 @@ export default {
           statusCookie,
           statusSecret,
         );
-        if (
-          !statusSession ||
-          !statusSession.scopes.includes("authorityManage")
-        ) {
-          return jsonErr("admin required", 403);
+        if (!statusSession) return jsonErr("admin required", 403);
+        {
+          const { liveScopes } = await import("./src/auth/session");
+          if (!(await liveScopes(statusSession, authDO)).includes("authorityManage")) {
+            return jsonErr("admin required", 403);
+          }
         }
         try {
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");

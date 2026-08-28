@@ -158,7 +158,21 @@ describe("RPC surface is an allow-list, not an accident", () => {
       // route sends none, so a long TTL is evidence of misuse, not clamped
       // away), and pathlen=0 means verifiers reject anything a minted tier
       // tries to issue below itself beyond one hop.
-    ).toBe(44);
+      //
+      // 44 → 47: revokeCapability, listGrants, ensurePasskeyPrincipal
+      // (notme-77a024). Reviewed. revokeCapability only NARROWS — a leaked
+      // stub can strip authority, never add it, and the pre-existing
+      // createPrincipalWithCapabilities already let a stub grant anything,
+      // so the widening capability class is unchanged. listGrants returns
+      // scope strings, timestamps and principal ids: an audit view, no
+      // secrets. ensurePasskeyPrincipal is a GRANTING path, so it was
+      // reviewed hardest: it grants the admin triple only when the principal
+      // has no row AND isFirstUser is true — the same "first user is admin"
+      // rule verifyRegistration already enforced via is_admin, now expressed
+      // as revocable grants. Idempotent by construction: an existing
+      // principal's grants are returned, never re-granted, so it cannot
+      // restore a revoked scope.
+    ).toBe(47);
   });
 });
 

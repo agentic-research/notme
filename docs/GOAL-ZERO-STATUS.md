@@ -24,7 +24,7 @@ unknown security-critical failures**. Five criteria:
 |---|---|---|
 | **A** | Every P0/P1 closed, linked, or deliberately deferred; runtime contracts exercised; artifacts have provenance; no schema/build drift; cross-repo smoke recorded | partial — scope settled 2026-08-27: the 7 disputed beads are deferred with recorded reasons, leaving the release-surface P0/P1 set; see §5 |
 | **B** | The authority states what it names; identity no longer varies with auth ceremony; registration policy follows from that | **ADR-019 accepted 2026-08-27**; code half open (`notme-77438b`) |
-| **C** | A revocation unit exists between "wait out the TTL" and "revoke everything" | open — **unblocked 2026-08-27** (ADR-019 accepted, naming decided on `signet-9dfb44`) |
+| **C** | A revocation unit exists between "wait out the TTL" and "revoke everything" | **met 2026-08-28** — the grant is the unit: `POST /principals/:id/revoke`, live re-read at every authority gate, passkey users enrolled as principals with grants |
 | **D** | A third party can verify without trusting notme at the moment of the check | open, half done |
 | **E** | First boot needs no secret from the logs and cannot be triggered by a stranger | open |
 

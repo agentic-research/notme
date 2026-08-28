@@ -165,11 +165,16 @@ criterion (D).
 |---|---|---|
 | **Epoch rotation** | every cert issued under the old epoch | **works** — `verifyX509` compares `OID_EPOCH` |
 | TTL expiry | one credential, ≤5 min | works |
-| `checkRevocation` (bundle/seqno/kid) | per-credential | **unwired** — no call sites (`notme-77a024`) |
-| Capability grants | per-principal | **not re-checked** — baked into a 24h session cookie |
+| **Grant revocation** | one scope, one principal | **works** — `POST /principals/:id/revoke`; every authority gate reads the grant store LIVE, so it takes effect on the next request, not at cookie expiry |
+| `checkRevocation` (bundle/seqno/kid) | external verifiers | SDK path; by design not called in-worker (in-worker checks read the live epoch) |
 
-Rotation is the emergency lever. Until yesterday `OID_EPOCH` was written into
-every cert and read nowhere, so rotating bumped a number nothing compared.
+Rotation is the emergency lever; **the grant is the everyday one** (ADR-019
+D3, criterion C). A passkey user is a principal with grants — `is_admin` no
+longer decides anything after first enrollment — and revoking a grant strips
+it from every live session immediately. Self-revocation of `authorityManage`
+is refused (409): the last admin revoking themselves is `notme-4838ae` again.
+Until 2026-08 `OID_EPOCH` was written into every cert and read nowhere, so
+rotating bumped a number nothing compared.
 
 **Never rotate production during a demo** — it invalidates every cert in
 flight. Staging has its own CA and DOs for exactly this.

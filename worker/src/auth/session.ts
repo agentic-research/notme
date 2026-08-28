@@ -121,3 +121,22 @@ export async function verifySessionCookie(
 export function clearSessionCookie(): string {
   return `${SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`;
 }
+
+/**
+ * Resolve a session's scopes against the grant store, LIVE.
+ *
+ * The cookie is a cache of the grant, never the source (notme-77a024). A
+ * grant revoked after the cookie was issued must take effect on the next
+ * request, not at cookie expiry 24h later — so every authority check reads
+ * the DO and INTERSECTS: a scope must be in the cookie (the session asked for
+ * it) AND in the grant store (the principal still holds it). Intersection,
+ * never either alone: cookie-only ignores revocation; store-only would widen
+ * a session past what it was issued with.
+ */
+export async function liveScopes(
+  session: Pick<SessionPayload, "principalId" | "scopes">,
+  authority: { getPrincipalScopes(principalId: string): Promise<string[]> },
+): Promise<string[]> {
+  const held = new Set(await authority.getPrincipalScopes(session.principalId));
+  return (session.scopes ?? []).filter((s) => held.has(s));
+}
