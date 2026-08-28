@@ -52,6 +52,8 @@
  * intrinsic X.509 behaviour.
  */
 
+import { OID_PEER_BINDING } from "../cert-authority";
+
 /** Segment delimiter and key terminator. See the header for why both. */
 const SEP = "/";
 
@@ -143,4 +145,43 @@ export function parseCorrelationKey(key: string): CorrelationParts | null {
     // decodeURIComponent throws on a malformed escape sequence.
     return null;
   }
+}
+
+/**
+ * Derive the full key from a TASK certificate and the TIER that issued it.
+ *
+ * The three components come from the certificates themselves, not from
+ * anything the task asserts: the principal is the tier's identity URI (the
+ * stable level), the bridge is the task pair's OID_PEER_BINDING (the
+ * session), and the task is the identity's final segment — which the D5
+ * confinement rule guarantees is exactly the segment the tier appended.
+ * Two derivations, one closure: this and `correlationKey()` must agree, and
+ * task-credential.do.test.ts pins that they do.
+ */
+export function taskCorrelationKey(
+  taskCert: {
+    getExtension(oid: string): { value: ArrayBuffer } | null;
+    subjectAltName?: unknown;
+  } & { getExtension(oid: string): any },
+  tierCert: { getExtension(oid: string): any },
+): string {
+  const SAN = "2.5.29.17";
+  const uriOf = (cert: { getExtension(oid: string): any }): string => {
+    const ext = cert.getExtension(SAN);
+    const uri = ext?.names?.items?.find((n: { type: string }) => n.type === "url")?.value;
+    if (!uri) throw new TypeError("certificate carries no identity URI");
+    return uri;
+  };
+  const principal = uriOf(tierCert);
+  const taskIdentity = uriOf(taskCert);
+  if (!taskIdentity.startsWith(principal + SEP)) {
+    throw new TypeError("task identity is not inside the tier's subtree");
+  }
+  const task = decodeURIComponent(taskIdentity.slice(principal.length + 1));
+  const bindingExt = taskCert.getExtension(OID_PEER_BINDING);
+  if (!bindingExt) throw new TypeError("task certificate carries no peer binding");
+  const binding = Array.from(new Uint8Array(bindingExt.value))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return correlationKey({ principal, binding, task });
 }

@@ -70,7 +70,13 @@ async function makeChain(opts?: {
     await pem(taskKeys.mtls.publicKey),
     await pem(taskKeys.signing.publicKey),
     machine.privateKey,
-    { scopes: opts?.taskScopes ?? ["bridgeCert"], epoch: opts?.epoch ?? 1, authMethod: "passkey" },
+    {
+      scopes: opts?.taskScopes ?? ["bridgeCert"], epoch: opts?.epoch ?? 1, authMethod: "passkey",
+      // Name chains as well as keys (RFC 5280 §6.1.3): the task names the
+      // TIER as issuer. Before the walker checked this, these fixtures
+      // claimed the root and nobody noticed — found while building A5.
+      issuerName: "CN=alice,O=notme",
+    },
   );
   return { root, machine, tier, task };
 }
@@ -132,7 +138,7 @@ describe("verifyCertChain — the three bounds", () => {
       `${MACHINE_ID}/sub`,
       await pem(machine2.publicKey),
       machine.privateKey, // signed by tier 1's key — a tier minting a tier
-      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey", issuerName: "CN=alice,O=notme" },
     );
     const taskKeys = { mtls: await genP256(), signing: await gen() };
     const task = await mintBridgeCertPair(
@@ -141,7 +147,7 @@ describe("verifyCertChain — the three bounds", () => {
       await pem(taskKeys.mtls.publicKey),
       await pem(taskKeys.signing.publicKey),
       machine2.privateKey,
-      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey", issuerName: "CN=alice-sub,O=notme" },
     );
     await expect(
       verifyCertChain(
@@ -165,7 +171,7 @@ describe("verifyCertChain — the three bounds", () => {
       "t", `${MACHINE_ID}/t`,
       await pem(taskKeys.mtls.publicKey), await pem(taskKeys.signing.publicKey),
       machine.privateKey,
-      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey", issuerName: "CN=alice,O=notme" },
     );
     await expect(
       verifyCertChain(task.certificates.signing, [tier.certificate], root0.pem, 1),

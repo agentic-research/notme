@@ -30,12 +30,14 @@ order:
 | A2 | ~~Chain-walking verifier~~ **BUILT 2026-08-27** — `auth/verify-chain.ts`: path signatures + pathlen + `scopes ⊆ parent` + prefix confinement, each bound mutation-proven load-bearing; wired at the x509 proof path (`chain` field) | `notme-acc822` | — | done |
 | A3 | ~~Grant object~~ **BUILT 2026-08-28** — grants are objects with id, granter, timestamps, revoker (`listGrants`); D3's fuller payload (`parent_grant_id`, `goal_hash`, `delegable`) lands with A5 | ADR-019 req #1 | — | done |
 | A4 | ~~Revocation unit = the grant~~ **BUILT 2026-08-28** — `POST /principals/:id/revoke`; every authority gate reads the grant store live; passkey users are principals with grants (criterion C met) | `notme-77a024` | — | done |
-| A5 | **Task-credential producer** — machine signs task certs; correlation key gets its third segment | `notme-9f84e6` | A2 | notme |
+| A5 | ~~Task-credential producer~~ **BUILT 2026-08-28** — `mintTaskCertPair` (offline, tier-signed; enforces namespace-by-construction, scope narrowing, tier-bounded TTL, possession, task scope at `OID_TASK_SCOPE`); `taskCorrelationKey` derives the third segment from the certs; walker now checks issuer-NAME chaining (found the fixtures lying) | `notme-9f84e6` | — | done |
 | A6 | **Delegation in receipts end-to-end** — the ninth commitment key becomes reachable | `notme-c0db9b` + `cloister-c10ff2` | A5 + cloister adoption | both |
 | A7 | Naming follow-through in signet docs (`id-kp-signet-bridge-delegate` is now a misnomer) | `signet-9dfb44` consequence | nothing | signet |
 
 A1 resolved 2026-08-27 — **no decisions remain on this line; everything after
-is work.** A2 is the head of the line; A3→A4 runs parallel to A2→A5.
+is work.** A2–A5 all shipped 2026-08-27/28. The line's only remaining step is
+A6, which is gated on cloister adopting the ninth key — notme's half is
+reachable now.
 
 ## Line B — transparency (the Fulcio/Rekor answer, operationalized)
 
@@ -61,7 +63,7 @@ corrections keep this line honest:
   instructions and needs its wording fixed.
 
 `cloister-c10ff2` (ninth commitment key) is optional-field-shaped: cloister
-can adopt any time; it carries real data only after A5.
+can adopt any time; with A5 shipped it carries real data from day one.
 
 ## Line D — key custody (root must not be weaker than leaves)
 

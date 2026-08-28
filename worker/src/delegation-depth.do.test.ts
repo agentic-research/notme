@@ -211,7 +211,7 @@ describe("chain verification is deliberately unbuilt (ADR-019 D5 gate)", () => {
       await spkiToPem(task.publicKey),
       await spkiToPem(taskEd.publicKey),
       machine.privateKey,
-      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey", issuerName: "CN=machine-under-test,O=notme" },
     );
 
     const { verifyX509 } = await import("./auth/verify-proof");

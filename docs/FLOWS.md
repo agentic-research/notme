@@ -68,6 +68,38 @@ the same principal gets a *different* identity depending on how they signed in
 
 ---
 
+## 2b. Delegation — human → machine → task
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as human session (certMint)
+    participant W as auth.notme.bot
+    participant M as machine (holds tier key)
+    participant T as task
+    participant V as any verifier
+
+    H->>W: POST /cert/issuing-ca + Ed25519 PoP
+    W-->>H: Issuing CA cert — CA=true, pathlen=0
+    H->>M: tier cert + key (the machine IS the holder)
+    M->>M: mintTaskCertPair — OFFLINE, no round trip
+    M-->>T: task pair, identity = tier/<task>, scopes ⊆ tier
+    T->>V: cert + chain [tier]
+    V->>V: verifyCertChain — signatures, names,<br/>pathlen, scopes ⊆ parent, prefix confinement
+```
+
+**The tier signs offline** — that is the point of issuing a CA tier rather
+than a leaf. Every task cert carries its task scope (`task` + `goal_hash`,
+`OID_TASK_SCOPE`) so it is bounded to *work*, not just to time, and
+`taskCorrelationKey` recovers `<principal>/<bridge>/<task>` from the
+certificates alone.
+
+**Gotcha:** the task cert must name the **tier** as its issuer, not the root.
+Names chain as well as keys (RFC 5280 §6.1.3); the walker checks both, and
+the first chain-test fixtures were lying about it without anyone noticing.
+
+---
+
 ## 3. First boot — how an authority gets its first admin
 
 ```mermaid

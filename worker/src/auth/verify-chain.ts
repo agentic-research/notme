@@ -165,9 +165,18 @@ export async function verifyCertChain(
     if (cert.notBefore > now) throw new Error("cert not yet valid");
   }
 
-  // 2. Signatures, leaf up to root — before any content is trusted.
+  // 2. Signatures AND names, leaf up to root — before any content is trusted.
+  // Name chaining (RFC 5280 §6.1.3(a)(4)) is checked alongside the key: a
+  // cert signed by the tier but naming the root as issuer has a valid
+  // signature and a false provenance claim. Stock validators reject it;
+  // a verifier laxer than openssl is not "cooperative", it is wrong.
   for (let i = 0; i < chain.length; i++) {
     const signer = i + 1 < chain.length ? chain[i + 1]! : root;
+    if (chain[i]!.issuer !== signer.subject) {
+      throw new Error(
+        "cert issuer name does not match its signer's subject — provenance claim is false",
+      );
+    }
     const ok = await chain[i]!.verify({ publicKey: signer.publicKey });
     if (!ok) {
       throw new Error(

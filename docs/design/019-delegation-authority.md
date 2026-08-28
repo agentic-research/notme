@@ -429,8 +429,11 @@ block).
 3. ~~**A namespace mechanism**, per D5's open question.~~ Decided 2026-08-27:
    segment-prefix confinement on the URI SAN (see D5); built as part of the
    chain verifier.
-4. **A task-credential producer**, which gives the correlation key its third
-   segment and the receipt field a value. Note the subject of a task credential
+4. ~~**A task-credential producer**~~ Built 2026-08-28: `mintTaskCertPair`
+   in `cert-authority.ts` — the machine mints offline under its tier, the
+   task scope (`task` + `goal_hash`) rides in the cert at `OID_TASK_SCOPE`,
+   and `taskCorrelationKey` derives `<principal>/<bridge>/<task>` from the
+   certificates alone. Note the subject of a task credential
    should be the **agent or agent instance**, with `task_id`/`goal_hash` as
    bounded context — a task is execution context, not an entity capable of
    holding a key, unless it genuinely generates and controls its own.

@@ -83,7 +83,8 @@ const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
 export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
 export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
-const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
+export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
+export const OID_TASK_SCOPE = `${OID_PEN}.1.7`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
 
 // ASN.1 definite-length encoding: short form (a single byte) up to 0x7f, long
 // form (0x81 nn, 0x82 nn nn, …) above it.
@@ -302,11 +303,21 @@ export async function mintBridgeCertPair(
     epoch: number;
     authMethod: string;
     ttlMs?: number;
+    /**
+     * The signer's SUBJECT name, when the signer is not the root. RFC 5280
+     * §6.1.3 chains by NAME as well as by key: a cert claiming
+     * CN=signet-authority while signed by a tier is rejected by every stock
+     * validator, and by verifyCertChain. mintTaskCertPair passes the tier's.
+     */
+    issuerName?: string;
+    /** Extra extensions (e.g. the task scope) — appended to both certs. */
+    extraExtensions?: Extension[];
   },
 ): Promise<BridgeCertPairResult> {
   const ttlMs = opts.ttlMs ?? 5 * 60 * 1000;
   const now = new Date();
   const expires = new Date(now.getTime() + ttlMs);
+  const issuerName = opts.issuerName ?? "CN=signet-authority,O=notme";
 
   // Import both public keys
   const mtlsPubKey = await importPublicKey(mtlsPublicKeyPem);
@@ -372,7 +383,7 @@ export async function mintBridgeCertPair(
   // Mint P-256 mTLS cert
   const mtlsCert = await X509CertificateGenerator.create({
     subject: `CN=${subject},O=notme`,
-    issuer: `CN=signet-authority,O=notme`,
+    issuer: issuerName,
     notBefore: now,
     notAfter: expires,
     signingAlgorithm: ED25519,
@@ -385,13 +396,14 @@ export async function mintBridgeCertPair(
       CLIENT_AUTH_EKU,
       ...sharedExtensions,
       sanExtension,
+      ...(opts.extraExtensions ?? []),
     ],
   });
 
   // Mint Ed25519 signing cert
   const signingCert = await X509CertificateGenerator.create({
     subject: `CN=${subject},O=notme`,
-    issuer: `CN=signet-authority,O=notme`,
+    issuer: issuerName,
     notBefore: now,
     notAfter: expires,
     signingAlgorithm: ED25519,
@@ -403,6 +415,7 @@ export async function mintBridgeCertPair(
       SIGNING_KEY_USAGE,
       ...sharedExtensions,
       sanExtension,
+      ...(opts.extraExtensions ?? []),
     ],
   });
 
@@ -456,6 +469,8 @@ export async function mintIssuingCaCert(
     epoch: number;
     authMethod: string;
     ttlMs?: number;
+    /** Signer's subject name when not the root — see mintBridgeCertPair. */
+    issuerName?: string;
   },
 ): Promise<IssuingCaCertResult> {
   // Longer-lived than the 5-minute leaves by design (ADR-019 D4: "a
@@ -479,7 +494,7 @@ export async function mintIssuingCaCert(
 
   const cert = await X509CertificateGenerator.create({
     subject: `CN=${subject},O=notme`,
-    issuer: `CN=signet-authority,O=notme`,
+    issuer: opts.issuerName ?? "CN=signet-authority,O=notme",
     notBefore: now,
     notAfter: expires,
     signingAlgorithm: ED25519,
@@ -507,4 +522,181 @@ export async function mintIssuingCaCert(
     expires_at: Math.floor(expires.getTime() / 1000),
     subject,
   };
+}
+
+// ── Hop 2: the machine mints task credentials (ADR-019 D3/D4/D5) ────────────
+
+const GOAL_HASH_RE = /^[0-9a-f]{64}$/;
+
+function derOctetString(bytes: Uint8Array): Uint8Array {
+  return derTlv(0x04, bytes);
+}
+
+/**
+ * Encode the task scope: SEQUENCE { UTF8String task, OCTET STRING goalHash }.
+ * This is what makes the credential TASK-scoped rather than merely
+ * time-bound (ADR-019 D3): `expires_at` stops it outliving the work;
+ * `goal_hash` says which work.
+ */
+function derTaskScope(task: string, goalHash: string): Uint8Array {
+  const hash = new Uint8Array(goalHash.match(/../g)!.map((h) => parseInt(h, 16)));
+  const body = new Uint8Array([...derUtf8String(task), ...derOctetString(hash)]);
+  return derTlv(0x30, body);
+}
+
+/** Read the task scope back — null when absent, never a partial. */
+export function certTaskScope(cert: {
+  getExtension(oid: string): { value: ArrayBuffer } | null;
+}): { task: string; goalHash: string } | null {
+  const ext = cert.getExtension(OID_TASK_SCOPE);
+  if (!ext) return null;
+  const der = new Uint8Array(ext.value);
+  // SEQUENCE
+  if (der[0] !== 0x30) return null;
+  let at = 2;
+  if (der[1]! & 0x80) at = 2 + (der[1]! & 0x7f);
+  // UTF8String
+  if (der[at] !== 0x0c) return null;
+  let len = der[at + 1]!;
+  let hdr = 2;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + der[at + 2 + i]!;
+    hdr = 2 + n;
+  }
+  const task = new TextDecoder().decode(der.subarray(at + hdr, at + hdr + len));
+  at = at + hdr + len;
+  // OCTET STRING, exactly 32 bytes
+  if (der[at] !== 0x04 || der[at + 1] !== 32 || der.length < at + 34) return null;
+  const goalHash = Array.from(der.subarray(at + 2, at + 34))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return { task, goalHash };
+}
+
+/**
+ * Mint a TASK credential pair, signed by an Issuing CA tier — offline, no
+ * round trip to the authority. This is hop 2 of the chain, and the reason
+ * the tier exists at all (ADR-019 D4: "a machine that mints locally").
+ *
+ * What the producer enforces, so a verifier is not the only line:
+ *
+ *   NAMESPACE  identity = tier.identity + "/" + task — D5 confinement by
+ *              construction; a task id that is empty, contains a separator,
+ *              or is a dot-segment is refused before it can escape
+ *   AUTHORITY  scopes ⊆ tier scopes, via narrowScopes' checked postcondition
+ *   DEPTH      the pair is CA=false (BASIC_CONSTRAINTS_LEAF): tasks are
+ *              terminal, and the tier's pathlen=0 makes stock validators
+ *              agree
+ *   LIFETIME   never past the tier's own notAfter — a task cert chaining to
+ *              an expired parent fails at first use
+ *   POSSESSION the private key must match the tier certificate's public key;
+ *              the producer refuses to sign with a key that is not the tier's
+ *
+ * Epoch is the caller's to supply because the machine is offline: it stamps
+ * the epoch it enrolled under, and a rotation since then is caught by the
+ * verifier (every tier checks the epoch), which is the intended blast
+ * radius.
+ */
+export async function mintTaskCertPair(
+  tierCertPem: string,
+  tierPrivateKey: CryptoKey,
+  mtlsPublicKeyPem: string,
+  signingPublicKeyPem: string,
+  opts: {
+    task: string;
+    goalHash: string;
+    scopes: string[];
+    epoch: number;
+    ttlMs?: number;
+  },
+): Promise<BridgeCertPairResult> {
+  const { X509Certificate, SubjectAlternativeNameExtension } = await import("@peculiar/x509");
+  const { narrowScopes, escalatedScopes } = await import("./auth/scope-chain");
+  const tier = new X509Certificate(tierCertPem);
+
+  // Possession: the private key must be the tier's. Sign a probe and verify
+  // against the cert's public key — WebCrypto has no "same key" oracle.
+  const probe = new TextEncoder().encode("notme task-credential possession probe");
+  const sig = await crypto.subtle.sign(ED25519, tierPrivateKey, probe);
+  const tierPublic = await tier.publicKey.export();
+  if (!(await crypto.subtle.verify(ED25519, tierPublic, sig, probe))) {
+    throw new Error("private key does not match the tier certificate");
+  }
+
+  // Task id: one segment, non-empty, no separator, no dot-segments. Encoded
+  // per segment so an odd character cannot become structure.
+  if (opts.task.length === 0 || opts.task.includes("/") || opts.task === "." || opts.task === "..") {
+    throw new Error(`task id must be one non-empty path segment, got ${JSON.stringify(opts.task)}`);
+  }
+  if (!GOAL_HASH_RE.test(opts.goalHash)) {
+    throw new Error("goal hash must be a SHA-256 hex digest (64 lowercase hex chars)");
+  }
+
+  const san = tier.getExtension(SubjectAlternativeNameExtension);
+  const tierIdentity = san?.names.items.find((n) => n.type === "url")?.value;
+  if (!tierIdentity) throw new Error("tier certificate carries no identity URI");
+  const identity = `${tierIdentity}/${encodeURIComponent(opts.task)}`;
+
+  const tierScopes = readScopes(tier);
+  if (tierScopes === null) throw new Error("tier certificate carries no scopes");
+  const requested = [...new Set(opts.scopes)];
+  const scopes = narrowScopes(tierScopes, requested);
+  if (scopes.length !== requested.length) {
+    throw new Error(
+      `scope escalation: ${escalatedScopes(tierScopes, requested).join(", ")} not held by the tier`,
+    );
+  }
+
+  // Lifetime: never past the tier's own expiry.
+  const requestedTtl = opts.ttlMs ?? 5 * 60 * 1000;
+  const untilTierExpiry = tier.notAfter.getTime() - Date.now();
+  const ttlMs = Math.max(0, Math.min(requestedTtl, untilTierExpiry));
+
+  const authMethodExt = tier.getExtension(OID_AUTH_METHOD);
+  const authMethod = authMethodExt
+    ? new TextDecoder().decode(new Uint8Array(authMethodExt.value).subarray(2))
+    : "task";
+
+  return mintBridgeCertPair(
+    opts.task,
+    identity,
+    mtlsPublicKeyPem,
+    signingPublicKeyPem,
+    tierPrivateKey,
+    {
+      scopes,
+      epoch: opts.epoch,
+      authMethod,
+      ttlMs,
+      issuerName: tier.subject,
+      extraExtensions: [new Extension(OID_TASK_SCOPE, false, derTaskScope(opts.task, opts.goalHash))],
+    },
+  );
+}
+
+/** Scopes at OID_SCOPES — a local reader so this module has no import cycle with verify-chain. */
+function readScopes(cert: { getExtension(oid: string): { value: ArrayBuffer } | null }): string[] | null {
+  const ext = cert.getExtension(OID_SCOPES);
+  if (!ext) return null;
+  const der = new Uint8Array(ext.value);
+  if (der[0] !== 0x30) return null;
+  let at = 2;
+  if (der[1]! & 0x80) at = 2 + (der[1]! & 0x7f);
+  const out: string[] = [];
+  while (at < der.length) {
+    if (der[at] !== 0x0c) return null;
+    let len = der[at + 1]!;
+    let hdr = 2;
+    if (len & 0x80) {
+      const n = len & 0x7f;
+      len = 0;
+      for (let i = 0; i < n; i++) len = len * 256 + der[at + 2 + i]!;
+      hdr = 2 + n;
+    }
+    out.push(new TextDecoder().decode(der.subarray(at + hdr, at + hdr + len)));
+    at += hdr + len;
+  }
+  return out;
 }
