@@ -48,7 +48,8 @@ encode the order:
 |---|---|---|---|
 | B1 | ~~Issuance log — compose-decision~~ **DECIDED 2026-08-28: a Static CT API log, composed from Cloudflare's `azul`** (Workers + DO + R2). Real SCTs, so signet's `--ctfe` path is buildable; public Rekor would record issuance but cannot satisfy SCT verification. Checkpoint key pinned out of band (B2). Build: spike azul → `notme-ct` Worker + R2 → SCTs at every mint path → key via signed trust material | `notme-907299` | build |
 | B2 | External trust anchor — pipeline-signed trust material, out-of-band pinning discipline | `notme-8e8836` | parallel to B1 |
-| B3 | **SCT enforcement at signet's verifier** — the flag flip that makes B1 compulsory; signet has it measured and filed | `signet-c0d32e` | **explicitly blocked on B1** |
+| B3 | **SCT enforcement at signet's verifier** — the flag flip that makes B1 compulsory; signet has it measured and filed | `signet-c0d32e` | blocked on B1's build (`notme-1b46a8`) |
+| B4 | **Monitor + mirror** — checkpoints verified against the out-of-band key, alerts on unexpected issuance; tiles mirrored for offline audit. The ids signet's bead cited (`ad4eac`/`ad7b5a`) were never filed; these replace them | `cloister-1b5fa2`, `cloister-1b7013` | B1's build |
 
 ## Line C — the receipts seam (notme ⇄ cloister)
 
