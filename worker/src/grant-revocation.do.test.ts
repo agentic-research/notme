@@ -169,3 +169,58 @@ describe("POST /principals/:id/revoke — the operator's lever", () => {
     expect(res.status).toBe(409);
   });
 });
+
+describe("a revoked admin cannot pass authority on from a stale cookie", () => {
+  // The gate that matters most. POST /invites feeds the session's scopes into
+  // canGrant(); if that read the cookie, an admin whose authorityManage was
+  // revoked could still mint invites carrying it — revocation would be
+  // defeated by the very mechanism that spreads authority. Pinned at the
+  // route because grant-revocation's gate test above covers only
+  // /admin/alarm-health.
+  const post = (path: string, body: unknown, cookie: string) =>
+    worker.fetch(
+      new Request(`${ORIGIN}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie },
+        body: JSON.stringify(body),
+      }),
+      { ...env, ...LOCAL_ENV },
+    );
+
+  it("POST /invites refuses once the granter's authorityManage is revoked — same cookie", async () => {
+    const admin = crypto.randomUUID();
+    await authority().createPrincipalWithCapabilities(admin, ["bridgeCert", "authorityManage"]);
+    const secret = await authority().getSessionSecret();
+    const cookie = await createSessionCookie(
+      { principalId: admin, scopes: ["bridgeCert", "authorityManage"], authMethod: "passkey" },
+      secret,
+    );
+
+    const before = await post("/invites", { scopes: ["bridgeCert", "authorityManage"] }, cookie);
+    expect(before.status).toBe(200);
+
+    // Revoked by a DIFFERENT admin (self-revocation of authorityManage is refused).
+    await authority().revokeCapability(admin, "authorityManage", "other-admin");
+
+    const after = await post("/invites", { scopes: ["bridgeCert", "authorityManage"] }, cookie);
+    expect(after.status).toBe(403);
+  });
+
+  it("POST /invites cannot grant a scope the granter no longer HOLDS, even with authorityManage intact", async () => {
+    // canGrant needs authorityManage AND the specific scope. Revoke certMint
+    // on the admin: they may still administer, but may no longer hand out
+    // certMint — and the check must see the LIVE set, not the cookie's.
+    const admin = crypto.randomUUID();
+    await authority().createPrincipalWithCapabilities(admin, ["bridgeCert", "authorityManage", "certMint"]);
+    const secret = await authority().getSessionSecret();
+    const cookie = await createSessionCookie(
+      { principalId: admin, scopes: ["bridgeCert", "authorityManage", "certMint"], authMethod: "passkey" },
+      secret,
+    );
+    await authority().revokeCapability(admin, "certMint", "other-admin");
+
+    const res = await post("/invites", { scopes: ["bridgeCert", "certMint"] }, cookie);
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toMatch(/certMint/);
+  });
+});

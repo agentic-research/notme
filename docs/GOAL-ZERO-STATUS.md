@@ -197,6 +197,21 @@ Two conventions follow from these and appear in the suite:
   hand-encoder in `receipt-commitment.test.ts` build inputs *without* the code
   under test, because a fixture built by the encoder it validates is a fixed
   point rather than a conformance check.
+- **A security control's tests are mutation-verified before commit.** For
+  every bound in `verify-chain.ts` and every `liveScopes` gate, the control
+  was disabled and the suite re-run: each mutation must kill *exactly* its own
+  tests and nothing else. A test that stays green when its control is removed
+  is the pattern in §7 wearing a green badge. The results are recorded in the
+  commit message, not just claimed.
+- **Route wiring is tested through the route, with a real authenticator.**
+  `passkey-lifecycle.do.test.ts` drives register → login → revoke → re-login
+  through `/auth/passkey/*` with a software WebAuthn authenticator that
+  builds genuine attestation objects and signs real assertions
+  (`__tests__/helpers/software-authenticator.ts`). The reason: a DO-layer
+  test of `ensurePasskeyPrincipal` proved the helper worked and would have
+  stayed green with the route never calling it — which is exactly the
+  "property of a path production never takes" defect, caught in this
+  session's own code on the day it was written.
 
 ---
 
