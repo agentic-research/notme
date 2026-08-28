@@ -1,0 +1,159 @@
+# Upstream patch for github.com/cloudflare/azul — Ed25519 chain signatures in x509_util
+#
+# WHY: azul's x509_util::is_link_valid dispatches on the signature OID and
+# accepts ECDSA P-256/384/521 and RSA PKCS#1 v1.5 only. Ed25519 (RFC 8410,
+# id-Ed25519 1.3.101.112) falls to `_ => false`, so a Static CT log built on
+# ct_worker refuses every Ed25519-signed chain at add-chain. notme's root and
+# all its issued certificates are Ed25519, and Ed25519 is a first-class
+# WebPKI signature algorithm (RFC 8410; CA/B Forum permits it).
+#
+# WHAT: one verify_ed25519 arm using ed25519_dalek (already a workspace
+# dependency, used for cosignatures) + one Cargo line + an openssl-verified
+# Ed25519 root/intermediate/leaf fixture chain + a test_validate_chain! case.
+# Uses verify_strict (rejects non-canonical points and small-order keys),
+# matching what a CT log should accept.
+#
+# PROOF: cargo test -p x509_util → 29 passed (28 existing + ed25519_chain_success);
+# with the match arm removed, ed25519_chain_success FAILS and nothing else
+# changes. cargo clippy -p x509_util -- -D warnings: clean.
+#
+# Generated 2026-08-28 against azul HEAD 2051772. Tracked by notme-1b46a8.
+# Apply with: git apply docs/design/azul-ed25519.patch (from the azul checkout).
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 8b28f4d..53418fd 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4345,6 +4345,7 @@ dependencies = [
+  "const-oid",
+  "der",
+  "digest",
++ "ed25519-dalek",
+  "p256",
+  "p384",
+  "p521",
+diff --git a/crates/static_ct_api/tests/ed25519-intermediate-cert.pem b/crates/static_ct_api/tests/ed25519-intermediate-cert.pem
+new file mode 100644
+index 0000000..3ef475d
+--- /dev/null
++++ b/crates/static_ct_api/tests/ed25519-intermediate-cert.pem
+@@ -0,0 +1,11 @@
++-----BEGIN CERTIFICATE-----
++MIIBhjCCATigAwIBAgIUHkhmDQoKC7ot1vxj0PAbOuVkOtwwBQYDK2VwMCsxGjAY
++BgNVBAMMEUVkMjU1MTkgVGVzdCBSb290MQ0wCwYDVQQKDARhenVsMB4XDTI2MDgy
++ODIwMTQxMFoXDTMxMDgyNzIwMTQxMFowMzEiMCAGA1UEAwwZRWQyNTUxOSBUZXN0
++IEludGVybWVkaWF0ZTENMAsGA1UECgwEYXp1bDAqMAUGAytlcAMhAH181GfRks2G
++yxw0hiAmpR6XUMS8I0ay8ngc2y3+LVk6o2YwZDASBgNVHRMBAf8ECDAGAQH/AgEA
++MA4GA1UdDwEB/wQEAwICBDAdBgNVHQ4EFgQUl5nR7EtcE6PKcBSg8Gr9d+d3IYsw
++HwYDVR0jBBgwFoAUIRJHPLN0Lsr2V5gsPJqea2pLzQowBQYDK2VwA0EA9ULdZ7qe
++D0H4yFS/ACmGCmi4Ov4fdpt2exgyfQAYrnzNT1VgzN8LZtCDf0xX9s4YufoaL/n9
++YTSQxL7jHVUdAQ==
++-----END CERTIFICATE-----
+diff --git a/crates/static_ct_api/tests/ed25519-leaf-cert.pem b/crates/static_ct_api/tests/ed25519-leaf-cert.pem
+new file mode 100644
+index 0000000..7abc072
+--- /dev/null
++++ b/crates/static_ct_api/tests/ed25519-leaf-cert.pem
+@@ -0,0 +1,12 @@
++-----BEGIN CERTIFICATE-----
++MIIBuzCCAW2gAwIBAgIUWoh60ZMT3jJCp3w5K/MeEkZA5+4wBQYDK2VwMDMxIjAg
++BgNVBAMMGUVkMjU1MTkgVGVzdCBJbnRlcm1lZGlhdGUxDTALBgNVBAoMBGF6dWww
++HhcNMjYwODI4MjAxNDEwWhcNMjcwODI4MjAxNDEwWjAuMR0wGwYDVQQDDBRlZDI1
++NTE5LWxlYWYuZXhhbXBsZTENMAsGA1UECgwEYXp1bDAqMAUGAytlcAMhAFfOQV71
++14jmJ6bsh37eqSbZVaBvmI6hCbYblA0SaXFPo4GXMIGUMAwGA1UdEwEB/wQCMAAw
++DgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB8GA1UdEQQYMBaC
++FGVkMjU1MTktbGVhZi5leGFtcGxlMB0GA1UdDgQWBBTg+4/voO1zopMfBu/+PhgM
++oNX44zAfBgNVHSMEGDAWgBSXmdHsS1wTo8pwFKDwav1353chizAFBgMrZXADQQD1
+++6ntp9IAbQx6w+lfcBTAQUsvrsW5IQGZl7ULfP0qF0yyKSaHQyfYEDk0oUU66vMw
++Yhp2HqU8kTzdr9XlumIP
++-----END CERTIFICATE-----
+diff --git a/crates/static_ct_api/tests/ed25519-root-ca-cert.pem b/crates/static_ct_api/tests/ed25519-root-ca-cert.pem
+new file mode 100644
+index 0000000..7926f76
+--- /dev/null
++++ b/crates/static_ct_api/tests/ed25519-root-ca-cert.pem
+@@ -0,0 +1,11 @@
++-----BEGIN CERTIFICATE-----
++MIIBfjCCATCgAwIBAgIURIP6DvIhfXReq55v+RQu6bcoAHswBQYDK2VwMCsxGjAY
++BgNVBAMMEUVkMjU1MTkgVGVzdCBSb290MQ0wCwYDVQQKDARhenVsMB4XDTI2MDgy
++ODIwMTQxMFoXDTM2MDgyNTIwMTQxMFowKzEaMBgGA1UEAwwRRWQyNTUxOSBUZXN0
++IFJvb3QxDTALBgNVBAoMBGF6dWwwKjAFBgMrZXADIQAOr9TZ0SgYnePrbWVhEzLO
++Yy4qVkJxX0IxwsmFORPwmKNmMGQwHQYDVR0OBBYEFCESRzyzdC7K9leYLDyanmtq
++S80KMB8GA1UdIwQYMBaAFCESRzyzdC7K9leYLDyanmtqS80KMBIGA1UdEwEB/wQI
++MAYBAf8CAQEwDgYDVR0PAQH/BAQDAgEGMAUGAytlcANBAKfFtbvdlGGC3wU7JlPh
++QOicqxXLPtEbjSd+E3rAGeUyHjZpkeyKyE/9z9gX1NboFsrN+bl1Sd+oA73EZ8y+
++6ww=
++-----END CERTIFICATE-----
+diff --git a/crates/x509_util/Cargo.toml b/crates/x509_util/Cargo.toml
+index 4ce9b51..2d78b1c 100644
+--- a/crates/x509_util/Cargo.toml
++++ b/crates/x509_util/Cargo.toml
+@@ -11,6 +11,7 @@ description.workspace = true
+ 
+ [dependencies]
+ const-oid.workspace = true
++ed25519-dalek.workspace = true
+ der.workspace = true
+ digest.workspace = true
+ p256.workspace = true
+diff --git a/crates/x509_util/src/lib.rs b/crates/x509_util/src/lib.rs
+index 0961f9e..dcf979d 100644
+--- a/crates/x509_util/src/lib.rs
++++ b/crates/x509_util/src/lib.rs
+@@ -549,7 +549,8 @@ fn check_well_formedness(cert: &Certificate) -> Result<(), ValidationError> {
+ /// ```
+ /// Verify that `issuer` signed `child` by dispatching on the signature algorithm OID.
+ ///
+-/// Supported algorithms: ECDSA P-256, ECDSA P-384, ECDSA P-521, RSA PKCS#1 v1.5 (SHA-1/256/384/512).
++/// Supported algorithms: ECDSA P-256, ECDSA P-384, ECDSA P-521, RSA PKCS#1 v1.5 (SHA-1/256/384/512),
++/// Ed25519 (RFC 8410).
+ fn is_link_valid(child: &Certificate, issuer: &Certificate) -> bool {
+     // Note: chain links are discovered by comparing
+     //   child.tbs_certificate().issuer().to_string()
+@@ -566,6 +567,7 @@ fn is_link_valid(child: &Certificate, issuer: &Certificate) -> bool {
+         ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512, SHA_1_WITH_RSA_ENCRYPTION,
+         SHA_256_WITH_RSA_ENCRYPTION, SHA_384_WITH_RSA_ENCRYPTION, SHA_512_WITH_RSA_ENCRYPTION,
+     };
++    use const_oid::db::rfc8410::ID_ED_25519;
+ 
+     let Ok(tbs_der) = child.tbs_certificate().to_der() else {
+         return false;
+@@ -589,10 +591,19 @@ fn is_link_valid(child: &Certificate, issuer: &Certificate) -> bool {
+         SHA_256_WITH_RSA_ENCRYPTION => verify_rsa::<sha2::Sha256>(spki, &tbs_der, sig_bytes),
+         SHA_384_WITH_RSA_ENCRYPTION => verify_rsa::<sha2::Sha384>(spki, &tbs_der, sig_bytes),
+         SHA_512_WITH_RSA_ENCRYPTION => verify_rsa::<sha2::Sha512>(spki, &tbs_der, sig_bytes),
++        ID_ED_25519 => verify_ed25519(spki, &tbs_der, sig_bytes),
+         _ => false,
+     }
+ }
+ 
++/// Verify an Ed25519 (PureEdDSA, RFC 8410) signature over `tbs_der` using the key in `spki`.
++fn verify_ed25519(spki: spki::SubjectPublicKeyInfoRef<'_>, tbs_der: &[u8], sig_bytes: &[u8]) -> bool {
++    let Ok(vk) = ed25519_dalek::VerifyingKey::try_from(spki) else {
++        return false;
++    };
++    ed25519_dalek::Signature::from_slice(sig_bytes).is_ok_and(|sig| vk.verify_strict(tbs_der, &sig).is_ok())
++}
++
+ /// Verify a P-256 ECDSA signature over `tbs_der` using the key in `spki`.
+ fn verify_p256(spki: spki::SubjectPublicKeyInfoRef<'_>, tbs_der: &[u8], sig_bytes: &[u8]) -> bool {
+     let Ok(vk) = p256::ecdsa::VerifyingKey::try_from(spki) else {
+@@ -892,6 +903,18 @@ mod tests {
+         None; None; false; 2; false
+     );
+ 
++    // Ed25519 chain (RFC 8410): root and intermediate both sign with id-Ed25519
++    // (PureEdDSA, no digest parameter). Fixtures generated with openssl and
++    // verified by `openssl verify -CAfile root -untrusted int leaf`.
++    // Chain fingerprints: [intermediate, inferred-root] = 2.
++    test_validate_chain!(
++        ed25519_chain_success;
++        "../../static_ct_api/tests/ed25519-root-ca-cert.pem";
++        "../../static_ct_api/tests/ed25519-leaf-cert.pem",
++        "../../static_ct_api/tests/ed25519-intermediate-cert.pem";
++        None; None; false; 2; false
++    );
++
+     #[test]
+     fn test_find_by_subject() {
+         // Load a root CA certificate
