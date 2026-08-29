@@ -258,6 +258,26 @@ That repeats the very defect it was fixing: **GHA is how the workload was
 attested, not what the workload is.** Kind and assurance mechanism are
 different axes and must not share a slot.
 
+**BUILT 2026-08-29** (`notme-77438b`, Goal Zero criterion B's code half).
+`principalIdentity()` in `cert-authority.ts` is the single builder; the four
+inline call sites that assembled this string in two different shapes are
+gone. `OID_PRINCIPAL_KIND` (`.1.8`) carries the kind. The GHA path's identity
+is now the OIDC `sub` — which is already the cert CN — so URI and subject
+name the same principal, which is the inversion this fixes.
+
+**One deviation, stated rather than slipped in.** This section lists
+`authentication` and `attestation` as separate claims; the implementation
+keeps the existing single `OID_AUTH_METHOD` and discriminates by
+`principal_kind` — for `kind=human` the value is an authentication
+(`passkey`, `invite`), for `kind=workload` an attestation (`gha-oidc`). The
+reason to split is real but not yet load-bearing: it becomes so when one
+credential needs BOTH, which is the delegation chain's case (a tier is an
+agent, armed by a human's passkey — `auth_method=passkey`,
+`principal_kind=agent`, three hops from the ceremony). That reads coherently
+today; the day it does not, split the field rather than overloading it. A
+second wire change now, for a distinction nothing yet reads, would cost every
+consumer twice.
+
 ### D3 — The grant is a first-class object with a defined payload
 
 The prior draft required only a granting subject and a grant time. That is not
@@ -378,8 +398,8 @@ Constraining kinds therefore requires one of:
 
 **DECIDED 2026-08-27: none of the three as primary — the confinement rule
 instead.** A child certificate's identity URI must **segment-prefix-extend**
-its parent's: a tier whose SAN is `wimse://notme.bot/passkey/alice` may only
-issue identities under `wimse://notme.bot/passkey/alice/…`. This is RFC 3820's
+its parent's: a tier whose SAN is `wimse://notme.bot/principal/alice` may only
+issue identities under `wimse://notme.bot/principal/alice/…`. This is RFC 3820's
 proxy-certificate confinement rule (child subject = parent subject + one
 appended component) transplanted onto WIMSE URIs — the one existing X.509
 delegation standard that solves exactly this, per ADR-020's required question.

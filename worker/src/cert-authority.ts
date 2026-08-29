@@ -85,6 +85,59 @@ export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
 export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
 export const OID_TASK_SCOPE = `${OID_PEN}.1.7`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
+export const OID_PRINCIPAL_KIND = `${OID_PEN}.1.8`; // UTF8String: human|agent|workload|organization
+
+/**
+ * What the certificate's subject IS — a different axis from HOW it was
+ * authenticated or attested (ADR-019 D2). An earlier identity shape put the
+ * ceremony in the URI, which conflated the two and made the identity vary
+ * with the door the principal came through.
+ */
+export type PrincipalKind = "human" | "agent" | "workload" | "organization";
+
+/**
+ * The WIMSE identity: `wimse://<trust-domain>/principal/<stable-id>`.
+ *
+ * THE ONE BUILDER, because this string was previously assembled inline at
+ * four call sites with two different shapes — `/<authMethod>/<id>` for
+ * sessions and `/gha/<owner>/<repo>` for CI — which is how one principal
+ * ended up with several identities (notme-77438b).
+ *
+ * The URI carries the SUBJECT and nothing else. Kind, authentication and
+ * attestation are signed extensions, so a verifier reads a claim rather than
+ * splitting a string whose segment meanings differ by route. `gen/go/verify`
+ * already documents the URI as display-and-routing only — this makes that
+ * documented contract true rather than merely asserted.
+ *
+ * The id is percent-encoded per segment: a GHA subject is
+ * `repo:owner/name:ref:refs/heads/main`, whose slashes would otherwise
+ * invent path segments and break the D5 prefix-confinement rule that
+ * compares segments raw.
+ */
+export function principalIdentity(
+  trustDomain: string,
+  principalId: string,
+): string {
+  if (!principalId) {
+    throw new Error("principal id required — refusing to mint a headless identity");
+  }
+  return `wimse://${trustDomain}/principal/${encodeURIComponent(principalId)}`;
+}
+
+/** Read `principal_kind` back, or null when the cert predates the claim. */
+export function certPrincipalKind(cert: {
+  getExtension(oid: string): { value: ArrayBuffer } | null;
+}): PrincipalKind | null {
+  const ext = cert.getExtension(OID_PRINCIPAL_KIND);
+  if (!ext) return null;
+  const der = new Uint8Array(ext.value);
+  if (der.length < 2 || der[0] !== 0x0c) return null;
+  const value = new TextDecoder().decode(der.subarray(2, 2 + der[1]!));
+  return value === "human" || value === "agent" || value === "workload" ||
+    value === "organization"
+    ? value
+    : null;
+}
 
 // ASN.1 definite-length encoding: short form (a single byte) up to 0x7f, long
 // form (0x81 nn, 0x82 nn nn, …) above it.
@@ -255,6 +308,7 @@ export async function mintGHABridgeCert(
       CLIENT_AUTH_EKU,
       new Extension(OID_SUBJECT, false, derUtf8String(subject)),
       new Extension(OID_ISSUANCE_TIME, false, derUtf8String(now.toISOString())),
+      new Extension(OID_PRINCIPAL_KIND, false, derUtf8String("workload")),
     ],
   });
 
@@ -312,6 +366,8 @@ export async function mintBridgeCertPair(
     issuerName?: string;
     /** Extra extensions (e.g. the task scope) — appended to both certs. */
     extraExtensions?: Extension[];
+    /** What the subject IS (ADR-019 D2). Defaults to the human case. */
+    principalKind?: PrincipalKind;
   },
 ): Promise<BridgeCertPairResult> {
   const ttlMs = opts.ttlMs ?? 5 * 60 * 1000;
@@ -350,6 +406,11 @@ export async function mintBridgeCertPair(
     new Extension(OID_EPOCH, false, derInteger(opts.epoch)),
     new Extension(OID_AUTH_METHOD, false, derUtf8String(opts.authMethod)),
     new Extension(OID_PEER_BINDING, false, new Uint8Array(bindingHash)),
+    new Extension(
+      OID_PRINCIPAL_KIND,
+      false,
+      derUtf8String(opts.principalKind ?? "human"),
+    ),
   ];
 
   // SAN URI extension (WIMSE identity)
@@ -471,6 +532,8 @@ export async function mintIssuingCaCert(
     ttlMs?: number;
     /** Signer's subject name when not the root — see mintBridgeCertPair. */
     issuerName?: string;
+    /** Defaults to "agent": a tier is a machine, however a human armed it. */
+    principalKind?: PrincipalKind;
   },
 ): Promise<IssuingCaCertResult> {
   // Longer-lived than the 5-minute leaves by design (ADR-019 D4: "a
@@ -511,6 +574,11 @@ export async function mintIssuingCaCert(
       new Extension(OID_SCOPES, false, derScopeSequence(opts.scopes)),
       new Extension(OID_EPOCH, false, derInteger(opts.epoch)),
       new Extension(OID_AUTH_METHOD, false, derUtf8String(opts.authMethod)),
+      new Extension(
+        OID_PRINCIPAL_KIND,
+        false,
+        derUtf8String(opts.principalKind ?? "agent"),
+      ),
       new Extension("2.5.29.17", true, sanDer),
     ],
   });
@@ -671,6 +739,9 @@ export async function mintTaskCertPair(
       authMethod,
       ttlMs,
       issuerName: tier.subject,
+      // A task is exercised by the same agent the tier names; the task scope
+      // bounds WHAT it may do, it does not make the task a separate kind.
+      principalKind: "agent",
       extraExtensions: [new Extension(OID_TASK_SCOPE, false, derTaskScope(opts.task, opts.goalHash))],
     },
   );

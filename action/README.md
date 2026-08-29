@@ -97,7 +97,7 @@ binding payload includes `SHA-256(jwt)` so the PoP signatures are inseparable fr
 | `notme_url` | authority URL for subsequent API calls |
 | `notme_cert` | P-256 bridge cert PEM — mTLS transport auth (public data) |
 | `notme_signing_cert` | Ed25519 bridge cert PEM — git commit signing + APAS attestations (public data) |
-| `notme_identity` | WIMSE identity URI: `wimse://notme.bot/gha/{owner}/{repo}` |
+| `notme_identity` | WIMSE identity URI: `wimse://notme.bot/principal/{oidc-sub}` (the sub is percent-encoded; owner and repo read from it, or from the cert's `principal_kind`/claims — changed 2026-08-29, `notme-77438b`) |
 | `expires_at` | cert expiry (Unix timestamp). worker default TTL is 5 minutes |
 
 private keys are **never** an output. they exist only in the step's process memory and are garbage-collected when the step exits. for cross-step usage, run the action again — each invocation gets its own keypair.

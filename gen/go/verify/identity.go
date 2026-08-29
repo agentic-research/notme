@@ -10,7 +10,7 @@
 //
 //	func handler(w http.ResponseWriter, r *http.Request) {
 //	    id := verify.IdentityFromContext(r.Context())
-//	    fmt.Println(id.URI)    // wimse://notme.bot/gha/agentic-research/notme
+//	    fmt.Println(id.URI)    // wimse://notme.bot/principal/repo%3Aowner%2Fname%3A...
 //	    fmt.Println(id.Scopes) // [bridgeCert sign:git]
 //	}
 package verify
@@ -25,20 +25,30 @@ import (
 
 // Identity represents a verified notme bridge cert identity.
 type Identity struct {
-	// URI is the WIMSE identity from the cert SAN (e.g. wimse://notme.bot/gha/owner/repo).
+	// URI is the WIMSE identity from the cert SAN:
+	// wimse://<trust-domain>/principal/<stable-id>, where <stable-id> is
+	// percent-encoded and equals Subject.
 	//
 	// DISPLAY AND ROUTING ONLY — never authorize on it.
 	//
-	// Its second segment is NOT reliably AuthMethod. For a GHA cert the
-	// path is /gha/<owner>/<repo> while AuthMethod is "gha-oidc"; for a
-	// session-minted cert the segment IS the auth method, percent-encoded
-	// so an issuer-qualified value stays a single segment
-	// (wimse://notme.bot/oidc%3Ahttps%3A%2F%2Fissuer/<subject>). The
-	// segment count differs too — three for GHA, two for session certs.
+	// The shape is now uniform across every issuing route, and the id is
+	// the same value as Subject, so splitting it yields nothing Subject
+	// does not already give you — correctly, and without an encoding step.
+	// Use Subject.
 	//
-	// So the obvious cross-check, strings.Split(uri.Path, "/")[1] ==
-	// id.AuthMethod, reads as a tamper signal while being wrong in two
-	// different ways at once. Compare AuthMethod. Never split this string.
+	// HISTORY, because certificates issued before 2026-08-29 are still
+	// verifiable and do not look like this. The second segment used to be
+	// the auth ceremony for session certs (percent-encoded, so an
+	// issuer-qualified method stayed one segment) and the attestation
+	// mechanism for CI certs, whose path was /gha/<owner>/<repo> — three
+	// segments against two, with the subject at a different index. The
+	// obvious cross-check, strings.Split(uri.Path, "/")[1] == AuthMethod,
+	// therefore read as a tamper signal while being wrong in two ways at
+	// once. That is why this field says never to split it, and the advice
+	// stands: an old cert and a new one answer differently.
+	//
+	// Compare AuthMethod for the ceremony, PrincipalKind for what the
+	// subject is (notme-77438b, ADR-019 D2).
 	URI string
 
 	// Scopes are the granted capabilities from the cert extensions.

@@ -23,7 +23,7 @@
  *
  * ── WHY THIS IS NOT JUST `[a, b, c].join("/")` ──
  * The principal is a WIMSE URI and ALREADY CONTAINS SLASHES
- * (`wimse://notme.bot/passkey/<uuid>`). Joining raw produces two silent
+ * (`wimse://notme.bot/principal/<uuid>`). Joining raw produces two silent
  * defects, both of which OVER-MATCH — and for a correlation key, over-matching
  * means attributing one principal's activity to another:
  *

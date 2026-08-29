@@ -56,6 +56,7 @@ const DENIED_HOSTS = new Set([
 import { getAllowedAudiences } from "./src/allowed-audiences";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
+import { principalIdentity } from "./src/cert-authority";
 import { buildInfo } from "./src/build-version";
 
 function isDeniedDestination(url: string): boolean {
@@ -744,7 +745,13 @@ async function handleCertGHA(
   }
 
   // Build WIMSE identity URI
-  const identity = `wimse://${wimseTrustDomain(env)}/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
+  // The identity names the stable subject — the OIDC `sub`, which is also
+  // the cert CN — rather than /gha/<owner>/<repo>, which encoded the
+  // ATTESTATION MECHANISM in the slot other routes filled with a ceremony
+  // (ADR-019 D2, notme-77438b). Owner and repo remain readable from `sub`
+  // and from the workflow claims; principal_kind = "workload" is stamped as
+  // its own extension.
+  const identity = principalIdentity(wimseTrustDomain(env), claims.sub);
 
   // Mint cert pair — both certs signed by CA, both carry the same identity + scopes
   let result;
@@ -2532,7 +2539,7 @@ export default {
           }
           const result = await authority.mintBridgeCertPair({
             subject: session.principalId,
-            identity: `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
+            identity: principalIdentity(wimseTrustDomain(env), session.principalId),
             mtlsPublicKeyPem: body.public_keys.mtls,
             signingPublicKeyPem: body.public_keys.signing,
             scopes,
@@ -2678,7 +2685,7 @@ export default {
 
           const result = await authority.mintIssuingCa({
             subject: session.principalId,
-            identity: `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
+            identity: principalIdentity(wimseTrustDomain(env), session.principalId),
             publicKeyPem: body.public_key,
             scopes,
             authMethod: sessionAuthMethod,

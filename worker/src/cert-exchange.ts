@@ -238,14 +238,12 @@ export async function handleCertExchange(
     }
 
     const { wimseTrustDomain } = await import("../worker");
-    // encodeURIComponent, matching /cert/passkey: an issuer-qualified method
-    // ("oidc:https://issuer") contains ':' and '/', which without encoding
-    // split the URI into FIVE path segments instead of three — moving the
-    // subject from index 2 to index 4, so a consumer routing on path position
-    // silently reads the wrong field rather than failing. gen/go/verify's
-    // Identity.URI docs and ADR-008 both state the encoded form as the
-    // contract; this path is why they were not universally true.
-    const identity = `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(authMethod)}/${principalId}`;
+    // The identity names the PRINCIPAL, not the ceremony (ADR-019 D2,
+    // notme-77438b). authMethod still travels — in OID_AUTH_METHOD, where a
+    // verifier reads it as a claim instead of splitting a URI whose segment
+    // meanings used to differ by route.
+    const { principalIdentity } = await import("./cert-authority");
+    const identity = principalIdentity(wimseTrustDomain(env), principalId);
 
     let result;
     try {

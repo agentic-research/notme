@@ -32,6 +32,7 @@ order:
 | A4 | ~~Revocation unit = the grant~~ **BUILT 2026-08-28** — `POST /principals/:id/revoke`; every authority gate reads the grant store live; passkey users are principals with grants (criterion C met) | `notme-77a024` | — | done |
 | A5 | ~~Task-credential producer~~ **BUILT 2026-08-28** — `mintTaskCertPair` (offline, tier-signed; enforces namespace-by-construction, scope narrowing, tier-bounded TTL, possession, task scope at `OID_TASK_SCOPE`); `taskCorrelationKey` derives the third segment from the certs; walker now checks issuer-NAME chaining (found the fixtures lying) | `notme-9f84e6` | — | done |
 | A6 | **Delegation in receipts end-to-end** — the ninth commitment key becomes reachable | `notme-c0db9b` + `cloister-c10ff2` | A5 + cloister adoption | both |
+| A7 | ~~Stable identity~~ **BUILT 2026-08-29** — `wimse://<domain>/principal/<stable-id>`, one builder, `principal_kind` as its own extension; the SPIFFE inversion is gone and criterion B's code half is met | `notme-77438b` | — | done |
 | A7 | Naming follow-through in signet docs (`id-kp-signet-bridge-delegate` is now a misnomer) | `signet-9dfb44` consequence | nothing | signet |
 
 A1 resolved 2026-08-27 — **no decisions remain on this line; everything after

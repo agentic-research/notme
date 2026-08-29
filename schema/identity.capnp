@@ -71,7 +71,7 @@ struct BridgeCertResult {
 struct BridgeCertPair {
   mtlsCert     @0 :Text;   # PEM — P-256 cert for mTLS transport auth
   signingCert  @1 :Text;   # PEM — Ed25519 cert for git commits + APAS attestations
-  identity     @2 :Text;   # WIMSE identity URI (wimse://notme.bot/{context}/{id})
+  identity     @2 :Text;   # WIMSE identity URI (wimse://notme.bot/principal/{stable-id})
   scopes       @3 :List(Text);  # Granted capabilities (string-based, not enum — extensible)
   expiresAt    @4 :Int64;  # Unix timestamp (seconds)
   subject      @5 :Text;   # Principal UUID or OIDC sub

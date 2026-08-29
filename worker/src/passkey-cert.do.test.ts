@@ -149,7 +149,7 @@ describe("POST /cert/passkey", () => {
     expect(body.certificates.mtls).toContain("BEGIN CERTIFICATE");
     expect(body.certificates.signing).toContain("BEGIN CERTIFICATE");
     expect(body.identity).toBe(
-      `wimse://${TRUST_DOMAIN}/passkey/principal-passkey-test`,
+      `wimse://${TRUST_DOMAIN}/principal/principal-passkey-test`,
     );
     expect(body.auth_method).toBe("passkey");
     expect(body.expires_at).toBeGreaterThan(0);
@@ -234,9 +234,16 @@ describe("POST /cert/passkey", () => {
 describe("authMethod provenance (notme-ebc9af)", () => {
   // The route accepts ANY valid session — /join sets authMethod "invite",
   // /auth/oidc/login sets "oidc:<issuer>" — but used to stamp every minted
-  // cert authMethod:"passkey" and a wimse://…/passkey/… identity. A verifier
-  // reading such a cert concluded a human touched a passkey when none did.
-  // The cert must DERIVE its provenance from the session that authorized it.
+  // cert authMethod:"passkey". A verifier reading such a cert concluded a
+  // human touched a passkey when none did. The cert must DERIVE its
+  // provenance from the session that authorized it.
+  //
+  // That property is unchanged; where it is READ moved (notme-77438b,
+  // ADR-019 D2). This test asserted provenance via the identity URI, which
+  // is what made one principal have several identities — a true-but-unstable
+  // identifier traded for a false-but-stable one. Provenance now lives in
+  // the auth_method claim, and the identity is stable, so both halves hold
+  // at once. identity-stability.do.test.ts pins the pairing directly.
 
   it("an invite-authed session mints a cert that says invite, not passkey", async () => {
     const cookie = await sessionCookie(["bridgeCert"], "invite");
@@ -244,10 +251,11 @@ describe("authMethod provenance (notme-ebc9af)", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     expect(body.auth_method).toBe("invite");
+    expect(body.auth_method).not.toBe("passkey");
+    // Stable regardless of the door: the ceremony is no longer in the name.
     expect(body.identity).toBe(
-      `wimse://${TRUST_DOMAIN}/invite/principal-passkey-test`,
+      `wimse://${TRUST_DOMAIN}/principal/principal-passkey-test`,
     );
-    expect(body.identity).not.toContain("/passkey/");
   });
 
   it("refuses a session with no authMethod rather than stamping a placeholder", async () => {
@@ -277,10 +285,14 @@ describe("authMethod provenance (notme-ebc9af)", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     expect(body.auth_method).toBe(method);
-    // The identity URI's method segment must stay a SINGLE path segment —
-    // ':' and '/' in the issuer are percent-encoded, not structural.
+    // The issuer-qualified method no longer appears in the URI at all, which
+    // is the fix: it was the segment whose ':' and '/' had to be encoded to
+    // avoid inventing path segments, and the reason the subject's position
+    // in the path differed by route. The identity is now the principal, and
+    // the ONLY encoded segment is the principal id itself.
     expect(body.identity).toBe(
-      `wimse://${TRUST_DOMAIN}/${encodeURIComponent(method)}/principal-passkey-test`,
+      `wimse://${TRUST_DOMAIN}/principal/principal-passkey-test`,
     );
+    expect(body.identity).not.toContain(encodeURIComponent(method));
   });
 });

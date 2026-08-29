@@ -65,13 +65,28 @@ Issue **proof-of-possession bridge certificates** via a nonce-based exchange. Th
 
 Adopt WIMSE identity URIs as the canonical format. The same URI appears in X.509 SAN, WIT `sub` claims, git signatures, and APAS attestations:
 
+> **CORRECTION (2026-08-29, `notme-77438b` / ADR-019 D2).** The `{context}`
+> segment below is **retired**. It held the auth ceremony for session-minted
+> certs and the attestation mechanism for CI certs, so one principal's
+> identity changed with the door they came through, and the subject's
+> position in the path differed by route. The format is now:
+>
+> ```
+> wimse://{trust-domain}/principal/{stable-id}
+> ```
+>
+> Kind (`principal_kind`, OID `.1.8`) and mechanism (`authMethod`, OID `.1.5`)
+> are signed extensions. The examples and `{context}` discussion below are
+> kept as the historical record of what shipped first; read them as history.
+
 ```
 wimse://notme.bot/gha/agentic-research/notme        (GHA workflow)
 wimse://notme.bot/user/james                         (passkey-authenticated human)
 wimse://notme.bot/agent/dev-agent/dispatch/abc123    (dispatched agent)
 ```
 
-Format: `wimse://{trust-domain}/{context}/{identity}`
+Format: `wimse://{trust-domain}/{context}/{identity}` — **superseded, see the
+correction above.**
 
 The trust domain is a FQDN. The path is scoped within the trust domain. This follows `draft-ietf-wimse-arch-02` Section 3.1 and is compatible with SPIFFE ID conventions.
 

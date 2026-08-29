@@ -62,9 +62,18 @@ sequenceDiagram
 mints a cert carrying only `bridgeCert` — a long-lived exportable credential
 must not carry authority that was granted to a browser session.
 
-**Known defect:** the identity reads `wimse://notme.bot/<authMethod>/<id>`, so
-the same principal gets a *different* identity depending on how they signed in
-(`notme-77438b`). ADR-019 exists to fix this.
+**The identity names the principal, not the door.**
+`wimse://<domain>/principal/<stable-id>` — the same for a given principal
+however they signed in. It used to read `wimse://<domain>/<authMethod>/<id>`,
+so one human had a different "identity" per ceremony while the stable
+principal sat unadvertised in the cert subject (`notme-77438b`, the SPIFFE
+inversion; fixed 2026-08-29 per ADR-019 D2).
+
+The ceremony still travels, in `OID_AUTH_METHOD` — a verifier reads a claim
+instead of splitting a URI whose segments meant different things per route.
+`principal_kind` (`OID_PRINCIPAL_KIND`, `human|agent|workload|organization`)
+is its own axis, because *what a subject is* and *how it was attested* are
+different questions.
 
 ---
 

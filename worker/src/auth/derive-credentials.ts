@@ -26,7 +26,7 @@ export interface DerivedCredentials {
    *
    * NOT from OID_SUBJECT — that extension carries the internal PRINCIPAL name
    * (e.g. `principal-test`), while the WIMSE URI callers audit and authorize
-   * against (`wimse://notme.bot/gha/org/repo`) is minted into the SAN. Reading
+   * against (`wimse://notme.bot/principal/<oidc-sub>`) is minted into the SAN. Reading
    * the wrong one yields a plausible non-empty string, which is the failure
    * mode that would survive review.
    */
