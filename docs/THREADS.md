@@ -46,7 +46,9 @@ encode the order:
 
 | # | Step | Beads | Gated on |
 |---|---|---|---|
-| B1 | ~~Issuance log — compose-decision~~ **DECIDED 2026-08-28: a Static CT API log, composed from Cloudflare's `azul`** (Workers + DO + R2). Real SCTs, so signet's `--ctfe` path is buildable; public Rekor would record issuance but cannot satisfy SCT verification. Checkpoint key pinned out of band (B2). Build: spike azul → `notme-ct` Worker + R2 → SCTs at every mint path → key via signed trust material | `notme-907299` | build |
+| B1 | ~~Issuance log — compose-decision~~ **DECIDED 2026-08-28: a Static CT API log, composed from Cloudflare's `azul`** (Workers + DO + R2). Real SCTs, so signet's `--ctfe` path is buildable; public Rekor would record issuance but cannot satisfy SCT verification. Checkpoint key pinned out of band (B2) | `notme-907299` | decided |
+| B1a | ~~Ed25519 precondition~~ — azul refused every Ed25519 chain at `add-chain`; **PR submitted upstream 2026-08-28: [cloudflare/azul#281](https://github.com/cloudflare/azul/pull/281)**, patch kept at `docs/design/azul-ed25519.patch` for vendoring if it stalls | `notme-1b46a8` | awaiting review |
+| B1b | **Build `notme-ct`** — scaffold from `ct_worker` with the production root as `roots.notme.pem`, R2 + KV + signing/witness secrets; SCTs at every mint path, plus a submission client for the offline task producer | `notme-1b46a8` | next |
 | B2 | External trust anchor — pipeline-signed trust material, out-of-band pinning discipline | `notme-8e8836` | parallel to B1 |
 | B3 | **SCT enforcement at signet's verifier** — the flag flip that makes B1 compulsory; signet has it measured and filed | `signet-c0d32e` | blocked on B1's build (`notme-1b46a8`) |
 | B4 | **Monitor + mirror** — checkpoints verified against the out-of-band key, alerts on unexpected issuance; tiles mirrored for offline audit. The ids signet's bead cited (`ad4eac`/`ad7b5a`) were never filed; these replace them | `cloister-1b5fa2`, `cloister-1b7013` | B1's build |
