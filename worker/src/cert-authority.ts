@@ -84,8 +84,25 @@ export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
 export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
 export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
-export const OID_TASK_SCOPE = `${OID_PEN}.1.7`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
+// `.1.7` IS NOT OURS. ley-line-open claimed it for `confinementDigest` — a
+// 32-byte BLAKE3-256 of the canonical ConfinementManifest — in LLO v0.7.6
+// (ley-line-open-c79ea8), and cloister's WASM verifier parses notme-minted
+// certs at this arc (`ep` from .1.4, `pf` from .1.6, `sc` from .1.3). This
+// file briefly allocated .1.7 for the task scope, which would have made a
+// notme task cert present a DER SEQUENCE where that verifier expects a
+// digest — mis-attributing "which confinement identity authorized the call".
+// Caught before any task cert was issued; nothing carries the old number.
+//
+// THE ARC IS SHARED, and this is the cost of squatting the IANA
+// example/private-experiment arc: notme, signet and ley-line-open all
+// allocate under 1.3.6.1.4.1.99999 with no registry between them. Check
+// every repo before taking a number, and see notme-229dc3 for the real fix.
+//   .1.1–.1.6  notme + signet (subject, issuance time, scopes, epoch,
+//              auth method, peer binding) — signet mirrors these for parity
+//   .1.7       ley-line-open: confinementDigest — DO NOT REUSE
+//   .1.8, .1.9 notme
 export const OID_PRINCIPAL_KIND = `${OID_PEN}.1.8`; // UTF8String: human|agent|workload|organization
+export const OID_TASK_SCOPE = `${OID_PEN}.1.9`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
 
 /**
  * What the certificate's subject IS — a different axis from HOW it was
