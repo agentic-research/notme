@@ -48,8 +48,21 @@ const cookieOf = (res: Response) =>
   res.headers.get("set-cookie")!.split(";")[0]!;
 
 /** Full registration ceremony through the routes. Returns the session cookie + principal id. */
-async function register(auth: SoftwareAuthenticator, bootstrapCode?: string) {
-  const opts = await post("/auth/passkey/register/options", { bootstrapCode });
+/**
+ * Registration through the real routes. Since ADR-021 every user after the
+ * first needs an invite — an authority does not admit strangers — so a
+ * caller supplies either the deployment's bootstrap code (first boot) or an
+ * invite token (everyone else).
+ */
+async function register(
+  auth: SoftwareAuthenticator,
+  bootstrapCode?: string,
+  inviteToken?: string,
+) {
+  const opts = await post("/auth/passkey/register/options", {
+    bootstrapCode,
+    inviteToken,
+  });
   expect(opts.status, await opts.clone().text()).toBe(200);
   // The route returns { options: {challenge, ...}, isFirstUser, userId, scopes }.
   const { userId, options } = (await opts.json()) as {
@@ -112,9 +125,12 @@ describe("passkey lifecycle through the real routes", () => {
     expect(scopes2).not.toContain("certMint");
   });
 
-  it("second user: registers with bridgeCert only, and cannot reach admin routes", async () => {
+  it("second user: joins by INVITE, gets bridgeCert only, cannot reach admin routes", async () => {
+    const invite = await authority().createInviteToken(
+      "admin-under-test", ["bridgeCert"], 3600,
+    );
     const user = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
-    const { cookie, principalId } = await register(user);
+    const { cookie, principalId } = await register(user, undefined, invite.token);
     expect(await scopesIn(cookie)).toEqual(["bridgeCert"]);
     expect(await authority().getPrincipalScopes(principalId)).toEqual(["bridgeCert"]);
     expect((await get("/admin/alarm-health", cookie)).status).toBe(403);
@@ -122,7 +138,10 @@ describe("passkey lifecycle through the real routes", () => {
 
   it("the server rejects a forged assertion — the authenticator is real, not a bypass", async () => {
     const legit = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
-    await register(legit);
+    const inv = await authority().createInviteToken(
+      "admin-under-test", ["bridgeCert"], 3600,
+    );
+    await register(legit, undefined, inv.token);
     const impostor = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
 
     const opts = await post("/auth/passkey/login/options", {});

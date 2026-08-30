@@ -58,6 +58,12 @@ sequenceDiagram
     W-->>B: certificate pair
 ```
 
+**Registration is invite-only** after the first user (ADR-021). Scopes come
+from the invite, never from the request. The eventual gate is signet's trust
+policy bundle (`sigpol`); the invite is the interim mechanism, and the
+decision — that registration is a policy question about a subject notme does
+not own the registry for — is the same either way.
+
 **Scopes narrow at the cert boundary.** A session holding `authorityManage`
 mints a cert carrying only `bridgeCert` — a long-lived exportable credential
 must not carry authority that was granted to a browser session.

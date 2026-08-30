@@ -832,7 +832,10 @@ async function handlePasskey(
 
   try {
     if (pathname === "/auth/passkey/register/options") {
-      const body = (await request.json()) as { bootstrapCode?: string };
+      const body = (await request.json()) as {
+        bootstrapCode?: string;
+        inviteToken?: string;
+      };
       const userId = crypto.randomUUID();
       const result = await authority.passkeyRegistrationOptions(
         userId,
@@ -897,10 +900,42 @@ async function handlePasskey(
         }
       }
 
-      // Determine scopes: deployer gets all, everyone else gets bridgeCert
+      // REGISTRATION IS GATED (notme-2c4209, ADR-021). Until now everyone
+      // after the first user registered freely and walked away with a
+      // CA-signed cert pair — an open-registration certificate authority,
+      // written down nowhere but a comment.
+      //
+      // The invite is the mechanism TODAY. The decision is that registration
+      // is a policy question, and the eventual answer is signet's trust
+      // policy bundle (sigpol, ADR-011 §5.3: is this subject provisioned,
+      // is it active, what capabilities do its groups resolve to). notme
+      // must not grow a second subject registry to answer it — ADR-011 §2.1
+      // argues that case, and ADR-020 forbids it here.
+      //
+      // Scopes come from the INVITE, never from the request: a caller that
+      // could name its own scopes would make the gate decorative.
+      let invitedScopes: string[] | null = null;
+      if (!result.isFirstUser) {
+        if (!body.inviteToken) {
+          return jsonErr(
+            "registration is invite-only — ask an administrator for an invite link",
+            403,
+          );
+        }
+        const redeemed = await authority.redeemInviteToken(
+          body.inviteToken,
+          userId,
+        );
+        if (!redeemed) {
+          return jsonErr("invalid, expired or already-used invite", 403);
+        }
+        invitedScopes = redeemed.scopes;
+      }
+
+      // Deployer gets all; an invited user gets exactly what the invite says.
       const scopes = result.isFirstUser
         ? ["bridgeCert", "authorityManage", "certMint"]
-        : ["bridgeCert"];
+        : (invitedScopes ?? ["bridgeCert"]);
 
       return Response.json({ ...result, userId, scopes });
     }
