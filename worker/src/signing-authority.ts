@@ -14,6 +14,10 @@
 
 import { DurableObject } from "cloudflare:workers";
 import {
+  bootstrapAttestedSubject,
+  mayBootstrapFromAttestation,
+} from "./auth/bootstrap-policy";
+import {
   X509CertificateGenerator,
   BasicConstraintsExtension,
   KeyUsagesExtension,
@@ -45,6 +49,17 @@ interface SigningAuthorityEnv {
    * unauthenticated HTTP request and read a log.
    */
   BOOTSTRAP_CODE?: string;
+  /**
+   * The one GitHub workflow identity permitted to bootstrap this authority —
+   * the full OIDC `sub`, e.g. `repo:owner/name:ref:refs/heads/main`.
+   *
+   * A `[vars]` entry, NOT a secret, and the distinction is the point: it is
+   * an identity, so there is nothing to leak and nothing to read out of a
+   * log. Security comes from GitHub's signature over the token, not from
+   * hiding this value — which is exactly the posture notme argues for
+   * everywhere else and did not practise at first boot (notme-addef9).
+   */
+  BOOTSTRAP_GHA_SUBJECT?: string;
   /**
    * This deployment's authority origin. Tokens minted here carry it as `iss`
    * (notme-28baf2) — a DO that hardcoded the issuer made staging assert the
@@ -109,6 +124,8 @@ function bootstrapSecret(env: { BOOTSTRAP_CODE?: string }): string | null {
   return raw && raw.length >= 16 ? raw : null;
 }
 
+
+
 /**
  * What a caller may learn about bootstrap WITHOUT causing anything to happen
  * (notme-addef9).
@@ -122,8 +139,22 @@ export type BootstrapReadState =
   | { status: "closed" }
   /** No authenticator, and no operator has armed one. Nobody can bootstrap. */
   | { status: "unconfigured" }
-  /** No authenticator, and a bootstrap secret is set. Present it to register. */
-  | { status: "armed" };
+  /**
+   * No authenticator, and at least one bootstrap mechanism is armed.
+   *
+   * `methods` says WHICH, because the register/options 401 is written from
+   * this and used to name a path that could not do the job: it told a fresh
+   * deployer to "bootstrap via GitHub OIDC at /cert/gha" when that route
+   * granted bridgeCert and created no principal at all. A message may only
+   * offer what is actually armed (notme-addef9).
+   */
+  | { status: "armed"; methods: BootstrapMethod[] };
+
+/** `secret` = BOOTSTRAP_CODE; `gha-oidc` = an attested workflow identity. */
+export type BootstrapMethod = "secret" | "gha-oidc";
+
+/** GitHub's OIDC issuer — the provider recorded for an attested bootstrap. */
+const GHA_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
@@ -1861,14 +1892,107 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * `BOOTSTRAP_CODE`, which requires control of the deployment rather than
    * merely the ability to send an HTTP request.
    */
+  /**
+   * First boot by ATTESTATION rather than by a shared secret (notme-addef9,
+   * Goal Zero criterion E).
+   *
+   * The register/options 401 has been telling fresh deployers to "bootstrap
+   * via GitHub OIDC at /cert/gha" since the log-scraping message was
+   * removed. That route verifies a real GitHub-signed token and then mints
+   * `bridgeCert` with no principal and no `authorityManage`, so following
+   * the advice left the authority with zero administrators. This is the
+   * method that makes the sentence true.
+   *
+   * Three conditions, all required:
+   *   1. the deployer named exactly one workflow identity (`BOOTSTRAP_GHA_SUBJECT`)
+   *   2. the attested `sub` equals it — not the owner allowlist, which is a
+   *      much wider set than "may administer this authority"
+   *   3. no principal exists yet
+   *
+   * IN THE DO, not the route, because (2) and (3) must be atomic with the
+   * create. Two workflows racing a fresh authority would otherwise both read
+   * "no principals" and both become admin; a Durable Object is
+   * single-threaded, so the read-check-write cannot interleave.
+   *
+   * The caller is trusted to have VERIFIED the token — this method takes an
+   * attested subject, never a raw one. It is unexported from the worker's
+   * perspective for that reason: the JWKS/audience/allowlist checks live at
+   * the route, and calling this with an unverified string would make the
+   * attestation decorative.
+   */
+  async bootstrapFromAttestation(
+    attestedSubject: string,
+  ): Promise<{ bootstrapped: boolean; principalId: string | null }> {
+    const expected = bootstrapAttestedSubject(this.env);
+
+    // Not a secret, but compared the same way as one: an identity match that
+    // gates administrator creation should not leak its prefix by timing.
+    const { timingSafeEqual } = await import("./auth/timing-safe");
+    const subjectsMatch =
+      expected !== null && (await timingSafeEqual(attestedSubject, expected));
+
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    const { ensurePrincipalSchema, principalCount } = await import(
+      "./auth/principals"
+    );
+    ensurePrincipalSchema(this.ctx.storage.sql);
+    const authorityIsGovernable =
+      principalCount(this.ctx.storage.sql) > 0 ||
+      this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema);
+
+    if (
+      !mayBootstrapFromAttestation({
+        configuredSubject: expected,
+        subjectsMatch,
+        authorityIsGovernable,
+      })
+    ) {
+      return { bootstrapped: false, principalId: null };
+    }
+
+    const principalId = crypto.randomUUID();
+    await this.createPrincipalWithCapabilities(
+      principalId,
+      ["bridgeCert", "authorityManage", "certMint"],
+      `gha-oidc:${attestedSubject}`,
+    );
+
+    // LINK THE ATTESTED IDENTITY, or this creates an administrator nobody
+    // can authenticate as. A principal carries grants; it is not a way to
+    // sign in. Without this the authority holds an admin row, still reports
+    // `armed` (hasAuthenticator counts credentials and federated identities,
+    // never principals), and no human or workflow can act as it — a
+    // credential-shaped hole dressed as a fix.
+    //
+    // With it, the workflow that bootstrapped can come back through the same
+    // attested route, and the human attaches a passkey by taking an invite
+    // from it — which is the flow notme-addef9 described and the reason the
+    // OIDC path was called the intended one.
+    await this.linkFederatedId(
+      principalId,
+      GHA_OIDC_ISSUER,
+      attestedSubject,
+    );
+
+    console.log(
+      `[bootstrap] attested first boot: principal=${principalId} subject=${attestedSubject}`,
+    );
+    return { bootstrapped: true, principalId };
+  }
+
   async getBootstrapState(): Promise<BootstrapReadState> {
     const { ensurePasskeySchema } = await import("./auth/passkey");
     const { ensurePrincipalSchema } = await import("./auth/principals");
     if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
       return { status: "closed" };
     }
-    // `armed` reports only that a secret EXISTS, never its value or length.
-    return bootstrapSecret(this.env) ? { status: "armed" } : { status: "unconfigured" };
+    // `armed` reports only that a mechanism EXISTS, never a value or length.
+    const methods: BootstrapMethod[] = [];
+    if (bootstrapSecret(this.env)) methods.push("secret");
+    if (bootstrapAttestedSubject(this.env)) methods.push("gha-oidc");
+    return methods.length > 0
+      ? { status: "armed", methods }
+      : { status: "unconfigured" };
   }
 
   async getOrCreateBootstrapCode(): Promise<BootstrapState> {

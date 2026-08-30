@@ -35,6 +35,11 @@ export default defineConfig({
           // back into an authority whose last admin credential is lost, and an
           // untested recovery path is the thing that bricked it.
           BOOTSTRAP_CODE: "r".repeat(40),
+          // The attested first-boot identity (notme-addef9). A var, not a
+          // secret — it is an identity, and the DO reads it from its OWN env
+          // rather than from the request, so a caller cannot name itself the
+          // subject permitted to bootstrap.
+          BOOTSTRAP_GHA_SUBJECT: "repo:agentic-research/notme:ref:refs/heads/main",
         },
         durableObjects: {
           // SQLite-backed per wrangler.toml migration v2 (new_sqlite_classes).

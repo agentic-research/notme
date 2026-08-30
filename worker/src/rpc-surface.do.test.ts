@@ -172,7 +172,18 @@ describe("RPC surface is an allow-list, not an accident", () => {
       // as revocable grants. Idempotent by construction: an existing
       // principal's grants are returned, never re-granted, so it cannot
       // restore a revoked scope.
-    ).toBe(47);
+      //
+      // 47 → 48: bootstrapFromAttestation (notme-addef9). Reviewed hardest
+      // of any addition so far, because it CREATES AN ADMINISTRATOR. Three
+      // conditions gate it and a leaked stub satisfies none of them: the
+      // deployer must have set BOOTSTRAP_GHA_SUBJECT (unset means off, and
+      // that is the branch a pure predicate in auth/bootstrap-policy.ts now
+      // covers), the argument must equal it, and the authority must have no
+      // principal or authenticator — which any authority a stub was stolen
+      // FROM necessarily has. So on a live authority this method is a no-op
+      // by construction; on a fresh one, a caller holding a stub already had
+      // the deployment access needed to set the variable in the first place.
+    ).toBe(48);
   });
 });
 

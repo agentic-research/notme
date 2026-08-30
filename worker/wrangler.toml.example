@@ -62,6 +62,29 @@ SIGNET_AUTHORITY_URL = "https://auth.notme.bot"
 # for bridge certs at auth.notme.bot/cert/gha.
 GHA_ALLOWED_OWNERS = "your-org"
 
+# ATTESTED FIRST BOOT (notme-addef9) — the default way a fresh authority gets
+# its administrator, and the reason no secret has to travel through a log.
+#
+# Set this to the FULL OIDC `sub` of exactly one workflow, e.g.
+#   repo:your-org/your-repo:ref:refs/heads/main
+# The first run of that workflow bootstraps the authority through /cert/gha:
+# it creates the admin principal and LINKS the attested GitHub identity to it,
+# so the administrator can actually authenticate rather than being an admin
+# row nobody can sign in as.
+#
+# A VAR, NOT A SECRET, deliberately: it is an identity, so there is nothing to
+# leak and nothing to scrape out of a log. Security comes from GitHub's
+# signature over the OIDC token.
+#
+# NARROWER THAN GHA_ALLOWED_OWNERS ON PURPOSE. That list answers "may this
+# workflow get a credential" — anyone with push access to any repo under the
+# owner clears it. "May it become the administrator" is a different question,
+# so it is answered by naming one workflow.
+#
+# Leave UNSET to disable attested bootstrap entirely; unset means off, never
+# "allow anyone the owner allowlist already admitted".
+# BOOTSTRAP_GHA_SUBJECT = "repo:your-org/your-repo:ref:refs/heads/main"
+
 # Workers VPC — direct tunnel to signet on Fly (identity server).
 # Create via: wrangler vpc create <name>
 # CF TF provider does not support vpc_service binding type — configured here directly.

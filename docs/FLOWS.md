@@ -123,17 +123,45 @@ served budget disagrees (no rotation, nothing in flight breaks), and
 
 ```mermaid
 graph TD
-    A["fresh authority"] --> B{"has an authenticator?"}
+    A["fresh authority"] --> B{"governable?<br/>(a credential or federated identity exists)"}
     B -->|yes| C["closed — sign in, or ask for an invite"]
-    B -->|no| D{"BOOTSTRAP_CODE set?"}
-    D -->|no| E["unconfigured<br/>wrangler secret put BOOTSTRAP_CODE"]
-    D -->|yes| F["armed — present the code to register"]
-    F --> G["first user gets<br/>bridgeCert + authorityManage + certMint"]
+    B -->|no| D{"which mechanisms are armed?"}
+    D -->|neither| E["unconfigured — arm one and retry"]
+    D -->|BOOTSTRAP_GHA_SUBJECT| F["attested — run THAT workflow"]
+    D -->|BOOTSTRAP_CODE| G["secret — present the code to register"]
+    F --> H["admin principal created,<br/>GitHub identity LINKED to it"]
+    G --> I["first user gets<br/>bridgeCert + authorityManage + certMint"]
 ```
+
+**The default path is attestation, not a secret.** Set
+`BOOTSTRAP_GHA_SUBJECT` to one GitHub workflow identity — the full OIDC
+`sub`, e.g. `repo:owner/name:ref:refs/heads/main` — and the first run of that
+workflow bootstraps the authority through `/cert/gha`. It is a **var, not a
+secret**: an identity has nothing to leak and nothing to read out of a log,
+and the security comes from GitHub's signature over the token. That is the
+posture notme argues for everywhere else and did not practise at first boot.
+
+**Why exact-subject and not the owner allowlist.** `GHA_ALLOWED_OWNERS`
+answers *may this workflow get a credential*; anyone with push access to any
+repo under that owner clears it. *May it become the administrator* is a
+different question, so the deployer names one workflow.
+
+**The bootstrap LINKS the attested identity to the principal.** A principal
+carries grants; it is not a way to sign in. Creating one without linking
+leaves an admin row nobody can authenticate as — the authority still reports
+`armed`, because `hasAuthenticator` counts credentials and federated
+identities, never principals. That is a credential-shaped hole dressed as a
+fix, and it is what the first version of this did.
 
 Asking about bootstrap state is a **read** — it mints nothing. Previously the
 first unauthenticated request caused an admin code to be minted and logged, so
 any stranger chose the moment a credential appeared (`notme-addef9`).
+
+**The 401 offers only what is armed.** It once said "check Worker logs
+(wrangler tail)"; the replacement pointed at `/cert/gha`, which minted
+`bridgeCert` and created no administrator — so the message that fixed a lie
+told a different one. It now names the mechanisms `getBootstrapState()`
+actually reports.
 
 ---
 

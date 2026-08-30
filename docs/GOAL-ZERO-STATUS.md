@@ -26,7 +26,7 @@ unknown security-critical failures**. Five criteria:
 | **B** | The authority states what it names; identity no longer varies with auth ceremony; registration policy follows from that | **met 2026-08-29** for the first two clauses — ADR-019 accepted, and `wimse://<domain>/principal/<stable-id>` shipped with `principal_kind` as its own claim (`notme-77438b`). Registration policy (`notme-2c4209`) remains open |
 | **C** | A revocation unit exists between "wait out the TTL" and "revoke everything" | **met 2026-08-28** — the grant is the unit: `POST /principals/:id/revoke`, live re-read at every authority gate, passkey users enrolled as principals with grants |
 | **D** | A third party can verify without trusting notme at the moment of the check | open, half done |
-| **E** | First boot needs no secret from the logs and cannot be triggered by a stranger | open |
+| **E** | First boot needs no secret from the logs and cannot be triggered by a stranger | **met 2026-08-30** — attested first boot: `BOOTSTRAP_GHA_SUBJECT` names one GitHub workflow identity, its OIDC token bootstraps the authority and is LINKED to the admin principal. No secret, nothing in a log, and the trigger is the deployer's own workflow. `BOOTSTRAP_CODE` remains the explicit-operator-action fallback (`notme-addef9`) |
 
 Plus a **documentation-honesty clause** applying to all of them: where a
 property is deliberately not provided, docs must say so rather than implying

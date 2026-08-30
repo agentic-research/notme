@@ -751,6 +751,14 @@ async function handleCertGHA(
   // (ADR-019 D2, notme-77438b). Owner and repo remain readable from `sub`
   // and from the workflow claims; principal_kind = "workload" is stamped as
   // its own extension.
+  // Attested first boot (notme-addef9, criterion E). AFTER the token is
+  // verified, the owner allowlist has passed and the JTI is spent — so this
+  // can only be reached by a caller GitHub actually signed for. The DO does
+  // the check-and-create atomically and refuses unless the deployer named
+  // this exact subject; on an authority that already has an administrator it
+  // is a no-op, so the normal CI path is unaffected.
+  const boot = await authority.bootstrapFromAttestation(claims.sub);
+
   const identity = principalIdentity(wimseTrustDomain(env), claims.sub);
 
   // Mint cert pair — both certs signed by CA, both carry the same identity + scopes
@@ -776,6 +784,10 @@ async function handleCertGHA(
     expires_at: result.expires_at,
     binding: result.binding,
     authority: result.authority,
+    // Present only when THIS call bootstrapped the authority. The cert still
+    // carries bridgeCert alone — capabilities live on the principal, and a
+    // cert carries only what is safe to export (passkey-cert-scopes.ts).
+    ...(boot.bootstrapped ? { principal_id: boot.principalId } : {}),
     claims: {
       repository: claims.repository,
       ref: claims.ref,
@@ -844,17 +856,31 @@ async function handlePasskey(
         // cycle, so the documented recovery could simply fail.
         const bootstrap = await authority.getBootstrapState();
         switch (bootstrap.status) {
-          case "armed":
-            return jsonErr(
-              "bootstrap code required — supply the BOOTSTRAP_CODE this deployment was configured with",
-              401,
-            );
+          case "armed": {
+            // Name only the mechanisms actually armed. This branch used to
+            // say "bootstrap code required" unconditionally, and the
+            // unconfigured branch pointed at /cert/gha — a route that
+            // granted bridgeCert and created no principal, so the advice
+            // could not work (notme-addef9).
+            const offers: string[] = [];
+            if (bootstrap.methods.includes("secret")) {
+              offers.push(
+                "supply the BOOTSTRAP_CODE this deployment was configured with",
+              );
+            }
+            if (bootstrap.methods.includes("gha-oidc")) {
+              offers.push(
+                "or run the workflow named by BOOTSTRAP_GHA_SUBJECT, which bootstraps this authority via GitHub OIDC at /cert/gha",
+              );
+            }
+            return jsonErr(`bootstrap required — ${offers.join(" ")}`, 401);
+          }
           case "unconfigured":
             // Fail closed AND fail informative. An authority nobody can
             // bootstrap is a recoverable operator error; one that silently
             // mints a credential into a log is not.
             return jsonErr(
-              "this authority has no administrator and no bootstrap secret — the deployer must set BOOTSTRAP_CODE (wrangler secret put BOOTSTRAP_CODE) and retry, or bootstrap via GitHub OIDC at /cert/gha",
+              "this authority has no administrator and no bootstrap mechanism is armed — the deployer must either set BOOTSTRAP_GHA_SUBJECT to the GitHub workflow identity allowed to bootstrap it (a var, not a secret: nothing to leak, nothing to read out of a log), or `wrangler secret put BOOTSTRAP_CODE`, and retry",
               401,
             );
           case "closed":
