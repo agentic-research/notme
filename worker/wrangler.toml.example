@@ -66,7 +66,16 @@ GHA_ALLOWED_OWNERS = "your-org"
 # its administrator, and the reason no secret has to travel through a log.
 #
 # Set this to the FULL OIDC `sub` of exactly one workflow, e.g.
-#   repo:your-org/your-repo:ref:refs/heads/main
+#   repo:your-org/your-repo:ref:refs/heads/main     (a branch push)
+#   repo:your-org/your-repo:ref:refs/tags/v1.2.3    (a tag / release run)
+#
+# THE REF SEGMENT DEPENDS ON THE TRIGGER, and getting it wrong fails SILENTLY
+# — bootstrap simply never fires, with no error naming why. Verified against a
+# real value: the certificate production notme minted on 2026-08-07 for
+# agentic-research/signet carries CN=repo:agentic-research/signet:ref:refs/
+# tags/v0.3.0, because that workflow ran on a tag. Arm the form your
+# bootstrap workflow will actually produce; if unsure, run it once and read
+# the `sub` from the cert CN or the run'"'"'s OIDC claims.
 # The first run of that workflow bootstraps the authority through /cert/gha:
 # it creates the admin principal and LINKS the attested GitHub identity to it,
 # so the administrator can actually authenticate rather than being an admin

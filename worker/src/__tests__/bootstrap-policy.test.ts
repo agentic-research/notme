@@ -79,3 +79,43 @@ describe("mayBootstrapFromAttestation — the whole matrix", () => {
     }
   });
 });
+
+describe("the subject grammar, against a REAL GitHub-issued value", () => {
+  /**
+   * Not a value this repo generated. This is the `sub` GitHub actually put in
+   * an OIDC token on 2026-08-07, read back out of the CN of a certificate
+   * production notme minted from it — recoverable today from
+   * `agentic-research/signet` release v0.3.0,
+   * `checksums-sha256.txt.signet.crt.pem`.
+   *
+   * A fixture the code under test could have produced would prove only that
+   * the code agrees with itself; this one is evidence about GitHub.
+   */
+  const REAL_SUB = "repo:agentic-research/signet:ref:refs/tags/v0.3.0";
+
+  it("matches an operator-armed value exactly, and nothing near it", () => {
+    const armed = (configured: string, attested: string) =>
+      mayBootstrapFromAttestation({
+        configuredSubject: configured,
+        subjectsMatch: configured === attested,
+        authorityIsGovernable: false,
+      });
+    expect(armed(REAL_SUB, REAL_SUB)).toBe(true);
+    // Same repo, different ref — a DIFFERENT workflow run.
+    expect(armed(REAL_SUB, "repo:agentic-research/signet:ref:refs/tags/v0.3.1")).toBe(false);
+    // Prefix, not a full subject.
+    expect(armed(REAL_SUB, "repo:agentic-research/signet")).toBe(false);
+  });
+
+  it("THE REF IS TRIGGER-DEPENDENT — refs/tags for a tag, refs/heads for a branch", () => {
+    // The trap this test exists for. Every doc example writes
+    // `refs/heads/main`, but the real value above is a TAG run. An operator
+    // who arms the branch form and then bootstraps from a release workflow
+    // matches nothing, and the failure is silent: bootstrap simply never
+    // fires and the authority stays unbootstrapped with no error naming why.
+    expect(REAL_SUB).toMatch(/^repo:[^:]+\/[^:]+:ref:refs\/(heads|tags)\/.+$/);
+    expect(REAL_SUB).toContain(":ref:refs/tags/");
+    const branchForm = "repo:agentic-research/signet:ref:refs/heads/main";
+    expect(branchForm).not.toBe(REAL_SUB);
+  });
+});

@@ -91,6 +91,7 @@ extension, and the answer differs by kind:
 |---|---|---|
 | **human** | no | invite today, `sigpol` subject when it lands |
 | **workload** | yes, by attestation | `/cert/gha`: a GitHub-signed OIDC token plus `GHA_ALLOWED_OWNERS` — already a policy gate, and already enforced |
+
 | **agent** | no — it is *delegated*, not registered | the Issuing CA tier (ADR-019 D4); its authority is bounded by its parent, not by a registration |
 | **organization** | n/a | not minted as a credential holder today |
 

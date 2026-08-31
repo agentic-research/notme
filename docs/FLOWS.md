@@ -147,6 +147,14 @@ secret**: an identity has nothing to leak and nothing to read out of a log,
 and the security comes from GitHub's signature over the token. That is the
 posture notme argues for everywhere else and did not practise at first boot.
 
+**The ref segment is trigger-dependent, and mismatching it fails silently.**
+A branch run produces `…:ref:refs/heads/main`; a tag run produces
+`…:ref:refs/tags/v1.2.3`. Verified against a real value — the cert production
+minted for `agentic-research/signet` on 2026-08-07 carries
+`CN=repo:agentic-research/signet:ref:refs/tags/v0.3.0`. Arm the form your
+bootstrap workflow actually produces; if it does not match, bootstrap never
+fires and nothing says why.
+
 **Why exact-subject and not the owner allowlist.** `GHA_ALLOWED_OWNERS`
 answers *may this workflow get a credential*; anyone with push access to any
 repo under that owner clears it. *May it become the administrator* is a
