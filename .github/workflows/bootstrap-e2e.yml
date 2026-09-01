@@ -18,6 +18,19 @@ name: Attested bootstrap (e2e)
 
 on:
   workflow_dispatch:
+  # Runs when the thing it checks changes. `workflow_dispatch` alone is not
+  # enough: the API only dispatches workflows present on the DEFAULT branch,
+  # so a check developed on a feature branch could never be run there — which
+  # is precisely when it is most worth running.
+  push:
+    paths:
+      - "worker/worker.ts"
+      - "worker/src/signing-authority.ts"
+      - "worker/src/auth/bootstrap-policy.ts"
+      - "worker/src/gha-oidc.ts"
+      - "worker/wrangler.e2e.toml"
+      - "scripts/bootstrap-e2e.mjs"
+      - ".github/workflows/bootstrap-e2e.yml"
 
 permissions: {}
 
