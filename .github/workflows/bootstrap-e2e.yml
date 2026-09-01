@@ -89,9 +89,13 @@ jobs:
             --var "BOOTSTRAP_GHA_SUBJECT:$BOOTSTRAP_SUB" \
             </dev/null > /tmp/wrangler.log 2>&1 &
           disown || true
-          for i in $(seq 1 60); do
-            if curl -sf -o /dev/null "http://localhost:8787/.well-known/version"; then
-              echo "worker up after ${i}s"; exit 0
+          # --max-time is not optional here. `wrangler dev` accepts the TCP
+          # connection before it can answer, so a bare `curl -sf` blocks
+          # forever on the first probe and the readiness loop never advances
+          # — the step hangs looking exactly like a slow start.
+          for i in $(seq 1 90); do
+            if curl -sf --max-time 5 -o /dev/null "http://localhost:8787/.well-known/version"; then
+              echo "worker up after ~${i}s"; exit 0
             fi
             sleep 1
           done
