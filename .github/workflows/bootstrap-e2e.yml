@@ -1,0 +1,89 @@
+# Attested first boot, end to end, with a REAL GitHub OIDC token.
+#
+# WHY THIS RUNS IN CI AND NOT AGAINST A DEPLOYMENT. Criterion E's bootstrap
+# path was covered by tests that forge genuinely-signed tokens against a
+# STUBBED JWKS — proving the code path, not the integration. The integration
+# needs a token GitHub actually signed, and the one place that exists is
+# inside an Actions job.
+#
+# It cannot be pointed at staging: staging's GHA_ALLOWED_OWNERS must differ
+# from production's (notme-1532eb, a red-team finding about staging being
+# name-identical to production), so a real agentic-research workflow is
+# refused there by design. Loosening that control to exercise another one is
+# a bad trade, so the Worker runs LOCALLY here instead — its CA is born in
+# local storage and dies with the job, so the certificates it mints are worth
+# nothing anywhere, which is exactly what makes the real owner allowlist safe
+# in this config and nowhere else.
+name: Attested bootstrap (e2e)
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # the whole point: a real GitHub-signed OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install worker deps
+        working-directory: worker
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Request a real OIDC token and read its subject
+        id: oidc
+        # The audience must match what the worker checks (GHA_CERT_AUDIENCE,
+        # default notme.bot). The `sub` is read back out of the token rather
+        # than assembled from github.* context, because assembling it is
+        # exactly the mistake this check exists to catch: the ref segment is
+        # trigger-dependent (refs/heads/… vs refs/tags/…) and a mismatch
+        # fails SILENTLY — bootstrap never fires and nothing says why.
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=notme.bot" | jq -r '.value')
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "no OIDC token"; exit 1; }
+          SUB=$(printf '%s' "$TOKEN" | cut -d. -f2 \
+            | tr '_-' '/+' | awk '{ while (length($0) % 4) $0 = $0 "="; print }' \
+            | base64 -d 2>/dev/null | jq -r '.sub')
+          echo "subject: $SUB"
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          echo "sub=$SUB" >> "$GITHUB_OUTPUT"
+
+      - name: Start the Worker locally, armed for THIS job's subject
+        working-directory: worker
+        env:
+          BOOTSTRAP_SUB: ${{ steps.oidc.outputs.sub }}
+        run: |
+          set -euo pipefail
+          pnpm exec wrangler dev --config wrangler.e2e.toml --port 8787 \
+            --var "BOOTSTRAP_GHA_SUBJECT:$BOOTSTRAP_SUB" \
+            > /tmp/wrangler.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null "http://localhost:8787/.well-known/version"; then
+              echo "worker up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "worker did not start"; cat /tmp/wrangler.log; exit 1
+
+      - name: Bootstrap it, and prove it went from ungovernable to governed
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          AUTH_BASE: http://localhost:8787
+        run: node scripts/bootstrap-e2e.mjs
+
+      - name: Worker log (on failure)
+        if: failure()
+        run: cat /tmp/wrangler.log || true

@@ -1,0 +1,59 @@
+#:schema node_modules/wrangler/config-schema.json
+#
+# Config for the attested-bootstrap end-to-end check, and for nothing else.
+#
+# WHY IT IS COMMITTED when worker/wrangler.toml is gitignored: that file holds
+# live Cloudflare resource ids. This one holds none — `wrangler dev` runs the
+# Worker and its Durable Objects in local storage, so the ids below are never
+# resolved against an account. Nothing here is a secret, and nothing here
+# reaches a deployment.
+#
+# WHY IT EXISTS AT ALL. Criterion E's attested first boot was proven by tests
+# that forge genuinely-signed OIDC tokens against a STUBBED JWKS — the code
+# path, not the integration. The integration cannot be exercised against
+# staging, whose GHA_ALLOWED_OWNERS must differ from production's
+# (notme-1532eb), and loosening that to run a test would break a real control
+# to check another. So the check runs the Worker locally inside a GitHub
+# Actions job, which is the one place a REAL GitHub-signed OIDC token exists.
+# See .github/workflows/bootstrap-e2e.yml.
+name = "notme-bootstrap-e2e"
+main = "worker.ts"
+compatibility_date = "2026-03-01"
+workers_dev = false
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+not_found_handling = "404-page"
+
+[vars]
+SITE_URL = "http://localhost:8787"
+SIGNET_AUTHORITY_URL = "http://localhost:8787"
+# The real owner, which is safe HERE and only here: this authority's CA is
+# born in local storage and dies with the job, so a certificate it mints is
+# worth nothing anywhere. That is precisely why staging cannot do this — its
+# CA persists and its trust domain is one promotion away from production.
+GHA_ALLOWED_OWNERS = "agentic-research"
+ALLOWED_AUDIENCES = "http://localhost:8787"
+# BOOTSTRAP_GHA_SUBJECT is supplied at runtime with --var, because it is the
+# `sub` of the job that is running, which cannot be known when this is written.
+
+[[kv_namespaces]]
+binding = "CA_BUNDLE_CACHE"
+id = "e2e-local-only-not-a-real-namespace"
+
+[[durable_objects.bindings]]
+name = "SIGNING_AUTHORITY"
+class_name = "SigningAuthority"
+
+[[durable_objects.bindings]]
+name = "REVOCATION"
+class_name = "RevocationAuthority"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RevocationAuthority"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["SigningAuthority"]
