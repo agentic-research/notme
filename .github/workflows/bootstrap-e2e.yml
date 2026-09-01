@@ -81,6 +81,10 @@ jobs:
           BOOTSTRAP_SUB: ${{ steps.oidc.outputs.sub }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
           AUTH_BASE: http://localhost:8787
+          # No telemetry prompt, and never reach for an account: this Worker
+          # is local-only and has no Cloudflare resources to resolve.
+          WRANGLER_SEND_METRICS: "false"
+          CLOUDFLARE_API_TOKEN: ""
         # ONE step start-to-finish, deliberately. Backgrounding the worker in
         # one step and testing in the next hung twice: a child started in a
         # `run:` block keeps the runner waiting on the step even when the
@@ -99,13 +103,22 @@ jobs:
           # --max-time is not optional: `wrangler dev` accepts the TCP
           # connection before it can answer, so an unbounded probe blocks
           # forever on the first attempt and the loop never counts.
+          # THE BUDGET MUST FIT INSIDE timeout-minutes, or the diagnostic
+          # never runs. 90 iterations x (5s curl + 1s sleep) is up to nine
+          # minutes against a five-minute step, so the first attempt timed
+          # out having printed NOTHING — the log dump below was unreachable,
+          # which made an ordinary startup failure look like a hang.
+          # 30 x (2 + 1) = 90s worst case, and the log is shown on the way.
           up=0
-          for i in $(seq 1 90); do
-            if curl -sf --max-time 5 -o /dev/null "http://localhost:8787/.well-known/version"; then
+          for i in $(seq 1 30); do
+            if curl -sf --max-time 2 -o /dev/null "http://localhost:8787/.well-known/version"; then
               echo "worker up after ~${i}s"; up=1; break
             fi
             if ! kill -0 "$WRANGLER_PID" 2>/dev/null; then
               echo "wrangler exited during startup"; break
+            fi
+            if [ "$i" = 10 ]; then
+              echo "--- wrangler log after 10 attempts ---"; cat /tmp/wrangler.log || true
             fi
             sleep 1
           done
