@@ -48,9 +48,25 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      - name: Install worker deps
-        working-directory: worker
-        run: pnpm install --frozen-lockfile --ignore-scripts
+      - uses: ./.github/actions/setup-task
+
+      # `task`, not raw pnpm — CI's own rule is that the Taskfile is the
+      # single source of truth beyond toolchain bootstrap.
+      - run: task worker:install
+
+      # BUILD dpop, or wrangler cannot resolve it. worker.ts imports
+      # @agentic-research/dpop, a workspace sibling whose entry point is
+      # ./dist/index.js — produced by tsc and gitignored. Installs use
+      # --ignore-scripts, which is exactly what skips the prepack that would
+      # build it, so on a clean checkout the module does not exist and esbuild
+      # fails with `Could not resolve "@agentic-research/dpop"`.
+      #
+      # This trap is already documented on `worker:build-local`, and it caught
+      # this workflow anyway: it reproduces only on a CLEAN checkout, and a
+      # developer machine always has dist/ lying around from an earlier build.
+      # That is why the local run of this same config succeeded in 3 seconds
+      # while CI could not start at all.
+      - run: task dpop:build
 
       - name: Request a real OIDC token and read its subject
         id: oidc
