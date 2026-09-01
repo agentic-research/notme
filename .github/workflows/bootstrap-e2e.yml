@@ -74,38 +74,51 @@ jobs:
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
           echo "sub=$SUB" >> "$GITHUB_OUTPUT"
 
-      - name: Start the Worker locally, armed for THIS job's subject
+      - name: Bootstrap a fresh authority with the real token, end to end
         working-directory: worker
+        timeout-minutes: 5
         env:
           BOOTSTRAP_SUB: ${{ steps.oidc.outputs.sub }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          AUTH_BASE: http://localhost:8787
+        # ONE step start-to-finish, deliberately. Backgrounding the worker in
+        # one step and testing in the next hung twice: a child started in a
+        # `run:` block keeps the runner waiting on the step even when the
+        # script itself is done, and detaching it portably is fiddlier than
+        # the check is worth. Keeping the process inside a single step means
+        # its lifetime is the step's lifetime, and the trap cleans it up on
+        # every exit path.
         run: |
-          set -euo pipefail
-          # setsid + </dev/null, not a bare `&`. A backgrounded child inherits
-          # the step's process group and stdin, and the runner waits on the
-          # whole group — so the step hangs after the script itself is done,
-          # with the worker up and nothing to show for it. Detaching is what
-          # lets the step exit while the worker keeps serving the next one.
-          setsid pnpm exec wrangler dev --config wrangler.e2e.toml --port 8787 \
+          set -uo pipefail
+          pnpm exec wrangler dev --config wrangler.e2e.toml --port 8787 \
             --var "BOOTSTRAP_GHA_SUBJECT:$BOOTSTRAP_SUB" \
             </dev/null > /tmp/wrangler.log 2>&1 &
-          disown || true
-          # --max-time is not optional here. `wrangler dev` accepts the TCP
-          # connection before it can answer, so a bare `curl -sf` blocks
-          # forever on the first probe and the readiness loop never advances
-          # — the step hangs looking exactly like a slow start.
+          WRANGLER_PID=$!
+          trap 'kill "$WRANGLER_PID" 2>/dev/null || true' EXIT
+
+          # --max-time is not optional: `wrangler dev` accepts the TCP
+          # connection before it can answer, so an unbounded probe blocks
+          # forever on the first attempt and the loop never counts.
+          up=0
           for i in $(seq 1 90); do
             if curl -sf --max-time 5 -o /dev/null "http://localhost:8787/.well-known/version"; then
-              echo "worker up after ~${i}s"; exit 0
+              echo "worker up after ~${i}s"; up=1; break
+            fi
+            if ! kill -0 "$WRANGLER_PID" 2>/dev/null; then
+              echo "wrangler exited during startup"; break
             fi
             sleep 1
           done
-          echo "worker did not start"; cat /tmp/wrangler.log; exit 1
+          if [ "$up" -ne 1 ]; then
+            echo "--- wrangler log ---"; cat /tmp/wrangler.log; exit 1
+          fi
 
-      - name: Bootstrap it, and prove it went from ungovernable to governed
-        env:
-          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
-          AUTH_BASE: http://localhost:8787
-        run: node scripts/bootstrap-e2e.mjs
+          node ../scripts/bootstrap-e2e.mjs
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "--- wrangler log ---"; cat /tmp/wrangler.log
+          fi
+          exit "$status"
 
       - name: Worker log (on failure)
         if: failure()

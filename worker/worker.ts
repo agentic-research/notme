@@ -865,6 +865,12 @@ async function handlePasskey(
             // unconfigured branch pointed at /cert/gha — a route that
             // granted bridgeCert and created no principal, so the advice
             // could not work (notme-addef9).
+            // Each offer is a standalone clause; the conjunction is added
+            // when joining. Baking "or " into the second one read as
+            // "bootstrap required — or run the workflow…" whenever gha-oidc
+            // was the only armed mechanism, which sounds like a first option
+            // went missing. Caught by running the thing and reading what it
+            // says, which is the only way this class of defect surfaces.
             const offers: string[] = [];
             if (bootstrap.methods.includes("secret")) {
               offers.push(
@@ -873,10 +879,10 @@ async function handlePasskey(
             }
             if (bootstrap.methods.includes("gha-oidc")) {
               offers.push(
-                "or run the workflow named by BOOTSTRAP_GHA_SUBJECT, which bootstraps this authority via GitHub OIDC at /cert/gha",
+                "run the workflow named by BOOTSTRAP_GHA_SUBJECT, which bootstraps this authority via GitHub OIDC at /cert/gha",
               );
             }
-            return jsonErr(`bootstrap required — ${offers.join(" ")}`, 401);
+            return jsonErr(`bootstrap required — ${offers.join(", or ")}`, 401);
           }
           case "unconfigured":
             // Fail closed AND fail informative. An authority nobody can
