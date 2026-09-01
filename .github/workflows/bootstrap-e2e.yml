@@ -80,9 +80,15 @@ jobs:
           BOOTSTRAP_SUB: ${{ steps.oidc.outputs.sub }}
         run: |
           set -euo pipefail
-          pnpm exec wrangler dev --config wrangler.e2e.toml --port 8787 \
+          # setsid + </dev/null, not a bare `&`. A backgrounded child inherits
+          # the step's process group and stdin, and the runner waits on the
+          # whole group — so the step hangs after the script itself is done,
+          # with the worker up and nothing to show for it. Detaching is what
+          # lets the step exit while the worker keeps serving the next one.
+          setsid pnpm exec wrangler dev --config wrangler.e2e.toml --port 8787 \
             --var "BOOTSTRAP_GHA_SUBJECT:$BOOTSTRAP_SUB" \
-            > /tmp/wrangler.log 2>&1 &
+            </dev/null > /tmp/wrangler.log 2>&1 &
+          disown || true
           for i in $(seq 1 60); do
             if curl -sf -o /dev/null "http://localhost:8787/.well-known/version"; then
               echo "worker up after ${i}s"; exit 0
