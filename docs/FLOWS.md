@@ -167,6 +167,15 @@ leaves an admin row nobody can authenticate as — the authority still reports
 identities, never principals. That is a credential-shaped hole dressed as a
 fix, and it is what the first version of this did.
 
+**Proven with a real token, not a fixture.**
+`.github/workflows/bootstrap-e2e.yml` runs the Worker locally inside an
+Actions job — the one place a genuine GitHub-signed OIDC token exists — and
+asserts the *transition*: ungovernable → real token → an authority that
+reports an administrator, then a second run that mints no second one. It
+cannot be pointed at staging, whose `GHA_ALLOWED_OWNERS` must differ from
+production's (`notme-1532eb`); the local CA is born in the job and dies with
+it, which is what makes the real owner allowlist safe there and nowhere else.
+
 Asking about bootstrap state is a **read** — it mints nothing. Previously the
 first unauthenticated request caused an admin code to be minted and logged, so
 any stranger chose the moment a credential appeared (`notme-addef9`).
