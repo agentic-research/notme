@@ -70,7 +70,16 @@ const before = await fetch(`${BASE}/auth/passkey/register/options`, {
 });
 const beforeBody = await before.json();
 if (before.status !== 401) fail(`expected a fresh authority to refuse registration, got ${before.status}`);
-if (!/no administrator/.test(beforeBody.error ?? "")) fail(`authority is not fresh: ${beforeBody.error}`);
+// A fresh authority WITH a mechanism armed says "bootstrap required". The
+// "no administrator" phrasing belongs to the UNCONFIGURED branch — nothing
+// armed at all — so asserting it here tested the wrong state and failed
+// against a system that was behaving correctly.
+if (!/bootstrap required/.test(beforeBody.error ?? "")) {
+  fail(`authority is not fresh-and-armed: ${beforeBody.error}`);
+}
+if (/already has an administrator/.test(beforeBody.error ?? "")) {
+  fail("authority is already governed — bootstrapping it would prove nothing");
+}
 if (!/BOOTSTRAP_GHA_SUBJECT/.test(beforeBody.error ?? "")) {
   fail(`gha-oidc is not armed — the 401 does not offer it: ${beforeBody.error}`);
 }
@@ -101,10 +110,14 @@ const after = await fetch(`${BASE}/auth/passkey/register/options`, {
   body: "{}",
 });
 const afterBody = await after.json();
-if (/no administrator/.test(afterBody.error ?? "")) {
-  fail("still reports no administrator — the principal was created but nothing can authenticate as it");
+// Assert the CLOSED message positively. Checking only for the absence of
+// "no administrator" would also pass on the still-armed message — i.e. it
+// would pass in the exact failure case it exists to catch, which is a
+// principal created with no identity linked to authenticate as.
+if (!/already has an administrator/.test(afterBody.error ?? "")) {
+  fail(`authority is not governed after bootstrap: ${afterBody.error ?? JSON.stringify(afterBody)}`);
 }
-ok("the authority now reports an administrator");
+ok("the authority now reports an administrator that can authenticate");
 
 // 4. Bootstrap is a one-time door.
 const again = await fetch(`${BASE}/cert/gha`, {
