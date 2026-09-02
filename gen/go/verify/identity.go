@@ -49,6 +49,21 @@ type Identity struct {
 	//
 	// Compare AuthMethod for the ceremony, PrincipalKind for what the
 	// subject is (notme-77438b, ADR-019 D2).
+	//
+	// AND IF YOU MUST TOUCH IT: use the string, never url.URL.Path.
+	// Measured 2026-09-02 on a real minted certificate whose subject is a
+	// GHA `sub`:
+	//
+	//	String()  wimse://notme.bot/principal/repo%3Aowner%2Fname%3Aref%3A...
+	//	RawPath   /principal/repo%3Aowner%2Fname%3Aref%3A...
+	//	Path      /principal/repo:owner/name:ref:refs/heads/main   <- DECODED
+	//
+	// Path silently turns encoded separators into real ones, so splitting it
+	// yields more segments than the issuer wrote — the subject moves, and a
+	// consumer routing on position reads the wrong field rather than
+	// failing. String() and RawPath round-trip exactly, which is why
+	// signet's exact-equality identity check still accepts these certs
+	// (verified against its enroll.go check, not just read).
 	URI string
 
 	// Scopes are the granted capabilities from the cert extensions.
