@@ -118,10 +118,24 @@ func ParseIdentity(cert *x509.Certificate) (*Identity, error) {
 				id.Scopes = scopes
 			}
 		case ext.Id.Equal(oidEpoch):
+			// An UNPARSEABLE epoch is not epoch zero. Swallowing this error
+			// is how a real defect stayed invisible: notme emitted the epoch
+			// as a fixed-width `02 04 00 00 00 01`, which is valid BER and
+			// invalid DER (X.690 §8.3.2 forbids the leading zero octets), so
+			// encoding/asn1 returned "integer not minimally encoded" and
+			// every certificate silently reported Epoch 0 — disabling the
+			// revocation lever for every Go consumer.
+			//
+			// Epoch is load-bearing: a caller comparing it against the
+			// authority's current epoch is making a revocation decision. A
+			// zero it cannot distinguish from a real value makes that
+			// decision wrong in whichever direction the caller's comparison
+			// happens to fall. Refuse the certificate instead.
 			epoch, err := parseInteger(ext.Value)
-			if err == nil {
-				id.Epoch = epoch
+			if err != nil {
+				return nil, fmt.Errorf("malformed epoch extension: %w", err)
 			}
+			id.Epoch = epoch
 		case ext.Id.Equal(oidAuthMethod):
 			s, err := parseUTF8String(ext.Value)
 			if err == nil {

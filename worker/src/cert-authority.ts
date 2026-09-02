@@ -351,17 +351,43 @@ function derScopeSequence(scopes: string[]): Uint8Array {
 }
 
 // Encode a 4-byte big-endian integer as ASN.1 INTEGER
-function derInteger(n: number): Uint8Array {
-  const buf = new Uint8Array([
-    0x02,
-    0x04,
-    (n >> 24) & 0xff,
-    (n >> 16) & 0xff,
-    (n >> 8) & 0xff,
-    n & 0xff,
-  ]);
-  return buf;
+/**
+ * DER INTEGER, MINIMALLY encoded — the shortest form that represents `n`.
+ *
+ * This emitted a fixed-width `02 04 xx xx xx xx`, so epoch 1 was
+ * `02 04 00 00 00 01`. That is valid BER and invalid DER: X.690 §8.3.2
+ * forbids a leading zero octet unless the next octet's high bit is set.
+ * Go's encoding/asn1 enforces it and returns "integer not minimally
+ * encoded", and `gen/go/verify` swallowed that error — so every notme
+ * certificate reported epoch 0 to every Go consumer since the extension
+ * was added, silently disabling the revocation lever for them.
+ *
+ * Found by RUNNING the Go verifier against a freshly minted certificate
+ * while discharging a claim-ledger row that said its consumers were
+ * unaffected. No test caught it because every reader in this repo was ours,
+ * and ours accepted what ours produced.
+ *
+ * Exported for `der-integer.test.ts`, which round-trips it through a
+ * deliberately foreign strict reader rather than through `certEpoch`.
+ */
+export function derIntegerBytes(n: number): Uint8Array {
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`epoch must be a non-negative integer, got ${n}`);
+  }
+  // Big-endian, no leading zeros.
+  const body: number[] = [];
+  let v = n;
+  do {
+    body.unshift(v & 0xff);
+    v = Math.floor(v / 256);
+  } while (v > 0);
+  // A leading high bit would read as a negative number; one zero octet
+  // disambiguates it, and that octet is then part of the minimal form.
+  if (body[0]! & 0x80) body.unshift(0x00);
+  return new Uint8Array([0x02, body.length, ...body]);
 }
+
+const derInteger = derIntegerBytes;
 
 export async function mintBridgeCertPair(
   subject: string,
