@@ -93,14 +93,31 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 // digest — mis-attributing "which confinement identity authorized the call".
 // Caught before any task cert was issued; nothing carries the old number.
 //
-// THE ARC IS SHARED, and this is the cost of squatting the IANA
-// example/private-experiment arc: notme, signet and ley-line-open all
-// allocate under 1.3.6.1.4.1.99999 with no registry between them. Check
-// every repo before taking a number, and see notme-229dc3 for the real fix.
-//   .1.1–.1.6  notme + signet (subject, issuance time, scopes, epoch,
-//              auth method, peer binding) — signet mirrors these for parity
-//   .1.7       ley-line-open: confinementDigest — DO NOT REUSE
-//   .1.8, .1.9 notme
+// THE ARC IS SHARED AND THE MEANINGS DISAGREE. notme, signet and
+// ley-line-open all allocate under the IANA example/private-experiment arc
+// 1.3.6.1.4.1.99999 with no registry between them. Measured 2026-09-09
+// against LLO's rs/ll-open/sign/src/cert_chain.rs:
+//
+//   OID    notme                          ley-line-open
+//   .1.1   subject                        —
+//   .1.2   issuance time                  —
+//   .1.3   scopes (SEQ OF UTF8String)     —
+//   .1.4   epoch (INTEGER)                epoch (INTEGER)        AGREE
+//   .1.5   authMethod (UTF8String)        interlace-peer         *** COLLIDES
+//   .1.6   peer binding (32 RAW bytes)    interlace-scope        *** COLLIDES
+//   .1.7   — (task scope moved off it)    confinementDigest      DO NOT REUSE
+//   .1.8   principal kind                 —
+//   .1.9   task scope                     —
+//
+// .1.6 fails loudly at LLO (it runs Utf8StringRef::from_der over our raw
+// binding bytes). .1.5 is worse: same TYPE, different MEANING, so it parses
+// silently and LLO reads our authMethod as a peer fingerprint — no error,
+// wrong value, in an identity-correlation field.
+//
+// An earlier version of this table said ".1.1–.1.6 notme + signet, .1.7
+// LLO". That was wrong, and it was wrong in the direction that makes a
+// collision look resolved. Tracked at ley-line-open-9ac66d; the real fix is
+// a per-project PEN (notme-229dc3), which is free and takes days.
 export const OID_PRINCIPAL_KIND = `${OID_PEN}.1.8`; // UTF8String: human|agent|workload|organization
 export const OID_TASK_SCOPE = `${OID_PEN}.1.9`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
 
