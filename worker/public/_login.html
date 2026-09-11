@@ -171,7 +171,7 @@
 
   <div id="bootstrapDiv" class="hidden" style="margin-top:12px">
     <input class="bootstrap-input" id="bootstrapInput" type="text"
-      placeholder="bootstrap code from wrangler tail" />
+      placeholder="the BOOTSTRAP_CODE this deployment was configured with" />
     <button class="term-provider" style="width:100%;margin-top:4px" onclick="bootstrapRegister()">
       bootstrap + register
     </button>
@@ -283,7 +283,13 @@ async function registerPasskey() {
       var err = (await optRes.json()).error || 'failed';
       if (err.indexOf('bootstrap') !== -1) {
         document.getElementById('bootstrapDiv').classList.remove('hidden');
-        setStatus('enter bootstrap code from wrangler tail', 'info');
+        // Never "read it from the logs". notme-addef9 removed the
+        // mechanism that minted a code into Worker logs on an
+        // unauthenticated request; this placeholder outlived it, so the UI
+        // was still sending operators to look for a secret nothing writes.
+        // The server's own 401 says which mechanisms are armed — show that,
+        // rather than a guess this page makes on its behalf.
+        setStatus(err, 'info');
         return;
       }
       throw new Error(err);
