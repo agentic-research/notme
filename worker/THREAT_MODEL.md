@@ -34,7 +34,7 @@
 | token replay      | replay a valid GHA OIDC JWT        | JTI tracking in KV (each token usable exactly once)    | `cert-gha.jti.replay`             |
 | wrong audience    | OIDC token with different audience | audience validation (must be "notme.bot")              | `cert-gha.audience.validation`    |
 | unauthorized repo | repo outside allowed owners        | owner allowlist (GHA_ALLOWED_OWNERS, case-insensitive) | `cert-gha.owner.allowlist`        |
-| rate exhaustion   | flood cert requests from one repo  | 10 certs/repo/hour rate limit                          | `cert-gha.rate-limit`             |
+| rate exhaustion   | flood cert requests from one repo  | 10 certs/repo/60s (CERT_LIMITER binding)               | `cert-gha.rate-limit`             |
 | signature forgery | forged JWT                         | RS256 signature verification against GitHub JWKS       | `cert-gha.signature.verification` |
 | expired token     | use expired OIDC JWT               | exp claim validation                                   | `cert-gha.token.expiry`           |
 | future token      | backdate iat claim                 | iat > now+60s rejected                                 | `cert-gha.token.future`           |
@@ -145,10 +145,12 @@ each test name maps to a row in the tables above.
 ```
 worker/src/__tests__/
   passkey.test.ts        — WebAuthn registration, authentication, session
-  cert-gha.test.ts       — OIDC validation, JTI, rate limiting, owner check
+  (cert-gha.* rows live in worker/src/threat-model-cert-gha.do.test.ts —
+   driving the real /cert/gha handler needs the workers pool)
   signing.test.ts        — SigningAuthority DO, key lifecycle, bundle generation
   revocation.test.ts     — epoch, seqno, bundle verification
-  routing.test.ts        — path blocking, subdomain isolation, content negotiation
+  (routing.* rows live in worker/src/threat-model-routes.do.test.ts —
+   same reason: the real fetch handler imports cloudflare:workers)
   dpop.test.ts           — DPoP proof validation (signature, claims, replay, nonce)
   token.test.ts          — JWT access token minting + verification (EdDSA)
   routes-dpop.test.ts    — /token endpoint integration (handler, JWKS)

@@ -575,9 +575,13 @@ function getConfig(env: any) {
     ghaCertAudience: (env.GHA_CERT_AUDIENCE as string) ?? "notme.bot",
     ghaCertTtlMs: Number(env.GHA_CERT_TTL_MS ?? 300_000), // 5 min
     jtiMinTtlSeconds: Number(env.JTI_MIN_TTL_SECONDS ?? 60),
-    rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS ?? 3600_000), // 1 hour
-    rateLimitMaxCerts: Number(env.RATE_LIMIT_MAX_CERTS ?? 10),
-    rateLimitKvTtlSeconds: Number(env.RATE_LIMIT_KV_TTL_SECONDS ?? 3600),
+    // NO rate-limit tunables here. They existed for the KV limiter that the
+    // CERT_LIMITER binding replaced, and nothing read them afterwards — so
+    // RATE_LIMIT_MAX_CERTS=50 in a self-hosted wrangler.toml changed nothing
+    // while reading as the knob that set the limit. Their 1-hour/10-cert
+    // defaults are also where THREAT_MODEL's "10 certs/repo/hour" came from;
+    // the binding enforces 10 per 60 SECONDS (wrangler.toml [[ratelimits]]).
+    // notme-900e28.
   };
 }
 /**
