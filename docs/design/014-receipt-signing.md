@@ -125,10 +125,37 @@ instead of served.
 - **No `/internal/sign-jwt`** (notme-d87ef2). Identical hazard class and it
   should get the same treatment, but it is a separate contract with a
   separate consumer; bundling them would hide one behind the other.
-- **No key material export, ever.** `signReceipt` returns a signature and an
-  epoch. `CryptoKey` is not Structured Cloneable and cannot cross the RPC
-  boundary regardless — that is a property of the platform, not a check we
-  perform, and it is worth not undermining by adding an export path later.
+- **`signReceipt` itself returns no key material** — a signature and an
+  epoch, and that is a property of the method.
+
+  This ADR previously generalised that into "`CryptoKey` is not Structured
+  Cloneable and cannot cross the RPC boundary regardless — that is a property
+  of the platform, not a check we perform." Both halves needed correcting
+  (notme-bcbd74), and the corrected version is *less* comfortable than the
+  original, which is why it is written out here rather than quietly reworded:
+
+  - **The platform claim is false.** W3C WebCrypto declares `[Serializable]
+    interface CryptoKey`, and Node clones a non-extractable Ed25519 private
+    key successfully. What is true is narrower and runtime-specific:
+    *workerd's* serializer refuses `CryptoKey` with a `DataCloneError`.
+    Measured, not assumed — `rpc.cryptokey.isolation`.
+  - **"Regardless" was doing real work, and it is load-bearing.**
+    `SigningAuthority.getOrCreateSigningKey()` is in the RPC allow-list and
+    its return type is `{ signingKey: CryptoKey; verifyKey: CryptoKey; keyId }`
+    — so a caller holding a stub *does* invoke a method that hands back the
+    authority's private key, and the ONLY thing stopping delivery is that
+    serializer. Measured: the call throws `DataCloneError` on the return path.
+  - **Non-extractability is a different control and does not cover the gap.**
+    The held key IS non-extractable in every storage mode — generated
+    extractable just long enough to serialize one JWK, then re-imported
+    non-extractable. That stops byte export. It does not stop USE: a
+    non-extractable private key still signs, so a caller who received one
+    would hold the authority's full signing capability.
+
+  So the mitigation for RPC key extraction is a single runtime behaviour that
+  no standard requires. Do not port this reasoning to another runtime, and do
+  not add a second method returning `CryptoKey` on the assumption that the
+  first one is safe. Narrowing that surface is tracked separately.
 - **`/internal/sign-receipt` as an HTTP path is explicitly refused**, not
   merely absent, so a caller following the bead's original wire shape gets a
   clear 404 with a pointer instead of falling through to the asset handler.

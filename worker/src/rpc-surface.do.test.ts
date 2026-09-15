@@ -23,6 +23,7 @@
  * of bug got in; reviewing a list is not.
  */
 
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { AuthService, JwtSigner, ReceiptSigner } from "../worker";
 import { SigningAuthority } from "./signing-authority";
@@ -197,7 +198,8 @@ describe("RPC surface is an allow-list, not an accident", () => {
 // AuthService.heldCerts is the live instance of the pattern. It holds
 // per-session credential state, and the class is reachable by service binding.
 // The mitigations are real — workerd gives a fresh `this` per RPC session, so a
-// caller sees only their own, and CryptoKeys are not structured-cloneable — but
+// caller sees only their own, and workerd's serializer refuses CryptoKey (see
+// rpc.cryptokey.isolation below — a workerd behaviour, not a W3C one) — but
 // they are properties of the RUNTIME, not of the declaration, and the rule this
 // file exists to enforce is about the declaration: on an RPC-reachable class
 // write `#foo`, never `private foo`.
@@ -218,5 +220,136 @@ describe("instance fields are private too, not merely TypeScript-private", () =>
       `AuthService instance exposes ${ours.join(", ")} — a TypeScript \`private\` ` +
         `field is erased and stays readable on a stub. Use #private.`,
     ).toEqual([]);
+  });
+});
+
+// ── rpc.cryptokey.isolation ─────────────────────────────────────────────────
+//
+// THREAT_MODEL's "CryptoKey extraction" row names this test. It did not
+// exist, and the mitigation the row asserted was wrong as stated: five sites
+// claimed "CryptoKey is not Structured Cloneable" as a PLATFORM property
+// needing no check. W3C WebCrypto declares `[Serializable] interface
+// CryptoKey`, and Node clones a non-extractable Ed25519 private key happily
+// — so as a statement about the web platform it is false, and a future
+// change reasoned against it reasons from a false premise (notme-bcbd74).
+//
+// What is true is narrower and had never been measured: WORKERD's serializer
+// refuses CryptoKey. Pinning it matters more than it first looks, because
+// this is not a redundant second line of defence —
+// `getOrCreateSigningKey()` is in the allow-list above and returns
+// `{ signingKey: CryptoKey, verifyKey: CryptoKey, keyId }`, so a stub holder
+// DOES reach a method that hands back the authority's private key, and the
+// serializer is the only thing that stops delivery. Non-extractability does
+// not cover it either: keys are non-extractable only in `ephemeral` mode and
+// production runs `cf-managed`.
+//
+// If workerd ever aligns with the IDL, that changes from "hardened" to "key
+// export endpoint", and it should break here loudly.
+describe("rpc.cryptokey.isolation", () => {
+  const edKeys = () =>
+    crypto.subtle.generateKey({ name: "Ed25519" }, false, [
+      "sign",
+      "verify",
+    ]) as Promise<CryptoKeyPair>;
+
+  it("workerd refuses to serialize a CryptoKey at all", async () => {
+    const { privateKey } = await edKeys();
+    expect(privateKey.extractable).toBe(false);
+    expect(() => structuredClone(privateKey)).toThrow(/serialize|clone/i);
+  });
+
+  it("...so a CryptoKey cannot cross a real RPC boundary", async () => {
+    // The serializer runs before the method does, so the argument being of
+    // the wrong type for getEpochPublicKey is irrelevant — and deliberate:
+    // this probes the BOUNDARY, not a particular method's validation.
+    const { privateKey } = await edKeys();
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-isolation"),
+    );
+    await expect(
+      // @ts-expect-error probing the serializer with a deliberately wrong type
+      stub.getEpochPublicKey(privateKey),
+    ).rejects.toThrow(/DataCloneError|serialize/i);
+  });
+
+  it("...nor nested inside an argument object", async () => {
+    // AuthService.authenticate's declared parameter is exactly this shape:
+    // { mtlsCert, signingCert, mtlsKey: CryptoKey, signingKey: CryptoKey }.
+    // Nesting does not help; the whole argument fails to serialize. Which
+    // means that signature cannot be satisfied across a service binding at
+    // all — see the note on authenticate() in worker.ts.
+    const { privateKey } = await edKeys();
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-isolation"),
+    );
+    await expect(
+      // @ts-expect-error probing the serializer with a deliberately wrong type
+      stub.getEpochPublicKey({
+        mtlsCert: "-----BEGIN CERTIFICATE-----",
+        signingCert: "-----BEGIN CERTIFICATE-----",
+        mtlsKey: privateKey,
+        signingKey: privateKey,
+      }),
+    ).rejects.toThrow(/DataCloneError|serialize/i);
+  });
+
+  it("THE ONE THAT MATTERS: getOrCreateSigningKey cannot deliver over a stub", async () => {
+    // This is the whole row. getOrCreateSigningKey is in the allow-list and
+    // returns { signingKey: CryptoKey, verifyKey: CryptoKey, keyId } — so a
+    // caller holding a stub genuinely calls a method that hands back this
+    // authority's private key, and the serializer refusing the RETURN value
+    // is the only reason they do not receive it.
+    //
+    // Treat a failure here as key exposure, not as a test to update.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-return-path"),
+    );
+    await expect(stub.getOrCreateSigningKey()).rejects.toThrow(
+      /DataCloneError|serialize/i,
+    );
+  });
+
+  it("in-isolate the same call DOES yield the key — the boundary is the control", async () => {
+    // The negative control. If this threw too, the test above would be
+    // passing for the wrong reason (a broken method rather than a refused
+    // serialization), and the row would look defended while proving nothing.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-return-path"),
+    );
+    const key = await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as {
+        getOrCreateSigningKey(): Promise<{ signingKey: CryptoKey }>;
+      };
+      return (await a.getOrCreateSigningKey()).signingKey;
+    });
+    expect(key.type).toBe("private");
+  });
+
+  it("the held key is non-extractable — which bounds the damage but is NOT this row's control", async () => {
+    // Worth separating carefully, because conflating the two is how the
+    // wrong mitigation got written down in the first place.
+    //
+    // Non-extractability stops BYTE EXPORT: the key is generated extractable
+    // for exactly long enough to serialize one JWK into storage, then
+    // re-imported non-extractable (signing-authority.ts, "Re-import as
+    // non-extractable"), in every storage mode. So a delivered CryptoKey
+    // could not be turned back into key material.
+    //
+    // It does NOT stop USE. A non-extractable private key still signs, so a
+    // caller who received one would hold the authority's full signing
+    // capability. That is why the serializer refusal above is the control for
+    // this row and non-extractability is not a substitute for it.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-extractability"),
+    );
+    const { extractable, usages } = await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as {
+        getOrCreateSigningKey(): Promise<{ signingKey: CryptoKey }>;
+      };
+      const k = (await a.getOrCreateSigningKey()).signingKey;
+      return { extractable: k.extractable, usages: k.usages };
+    });
+    expect(extractable).toBe(false);
+    expect(usages).toContain("sign");
   });
 });

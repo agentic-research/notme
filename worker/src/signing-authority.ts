@@ -795,8 +795,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * the commitment is rejected if it disagrees — the notme-6ad276 invariant:
    * facts about this authority are never taken from the caller.
    *
-   * Returns the signature and the epoch. It cannot return key material:
-   * `CryptoKey` is not Structured Cloneable and cannot cross the RPC boundary.
+   * Returns the signature and the epoch. THIS method returns no key
+   * material, which is a property of the method and nothing more.
+   *
+   * It used to add "`CryptoKey` is not Structured Cloneable and cannot cross
+   * the RPC boundary" as though that were a standing guarantee. It is not
+   * (notme-bcbd74). W3C WebCrypto marks CryptoKey `[Serializable]`; workerd
+   * happens to refuse it, measured by `rpc.cryptokey.isolation`. And the
+   * class does not otherwise hold that line: `getOrCreateSigningKey()` is
+   * RPC-reachable and returns the signing CryptoKey, so that serializer
+   * refusal is the only thing between a stub holder and this authority's
+   * private key. Non-extractability does not cover that: the held key is
+   * non-extractable in every mode, which stops byte export but not USE — a
+   * delivered CryptoKey would still sign as this CA.
    */
 
   /**

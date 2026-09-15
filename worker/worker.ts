@@ -274,8 +274,10 @@ export class AuthService extends WorkerEntrypoint<any> {
   // TS `private` is erased at build time, so the field would stay readable on
   // any stub someone obtains. The runtime mitigations are real — workerd gives
   // a fresh `this` per RPC session, so a caller sees only their own, and
-  // CryptoKeys are not structured-cloneable — but they are properties of the
-  // RUNTIME, not of the declaration (notme-2154b8).
+  // workerd's serializer refuses CryptoKey (measured by
+  // rpc.cryptokey.isolation; note this is a WORKERD behaviour, not the W3C
+  // one — CryptoKey is `[Serializable]` in the IDL, notme-bcbd74) — but they
+  // are properties of the RUNTIME, not of the declaration (notme-2154b8).
   #heldCerts: HeldCerts | null = null;
 
   /**
@@ -367,6 +369,20 @@ export class AuthService extends WorkerEntrypoint<any> {
    *         window, or names a different principal than its partner. On throw
    *         the session stays unauthenticated — a failed authenticate() must
    *         not leave stale creds from a previous successful one.
+   *
+   * CALLING CONVENTION, measured (notme-bcbd74): this signature cannot be
+   * satisfied over a service binding today. workerd's RPC serializer refuses
+   * `CryptoKey` — the whole argument fails with a DataCloneError before the
+   * method runs, nested or not (`rpc.cryptokey.isolation`). Every caller in
+   * this repo constructs an AuthService directly, in-isolate, where that does
+   * not apply.
+   *
+   * The reachability reasoning above still holds and the derivation is still
+   * required: a bound Worker CAN reach this method, and can pass the cert
+   * strings — which serialize fine — with the key fields absent. That call
+   * would set credentials whose identity and scopes came from certs, which is
+   * the point; it simply could not then sign. Do not read "unreachable in
+   * practice" into a serializer limitation.
    */
   async authenticate(creds: {
     mtlsCert: string;
