@@ -1809,12 +1809,21 @@ export default {
       );
     }
 
+    // The binding named here MUST be a dedicated one. This string used to say
+    // `entrypoint = "ReceiptSigner"` on the NOTME binding and `env.NOTME.
+    // signReceipt(...)` — the instruction ADR-014 retracted by name, because
+    // setting `entrypoint` on a binding already used as a fetch proxy
+    // silently routes that binding's fetch() to a class with no fetch
+    // handler, breaking the integrator's existing /identity/* traffic
+    // (ADR-016 rule 2). The correction reached the ADR and the ReceiptSigner
+    // docstring; it never reached the string an integrator actually reads,
+    // which is the only one of the three they ever see. notme-bd133e.
     if (pathname === "/internal/sign-receipt") {
       return Response.json(
         {
           error: "not_an_http_endpoint",
           error_description:
-            'Receipt signing is an RPC method, not a route. Bind with entrypoint = "ReceiptSigner" and call env.NOTME.signReceipt(commitmentBytes). See docs/design/014-receipt-signing.md.',
+            'Receipt signing is an RPC method, not a route. Add a dedicated binding — ( name = "NOTME_RECEIPTS", service = "notme-bot", entrypoint = "ReceiptSigner" ) — and call env.NOTME_RECEIPTS.signReceipt(commitmentBytes). Do NOT add entrypoint to an existing NOTME binding: that reroutes its fetch() to a class with no fetch handler (ADR-016 rule 2). See docs/design/014-receipt-signing.md.',
         },
         { status: 404 },
       );

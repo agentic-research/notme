@@ -73,6 +73,42 @@ describe("ADR-016 rule 1 — no signing surface is a fetch route", () => {
       );
     }
   });
+
+  it("...and the somewhere they point is a DEDICATED binding", async () => {
+    // Rule 1's reason for refusing explicitly is "so a caller built against
+    // an older spec is told where it went". A refusal that tells them
+    // somewhere WRONG is worse than a blank 404: /internal/sign-receipt used
+    // to answer `entrypoint = "ReceiptSigner"` + `env.NOTME.signReceipt(...)`,
+    // which is the instruction ADR-014 retracted by name and ADR-016 rule 2
+    // forbids — setting entrypoint on a binding already used as a fetch
+    // proxy reroutes its fetch() to a class with no fetch handler, breaking
+    // the integrator's live /identity/* traffic.
+    //
+    // The class docstrings and the sibling sign-jwt refusal had it right the
+    // whole time, so this asserts the surface an integrator READS, which is
+    // the only copy that reaches them. notme-bd133e.
+    const cases = [
+      { path: "/internal/sign-receipt", binding: "NOTME_RECEIPTS", method: "signReceipt" },
+      { path: "/internal/sign-jwt", binding: "NOTME_JWT", method: "signJwt" },
+    ];
+    for (const { path, binding, method } of cases) {
+      const res = await worker.fetch(
+        new Request(`${ORIGIN}${path}`, { method: "POST" }),
+        { ...env, ...LOCAL_ENV },
+      );
+      const body = await res.text();
+      expect(body, `${path} must name a dedicated binding`).toContain(
+        `name = \\"${binding}\\"`,
+      );
+      expect(body, `${path} must show the call on that binding`).toContain(
+        `env.${binding}.${method}`,
+      );
+      // The retracted form. `env.NOTME.` must appear in NEITHER refusal.
+      expect(body, `${path} still tells integrators to pin NOTME`).not.toMatch(
+        /env\.NOTME\./,
+      );
+    }
+  });
 });
 
 describe("ADR-016 rule 5 — signing entrypoints return a union, not a throw", () => {
