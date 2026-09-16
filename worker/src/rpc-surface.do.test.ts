@@ -184,7 +184,32 @@ describe("RPC surface is an allow-list, not an accident", () => {
       // FROM necessarily has. So on a live authority this method is a no-op
       // by construction; on a fresh one, a caller holding a stub already had
       // the deployment access needed to set the variable in the first place.
-    ).toBe(48);
+      //
+      // 48 → 47: getOrCreateSigningKey REMOVED (notme-eedc9c). The first
+      // removal in this log, and the only one so far that was a live
+      // exposure rather than a reviewed addition.
+      //
+      // Its return type was { signingKey: CryptoKey; verifyKey: CryptoKey;
+      // keyId } — the CA's private key, handed to anyone holding a stub. The
+      // pin above never caught it because the pin asks what is REACHABLE,
+      // not what reachable things RETURN, and the surrounding documentation
+      // asserted (falsely) that "CryptoKey is not Structured Cloneable", so
+      // a method returning one read as harmless (notme-bcbd74).
+      //
+      // What actually stopped delivery was workerd refusing to serialize
+      // CryptoKey — measured, and a runtime behaviour no standard requires.
+      // Non-extractability did not cover it: the held key is non-extractable
+      // in every mode, which stops byte export but not USE, and a delivered
+      // key still signs as this CA.
+      //
+      // It is `#getOrCreateSigningKey()` now. All fourteen call sites were
+      // internal; the only external consumer was delegation-depth.do.test.ts,
+      // which reads the stored JWK directly instead — a test forging
+      // production's exact condition, not a caller being handed a key.
+      //
+      // The standard for the next removal: prefer taking a method off the
+      // surface over relying on any property of the boundary.
+    ).toBe(47);
   });
 });
 
@@ -293,63 +318,59 @@ describe("rpc.cryptokey.isolation", () => {
     ).rejects.toThrow(/DataCloneError|serialize/i);
   });
 
-  it("THE ONE THAT MATTERS: getOrCreateSigningKey cannot deliver over a stub", async () => {
-    // This is the whole row. getOrCreateSigningKey is in the allow-list and
-    // returns { signingKey: CryptoKey, verifyKey: CryptoKey, keyId } — so a
-    // caller holding a stub genuinely calls a method that hands back this
-    // authority's private key, and the serializer refusing the RETURN value
-    // is the only reason they do not receive it.
-    //
-    // Treat a failure here as key exposure, not as a test to update.
-    const stub = env.SIGNING_AUTHORITY.get(
-      env.SIGNING_AUTHORITY.idFromName("cryptokey-return-path"),
-    );
-    await expect(stub.getOrCreateSigningKey()).rejects.toThrow(
-      /DataCloneError|serialize/i,
-    );
+  it("THE FIX: no method returning the authority's private key is on the surface", () => {
+    // getOrCreateSigningKey() used to be here, returning
+    // { signingKey: CryptoKey, verifyKey, keyId }. A stub holder called it and
+    // the ONLY thing that stopped delivery was the serializer above — a
+    // workerd behaviour no standard requires. It is #getOrCreateSigningKey()
+    // now, so the property is "not returnable" rather than "undeliverable by
+    // a quirk" (notme-eedc9c).
+    expect(rpcSurface(SigningAuthority)).not.toContain("getOrCreateSigningKey");
   });
 
-  it("in-isolate the same call DOES yield the key — the boundary is the control", async () => {
-    // The negative control. If this threw too, the test above would be
-    // passing for the wrong reason (a broken method rather than a refused
-    // serialization), and the row would look defended while proving nothing.
+  it("...and no surface method hands back a CryptoKey by any other name", async () => {
+    // The generic form, so the next method with a CryptoKey in its return
+    // type is caught when it is written rather than when it is exploited.
+    //
+    // Every zero-argument method on the surface is called over a REAL stub.
+    // Methods that need arguments fail for their own reasons and are ignored;
+    // the only failure this cares about is the serializer refusing a
+    // CryptoKey, which is precisely the signature of a method that tried to
+    // return one.
     const stub = env.SIGNING_AUTHORITY.get(
-      env.SIGNING_AUTHORITY.idFromName("cryptokey-return-path"),
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-return-sweep"),
     );
-    const key = await runInDurableObject(stub, async (auth) => {
-      const a = auth as unknown as {
-        getOrCreateSigningKey(): Promise<{ signingKey: CryptoKey }>;
-      };
-      return (await a.getOrCreateSigningKey()).signingKey;
-    });
-    expect(key.type).toBe("private");
+    const leaks: string[] = [];
+    for (const name of rpcSurface(SigningAuthority)) {
+      let result: unknown;
+      try {
+        result = await (stub as unknown as Record<string, () => Promise<unknown>>)[
+          name
+        ]!();
+      } catch (e) {
+        const msg = String((e as Error).message ?? e);
+        if (/CryptoKey/.test(msg)) leaks.push(`${name}: ${msg}`);
+        continue;
+      }
+      // A delivered CryptoKey would mean workerd started serializing them —
+      // the day the old mitigation evaporates.
+      const values = result && typeof result === "object" ? Object.values(result) : [];
+      if (values.some((v) => v instanceof CryptoKey)) leaks.push(`${name}: returned a CryptoKey`);
+    }
+    expect(leaks, `methods returning key material: ${leaks.join(" | ")}`).toEqual([]);
   });
 
-  it("the held key is non-extractable — which bounds the damage but is NOT this row's control", async () => {
-    // Worth separating carefully, because conflating the two is how the
-    // wrong mitigation got written down in the first place.
-    //
-    // Non-extractability stops BYTE EXPORT: the key is generated extractable
-    // for exactly long enough to serialize one JWK into storage, then
-    // re-imported non-extractable (signing-authority.ts, "Re-import as
-    // non-extractable"), in every storage mode. So a delivered CryptoKey
-    // could not be turned back into key material.
-    //
-    // It does NOT stop USE. A non-extractable private key still signs, so a
-    // caller who received one would hold the authority's full signing
-    // capability. That is why the serializer refusal above is the control for
-    // this row and non-extractability is not a substitute for it.
+  it("the authority still signs — the key was hidden, not removed", async () => {
+    // Negative control for the two above. If #getOrCreateSigningKey had been
+    // broken by the rename rather than merely made private, every assertion
+    // in this describe would pass over a DO that can no longer do anything,
+    // and the file would look hardened because it was inert.
     const stub = env.SIGNING_AUTHORITY.get(
-      env.SIGNING_AUTHORITY.idFromName("cryptokey-extractability"),
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-still-signs"),
     );
-    const { extractable, usages } = await runInDurableObject(stub, async (auth) => {
-      const a = auth as unknown as {
-        getOrCreateSigningKey(): Promise<{ signingKey: CryptoKey }>;
-      };
-      const k = (await a.getOrCreateSigningKey()).signingKey;
-      return { extractable: k.extractable, usages: k.usages };
-    });
-    expect(extractable).toBe(false);
-    expect(usages).toContain("sign");
+    const pem = await stub.getCACertificatePem();
+    expect(pem).toContain("BEGIN CERTIFICATE");
+    const jwk = await stub.getPublicKeyJwk();
+    expect(jwk.crv).toBe("Ed25519");
   });
 });

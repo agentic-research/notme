@@ -395,7 +395,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   // Load or generate the authority keypair. Cached in memory for the DO lifetime.
-  async getOrCreateSigningKey(): Promise<{
+  async #getOrCreateSigningKey(): Promise<{
     signingKey: CryptoKey;
     verifyKey: CryptoKey;
     keyId: string;
@@ -575,7 +575,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   // Return the authority's public key as PEM.
   async getPublicKeyPem(): Promise<string> {
-    const { verifyKey } = await this.getOrCreateSigningKey();
+    const { verifyKey } = await this.#getOrCreateSigningKey();
     const spki = (await crypto.subtle.exportKey(
       "spki",
       verifyKey,
@@ -594,7 +594,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     use: string;
     alg: string;
   }> {
-    const { verifyKey, keyId } = await this.getOrCreateSigningKey();
+    const { verifyKey, keyId } = await this.#getOrCreateSigningKey();
     const raw = (await crypto.subtle.exportKey(
       "raw",
       verifyKey,
@@ -654,7 +654,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       }
     }
 
-    const { signingKey, verifyKey } = await this.getOrCreateSigningKey();
+    const { signingKey, verifyKey } = await this.#getOrCreateSigningKey();
     const now = new Date();
     const notAfter = new Date(
       now.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
@@ -691,7 +691,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   // Return the raw 32-byte Ed25519 public key as base64 (for CABundle.keys).
   async getPublicKeyRawB64(): Promise<string> {
-    const { verifyKey } = await this.getOrCreateSigningKey();
+    const { verifyKey } = await this.#getOrCreateSigningKey();
     const raw = (await crypto.subtle.exportKey(
       "raw",
       verifyKey,
@@ -722,7 +722,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     audience: string;
     jkt: string; // JWK thumbprint of the DPoP proof key
   }): Promise<string> {
-    const { signingKey, keyId } = await this.getOrCreateSigningKey();
+    const { signingKey, keyId } = await this.#getOrCreateSigningKey();
     const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
       issuer: issuerFromEnv(this.env),
@@ -795,19 +795,21 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * the commitment is rejected if it disagrees — the notme-6ad276 invariant:
    * facts about this authority are never taken from the caller.
    *
-   * Returns the signature and the epoch. THIS method returns no key
-   * material, which is a property of the method and nothing more.
+   * Returns the signature and the epoch, and no key material.
    *
    * It used to add "`CryptoKey` is not Structured Cloneable and cannot cross
    * the RPC boundary" as though that were a standing guarantee. It is not
-   * (notme-bcbd74). W3C WebCrypto marks CryptoKey `[Serializable]`; workerd
-   * happens to refuse it, measured by `rpc.cryptokey.isolation`. And the
-   * class does not otherwise hold that line: `getOrCreateSigningKey()` is
-   * RPC-reachable and returns the signing CryptoKey, so that serializer
-   * refusal is the only thing between a stub holder and this authority's
-   * private key. Non-extractability does not cover that: the held key is
-   * non-extractable in every mode, which stops byte export but not USE — a
-   * delivered CryptoKey would still sign as this CA.
+   * (notme-bcbd74): W3C WebCrypto marks CryptoKey `[Serializable]`, and
+   * workerd merely happens to refuse it — measured by
+   * `rpc.cryptokey.isolation`, a runtime behaviour no standard requires.
+   *
+   * That mattered because the class did not otherwise hold the line:
+   * `getOrCreateSigningKey()` was RPC-reachable and returned the signing
+   * CryptoKey, so the serializer was the only thing between a stub holder
+   * and a key that still signs as this CA (non-extractability stops byte
+   * export, not USE). It is `#getOrCreateSigningKey()` now — off the surface
+   * entirely, so the property is "not returnable" rather than "undeliverable
+   * by a quirk" (notme-eedc9c). The serializer test stays as a backstop.
    */
 
   /**
@@ -945,7 +947,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   async getReceiptFacts(): Promise<{ actorFp: Uint8Array; epoch: number }> {
     this.#ensureSchema();
-    const { verifyKey } = await this.getOrCreateSigningKey();
+    const { verifyKey } = await this.#getOrCreateSigningKey();
 
     // actor_fp per RECEIPTS.md §2.1: SHA-256 of the actor's master PUBLIC key.
     // Over the RAW Ed25519 key, which is what a verifier resolving
@@ -1100,7 +1102,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async signReceiptCommitment(
     commitment: Uint8Array,
   ): Promise<ReceiptSignResult> {
-    const { signingKey } = await this.getOrCreateSigningKey();
+    const { signingKey } = await this.#getOrCreateSigningKey();
     const { actorFp, epoch } = await this.getReceiptFacts();
 
     const { validateCommitment, CommitmentError } =
@@ -1264,7 +1266,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     scope: string;
     audience: string;
   }): Promise<string> {
-    const { signingKey, keyId } = await this.getOrCreateSigningKey();
+    const { signingKey, keyId } = await this.#getOrCreateSigningKey();
     const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
       issuer: issuerFromEnv(this.env),
@@ -1288,7 +1290,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     subject: string;
     authority: { epoch: number; key_id: string };
   }> {
-    const { signingKey } = await this.getOrCreateSigningKey();
+    const { signingKey } = await this.#getOrCreateSigningKey();
     const state = await this.getAuthorityState();
     const { mintGHABridgeCert } = await import("./cert-authority");
     const result = await mintGHABridgeCert(
@@ -1318,7 +1320,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       authority: { epoch: number; key_id: string };
     }
   > {
-    const { signingKey } = await this.getOrCreateSigningKey();
+    const { signingKey } = await this.#getOrCreateSigningKey();
     const state = await this.getAuthorityState();
     const { mintBridgeCertPair } = await import("./cert-authority");
     const result = await mintBridgeCertPair(
@@ -1369,7 +1371,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         `issuing tier ttl capped at 24h, got ${params.ttlMs}ms`,
       );
     }
-    const { signingKey } = await this.getOrCreateSigningKey();
+    const { signingKey } = await this.#getOrCreateSigningKey();
     const state = await this.getAuthorityState();
     const { mintIssuingCaCert } = await import("./cert-authority");
     const result = await mintIssuingCaCert(
@@ -1397,7 +1399,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     keyId: string;
   }> {
     this.#ensureSchema();
-    const { keyId } = await this.getOrCreateSigningKey();
+    const { keyId } = await this.#getOrCreateSigningKey();
     const rows = this.ctx.storage.sql
       .exec("SELECT epoch, seqno FROM state WHERE id = 'authority'")
       .toArray() as Array<{ epoch: number; seqno: number }>;
@@ -1408,7 +1410,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Generate a signed CABundle for the revocation verifier.
   // Caller writes this to CA_BUNDLE_CACHE KV.
   async generateBundle(): Promise<CABundle> {
-    const { signingKey, keyId } = await this.getOrCreateSigningKey();
+    const { signingKey, keyId } = await this.#getOrCreateSigningKey();
     const pubKeyB64 = await this.getPublicKeyRawB64();
 
     this.#ensureSchema();
@@ -1502,8 +1504,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       "UPDATE state SET epoch = epoch + 1, seqno = seqno + 1 WHERE id = 'authority'",
     );
 
-    // Generate new key (getOrCreateSigningKey will create since we deleted)
-    const { keyId: newKeyId } = await this.getOrCreateSigningKey();
+    // Generate new key (#getOrCreateSigningKey will create since we deleted)
+    const { keyId: newKeyId } = await this.#getOrCreateSigningKey();
 
     // Store prevKeyId + prevPubKey for the transition window (both needed so
     // generateBundle can republish the previous key for grace-window verify).
@@ -2222,7 +2224,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   // ── Alarm: periodic bundle publish ──────────────────────────────────
   // Ensures CA bundle in KV stays fresh (< BUNDLE_MAX_AGE_MS).
-  // Scheduled on first getOrCreateSigningKey() and re-arms after each fire.
+  // Scheduled on first #getOrCreateSigningKey() and re-arms after each fire.
   //
   // Hardening (notme-5c2511 EPIC, post 2026-05-10 cautionary-tale review):
   //   - alarm_health table tracks failure_count, total_fires, last_fire_at,

@@ -51,6 +51,11 @@ async function spkiToPem(key: CryptoKey): Promise<string> {
   return `-----BEGIN PUBLIC KEY-----\n${b64.match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
 }
 
+function pemToSpki(pem: string): Uint8Array {
+  const b64 = pem.replace(/-----(BEGIN|END) PUBLIC KEY-----|\s/g, "");
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
 /**
  * Every certificate notme can issue, minted through its real mint paths.
  *
@@ -239,7 +244,36 @@ describe("the SERVED root's budget matches the code's (notme-1b1db4)", () => {
       const state = await a.getAuthorityState();
       // Plant a pathlen:0 self-signed cert under the CURRENT key, as March
       // 2026 production did.
-      const { signingKey, verifyKey } = await a.getOrCreateSigningKey();
+      //
+      // The key is read out of the DO's own storage rather than from a
+      // method: #getOrCreateSigningKey is ECMAScript-private and off the RPC
+      // surface (notme-eedc9c), which is the point — no caller, in-isolate or
+      // otherwise, is handed the authority's private key. A test that needs
+      // to forge production's exact condition reaches for the stored material
+      // the same way the DO does, and this file already reaches into
+      // ctx.storage.sql below to plant the stale row.
+      //
+      // Plaintext JWK because the pool env sets no KEK, so key storage
+      // resolves to cf-managed — the same mode production runs (notme-41d0d3
+      // tracks the at-rest exposure that follows from it).
+      await a.getCACertificatePem(); // force key + schema init
+      const keyRow = a["ctx"].storage.sql
+        .exec("SELECT private_jwk FROM keys WHERE id = 'authority'")
+        .toArray()[0] as { private_jwk: string };
+      const signingKey = await crypto.subtle.importKey(
+        "jwk",
+        JSON.parse(keyRow.private_jwk),
+        ED25519,
+        false,
+        ["sign"],
+      );
+      const verifyKey = await crypto.subtle.importKey(
+        "spki",
+        pemToSpki(await a.getPublicKeyPem()),
+        ED25519,
+        true,
+        ["verify"],
+      );
       const stale = await X509CertificateGenerator.createSelfSigned({
         name: "CN=signet-authority,O=notme",
         notBefore: new Date(Date.now() - 86_400_000),
@@ -249,14 +283,13 @@ describe("the SERVED root's budget matches the code's (notme-1b1db4)", () => {
         serialNumber: "0a",
         extensions: [new BasicConstraintsExtension(true, 0, true)],
       });
-      await a.getCACertificatePem(); // ensure the table exists
       a["ctx"].storage.sql.exec("DELETE FROM ca_cert WHERE id = 'cert'");
       a["ctx"].storage.sql.exec(
         "INSERT INTO ca_cert (id, pem, key_id) VALUES ('cert', ?, ?)",
         stale.toString("pem"),
         state.keyId,
       );
-      return { epoch: state.epoch, keyId: state.keyId, spki: await spkiToPem(verifyKey) };
+      return { epoch: state.epoch, keyId: state.keyId, spki: await a.getPublicKeyPem() };
     });
 
     const pem = await runInDurableObject(stub, (auth) =>
@@ -269,10 +302,16 @@ describe("the SERVED root's budget matches the code's (notme-1b1db4)", () => {
     const after = await runInDurableObject(stub, async (auth) => {
       const a = auth as SigningAuthority;
       const s = await a.getAuthorityState();
-      const { verifyKey } = await a.getOrCreateSigningKey();
-      return { epoch: s.epoch, keyId: s.keyId, spki: await spkiToPem(verifyKey) };
+      // getPublicKeyPem() is the public half and is a legitimate RPC method;
+      // it is what the "same key" comparison actually needs.
+      return { epoch: s.epoch, keyId: s.keyId, spki: await a.getPublicKeyPem() };
     });
     expect(after).toEqual(before);
-    expect(await spkiToPem(await served.publicKey.export())).toBe(before.spki);
+    // getPublicKeyPem() ends with a trailing newline; spkiToPem does not.
+    // Compare the base64 body, which is the thing that must be identical.
+    const body = (pem: string) => pem.replace(/-----[A-Z ]+-----|\s/g, "");
+    expect(body(await spkiToPem(await served.publicKey.export()))).toBe(
+      body(before.spki),
+    );
   });
 });
