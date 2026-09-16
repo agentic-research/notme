@@ -91,7 +91,7 @@ describe("bundleCanonical", () => {
 
 // ── verifyBundleSignature ─────────────────────────────────────────────────────
 
-describe("verifyBundleSignature", () => {
+describe("bundle.signature.verification — verifyBundleSignature", () => {
   it("accepts a valid bundle signature", async () => {
     const bundle = makeBundle();
     bundle.signature = await signBundle(bundle);
@@ -169,7 +169,7 @@ describe("RevocationAuthority", () => {
     });
   });
 
-  it("rejects lower seqno (rollback attack)", async () => {
+  it("revocation.seqno.monotonic — rejects lower seqno (rollback attack)", async () => {
     const id = env.REVOCATION.idFromName("test-reject-rollback");
     const stub = env.REVOCATION.get(id);
     await runInDurableObject(stub, async (instance: RevocationAuthority) => {
@@ -218,7 +218,7 @@ describe("checkRevocation", () => {
     expect(result.revoked).toBe(false);
   });
 
-  it("revokes token with old epoch", async () => {
+  it("revocation.epoch.mismatch — revokes token with old epoch", async () => {
     const bundle = makeBundle({ epoch: 5, seqno: 2 });
     bundle.signature = await signBundle(bundle);
     await env.CA_BUNDLE_CACHE.put("bundle:current", JSON.stringify(bundle));

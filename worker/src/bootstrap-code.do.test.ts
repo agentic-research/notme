@@ -70,8 +70,8 @@ async function bootstrapStatus(stub: {
   return (await stub.getOrCreateBootstrapCode()).status as string;
 }
 
-describe("bootstrap code single-use invariant (real DO)", () => {
-  it("consumes exactly once — the same code never consumes twice", async () => {
+describe("passkey.admin.bootstrap-code — bootstrap code single-use invariant (real DO)", () => {
+  it("passkey.reset.single-use — consumes exactly once, so a leaked code cannot re-wipe", async () => {
     const stub = authority("bs-single-use");
     const code = await issuedCode(stub);
     expect(code).toBeTruthy();

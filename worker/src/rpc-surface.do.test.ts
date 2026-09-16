@@ -35,7 +35,7 @@ function rpcSurface(cls: { prototype: object }): string[] {
     .sort();
 }
 
-describe("RPC surface is an allow-list, not an accident", () => {
+describe("rpc.capability.isolation — RPC surface is an allow-list, not an accident", () => {
   it("ReceiptSigner exposes only receipt signing (ADR-014 least privilege)", () => {
     // The ADR claims a binding to ReceiptSigner "grants receipt signing and
     // nothing else". This is that claim, executable.
@@ -49,7 +49,7 @@ describe("RPC surface is an allow-list, not an accident", () => {
     expect(rpcSurface(JwtSigner)).toEqual(["issuerPublicKey", "signJwt"]);
   });
 
-  it("AuthService exposes no capability-handing method", () => {
+  it("rpc.data.boundary — AuthService exposes no capability-handing method", () => {
     const surface = rpcSurface(AuthService);
 
     // The specific regression. getAuthority() returned a DO stub; a stub is a
