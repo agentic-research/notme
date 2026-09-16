@@ -164,4 +164,60 @@ describe("routing.subdomain.isolation", () => {
     expect(res.status).toBe(301);
     expect(res.headers.get("location")).toBe("https://notme.bot/");
   });
+
+  it("canonicalizes to the CONFIGURED host, not the literal notme.bot", async () => {
+    // The rule used to be `!host.endsWith("notme.bot")`, so a deployment
+    // anywhere else answered every request with a 301 to notme.bot and could
+    // never reach its own routing at all. Found by the staging-impersonation
+    // mint under a third domain (notme-1532eb).
+    const SELF_HOSTED = {
+      SITE_URL: "https://id.example.com",
+      SIGNET_AUTHORITY_URL: "https://auth.id.example.com",
+    };
+    // NOT /health: that is answered before host canonicalization on purpose,
+    // so every host returns 200 and the assertions below would pass without
+    // the routing working at all. /robots.txt and the authority descriptor
+    // both sit after the redirect and are host-routed.
+    const at = (host: string, path: string) =>
+      worker.fetch(new Request(`https://${host}${path}`, { headers: { host } }), {
+        ...env,
+        ...SELF_HOSTED,
+        ASSETS,
+      } as never);
+
+    // Its own hosts are served, not redirected.
+    expect((await at("id.example.com", "/robots.txt")).status).toBe(200);
+    const authRes = await at("auth.id.example.com", "/.well-known/signet-authority.json");
+    expect(authRes.status).toBe(200);
+    expect(await authRes.text()).toContain("https://auth.id.example.com");
+
+    // A stray host still redirects — to ITS canonical site.
+    const stray = await at("notme-bot.workers.dev", "/robots.txt");
+    expect(stray.status).toBe(301);
+    expect(stray.headers.get("location")).toBe("https://id.example.com/robots.txt");
+
+    // And notme.bot is a stray host for THIS deployment, which is the
+    // assertion a hardcode cannot satisfy.
+    const foreign = await at("notme.bot", "/robots.txt");
+    expect(foreign.status).toBe(301);
+    expect(foreign.headers.get("location")).toBe("https://id.example.com/robots.txt");
+  });
+
+  it("an authority host outside the site domain is still served", async () => {
+    // auth.notme.bot is a subdomain of notme.bot, so `endsWith` covered it by
+    // luck. An authority on a wholly different domain is the case that breaks
+    // if the check only walks the site host.
+    const SPLIT = {
+      SITE_URL: "https://notme.bot",
+      SIGNET_AUTHORITY_URL: "https://id.example.net",
+    };
+    const res = await worker.fetch(
+      new Request("https://id.example.net/.well-known/signet-authority.json", {
+        headers: { host: "id.example.net" },
+      }),
+      { ...env, ...SPLIT, ASSETS } as never,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("https://id.example.net");
+  });
 });

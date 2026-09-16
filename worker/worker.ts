@@ -1620,6 +1620,26 @@ export function wimseTrustDomain(env: { SITE_URL?: string }): string {
   return u.host;
 }
 
+/**
+ * The host this deployment canonicalizes to, from SITE_URL.
+ *
+ * Absent → "notme.bot", the documented production default, matching
+ * wimseTrustDomain's treatment of the same variable. Malformed → also
+ * "notme.bot", and deliberately NOT a throw: this runs on every request
+ * before any route matches, so throwing would turn one bad var into a total
+ * outage. wimseTrustDomain throws because minting under a domain nobody
+ * chose is worse than failing the mint; serving the wrong canonical host is
+ * an SEO defect, not a trust one.
+ */
+export function siteHostFromEnv(siteUrl: string | undefined): string {
+  if (!siteUrl) return "notme.bot";
+  try {
+    return new URL(siteUrl).host || "notme.bot";
+  } catch {
+    return "notme.bot";
+  }
+}
+
 // ── CF Edge Cache helpers ──
 // With run_worker_first = true, responses constructed in the Worker bypass CF
 // edge cache entirely. We use the Cache API to store and serve them at the edge.
@@ -1846,10 +1866,29 @@ export default {
     }
 
     // ── Canonical host enforcement ──
-    // Redirect any non-notme.bot host (e.g. workers.dev) to the canonical domain.
-    // This prevents Google from indexing the workers.dev URL as a duplicate.
-    if (!isLocal && !host.endsWith("notme.bot") && host !== "") {
-      const canonicalUrl = `https://notme.bot${pathname}${url.search}`;
+    // Redirect a host this deployment does not serve (e.g. workers.dev) to its
+    // canonical site. This prevents Google from indexing the workers.dev URL
+    // as a duplicate.
+    //
+    // DERIVED, not the literal "notme.bot" it used to test. The old rule was
+    // `!host.endsWith("notme.bot")`, which 301'd EVERY request of any
+    // deployment not under that registrable domain — a self-hosted authority
+    // at id.example.com answered nothing but redirects TO notme.bot, and the
+    // env-derived host selection that ADR-018 and notme-1532eb added below
+    // could never be reached to do its job. Found by a staging-impersonation
+    // test that minted under a third domain (notme-1532eb).
+    //
+    // Both the site host and the authority host are legitimate, and they
+    // differ (notme.bot vs auth.notme.bot). Subdomains of the site host stay
+    // allowed, which is what `endsWith` was expressing for production.
+    const canonicalHost = siteHostFromEnv(env.SITE_URL);
+    const authorityHostForCanon = authorityHostFromEnv(env.SIGNET_AUTHORITY_URL);
+    const hostIsServed =
+      host === canonicalHost ||
+      host.endsWith(`.${canonicalHost}`) ||
+      (authorityHostForCanon !== null && host === authorityHostForCanon);
+    if (!isLocal && !hostIsServed && host !== "") {
+      const canonicalUrl = `https://${canonicalHost}${pathname}${url.search}`;
       const redirect = new Response(null, {
         status: 301,
         headers: {
