@@ -52,10 +52,20 @@ const STAGING = {
   GHA_CERT_AUDIENCE: AUDIENCE,
 };
 
+/**
+ * Minting is genuinely slow: each case generates an RSA-2048 keypair for the
+ * OIDC signer plus a P-256 and an Ed25519 pair for the proof of possession,
+ * then drives a full cert-pair mint through the DO. Two mints in one case
+ * exceeded vitest's 5s default about one run in six — a timeout, never an
+ * assertion failure. Stated as a constant with this note rather than a
+ * global bump, so the next slow test has to make its own case.
+ */
+const MINT_TIMEOUT_MS = 20_000;
+
 let signer: GhaSigner;
 beforeAll(async () => {
   signer = await installGhaSigner({ owner: OWNER, repo: REPO, audience: AUDIENCE });
-});
+}, MINT_TIMEOUT_MS);
 afterAll(() => signer.restore());
 
 async function mint(vars: Record<string, string>) {
@@ -86,7 +96,7 @@ describe("staging.impersonation.identity", () => {
     expect(prod.identity).toContain("wimse://notme.bot/");
     expect(staging.identity).toContain("wimse://staging.notme.bot/");
     expect(staging.identity).not.toBe(prod.identity);
-  });
+  }, MINT_TIMEOUT_MS);
 
   it("the identity is DERIVED, not a literal that happens to differ", async () => {
     // A third, arbitrary domain: a hardcode matching two known environments
@@ -98,7 +108,7 @@ describe("staging.impersonation.identity", () => {
     });
     expect(other.identity).toContain("wimse://notme.example/");
     expect(other.identity).not.toContain("notme.bot");
-  });
+  }, MINT_TIMEOUT_MS);
 });
 
 describe("staging.impersonation.issuer", () => {
@@ -128,7 +138,7 @@ describe("staging.impersonation.issuer", () => {
     expect(prodSubject).not.toContain("auth-staging");
     expect(stagingSubject).toContain("auth-staging.notme.bot");
     expect(stagingSubject).not.toBe(prodSubject);
-  });
+  }, MINT_TIMEOUT_MS);
 
   it("the CA is self-signed, so issuer and subject move together", async () => {
     // Guards against a fix that renames the subject and leaves the issuer —

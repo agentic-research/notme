@@ -270,6 +270,30 @@ describe("instance fields are private too, not merely TypeScript-private", () =>
 //
 // If workerd ever aligns with the IDL, that changes from "hardened" to "key
 // export endpoint", and it should break here loudly.
+/**
+ * Drive an RPC call expected to fail serialization, consuming BOTH rejections.
+ *
+ * `await expect(p).rejects.toThrow()` handles the promise it is given, but a
+ * workerd stub call that fails to serialize its argument leaves a second
+ * rejected promise behind, which vitest reports as an unhandled error and
+ * exits non-zero on — with every test still passing. That is how this file
+ * went green locally and red in the ship gate.
+ */
+async function expectRpcRefusesCryptoKey(call: () => Promise<unknown>) {
+  let message = "";
+  try {
+    const p = call();
+    // Attach a no-op handler before awaiting, so the duplicate rejection has
+    // an owner even if the await path takes the other one.
+    p.catch(() => {});
+    await p;
+  } catch (e) {
+    message = String((e as Error)?.message ?? e);
+  }
+  expect(message, "the call did not fail at all").not.toBe("");
+  expect(message).toMatch(/DataCloneError|serialize/i);
+}
+
 describe("rpc.cryptokey.isolation", () => {
   const edKeys = () =>
     crypto.subtle.generateKey({ name: "Ed25519" }, false, [
@@ -291,10 +315,10 @@ describe("rpc.cryptokey.isolation", () => {
     const stub = env.SIGNING_AUTHORITY.get(
       env.SIGNING_AUTHORITY.idFromName("cryptokey-isolation"),
     );
-    await expect(
+    await expectRpcRefusesCryptoKey(() =>
       // @ts-expect-error probing the serializer with a deliberately wrong type
       stub.getEpochPublicKey(privateKey),
-    ).rejects.toThrow(/DataCloneError|serialize/i);
+    );
   });
 
   it("...nor nested inside an argument object", async () => {
@@ -307,7 +331,7 @@ describe("rpc.cryptokey.isolation", () => {
     const stub = env.SIGNING_AUTHORITY.get(
       env.SIGNING_AUTHORITY.idFromName("cryptokey-isolation"),
     );
-    await expect(
+    await expectRpcRefusesCryptoKey(() =>
       // @ts-expect-error probing the serializer with a deliberately wrong type
       stub.getEpochPublicKey({
         mtlsCert: "-----BEGIN CERTIFICATE-----",
@@ -315,7 +339,7 @@ describe("rpc.cryptokey.isolation", () => {
         mtlsKey: privateKey,
         signingKey: privateKey,
       }),
-    ).rejects.toThrow(/DataCloneError|serialize/i);
+    );
   });
 
   it("THE FIX: no method returning the authority's private key is on the surface", () => {
@@ -332,16 +356,28 @@ describe("rpc.cryptokey.isolation", () => {
     // The generic form, so the next method with a CryptoKey in its return
     // type is caught when it is written rather than when it is exploited.
     //
-    // Every zero-argument method on the surface is called over a REAL stub.
-    // Methods that need arguments fail for their own reasons and are ignored;
-    // the only failure this cares about is the serializer refusing a
-    // CryptoKey, which is precisely the signature of a method that tried to
-    // return one.
+    // Restricted to methods declaring NO parameters. The first version called
+    // everything and passed — while leaving unhandled rejections in the DO
+    // isolate from methods dereferencing `params.x` on undefined. Vitest
+    // reports those as errors and exits non-zero NON-DETERMINISTICALLY, so
+    // the suite was green locally and red in the ship gate. A test that
+    // sometimes fails for a reason unrelated to its subject is worse than no
+    // test: it trains you to re-run.
+    //
+    // Arity is read from the prototype, not hand-listed, so a new zero-arg
+    // method is swept automatically. Methods that take arguments are covered
+    // by the compile-time check below, which does not have to call anything.
     const stub = env.SIGNING_AUTHORITY.get(
       env.SIGNING_AUTHORITY.idFromName("cryptokey-return-sweep"),
     );
+    const proto = SigningAuthority.prototype as unknown as Record<string, Function>;
+    const nullary = rpcSurface(SigningAuthority).filter(
+      (n) => typeof proto[n] === "function" && proto[n]!.length === 0,
+    );
+    expect(nullary.length, "arity filter matched nothing").toBeGreaterThan(5);
+
     const leaks: string[] = [];
-    for (const name of rpcSurface(SigningAuthority)) {
+    for (const name of nullary) {
       let result: unknown;
       try {
         result = await (stub as unknown as Record<string, () => Promise<unknown>>)[
@@ -358,6 +394,54 @@ describe("rpc.cryptokey.isolation", () => {
       if (values.some((v) => v instanceof CryptoKey)) leaks.push(`${name}: returned a CryptoKey`);
     }
     expect(leaks, `methods returning key material: ${leaks.join(" | ")}`).toEqual([]);
+  });
+
+  it("...including the ones that take arguments — checked by the compiler", () => {
+    /**
+     * The half the runtime sweep cannot reach. `KeyReturning` resolves to the
+     * names of any public method whose resolved return type has a CryptoKey
+     * property; `satisfies never` fails the BUILD if that set is inhabited,
+     * so a method added with `Promise<{ key: CryptoKey }>` does not compile
+     * regardless of how many arguments it takes.
+     *
+     * tsc -p tsconfig.test.json runs in `task worker:check`, so this is a
+     * gate and not a comment.
+     */
+    type Await<T> = T extends Promise<infer U> ? U : T;
+    // `T[K] extends CryptoKey`, not the reverse. The reverse direction reads
+    // "could a CryptoKey be assigned here", which is true of every wide
+    // member type an array or index signature brings along — it flagged five
+    // methods returning plain arrays of strings.
+    type HasCryptoKey<T> = T extends CryptoKey
+      ? true
+      : T extends readonly unknown[] | Function
+        ? // Arrays are excluded deliberately: mapping over one walks its
+          // built-in members, and this flagged five methods that return
+          // plain string[]. No RPC method returns an array OF keys, and if
+          // one ever did the runtime sweep would still see it.
+          false
+        : T extends object
+          ? {
+              [K in keyof T]-?: T[K] extends CryptoKey ? true : never;
+            }[keyof T] extends never
+            ? false
+            : true
+          : false;
+    type KeyReturning = {
+      [K in keyof SigningAuthority]: SigningAuthority[K] extends (
+        ...args: never[]
+      ) => infer R
+        ? HasCryptoKey<Await<R>> extends true
+          ? K
+          : never
+        : never;
+    }[keyof SigningAuthority];
+
+    // Extract<..., string> because the mapped type also yields `undefined`
+    // for optional members, which is noise rather than a method name.
+    const keyReturningMethods: Extract<KeyReturning, string>[] = [];
+    keyReturningMethods satisfies never[];
+    expect(keyReturningMethods).toEqual([]);
   });
 
   it("the authority still signs — the key was hidden, not removed", async () => {
