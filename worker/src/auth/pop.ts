@@ -74,9 +74,30 @@ export type PopResult =
  * to any other verifier in this system. What it costs is one extra verify on
  * the failure path, and an ambiguity that must not become permanent.
  *
- * REMOVAL — notme-a011d2 tracks it. Delete this constant and the second
- * attempt in `verifyPopProofs` once the action pin is bumped past
- * 0d2312f and no request has reported `binding: "digest"`.
+ * REMOVAL — notme-a011d2 tracks it. The condition this comment used to state
+ * was BOTH already satisfied and unobservable, which would have kept the flag
+ * here forever (notme-bd68f2):
+ *
+ *   - "once the action pin is bumped past 0d2312f" — 0d2312f IS the corrected
+ *     action. It signs the pre-image, and so does every pin in the ecosystem
+ *     (notme's own gha-identity.yml at 0d2312f, signet's at f35a46a). The
+ *     signer-side half has been met since before this comment was written.
+ *   - "and no request has reported `binding: \"digest\"`" — nothing reported
+ *     it. The field was computed, returned, and read by no caller: no log, no
+ *     metric, no response field. A gate whose evidence is never produced is
+ *     not a gate.
+ *
+ * THE REAL BLOCKER, measured: signet's `cmd/sigstore-kms-signet/enroll.go`
+ * computes `binding := sha256.Sum256(bindingInput)` and hands that one value
+ * to both signers. Go's `ecdsa.Sign` takes a message REPRESENTATIVE, so the
+ * ECDSA proof is conformant by accident; Go's Ed25519 `Sign` takes a MESSAGE,
+ * so the Ed25519 proof is over the digest. Since the fallback below is per
+ * proof, that MIXED pair is accepted and reported as "digest". Deleting this
+ * constant today breaks `sigstore-kms-signet enroll`.
+ *
+ * Pinned by "a GO caller produces a MIXED pair" in pop-preimage.test.ts.
+ * Delete this constant and the second attempt once signet signs `bindingInput`
+ * directly with Ed25519 and the warning below stops appearing.
  */
 const ACCEPT_LEGACY_DIGEST_BINDING = true;
 
@@ -173,6 +194,21 @@ export async function verifyPopProofs(
     if (!(await attempt(digest))) {
       return { ok: false, algorithm: check.algorithm };
     }
+    // SAY SO. The removal condition is "no caller uses this any more", and
+    // for as long as the only record of a legacy proof was a return value
+    // nobody read, that condition could never be evaluated — so the window
+    // would have stayed open indefinitely on no evidence (notme-bd68f2).
+    //
+    // Named per algorithm because the interesting case is a MIXED pair: a Go
+    // caller's ECDSA half is conformant and its Ed25519 half is not, and
+    // "which half" is the whole actionable content of the warning.
+    console.warn(
+      JSON.stringify({
+        event: "pop.legacy_digest_binding",
+        algorithm: check.algorithm,
+        note: "proof verified over SHA-256(bindingInput), not the pre-image; see ADR-008 and notme-a011d2",
+      }),
+    );
     sawLegacy = true;
   }
 

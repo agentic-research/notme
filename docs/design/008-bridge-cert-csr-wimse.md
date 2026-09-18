@@ -169,16 +169,16 @@ sequenceDiagram
     participant G as GitHub OIDC
 
     Note over C: Generate P-256 + Ed25519 keypairs<br/>(extractable: false)
-    Note over C: binding_payload = SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
-    Note over C: Sign binding_payload with both private keys
+    Note over C: binding_input = mtls_spki || signing_spki || SHA-256(oidc_jwt)
+    Note over C: Sign binding_input ITSELF with both keys — never its digest
 
     C->>G: (pre-step) Request OIDC JWT
     G-->>C: OIDC JWT (one-time JTI)
 
     C->>A: POST /cert/gha<br/>Authorization: Bearer {oidc_jwt}<br/>Body: {public_keys, proofs}
     Note over A: 1. Verify OIDC JWT signature + JTI (replay check)
-    Note over A: 2. Verify ES256 proof over binding_payload
-    Note over A: 3. Verify EdDSA proof over binding_payload
+    Note over A: 2. Verify ES256 proof over binding_input
+    Note over A: 3. Verify EdDSA proof over binding_input
     Note over A: 4. Issue P-256 cert + Ed25519 cert<br/>   signed by CA (extractable:false)
     A-->>C: {certificates: {mtls, signing}, identity, scopes, expires_at}
 
@@ -196,18 +196,19 @@ Content-Type: application/json
     "signing": "<Ed25519 SPKI PEM>"
   },
   "proofs": {
-    "mtls": "<ES256 signature over binding_payload>",
-    "signing": "<EdDSA signature over binding_payload>"
+    "mtls": "<ES256 signature over binding_input>",
+    "signing": "<EdDSA signature over binding_input>"
   }
 }
 ```
 
-Where `binding_payload = SHA-256(mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt))`.
+Where `binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)`.
 
-> **CORRECTION (2026-08-06, `notme-bd68f2`).** The outer `SHA-256(…)` is wrong,
-> in both this definition and the sequence diagram above. **Signers must sign
-> the concatenation itself — the pre-image — never its digest.** The normative
-> encoding is:
+> **CORRECTION (2026-08-06, amended 2026-09-18, `notme-bd68f2`).** This
+> definition and the sequence diagram above both used to specify
+> `binding_payload = SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))`.
+> The outer `SHA-256(…)` is wrong. **Signers must sign the concatenation
+> itself — the pre-image — never its digest.** The normative encoding is:
 >
 > ```
 > binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)

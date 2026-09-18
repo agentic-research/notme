@@ -32,6 +32,8 @@
  * default is DER, which would fail for an unrelated reason and mask this one.
  */
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ED25519 } from "../platform";
 
@@ -180,6 +182,68 @@ describe("PoP binding pre-image (notme-a011d2)", () => {
     expect(result).toEqual({ ok: true, binding: "digest" });
   });
 
+  it("a GO caller produces a MIXED pair — and that is who the window is open for", async () => {
+    // Measured, not reasoned about (notme-bd68f2). signet's
+    // `cmd/sigstore-kms-signet/enroll.go` computes one value,
+    // `binding := sha256.Sum256(bindingInput)`, and hands it to both signers.
+    // The two Go APIs read it differently:
+    //
+    //   ecdsa.Sign(rand, priv, binding[:])        — binding is the message
+    //                                               REPRESENTATIVE, already
+    //                                               hashed. Equivalent to
+    //                                               WebCrypto signing the
+    //                                               PRE-IMAGE with SHA-256.
+    //   signer.Sign(rand, binding[:], Hash(0))    — PureEd25519 over the
+    //                                               MESSAGE, and the message
+    //                                               it is handed is the
+    //                                               DIGEST.
+    //
+    // So the ECDSA proof is conformant and the Ed25519 proof is not, from one
+    // variable — the notme-a011d2 defect recurring in another language, and
+    // invisible from either side alone.
+    //
+    // verifyPopProofs falls back PER PROOF, so the pair is accepted and
+    // reported as "digest". Deleting ACCEPT_LEGACY_DIGEST_BINDING today
+    // breaks `sigstore-kms-signet enroll` on its Ed25519 half.
+    const { verifyPopProofs } = await import("../auth/pop");
+    const { bindingInput } = await fixtureBinding();
+
+    const mtls = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const signing = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign", "verify",
+    ])) as CryptoKeyPair;
+    const digest = await crypto.subtle.digest("SHA-256", bindingInput);
+    const b64 = (b: ArrayBuffer) => btoa(String.fromCharCode(...new Uint8Array(b)));
+
+    const goEcdsa = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" }, mtls.privateKey, bindingInput,
+    );
+    const goEd = await crypto.subtle.sign(ED25519, signing.privateKey, digest);
+
+    // Each half, in isolation, against the PRE-IMAGE — this is the assertion
+    // that says which one needs fixing, and it is the payload of the signet
+    // bead.
+    expect(
+      await crypto.subtle.verify(
+        { name: "ECDSA", hash: "SHA-256" }, mtls.publicKey, goEcdsa, bindingInput,
+      ),
+      "Go's ECDSA half is already conformant",
+    ).toBe(true);
+    expect(
+      await crypto.subtle.verify(ED25519, signing.publicKey, goEd, bindingInput),
+      "Go's Ed25519 half signs the digest, so it is NOT conformant",
+    ).toBe(false);
+
+    await expect(
+      verifyPopProofs(bindingInput, mtls.publicKey, signing.publicKey, {
+        mtls: b64(goEcdsa),
+        signing: b64(goEd),
+      }),
+    ).resolves.toEqual({ ok: true, binding: "digest" });
+  });
+
   it("rejects a proof over the wrong binding, and names which key failed", async () => {
     const { verifyPopProofs } = await import("../auth/pop");
     const { mtlsKey, signingKey } = await fixtureBinding();
@@ -205,6 +269,52 @@ describe("PoP binding pre-image (notme-a011d2)", () => {
       signing: FIXTURE.signingProof,
     });
     expect(result).toEqual({ ok: false, algorithm: "P-256" });
+  });
+});
+
+describe("ADR-008 specifies what the verifier implements", () => {
+  // ADR-008 is the cross-language contract: signet implements against it, not
+  // against this code. It specified `binding_payload = SHA-256(...)` in its
+  // sequence diagram, its HTTP example and its prose — the exact encoding that
+  // caused the notme-a011d2 P0 — so an implementer following it built a
+  // signature no notme verifier accepts once the migration window closes.
+  //
+  // Prose next to a wrong diagram is not a correction: the mermaid block
+  // renders as a picture, and the correction lived below the HTTP example
+  // where a reader copying the diagram never reaches it (notme-bd68f2).
+  const adr = readFileSync(
+    fileURLToPath(new URL("../../../docs/design/008-bridge-cert-csr-wimse.md", import.meta.url)),
+    "utf8",
+  );
+
+  it("the sequence diagram tells signers to sign the pre-image", () => {
+    const diagram = adr.slice(adr.indexOf("sequenceDiagram"), adr.indexOf("```http"));
+    expect(diagram).toContain("binding_input = mtls_spki || signing_spki || SHA-256(oidc_jwt)");
+    expect(diagram).toMatch(/never its digest/i);
+    // The wrong formula must not appear in the diagram in any form.
+    expect(diagram).not.toMatch(/SHA-256\(mtls_spki/);
+  });
+
+  // ADR-008 carries three CORRECTION blocks; this is the binding one. Sliced
+  // by its own bead id rather than by the first "> **CORRECTION" in the file,
+  // which belongs to notme-77438b two hundred lines earlier.
+  const CORRECTION = "> **CORRECTION (2026-08-06, amended 2026-09-18, `notme-bd68f2`)";
+
+  it("the normative definition has no outer digest", () => {
+    // Everything before the correction is what a skimmer reads.
+    const normative = adr.slice(0, adr.indexOf(CORRECTION));
+    expect(normative).toContain(
+      "binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)",
+    );
+    expect(normative).not.toContain("binding_payload = SHA-256(");
+  });
+
+  it("keeps the retracted formula, once, inside the correction", () => {
+    // Deleting it silently would leave a reader who already built the wrong
+    // thing with no explanation of why their signature is refused.
+    const correction = adr.slice(adr.indexOf(CORRECTION));
+    expect(correction).toContain("binding_payload = SHA-256(");
+    expect(correction).toMatch(/pre-image/);
   });
 });
 
