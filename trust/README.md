@@ -6,7 +6,7 @@ authenticated.
 
 | File | What it is |
 | --- | --- |
-| `notme-root.pem` | The **same certificate** that `https://auth.notme.bot/.well-known/ca-bundle.pem` serves. The file *framing* may differ by trailing whitespace, so compare the parsed certificate, never the file bytes — see [the warning below](#do-not-compare-file-bytes). |
+| `notme-root.pem` | The **same certificate** that `https://auth.notme.bot/.well-known/ca-bundle.pem` serves. The file *framing* may differ by trailing whitespace, so compare the parsed certificate, never the file bytes — see [the warning below](#do-not-compare-file-bytes). Refreshed 2026-09-25; see [staleness](#this-file-went-stale-once). |
 | `notme-root.json` | Machine-readable pin: authority URL, subject, SPKI SHA-256, certificate SHA-256, validity window. |
 
 `worker/src/__tests__/trust-anchor.test.ts` re-derives both digests from
@@ -14,6 +14,32 @@ authenticated.
 `.github/workflows/ci.yml`), so the pin and the certificate beside it cannot
 drift apart. A pin that disagrees with its own certificate is worse than no pin,
 because it still looks authoritative.
+
+## This file went stale once
+
+Self-consistency is necessary and it is not sufficient. Between 2026-08-28 and
+2026-09-25 the committed certificate was the **pre-heal root** — serial
+`d01f2a0a`, `pathlen:0`, issued 2026-03-31 — while production served a root
+re-issued under the **same key** with `pathlen:1` (`notme-1b1db4`). Both tests
+passed the whole time, because both compared the anchor only to itself.
+
+The public key never changed, so nobody pinning the SPKI was affected. Anyone
+pinning the **certificate** was pinning one production no longer serves, and
+`pathlen:0` forbids the intermediate tier ADR-019 D4 issues — so a verifier
+using the committed file would have rejected every tier-signed certificate.
+
+Caught while wiring the certificate transparency log, whose `roots.<env>.pem`
+is compiled in and whose chain validation enforces path length: shipping the
+stale anchor would have made the log refuse the certs it exists to record
+(`notme-1b46a8`).
+
+The test now also asserts the anchor's `pathLenConstraint` equals `CA_PATH_LEN`
+in `signing-authority.ts` — a fact that moves when production moves, checked
+without a network call. Re-verified by restoring the stale file: it fails.
+
+**If you refresh this directory**, re-fetch the PEM, regenerate every field of
+`notme-root.json` from it, and confirm the SPKI is unchanged. A changed SPKI is
+not a refresh — it is a different authority, and it needs its own review.
 
 ## Why this exists
 

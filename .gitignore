@@ -124,6 +124,13 @@ proxy/target/
 !docs/
 !docs/**
 
+# notme-ct — the issuance transparency log's OWN identity: its roots, its
+# temporal interval, its EKU policy (notme-1b46a8). azul is the engine and is
+# deliberately not vendored; only the material that says "this is notme's log"
+# lives here. roots.notme.pem is the published CA, not a secret.
+!ct/
+!ct/**
+
 # GitHub Actions workflows
 !.github/
 !.github/**

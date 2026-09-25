@@ -1,0 +1,32 @@
+{
+    "logging_level": "info",
+    "logs": {
+        "notmedev": {
+            "description": "notme workload-identity issuance log (local dev)",
+            "log_type": "test",
+            "submission_url": "http://localhost:8787/logs/notmedev/",
+            "temporal_interval": {
+                "start_inclusive": "2026-01-01T00:00:00Z",
+                "end_exclusive": "2027-01-01T00:00:00Z"
+            },
+            "enable_ccadb_roots": false,
+            "enable_dedup": false,
+            "require_server_auth_eku": false,
+            "location_hint": "enam",
+            "reject_expired": false
+        },
+        "notmestrict": {
+            "description": "notme strict twin \u2014 RFC 6962 serverAuth required (negative control)",
+            "log_type": "test",
+            "submission_url": "http://localhost:8787/logs/notmestrict/",
+            "temporal_interval": {
+                "start_inclusive": "2026-01-01T00:00:00Z",
+                "end_exclusive": "2027-01-01T00:00:00Z"
+            },
+            "enable_ccadb_roots": false,
+            "enable_dedup": false,
+            "location_hint": "enam",
+            "reject_expired": false
+        }
+    }
+}
