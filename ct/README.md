@@ -20,17 +20,50 @@ minted by notme's own `mintBridgeCertPair`:
 - `log.v3.json` publishes the log's P-256 key and a `log_id` matching the
   `id` in the SCT.
 
+- `add-pre-chain` accepts a **real precertificate** minted by
+  `mintBridgeCertPair` with the poison extension, and returns an SCT. The same
+  poisoned certificate submitted to `add-chain` is **refused** — so the two
+  endpoints discriminate on the poison rather than accepting anything.
+- A precertificate and its final certificate can be minted as a PINNED pair
+  that differs only in the CT extension (see below).
+
 **Not yet done**, and not claimed anywhere in this repo:
 
-- `add-pre-chain` — needs notme to mint a *precertificate* carrying the CT
-  poison extension. Nothing does that yet.
-- SCT embedding at the three authority mint paths, plus a submission client
-  for the offline producer `mintTaskCertPair`.
+- **The SCT signature has never been verified.** Everything above proves the
+  bytes encode and round-trip; nothing yet proves a log signature is valid
+  over the precertificate. Until that is checked against an independent
+  implementation — azul ships `sct_validator::validate_embedded_scts` — the
+  chain is not known to work end to end. This is the next step and it is the
+  one that can still invalidate the rest.
+- Wiring the submit-between-mints flow into the three authority mint paths,
+  plus a submission client for the offline producer `mintTaskCertPair`.
 - Publishing the log key via pipeline-signed trust material rather than only
   `/metadata` (`notme-8e8836`).
 - `cosign verify --ctfe=...` accepting a notme artifact while a cert with no
-  valid SCT is rejected. That negative control is the point of the whole
-  exercise and it has not been run.
+  valid SCT is rejected. signet currently passes `--no-default-ctfe
+  --insecure-ignore-sct`; removing the latter is what turns the log from a
+  record into an enforced requirement, and it is the only step that actually
+  defends anything.
+
+## Why embedding needs a PAIRED mint
+
+RFC 6962 §3.2 has the log sign the precertificate's `TBSCertificate` with the
+poison **removed**, and a verifier reconstruct those bytes from the final
+certificate by removing the SCT list. The two reconstructions must be
+byte-identical.
+
+`mintBridgeCertPair` generated a fresh random serial and read the clock on
+every call, so minting a precertificate and then a final certificate as two
+ordinary calls produces two different `TBSCertificate`s. The SCT would be
+signed over bytes the final certificate never contains — and it would verify
+nowhere while every other check passed and the certificate looked logged.
+
+The build order in `notme-1b46a8` does not mention this. `opts.pin` now
+carries the serials and the validity window across, and
+`worker/src/ct-precert.do.test.ts` asserts that a pinned pair's extension sets
+are byte-identical once the CT extension is dropped from each. Both halves of
+the pin are mutation-checked: ignoring it for serials, or for validity, fails
+that test.
 
 ## Two preconditions, both now met
 

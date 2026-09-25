@@ -428,11 +428,36 @@ export async function mintBridgeCertPair(
     extraExtensions?: Extension[];
     /** What the subject IS (ADR-019 D2). Defaults to the human case. */
     principalKind?: PrincipalKind;
+    /**
+     * Pin the fields that must be IDENTICAL between a precertificate and the
+     * certificate that replaces it (RFC 6962 §3.2).
+     *
+     * The log signs an SCT over the precertificate's TBSCertificate with the
+     * poison removed, and a verifier reconstructs that from the FINAL
+     * certificate by removing the SCT list. The two reconstructions have to be
+     * byte-identical, so every other field — serial numbers above all — must
+     * carry across. Two ordinary calls to this function generate fresh random
+     * serials and a fresh `now`, so the SCT would be signed over bytes the
+     * final certificate never contains, and it would verify nowhere
+     * (notme-1b46a8).
+     *
+     * Absent, both are random and the clock is read once, which is correct for
+     * every mint that is not being logged.
+     */
+    pin?: {
+      serialMtls: string;
+      serialSigning: string;
+      notBefore: Date;
+      notAfter: Date;
+    };
   },
 ): Promise<BridgeCertPairResult> {
   const ttlMs = opts.ttlMs ?? 5 * 60 * 1000;
-  const now = new Date();
-  const expires = new Date(now.getTime() + ttlMs);
+  // The pin carries the precertificate's clock across to the final
+  // certificate; without it the two differ in notBefore/notAfter and the
+  // SCT signs bytes the final certificate does not contain.
+  const now = opts.pin?.notBefore ?? new Date();
+  const expires = opts.pin?.notAfter ?? new Date(now.getTime() + ttlMs);
   const issuerName = opts.issuerName ?? "CN=signet-authority,O=notme";
 
   // Import both public keys
@@ -488,18 +513,16 @@ export async function mintBridgeCertPair(
   const sanDer = derTlv(0x30, sanUri); // SEQUENCE { [6] URI }
   const sanExtension = new Extension("2.5.29.17", true, sanDer); // SubjectAltName OID, critical
 
-  const serial1 = crypto.getRandomValues(new Uint8Array(16));
-  // Ensure positive (RFC 5280: serial must be positive integer)
-  serial1[0] &= 0x7f;
-  const serialHex1 = Array.from(serial1)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-
-  const serial2 = crypto.getRandomValues(new Uint8Array(16));
-  serial2[0] &= 0x7f;
-  const serialHex2 = Array.from(serial2)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  const randomSerial = (): string => {
+    const s = crypto.getRandomValues(new Uint8Array(16));
+    // Ensure positive (RFC 5280: serial must be positive integer)
+    s[0]! &= 0x7f;
+    return Array.from(s)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  };
+  const serialHex1 = opts.pin?.serialMtls ?? randomSerial();
+  const serialHex2 = opts.pin?.serialSigning ?? randomSerial();
 
   // Mint P-256 mTLS cert
   const mtlsCert = await X509CertificateGenerator.create({
