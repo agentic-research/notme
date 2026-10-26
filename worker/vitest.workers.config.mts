@@ -40,6 +40,14 @@ export default defineConfig({
           // rather than from the request, so a caller cannot name itself the
           // subject permitted to bootstrap.
           BOOTSTRAP_GHA_SUBJECT: "repo:agentic-research/notme:ref:refs/heads/main",
+          // Forwarded from the shell so ct-full-cycle.do.test.ts can be
+          // pointed at a locally running transparency log. `env` in this pool
+          // is the MINIFLARE binding set, not process.env, so a bare shell
+          // variable never reaches the Worker — which is why that test
+          // silently skipped rather than running (notme-1b46a8).
+          ...(process.env.CT_LOG_URL
+            ? { CT_LOG_URL: process.env.CT_LOG_URL }
+            : {}),
         },
         durableObjects: {
           // SQLite-backed per wrangler.toml migration v2 (new_sqlite_classes).

@@ -26,15 +26,29 @@ minted by notme's own `mintBridgeCertPair`:
   endpoints discriminate on the poison rather than accepting anything.
 - A precertificate and its final certificate can be minted as a PINNED pair
   that differs only in the CT extension (see below).
+- **The embedded SCT's signature VERIFIES**, checked by an independent
+  implementation rather than by my own encoder. A full cycle — pinned
+  precertificate → `add-pre-chain` → embed the returned SCT under the same
+  pin — produces a certificate that azul's
+  `sct_validator::validate_embedded_scts` accepts, doing its own RFC 6962
+  §3.2 reconstruction (strip the poison, rebuild the signed
+  `CertificateTimestamp`, hash the issuer key).
+
+  The assertion is on the SCT **count**, not on `Valid`: Chrome's policy wants
+  two distinct log operators and notme runs one log, so `Valid` is
+  structurally unreachable and asserting it would be asserting that notme is
+  in the WebPKI. azul drops an SCT whose signature fails before the policy
+  check sees it (`lib.rs:482`), so a count of one *is* the statement that a
+  signature verified. Two controls hold that reading up: substituting a real
+  but unrelated P-256 key drops the count to zero, and the precertificate —
+  poison, no SCT list — is refused outright.
 
 **Not yet done**, and not claimed anywhere in this repo:
 
-- **The SCT signature has never been verified.** Everything above proves the
-  bytes encode and round-trip; nothing yet proves a log signature is valid
-  over the precertificate. Until that is checked against an independent
-  implementation — azul ships `sct_validator::validate_embedded_scts` — the
-  chain is not known to work end to end. This is the next step and it is the
-  one that can still invalidate the rest.
+- Wiring the submit-between-mints flow into the three authority mint paths,
+  plus a submission client for the offline producer `mintTaskCertPair`.
+  `worker/src/ct-full-cycle.do.test.ts` does the flow by hand against a
+  running log; no production route does it.
 - Wiring the submit-between-mints flow into the three authority mint paths,
   plus a submission client for the offline producer `mintTaskCertPair`.
 - Publishing the log key via pipeline-signed trust material rather than only
