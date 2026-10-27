@@ -803,7 +803,27 @@ export async function mintTaskCertPair(
   // Lifetime: never past the tier's own expiry.
   const requestedTtl = opts.ttlMs ?? 5 * 60 * 1000;
   const untilTierExpiry = tier.notAfter.getTime() - Date.now();
-  const ttlMs = Math.max(0, Math.min(requestedTtl, untilTierExpiry));
+  // REFUSE AN EXPIRED TIER rather than minting against it.
+  //
+  // This is the pause/resume path. A microVM suspended for longer than the
+  // tier's lifetime resumes holding a tier past its own notAfter, and the
+  // clamp used to be `Math.max(0, Math.min(...))` — so a negative remaining
+  // lifetime floored to zero and the mint SUCCEEDED, returning a certificate
+  // whose notBefore equals its notAfter. Valid for zero seconds,
+  // indistinguishable from a working credential at the call site, and failing
+  // later at whoever first used it with an expiry error naming the TASK
+  // rather than the expired tier that caused it.
+  //
+  // The caller's recovery for an expired tier is to re-enrol the machine, and
+  // nothing in a zero-second certificate says so. Minting a corpse is worse
+  // than refusing. (`Math.max(0, …)` is gone with the throw: it existed only
+  // to paper over this case.)
+  if (untilTierExpiry <= 0) {
+    throw new Error(
+      `tier certificate expired at ${tier.notAfter.toISOString()} — re-enrol the machine before minting task credentials`,
+    );
+  }
+  const ttlMs = Math.min(requestedTtl, untilTierExpiry);
 
   const authMethodExt = tier.getExtension(OID_AUTH_METHOD);
   const authMethod = authMethodExt

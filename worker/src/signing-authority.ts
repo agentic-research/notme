@@ -1651,12 +1651,26 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * it, so a bump invalidates outstanding certificates and tokens at their
    * next verification without the authority enumerating them.
    *
-   * WHAT IT IS NOT. It is class-level and immediate-ish, not targeted: it
-   * cannot revoke one task, one tier, or one principal. Those are the grant
-   * (revoked at the authorization gate by `liveScopes`) and the chain
-   * (revoke a tier and every task cert beneath it fails path validation by
-   * issuer — intrinsic X.509, no index required). Reaching for this lever to
-   * do a targeted job is the error it exists to make unnecessary.
+   * WHAT IT IS NOT. Class-level, never targeted: it cannot revoke one task,
+   * one tier, or one principal.
+   *
+   * CORRECTION to the first version of this comment, which claimed the
+   * targeted job was already covered by "the chain — revoke a tier and every
+   * task cert beneath it fails path validation by issuer, intrinsic X.509, no
+   * index required". The X.509 mechanics are right and the LEVER DOES NOT
+   * EXIST: there is no CRL, no OCSP, and no per-certificate status anywhere
+   * in this repo, and the published bundle carries only epoch, seqno, keys,
+   * keyId, prevKeyId and issuedAt — no revoked-serial list. Nothing can mark
+   * one tier revoked, so nothing beneath one falls. That claim also
+   * contradicted the paragraph directly above it in ADR-019, which had
+   * always said the honest version: TTL-only for anything finer than an
+   * epoch.
+   *
+   * So the levers that EXIST are this one and the grant (`liveScopes` at the
+   * authorization gate, which governs what a session may do — not the
+   * validity of a certificate already in someone's hands). Killing one task
+   * or one machine is the open hole, and the shape ADR-019 D7 commits to is
+   * a renewal predicate rather than a revocation list.
    *
    * THE KEY SURVIVES, deliberately. Receipts naming earlier epochs stay
    * verifiable, which is the difference between revoking credentials and

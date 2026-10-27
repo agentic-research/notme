@@ -547,11 +547,28 @@ days). A verifier that cannot reach the bundle has TTL and nothing else —
 unchanged, and still the honest answer.
 
 **WHAT THE LEVER IS NOT.** Class-level, never targeted: it cannot revoke one
-task, one tier, or one principal, and reaching for it to do a targeted job is
-the error it exists to make unnecessary. Those jobs already have units — the
-**grant**, revoked at the authorization gate by `liveScopes`, and the
-**chain**, where revoking a tier fails every task credential beneath it by
-issuer under ordinary path validation, needing no index at all.
+task, one tier, or one principal.
+
+**AND THE FIRST VERSION OF THIS SECTION OVERSTATED WHAT COVERS THAT**, in the
+one direction that makes a hole look filled. It claimed the targeted job was
+already handled by "the chain, where revoking a tier fails every task
+credential beneath it by issuer under ordinary path validation, needing no
+index at all". The path-validation mechanics are correct; **the lever does not
+exist.** Measured 2026-10-27: no CRL, no OCSP, no per-certificate status
+anywhere in the worker, and `CABundle` carries `epoch`, `seqno`, `keys`,
+`keyId`, `prevKeyId`, `issuedAt`, `signature` — no revoked-serial list.
+Nothing can mark one tier revoked, so nothing beneath one falls. The claim
+also contradicted the paragraph two above it, which had said the honest thing
+all along.
+
+The levers that EXIST are this one and the **grant** (`liveScopes` at the
+authorization gate — which governs what a session may do, not the validity of
+a certificate already in someone's hands). **Killing one task, or one machine,
+is an open hole**, tracked at `notme-9f84e6`, and the shape this ADR commits
+to for it is a renewal predicate, not a revocation list — see "Enforcement is
+a short lease, never 'valid until done'" above. Reaching for the epoch to do a
+targeted job remains the error; the point is that the targeted lever has to be
+BUILT, not that it is already there.
 
 **CONSEQUENCE THE SCHEMA PAID FOR.** `retired_keys` was keyed
 `epoch INTEGER PRIMARY KEY`, which is sound only while the two axes move
