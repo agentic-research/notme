@@ -37,6 +37,16 @@ import {
 
 interface SigningAuthorityEnv {
   CA_BUNDLE_CACHE?: KVNamespace;
+  /**
+   * Expected `aud` for a GitHub OIDC token presented to `mintBridgeCert`.
+   *
+   * READ FROM THE DO'S OWN ENV, never from the caller's proof envelope
+   * (notme-51ccd7). An audience a caller can supply is an audience a caller
+   * can widen, which would hand back the whole defect in a new wrapper —
+   * so `MintBridgeCertProof` deliberately has no `audience` field. Same
+   * default as the route's `getConfig` so the two cannot disagree.
+   */
+  GHA_CERT_AUDIENCE?: string;
   NOTME_KEY_STORAGE?: string;
   NOTME_KEK_SECRET?: string;
   /**
@@ -155,6 +165,64 @@ export type BootstrapMethod = "secret" | "gha-oidc";
 
 /** GitHub's OIDC issuer — the provider recorded for an attested bootstrap. */
 const GHA_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
+
+/**
+ * Evidence that entitles a caller to a subject — NOT the subject itself
+ * (notme-51ccd7).
+ *
+ * `mintBridgeCert` used to take `subject: string`, so a holder of the AUTH
+ * service binding could name any subject and get a certificate for it.
+ * Measured before the fix: it returned
+ * `MINTED subject="wimse://notme.bot/i-am-whoever"`. The docstring said "for
+ * a verified subject" — an assumption about the caller standing in for a
+ * check.
+ *
+ * WHY THAT MATTERS, AND IT IS NOT ABOUT CODE STYLE. signet verifies a
+ * release by pinning the identity URI and requiring EQUALITY
+ * (`cosign verify-blob --certificate-identity`). Its security therefore
+ * rests entirely on that URI being unforgeable. If a binding holder can
+ * assert the subject, it can mint a certificate whose identity equals
+ * signet's pin for a key it controls, and the documented verification
+ * PASSES for an artifact that holder signed. That is a forged release
+ * signature, not a convenience.
+ *
+ * Keeping the capability and merely bounding it does not work either: the
+ * only namespace notme emits is `principal/<sub>`, which is exactly what a
+ * verifier pins, so "refuse the reserved namespaces" leaves nothing useful
+ * to assert.
+ *
+ * NO `audience` FIELD, deliberately — see `GHA_CERT_AUDIENCE` above.
+ */
+export type MintBridgeCertProof =
+  | { kind: "gha-oidc"; token: string }
+  | { kind: "session-cookie"; cookie: string };
+
+/**
+ * Why a mint was refused. Exhaustive; switch on it.
+ *
+ * A RETURNED REASON, NOT A THROWN ERROR, for two reasons.
+ *
+ * The house pattern: `mintDPoPTokenOnce` returns
+ * `{ ok: false, reason: "proof_reused" }` and `signReceiptCommitment`
+ * returns a code union. A failed proof is an EXPECTED outcome of a
+ * well-formed call, not programmer error, and the caller needs to map it to
+ * a status code rather than parse an error string.
+ *
+ * And the runtime forces it: when a DO RPC method throws, workerd delivers
+ * the rejection to the caller AND raises it in the DO's own isolate. The
+ * caller's `.catch()` cannot own the second one, so vitest counted them as
+ * unhandled errors and the workers suite exited 1 with all 300 tests
+ * passing. Measured across three runs. Returning leaves nothing to reject.
+ *
+ * Deliberately COARSE: a caller learns that its evidence was rejected, not
+ * which claim failed. `validateGHAToken` throws messages like
+ * "wrong audience: <value>", and echoing those back to whoever supplied the
+ * token is free reconnaissance. The detail goes to the log.
+ */
+export type BridgeCertRefusal =
+  | "invalid_gha_token"
+  | "invalid_session"
+  | "unknown_proof_kind";
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
@@ -1372,16 +1440,82 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   // Mint a bridge cert inside the DO — CryptoKey never crosses the RPC boundary.
+  /**
+   * Mint a bridge cert for the subject the EVIDENCE names (notme-51ccd7).
+   *
+   * The DO re-verifies the proof inside its own method body and derives the
+   * subject from the verified claims. A caller cannot assert a subject, and
+   * there is no overload that lets it.
+   *
+   * DOUBLE-VERIFY IS INTENTIONAL. The worker in front of this may already
+   * have validated the same token or cookie; that check exists for early
+   * rejection and clean 401/403 responses. This one is the trust kernel. If
+   * only one may be trusted it is this one, because the worker is reachable
+   * by anything holding the binding and the DO is not.
+   *
+   * FORWARD-PORTED from the private agentic-research/notme.bot repo, which
+   * diagnosed and fixed the same defect on 2026-05-18 (commit 1d1ec7e, bead
+   * notme.bot-69a3a9) in a repo whose code never ran. Verified against
+   * signet's documented verification before porting rather than taken on
+   * that repo's authority — see the `MintBridgeCertProof` docstring.
+   */
   async mintBridgeCert(
-    subject: string,
+    proof: MintBridgeCertProof,
     publicKeyPem: string,
     ttlMs?: number,
-  ): Promise<{
-    certificate: string;
-    expires_at: number;
-    subject: string;
-    authority: { epoch: number; key_id: string };
-  }> {
+  ): Promise<
+    | {
+        ok: true;
+        certificate: string;
+        expires_at: number;
+        subject: string;
+        authority: { epoch: number; key_id: string };
+      }
+    | { ok: false; reason: BridgeCertRefusal }
+  > {
+    // Derive the subject. Every branch ends in a value this DO computed from
+    // something it checked itself, or in a refusal.
+    let subject: string;
+    if (proof?.kind === "gha-oidc") {
+      // Audience from OUR env, never the envelope (notme-51ccd7).
+      const expectedAudience = this.env.GHA_CERT_AUDIENCE ?? "notme.bot";
+      const { validateGHAToken } = await import("./gha-oidc");
+      try {
+        const claims = await validateGHAToken(proof.token, expectedAudience);
+        subject = claims.sub;
+      } catch (e) {
+        console.warn({
+          event: "mint.gha_proof_rejected",
+          detail: (e as Error)?.message,
+        });
+        return { ok: false, reason: "invalid_gha_token" };
+      }
+    } else if (proof?.kind === "session-cookie") {
+      // The secret is read inside the DO and does not leave it.
+      const { verifySessionCookie } = await import("./auth/session");
+      const session = await verifySessionCookie(
+        proof.cookie,
+        await this.getSessionSecret(),
+      );
+      if (!session) {
+        console.warn({ event: "mint.session_proof_rejected" });
+        return { ok: false, reason: "invalid_session" };
+      }
+      subject = session.principalId;
+    } else {
+      // Exhaustive at RUNTIME as well as in the type. A caller reaching this
+      // DO over RPC is not bound by our types — `proof` may be a string, as
+      // it was under the old signature, or a shape invented today — so a
+      // third kind is refused rather than falling through to an undefined
+      // subject. `proof?.kind` rather than `proof.kind` because a string
+      // argument has no `kind` and a null one would throw on the read.
+      console.warn({
+        event: "mint.unknown_proof_kind",
+        kind: typeof proof === "object" ? (proof as { kind?: unknown })?.kind : typeof proof,
+      });
+      return { ok: false, reason: "unknown_proof_kind" };
+    }
+
     const { signingKey } = await this.#getOrCreateSigningKey();
     const state = await this.getAuthorityState();
     const { mintGHABridgeCert } = await import("./cert-authority");
@@ -1392,6 +1526,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ttlMs,
     );
     return {
+      ok: true,
       ...result,
       authority: { epoch: state.epoch, key_id: state.keyId },
     };

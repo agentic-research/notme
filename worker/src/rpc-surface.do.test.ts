@@ -225,6 +225,32 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       // there is no HTTP route onto it — an authentication bug on a public
       // door would make mass revocation free, where a service binding is a
       // deployment-time grant.
+      //
+      // NO COUNT CHANGE, but a TRUST-POSITION CHANGE worth recording here,
+      // because this file is where the question should have been asked
+      // (notme-51ccd7). `mintBridgeCert` kept its name and took a
+      // `MintBridgeCertProof` in place of `subject: string`.
+      //
+      // The old signature meant a holder of this surface could name ANY
+      // subject and receive a certificate for it — measured, not inferred:
+      // it returned `MINTED subject="wimse://notme.bot/i-am-whoever"`. This
+      // pin had reviewed the method for REACHABILITY ("may a service-binding
+      // holder call it") and never for ARGUMENT TRUST ("does it believe what
+      // it is told"). Both questions belong here.
+      //
+      // What settled it was not taste but signet's documented verification:
+      // it pins the identity URI and requires EQUALITY
+      // (`cosign verify-blob --certificate-identity`). So a caller that can
+      // assert the subject can mint a certificate matching that pin for a
+      // key it controls, and the published verification PASSES for an
+      // artifact it signed. Bounding the capability instead was considered
+      // and does not work: the only namespace notme emits is
+      // `principal/<sub>`, which is precisely what a verifier pins.
+      //
+      // THE STANDARD THIS SETS for the next addition: ask both questions.
+      // Reachability is about who may call; argument trust is about what the
+      // method concludes from what it is handed. A method can be perfectly
+      // safe to expose and still be unsafe to believe.
     ).toBe(48);
   });
 });

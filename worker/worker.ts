@@ -3,6 +3,7 @@
 
 export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
+import type { MintBridgeCertProof } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
@@ -23,8 +24,12 @@ import { ED25519, type Platform } from "./src/platform";
 //   service = "notme-bot"
 //   entrypoint = "AuthService"
 //
-// Then call: await env.AUTH.mintBridgeCert(subject, publicKeyPem)
-// No HTTP, no public URL, no CORS, no tokens needed.
+// Then call, passing EVIDENCE rather than a subject (notme-51ccd7):
+//   await env.AUTH.mintBridgeCert({ kind: "gha-oidc", token }, publicKeyPem)
+//   await env.AUTH.mintBridgeCert({ kind: "session-cookie", cookie }, pem)
+// The authority re-verifies the proof and derives the subject itself, so a
+// binding holder cannot mint a certificate for an identity it has not
+// proved. No HTTP, no public URL, no CORS, no tokens needed.
 
 // ── Held credentials type ─────────────────────────────────────────────────
 // Per-RPC-session — stored on `this.#heldCerts` so concurrent / sequential
@@ -303,10 +308,29 @@ export class AuthService extends WorkerEntrypoint<any> {
     return this.env.SIGNING_AUTHORITY.get(id);
   }
 
-  /** Mint a bridge cert for a verified subject. */
-  async mintBridgeCert(subject: string, publicKeyPem: string, ttlMs?: number) {
+  /**
+   * Mint a bridge cert for the subject the PROOF names (notme-51ccd7).
+   *
+   * This used to read "for a verified subject" and take that subject as a
+   * string — nothing verified it, and the word was doing the work a check
+   * should have. A holder of this binding could name any subject; per
+   * ADR-009 that is every agent Worker.
+   *
+   * The envelope is passed through unexamined ON PURPOSE. This entrypoint
+   * must not be the thing that decides the subject is genuine, because it is
+   * the surface an attacker reaches; the DO re-verifies and derives it.
+   *
+   * Returns `{ ok: false, reason }` rather than throwing — switch on it. A
+   * rejected proof is an expected outcome, and a DO method that throws is
+   * double-reported by workerd (see `BridgeCertRefusal`).
+   */
+  async mintBridgeCert(
+    proof: MintBridgeCertProof,
+    publicKeyPem: string,
+    ttlMs?: number,
+  ) {
     const authority = this.#getAuthority();
-    return authority.mintBridgeCert(subject, publicKeyPem, ttlMs);
+    return authority.mintBridgeCert(proof, publicKeyPem, ttlMs);
   }
 
   /** Mint a DPoP-bound access token. */
