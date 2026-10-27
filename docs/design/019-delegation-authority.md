@@ -709,6 +709,25 @@ delegation chain, the represented principal, and an actor that was itself
 delegated to mid-execution, none of which in-toto's functionary model covers.
 Extending that model is a stronger position than a parallel format.
 
+**PARTLY ANSWERED UPSTREAM, 2026-10-26 — and in the direction above.** APAS
+0.4 (signet `signet-ded9d4`, on branch, UNMERGED) makes an **in-toto Statement
+the mandatory baseline carrier**, with DSSE required at L2 and above, and
+assigns notme the predicate/schema namespace (`https://notme.bot/provenance/…`,
+its Appendix B). So "compose onto in-toto" is already the decided shape for the
+statement layer; what remains open is only the narrower question of whether the
+delegation chain, the represented principal and the mid-execution re-delegation
+fit a layout's functionary model or need a predicate of their own. Being
+assigned the predicate namespace means notme answers that as a predicate
+schema, which is composition, not a parallel format.
+
+Two consequences for the grant payload: it should be specified as a predicate
+under that namespace rather than as notme-internal columns first, and the
+sequencing waits on 0.4 merging — building against an unmerged document would
+pin notme to a draft. Tracked at `notme-230b40` (notme serves 0.3's
+`dispatch/v1` and owes 0.4's `activity/v1`; the rename from *dispatch* to
+*Activity* is itself the task-not-time distinction, since an Activity spans
+process replacement and resumption while a dispatch does not).
+
 **Federation** is a separate, horizontal axis and is out of scope here. notme
 already emits trust-domain-qualified identities; the accept side is missing.
 SPIFFE Federation is the model. Cross-signing is worse here because it makes a
