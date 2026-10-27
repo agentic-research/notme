@@ -3776,6 +3776,34 @@ export default {
       return cachePut(request, result, "Accept");
     }
 
+    // /why moved to the blog at q-q.dev.
+    //
+    // The page itself lives in the PRIVATE agentic-research/notme.bot repo,
+    // which declares a worker of the same name on these same two routes —
+    // so the two repos are two sources for ONE deployment and the last
+    // deploy wins. This repo is what is live (production's nav.js matches
+    // this repo's, and has no "why" entry), and this repo has no why.html,
+    // which is why /why has been 404ing. Nothing pointed at it: the
+    // deployed nav and sitemap predate the page, so only a typed URL
+    // reached the 404.
+    //
+    // 302 AND SHORT-CACHED, UNLIKE EVERY OTHER REDIRECT BELOW. Those are
+    // settled renames and use 301 with `max-age=31536000, immutable`. This
+    // destination is NOT settled: the post is not published on q-q.dev yet,
+    // so the target is the blog root and will become the post's own URL. An
+    // immutable 301 would make browsers ignore that change for a year.
+    // Flip both when the post lands (notme-4e02fb).
+    if (url.pathname === "/why") {
+      const resp = new Response(null, {
+        status: 302,
+        headers: {
+          Location: "https://q-q.dev/",
+          "Cache-Control": "public, max-age=600",
+        },
+      });
+      return cachePut(request, resp);
+    }
+
     // Redirects for renamed pages — cached at edge with long TTL
     if (url.pathname === "/stack") {
       const resp = new Response(null, {
