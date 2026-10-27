@@ -429,7 +429,10 @@ graph LR
           </div>
           <div class="spec-item">
             <strong>Algorithm</strong>
-            <p>Ed25519 by default. Post-quantum (ML-DSA) ready.</p>
+            <p>
+              Ed25519 only &mdash; the minter refuses any other key type.
+              Post-quantum (ML-DSA) is a design intent, not implemented.
+            </p>
           </div>
           <div class="spec-item">
             <strong>TTL</strong>
@@ -441,29 +444,37 @@ graph LR
       <section>
         <h2>03. Edge Enforcement & Revocation</h2>
         <p>
-          Revocation is not a batch job &mdash; it is a real-time state machine.
-          <strong>Cloudflare Durable Objects</strong> track and kill credentials
-          in seconds at the edge.
+          Revocation is coarse and pull-based, and the honest unit is a whole
+          signing <strong>generation</strong> &mdash; not an individual
+          certificate. A <strong>Durable Object</strong> signs a CA bundle
+          naming the current generation; verifiers fetch it and refuse one
+          older than five minutes.
+        </p>
+        <p>
+          There is no CRL, no OCSP and no per-certificate status. Nothing
+          looks up a serial. For anything finer than a generation the bound is
+          the five-minute certificate lifetime.
         </p>
 
         <div class="diagram-container">
           <pre class="mermaid">
 sequenceDiagram
-    participant Agent
-    participant Edge as mTLS Edge
-    participant DO as CertAgent (Durable Object)
-    participant D1 as Analytics (SQLite)
+    participant A as SigningAuthority (Durable Object)
+    participant KV as Edge cache (KV)
+    participant V as Verifier
 
-    Agent->>Edge: TLS Handshake (Client Cert)
-    Edge->>DO: Check Serial Status
-    Note over DO: SQLite-backed state lookup
-    alt is Revoked or Expired
-        DO-->>Edge: 403 Forbidden
-        Edge-->>Agent: Connection Terminated
-    else is Valid
-        DO-->>Edge: 200 OK (Principal Identity)
-        Edge->>D1: Log Access Event
-        Edge->>Agent: Route to Origin
+    Note over A: alarm, every 4 minutes
+    A->>A: build bundle (epoch, seqno, keys), sign with CA key
+    A->>KV: publish bundle:current
+
+    V->>KV: fetch bundle
+    V->>V: verify signature against out-of-band root
+    alt bundle older than 5 minutes
+        V-->>V: reject (fail closed, stale)
+    else certificate epoch is not the current generation
+        V-->>V: reject (generation revoked)
+    else
+        V-->>V: accept for this generation
     end
           </pre>
         </div>
@@ -471,29 +482,33 @@ sequenceDiagram
         <div class="dossier-card">
           <span class="card-label">Technical Readout: Revocation</span>
           <div class="flow-step">
-            <h3>Stateful Ledger (SQLite in DO)</h3>
+            <h3>Signed bundle, not a ledger</h3>
             <p>
-              Every bridge cert is registered in a
-              <strong>Durable Object</strong>. This provides a strongly
-              consistent state machine for issuance, expiration, and manual
-              revocation.
+              Issued certificates are <strong>not</strong> recorded. The
+              Durable Object holds the signing key and the current generation
+              number; it keeps no registry of what it has issued, so there is
+              nothing to look a serial up in. Issuance transparency is
+              separate, and in progress.
             </p>
           </div>
           <div class="flow-step">
-            <h3>Scheduled Alarms</h3>
+            <h3>One alarm, and it refreshes the bundle</h3>
             <p>
-              Cloudflare Alarm APIs pre-schedule the exact moment of expiry.
-              Trust is withdrawn proactively at the edge, rather than waiting
-              for CRL propagation.
+              A single alarm regenerates and republishes the signed bundle
+              every four minutes, inside the five-minute staleness limit
+              verifiers enforce. It does not schedule expiries and does not
+              withdraw individual credentials &mdash; certificates expire on
+              their own <code>notAfter</code>.
             </p>
           </div>
           <div class="flow-step">
             <h3>Route Classification</h3>
             <p>
-              The edge differentiates between
-              <code>Public</code> (Landing/Explainer) and
-              <code>Protected</code> (MCP/API) routes. Public routes are open;
-              Protected routes require valid mTLS handshakes.
+              The edge separates <code>Public</code> (landing, explainer)
+              from <code>Protected</code> (API) routes by host and path.
+              Protected routes require a proof the Worker verifies in the
+              request &mdash; a session cookie, a DPoP proof, or an X.509
+              chain &mdash; <em>not</em> a TLS client-certificate handshake.
             </p>
           </div>
         </div>
@@ -596,8 +611,10 @@ graph TD
           <div class="comp-box good">
             <span class="comp-label">Sovereign Model (notme)</span>
             <p>
-              <strong>Stolen Cert:</strong> Inert without private key.
-              Revocation is surgical (kill the specific machine cert).
+              <strong>Stolen Cert:</strong> Inert without its private key, and
+              expires within minutes. There is no way to kill one specific
+              certificate &mdash; the levers are the whole signing generation
+              or the principal's grants.
             </p>
             <p>
               <strong>Detection:</strong> Every commit signed by a distinct
