@@ -135,16 +135,33 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 //     Interlace profile  otherwise
 //     Under the Signet profile, .1.5 and .1.6 are NEVER reported.
 //
-// THAT MAKES .1.1 AND .1.2 A CROSS-REPO CONTRACT, and the single most
-// surprising consequence in this file: they look like decorative audit
+// THAT MAKES THE MARKER EXTENSIONS A CROSS-REPO CONTRACT, and the single
+// most surprising consequence in this file: they look like decorative audit
 // metadata — a subject the SAN already carries, a timestamp notBefore
 // already carries — but they are what tells a third-party verifier it holds
-// a notme certificate rather than a cloister one. Drop both from any mint
-// path and that path's certificates are classified as the Interlace profile,
-// at which point .1.5/.1.6 ARE read, with the wrong meaning. Nothing in this
-// repo would fail; the misread would happen in another, against a
-// certificate this one signed. Pinned for all four mint paths by
-// llo-profile-contract.do.test.ts, mutation-verified.
+// a notme certificate rather than a cloister one.
+//
+// The discriminator is a SET, and any ONE member selects it. An earlier
+// version of this comment said dropping .1.1/.1.2 from a mint path
+// reclassifies that path as Interlace. IT DOES NOT. Measured against LLO's
+// `oid_signet::MARKERS` + `classify_profile` (branch
+// fix/9ac66d-interlace-oid-profiles, NOT yet released): the set is .1.1,
+// .1.2, .1.3, .1.8, .1.9 and the check is `.any()`. Every notme mint path
+// emits .1.1, .1.2 AND .1.8, so the contract is satisfied three times over
+// and losing any single extension is survivable. The real hazard is a sweep
+// that strips ALL markers from a path — harder to do by accident, and the
+// thing actually worth watching for.
+//
+// So this is the second overstatement in this comment's history, in the same
+// direction as the first: a latent allocation conflict described as a
+// confirmed live misread.
+//
+// llo-profile-contract.do.test.ts pins .1.1/.1.2 on all four mint paths
+// (mutation-verified). That pin stands on its own footing — they are notme's
+// own identity contract, read by signet and cross-checked against the URI
+// SAN (notme-729801) — not on LLO's classifier. Pinning LLO's marker SET
+// waits for LLO's release, since the set can still move before then
+// (notme-6070fa).
 //
 // An even earlier version of this table said ".1.1–.1.6 notme + signet, .1.7
 // LLO". That was also wrong, and also in the direction that makes a

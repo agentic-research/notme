@@ -16,13 +16,24 @@
  *     Interlace profile otherwise.
  *     Under the Signet profile `.1.5` and `.1.6` are never reported.
  *
- * So the presence of `.1.1`/`.1.2` is what tells a third-party verifier it is
- * holding a notme certificate rather than a cloister one. **Drop them from a
- * mint path and that path's certificates get classified as cloister's
- * profile, at which point `.1.5` and `.1.6` ARE read — silently, with the
- * wrong meaning, in an identity-correlation field.** Nothing in notme would
- * fail; the misread happens in another repo, against a certificate this one
- * signed.
+ * So a marker extension is what tells a third-party verifier it is holding a
+ * notme certificate rather than a cloister one. With NO marker present, a
+ * cert is read under cloister's profile, at which point `.1.5` and `.1.6`
+ * ARE read — silently, with the wrong meaning, in an identity-correlation
+ * field. Nothing in notme would fail; the misread happens in another repo,
+ * against a certificate this one signed.
+ *
+ * CORRECTED: the marker set is FIVE OIDs (`.1.1`, `.1.2`, `.1.3`, `.1.8`,
+ * `.1.9`) and LLO's check is `.any()`, so dropping `.1.1`/`.1.2` from a path
+ * does NOT reclassify it — `.1.8` principal-kind, which every path also
+ * emits, keeps it on the Signet profile. This file therefore does not test
+ * LLO's classifier; pinning the marker SET waits for LLO to release, since
+ * the set can still move.
+ *
+ * What it DOES test is notme's own guarantee: `.1.1` and `.1.2` are the
+ * subject and issuance time that signet reads by name and that
+ * `identity-contract.do.test.ts` cross-checks against the URI SAN
+ * (notme-729801). That stands whatever LLO ships.
  *
  * They look like decorative audit metadata — a subject string the SAN
  * already carries, and an issuance time `notBefore` already carries — which
@@ -67,10 +78,13 @@ function expectDiscriminator(certPem: string, path: string) {
   ] as const) {
     expect(
       cert.getExtension(oid),
-      `${path} emitted no ${label}. LLO decides a cert's PROFILE from these: ` +
-        `with neither present it classifies this certificate as cloister's ` +
-        `Interlace profile and reads .1.5/.1.6 with the wrong meaning. ` +
-        `See notme-6070fa / LLO PR #489.`,
+      `${path} emitted no ${label}. This is notme's identity contract: ` +
+        `signet reads .1.1/.1.2 by name, and identity-contract.do.test.ts ` +
+        `cross-checks .1.1 against the URI SAN the API returns as ` +
+        `\`identity\`. They are also two of the five markers LLO uses to ` +
+        `classify a cert as the Signet rather than the Interlace profile — ` +
+        `a cert carrying NONE of the five has .1.5/.1.6 read with the wrong ` +
+        `meaning. See notme-6070fa / notme-729801 / LLO PR #489.`,
     ).toBeTruthy();
   }
 }
