@@ -537,6 +537,24 @@ built for `notme-54f84b` guarded a branch no token could reach.
 > `revokeEpoch()`. The key id says which key signed and moves only on
 > `rotate()`. Neither implies the other.**
 
+**AND THE LEVER NEEDED A HANDLE.** Decoupling the axes made the mechanism
+sound and left it unreachable: `revokeEpoch()` shipped as a Durable Object
+RPC method with no route and no caller outside the test suite, so the
+sentence above — "could not be operated" — stayed true for a different
+reason. That is the same defect this bead had already fixed one function
+earlier, for `resetAlarmHealth()`, whose absent route let production serve a
+rejected bundle for 130 days (`notme-4896d8`). Found 2026-10-27 while
+answering whether the release waits on ley-line-open; `grep -rn revokeEpoch`
+returned its own definition, nine test call sites, and nothing else.
+
+`POST /admin/revoke-epoch` now exposes it, `authorityManage`-gated with the
+auth check ahead of the method check, and it returns `BUNDLE_MAX_AGE_MS`
+alongside the new generation so an operator pulling it is told when it takes
+effect rather than assuming "now". Gating and effect are pinned by
+`admin-revoke-epoch-route.do.test.ts` — including that a second pull advances
+the generation again, because an idempotent revoke could not answer a second
+incident, and that a revoked grant shuts the door on the next request.
+
 **PROPAGATION BOUND: `BUNDLE_MAX_AGE_MS` — five minutes.** A verifier that
 can reach the bundle enforces the new generation within one refresh;
 `isBundleStale()` refuses a bundle older than that, so the bound is enforced

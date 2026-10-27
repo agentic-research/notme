@@ -2191,6 +2191,65 @@ export default {
         return Response.json(await authority.getAlarmHealth());
       }
 
+      // POST /admin/revoke-epoch — pull the mass-revocation lever
+      //
+      // `revokeEpoch()` advances the revocation generation and republishes
+      // the CA bundle synchronously. Per ADR-019 D7 it is the ONLY mass
+      // revocation notme has, and D7's whole subject was that the previous
+      // mechanism "could not be operated" because revoking cost the signing
+      // key and destroyed the evidence for every past receipt.
+      //
+      // It then shipped as an RPC method with NO ROUTE — the same defect, in
+      // the same bead, that left resetAlarmHealth() uninvocable while
+      // production served a rejected bundle for 130 days (see above). Fixing
+      // the mechanism and leaving it unreachable is not fixing it.
+      //
+      // authorityManage-gated and POST-only: this invalidates every
+      // outstanding credential of the current generation, so reachable
+      // unauthenticated it is a denial-of-service primitive against the whole
+      // authority. Gating is pinned by admin-revoke-epoch-route.do.test.ts.
+      if (pathname === "/admin/revoke-epoch") {
+        // AUTH BEFORE METHOD, same reason as /admin/alarm-health: answering
+        // 405 first would confirm to an anonymous caller that this authority
+        // exposes a mass-revocation endpoint.
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        if (!cookie) return jsonErr("sign in first", 401);
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const sessionSecret = await authority.getSessionSecret();
+        const session = await verifySessionCookie(cookie, sessionSecret);
+        if (!session) return jsonErr("invalid session", 401);
+        // LIVE against the grant store, so a revoked grant shuts this door on
+        // the next request rather than when the cookie expires.
+        const { liveScopes } = await import("./src/auth/session");
+        if (!(await liveScopes(session, authority)).includes("authorityManage")) {
+          return jsonErr("authorityManage scope required", 403);
+        }
+        if (request.method !== "POST") {
+          return jsonErr("method not allowed", 405);
+        }
+        const result = await authority.revokeEpoch();
+        // Dynamic import to match this file's idiom — the constant is only
+        // needed on the one request that pulls the lever.
+        const { BUNDLE_MAX_AGE_MS } = await import("./src/revocation");
+        // Return the propagation bound with the result. An operator who pulls
+        // this needs to know WHEN it takes effect, and the honest answer is
+        // bounded only for verifiers that can reach the bundle — one
+        // BUNDLE_MAX_AGE_MS refresh. A verifier that cannot has TTL and
+        // nothing else (ADR-019 D7).
+        return Response.json({
+          ...result,
+          propagation: {
+            boundMs: BUNDLE_MAX_AGE_MS,
+            note: "Verifiers that can reach the CA bundle enforce the new generation within one refresh. Offline verifiers have TTL only.",
+          },
+        });
+      }
+
       // POST /invites — create an invite (requires authorityManage scope)
       // GET /invites — the form. authorityManage-gated BEFORE the asset is
       // served, so an unprivileged caller never sees it.
