@@ -123,6 +123,65 @@ describe("site claims stay coupled to what the code does", () => {
     }
   });
 
+  it("does not claim scopes live outside the certificate", () => {
+    // Scopes ride at OID_SCOPES and the chain verifier enforces
+    // child ⊆ parent at every hop (verify-chain.ts). A page saying scope is
+    // "not embedded in the cert" describes the opposite of the design, and
+    // undersells the one bound a third-party validator can check offline.
+    const certAuthority = readFileSync(
+      `${workerDir}/src/cert-authority.ts`,
+      "utf8",
+    );
+    expect(certAuthority).toMatch(/OID_SCOPES/); // guard: still true
+    for (const { name, text } of pages) {
+      const flat = text.replace(/\s+/g, " ");
+      expect(
+        /not embedded in the cert/i.test(flat),
+        `${name} says scope is not embedded in the certificate, but scopes are ` +
+          `carried at OID_SCOPES and narrowed at every hop.`,
+      ).toBe(false);
+    }
+  });
+
+  it("states leaf and tier TTLs that match the code", () => {
+    // Read the real defaults rather than restating them: the page claimed
+    // "Hours, not days" for a credential that lives five minutes.
+    const certAuthority = readFileSync(
+      `${workerDir}/src/cert-authority.ts`,
+      "utf8",
+    );
+    const authority = readFileSync(
+      `${workerDir}/src/signing-authority.ts`,
+      "utf8",
+    );
+    // Leaf default: 5 * 60 * 1000. Tier default: 60 * 60 * 1000. Cap: 24h.
+    expect(certAuthority).toMatch(/opts\.ttlMs \?\? 5 \* 60 \* 1000/);
+    expect(certAuthority).toMatch(/opts\.ttlMs \?\? 60 \* 60 \* 1000/);
+    expect(authority).toMatch(/MAX_ISSUING_TTL_MS = 24 \* 60 \* 60 \* 1000/);
+
+    for (const { name, text } of pages) {
+      const flat = text.replace(/\s+/g, " ");
+      // FORBIDDEN OUTRIGHT, not "unless 5 minutes appears somewhere".
+      //
+      // The first version of this check was conditional — if the page says
+      // "Hours, not days" it must also mention 5 minutes — and a mutation
+      // reinstating the claim SURVIVED it, because the rewritten §03 nearby
+      // mentions the five-minute lifetime for an unrelated reason. A
+      // page-wide co-occurrence test cannot tell "this card is accurate"
+      // from "some other paragraph happens to say the right number".
+      //
+      // "Hours, not days" is simply wrong for the credential a reader of
+      // that card is looking at — leaves live 5 minutes — so the phrase is
+      // the defect, and a correct page has no reason to carry it.
+      expect(
+        /Hours, not days/i.test(flat),
+        `${name} says "Hours, not days" for a certificate TTL. Leaf certs ` +
+          `last 5 MINUTES (cert-authority.ts default); only issuing tiers ` +
+          `are measured in hours, 1 by default and 24 at most. State both.`,
+      ).toBe(false);
+    }
+  });
+
   it("does not claim mTLS handshake enforcement that no code performs", () => {
     // Nothing reads Cloudflare's client-certificate fields.
     const src = readdirSync(`${workerDir}/src`)

@@ -423,8 +423,12 @@ graph LR
           <div class="spec-item">
             <strong>Scope</strong>
             <p>
-              Bound to a verified identity. Task scope is enforced by the
-              orchestrator, not embedded in the cert.
+              Scopes ride IN the certificate and can only narrow: the chain
+              verifier enforces child &sube; parent at every hop, and refuses
+              the chain otherwise. Task scope (<code>task</code> +
+              <code>goal_hash</code>) is carried in the certificate too.
+              Whether a holder may use a granted scope for a particular
+              action is the calling system's decision, not notme's.
             </p>
           </div>
           <div class="spec-item">
@@ -436,7 +440,11 @@ graph LR
           </div>
           <div class="spec-item">
             <strong>TTL</strong>
-            <p>Hours, not days. Short windows reduce the audit-gap risk.</p>
+            <p>
+              Leaf certs: 5 minutes. Issuing tiers: 1 hour by default,
+              24 hours maximum &mdash; the minter refuses more. Short windows
+              reduce the audit-gap risk.
+            </p>
           </div>
         </div>
       </section>
