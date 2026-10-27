@@ -79,7 +79,10 @@ const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigne
 // cert" rather than erroring — which is how a derived-identity check
 // degrades back into a trust-the-caller one (notme-6ad276).
 export const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
-const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
+// Exported, like OID_SUBJECT, because a cross-repo contract now depends on
+// this extension being PRESENT (see the profile-discriminator note below) and
+// the test that pins it must read exactly what minting wrote.
+export const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
 export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
 export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
@@ -109,15 +112,44 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 //   .1.8   principal kind                 —
 //   .1.9   task scope                     —
 //
-// .1.6 fails loudly at LLO (it runs Utf8StringRef::from_der over our raw
-// binding bytes). .1.5 is worse: same TYPE, different MEANING, so it parses
-// silently and LLO reads our authMethod as a peer fingerprint — no error,
-// wrong value, in an identity-correlation field.
+// CORRECTED 2026-10-27 (notme-6070fa, relayed from LLO PR #489 and verified
+// against LLO's own source on both sides of the fix).
 //
-// An earlier version of this table said ".1.1–.1.6 notme + signet, .1.7
-// LLO". That was wrong, and it was wrong in the direction that makes a
-// collision look resolved. Tracked at ley-line-open-9ac66d; the real fix is
-// a per-project PEN (notme-229dc3), which is free and takes days.
+// An earlier version of this comment said .1.5 "parses silently and LLO
+// reads our authMethod as a peer fingerprint — no error, wrong value, in an
+// identity-correlation field". THAT MISREAD NEVER HAPPENED, and the reason
+// matters: LLO's known-critical-extension set contained no
+// ID_CE_BASIC_CONSTRAINTS, and notme marks BasicConstraints critical, so
+// every real notme certificate was REJECTED as carrying an unknown critical
+// extension (RFC 5280 §4.2) before any .1.x extension was read at all. The
+// collision was real as an allocation conflict and inert in practice,
+// sitting behind an earlier rejection. Describing it as a live silent
+// misread overstated it — in the direction that makes a hazard sound
+// confirmed rather than latent, which is its own kind of wrong.
+//
+// Nor will it happen now. LLO #489 decides a certificate's PROFILE from its
+// SIGNED extensions, so the choice cannot be stripped without breaking the
+// signature:
+//
+//     Signet profile  iff it carries at least one of .1.1, .1.2, …
+//     Interlace profile  otherwise
+//     Under the Signet profile, .1.5 and .1.6 are NEVER reported.
+//
+// THAT MAKES .1.1 AND .1.2 A CROSS-REPO CONTRACT, and the single most
+// surprising consequence in this file: they look like decorative audit
+// metadata — a subject the SAN already carries, a timestamp notBefore
+// already carries — but they are what tells a third-party verifier it holds
+// a notme certificate rather than a cloister one. Drop both from any mint
+// path and that path's certificates are classified as the Interlace profile,
+// at which point .1.5/.1.6 ARE read, with the wrong meaning. Nothing in this
+// repo would fail; the misread would happen in another, against a
+// certificate this one signed. Pinned for all four mint paths by
+// llo-profile-contract.do.test.ts, mutation-verified.
+//
+// An even earlier version of this table said ".1.1–.1.6 notme + signet, .1.7
+// LLO". That was also wrong, and also in the direction that makes a
+// collision look resolved. The real fix remains a per-project PEN
+// (notme-229dc3), which is free and takes days.
 export const OID_PRINCIPAL_KIND = `${OID_PEN}.1.8`; // UTF8String: human|agent|workload|organization
 export const OID_TASK_SCOPE = `${OID_PEN}.1.9`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
 
