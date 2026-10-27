@@ -305,6 +305,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO state (id, epoch, seqno) VALUES ('authority', 1, 1)",
     );
+    // Migration (v2 → v3): which epoch the LIVE key started serving.
+    //
+    // Needed because epoch and key identity were decoupled (notme-77a024):
+    // one key may now serve several epochs, so "the epoch" is no longer a
+    // property of the key and has to be recorded as the span it covered.
+    //
+    // The backfill is the current epoch, not 1. Under the old coupling
+    // `rotate()` bumped the epoch in the same statement that replaced the
+    // key, so an existing key began serving exactly at the epoch now
+    // current — and for a deployment that never rotated, that is epoch 1
+    // anyway. Defaulting to 1 instead would claim the live key served every
+    // earlier epoch too, which over-matches: `getEpochPublicKey(1)` would
+    // offer today's key for an epoch an archived key actually signed.
+    try {
+      this.ctx.storage.sql.exec("SELECT from_epoch FROM keys LIMIT 0");
+    } catch {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE keys ADD COLUMN from_epoch INTEGER NOT NULL DEFAULT 0",
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE keys SET from_epoch = (SELECT epoch FROM state WHERE id = 'authority') WHERE from_epoch = 0",
+      );
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS dpop_jtis (
         jti        TEXT PRIMARY KEY,
@@ -332,14 +355,62 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // for good, while a discovery endpoint can be added at any time. Serving
     // these at /.well-known/interlace/index.json per §2.3 is tracked
     // separately; persisting them cannot wait for it.
+    //
+    // KEYED ON THE KEY, NOT THE EPOCH (notme-77a024). The original shape was
+    // `epoch INTEGER PRIMARY KEY`, which is only sound while a rotation and
+    // an epoch bump are the same event. They are not any more: epoch is the
+    // revocation generation and moves only on `revokeEpoch()`, so a second
+    // rotation inside one epoch would collide on that primary key — and the
+    // archive write is `INSERT OR IGNORE`, so the collision is SILENT and the
+    // second key's bytes are simply lost. That is precisely the audit-defeat
+    // failure §2.3 names, reintroduced by the decoupling if the key stays.
+    //
+    // `from_epoch`/`until_epoch` are the inclusive span of epochs the key
+    // served. One key may cover several (it keeps signing across a
+    // revocation), and one epoch may have been served by several keys (it
+    // survives rotations) — so neither side is a function of the other, and
+    // resolution at audit time is by `actor_fp`, with the span as the filter.
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS retired_keys (
-        epoch      INTEGER PRIMARY KEY,
-        key_id     TEXT NOT NULL,
-        public_raw TEXT NOT NULL,
-        retired_at INTEGER NOT NULL
+        key_id      TEXT PRIMARY KEY,
+        public_raw  TEXT NOT NULL,
+        from_epoch  INTEGER NOT NULL,
+        until_epoch INTEGER NOT NULL,
+        retired_at  INTEGER NOT NULL
       )
     `);
+    // Migration (v1 → v2): rebuild an epoch-keyed archive onto the key.
+    //
+    // `CREATE TABLE IF NOT EXISTS` above is a no-op when the v1 table is
+    // already there, so the old shape has to be detected and rewritten.
+    // from_epoch = until_epoch = the recorded epoch is EXACT for v1 rows
+    // rather than a guess: under the coupling that wrote them, a key served
+    // exactly the one epoch it was retired at.
+    let retiredKeysIsV1 = false;
+    try {
+      this.ctx.storage.sql.exec("SELECT until_epoch FROM retired_keys LIMIT 0");
+    } catch {
+      retiredKeysIsV1 = true;
+    }
+    if (retiredKeysIsV1) {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE retired_keys_v2 (
+          key_id      TEXT PRIMARY KEY,
+          public_raw  TEXT NOT NULL,
+          from_epoch  INTEGER NOT NULL,
+          until_epoch INTEGER NOT NULL,
+          retired_at  INTEGER NOT NULL
+        )
+      `);
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO retired_keys_v2 (key_id, public_raw, from_epoch, until_epoch, retired_at) " +
+          "SELECT key_id, public_raw, epoch, epoch, retired_at FROM retired_keys",
+      );
+      this.ctx.storage.sql.exec("DROP TABLE retired_keys");
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE retired_keys_v2 RENAME TO retired_keys",
+      );
+    }
     // Delegated JWT signing keys, one per issuer (ADR-015).
     //
     // SEPARATE from the CA master, and that separation is the entire security
@@ -522,12 +593,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     );
     const keyId = await SigningAuthority.#keyIdFromSpki(publicSpkiB64);
 
+    // The epoch this key begins serving (notme-77a024). The epoch moves on
+    // `revokeEpoch()` alone, so a new key INHERITS the current generation
+    // rather than defining one — which is what lets `rotate()` leave the
+    // revocation state untouched.
+    const startEpoch =
+      (
+        this.ctx.storage.sql
+          .exec("SELECT epoch FROM state WHERE id = 'authority'")
+          .toArray() as Array<{ epoch: number }>
+      )[0]?.epoch ?? 1;
+
     if (isEphemeral) {
       // Store public key + key ID only — no private key material on disk
       this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', '', ?, ?)",
+        "INSERT OR REPLACE INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', '', ?, ?, ?)",
         publicSpkiB64,
         keyId,
+        startEpoch,
       );
       this.#signingKey = kp.privateKey;
       this.#verifyKey = kp.publicKey;
@@ -542,13 +625,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       )) as JsonWebKey;
       const kekForWrite = this.#getKek();
       this.ctx.storage.sql.exec(
-        "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
+        "INSERT INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', ?, ?, ?, ?)",
         await serialiseJwkForStorage(
           privateJwk,
           kekForWrite ? await kekForWrite : null,
         ),
         publicSpkiB64,
         keyId,
+        startEpoch,
       );
       // Re-import as non-extractable — JWK is stored, no need to keep extractable
       this.#signingKey = await crypto.subtle.importKey(
@@ -837,10 +921,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * answer for the current epoch, and it is keyed by keyId rather than epoch,
    * so historical resolution needs its own lookup.
    *
-   * Returns raw base64 Ed25519 public key bytes — the same form `actor_fp` is
-   * computed over — or null when the epoch is unknown. Null is honest rather
-   * than an error: an auditor must be able to distinguish "notme does not have
-   * this" from a transport failure.
+   * Returns EVERY key that served the epoch, raw base64 Ed25519 public key
+   * bytes — the same form `actor_fp` is computed over — and an empty array
+   * when none did. Empty is honest rather than an error: an auditor must be
+   * able to distinguish "notme does not have this" from a transport failure.
+   *
+   * A SET, not one key, since notme-77a024 decoupled the epoch from key
+   * identity: rotations no longer move the epoch, so several keys can have
+   * signed under one generation. The caller disambiguates by `actor_fp` =
+   * SHA-256(public key), which the receipt carries — so the fingerprint was
+   * always the real index and the epoch is the filter. Returning any single
+   * member would be a coin flip wearing a lookup's clothes.
    */
   /**
    * Every epoch's signing key — current and retired — for third-party
@@ -860,6 +951,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async listEpochKeys(): Promise<
     Array<{
       epoch: number;
+      untilEpoch: number | null;
       keyId: string;
       publicRawB64: string;
       retiredAt: number | null;
@@ -869,35 +961,42 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const retired = this.ctx.storage.sql
       .exec(
-        "SELECT epoch, key_id, public_raw, retired_at FROM retired_keys ORDER BY epoch ASC",
+        "SELECT key_id, public_raw, from_epoch, until_epoch, retired_at FROM retired_keys ORDER BY from_epoch ASC, key_id ASC",
       )
       .toArray() as Array<{
-      epoch: number;
       key_id: string;
       public_raw: string;
+      from_epoch: number;
+      until_epoch: number;
       retired_at: number;
     }>;
 
     const out: Array<{
       epoch: number;
+      untilEpoch: number | null;
       keyId: string;
       publicRawB64: string;
       retiredAt: number | null;
     }> = retired.map((r) => ({
-      epoch: r.epoch,
+      epoch: r.from_epoch,
+      untilEpoch: r.until_epoch,
       keyId: r.key_id,
       publicRawB64: r.public_raw,
       retiredAt: r.retired_at,
     }));
 
-    // The live epoch is not in retired_keys — it has not been retired.
-    const current = this.ctx.storage.sql
-      .exec("SELECT epoch FROM state WHERE id = 'authority'")
-      .toArray() as Array<{ epoch: number }>;
-    const currentEpoch = current[0]?.epoch;
-    if (typeof currentEpoch === "number") {
+    // The live key is not in retired_keys — it has not been retired. Its span
+    // is open-ended: `untilEpoch: null` means "still serving", which is
+    // different from "served up to the current epoch" and will stay true
+    // through the next revokeEpoch().
+    const live = this.ctx.storage.sql
+      .exec("SELECT from_epoch FROM keys WHERE id = 'authority'")
+      .toArray() as Array<{ from_epoch: number }>;
+    const liveFrom = live[0]?.from_epoch;
+    if (typeof liveFrom === "number") {
       out.push({
-        epoch: currentEpoch,
+        epoch: liveFrom,
+        untilEpoch: null,
         keyId: this.#getKeyId(),
         publicRawB64: await this.getPublicKeyRawB64(),
         retiredAt: null,
@@ -906,43 +1005,36 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return out;
   }
 
-  async getEpochPublicKey(
-    epoch: number,
-  ): Promise<{
-    keyId: string;
-    publicRawB64: string;
-    retiredAt: number | null;
-  } | null> {
+  async getEpochPublicKey(epoch: number): Promise<
+    Array<{
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }>
+  > {
     this.#ensureSchema();
-
+    // An epoch the authority has never reached has no keys, even though the
+    // live key's span is open-ended. `untilEpoch: null` means "has not
+    // retired", NOT "serves every number" — and answering for a future epoch
+    // would hand a verifier a working key for a generation that does not
+    // exist, which is the over-matching half of the same mistake the archive
+    // schema made in the other direction.
     const current = this.ctx.storage.sql
       .exec("SELECT epoch FROM state WHERE id = 'authority'")
       .toArray() as Array<{ epoch: number }>;
-    if (current[0]?.epoch === epoch) {
-      return {
-        keyId: this.#getKeyId(),
-        publicRawB64: await this.getPublicKeyRawB64(),
-        retiredAt: null, // still active
-      };
-    }
+    if (epoch > (current[0]?.epoch ?? 0)) return [];
 
-    const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT key_id, public_raw, retired_at FROM retired_keys WHERE epoch = ?",
-        epoch,
+    const keys = await this.listEpochKeys();
+    return keys
+      .filter(
+        (k) =>
+          epoch >= k.epoch && (k.untilEpoch === null || epoch <= k.untilEpoch),
       )
-      .toArray() as Array<{
-      key_id: string;
-      public_raw: string;
-      retired_at: number;
-    }>;
-    const row = rows[0];
-    if (!row) return null;
-    return {
-      keyId: row.key_id,
-      publicRawB64: row.public_raw,
-      retiredAt: row.retired_at,
-    };
+      .map((k) => ({
+        keyId: k.keyId,
+        publicRawB64: k.publicRawB64,
+        retiredAt: k.retiredAt,
+      }));
   }
 
   async getReceiptFacts(): Promise<{ actorFp: Uint8Array; epoch: number }> {
@@ -1460,8 +1552,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return { ...bundle, signature: sigB64 } as CABundle;
   }
 
-  // Rotate the CA key. Increments epoch, generates new keypair.
-  // Previous keyId is preserved in the bundle as prevKeyId for graceful transition.
+  /**
+   * Replace the CA key. Does NOT move the epoch (notme-77a024).
+   *
+   * Epoch and key identity are independent axes, and conflating them cost
+   * notme both levers at once:
+   *
+   *   - A ROUTINE ROTATION became a mass revocation nobody asked for.
+   *     `checkRevocation` tests epoch (step 5) before keyId (step 6), so
+   *     every token minted before the rotation died on `epoch_mismatch` and
+   *     the republished `prevKeyId` grace window built for notme-54f84b
+   *     guarded a branch no token could enter.
+   *   - A MASS REVOCATION required destroying the signing key, the one
+   *     irreversible action available — which past the archive's retention
+   *     made the actor's own receipts unverifiable. A lever that costs an
+   *     audit trail does not get pulled.
+   *
+   * So: rotation is about which key signs, `revokeEpoch()` is about which
+   * credentials are still good, and the grace window now works because a
+   * pre-rotation token carries the SAME epoch and a `prevKeyId` match.
+   *
+   * seqno still advances: the published bundle genuinely changed, and the
+   * rollback-protection DO must refuse the pre-rotation bundle afterwards.
+   */
   async rotate(): Promise<{ newKeyId: string; epoch: number }> {
     this.#ensureSchema();
     const oldKeyId = this.#getKeyId();
@@ -1483,14 +1596,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // INSERT OR IGNORE, not REPLACE: an epoch's public key is immutable once
     // recorded. Overwriting one would rewrite history, which is precisely the
     // capability an audit trail exists to deny.
+    //
+    // The span, not one epoch: this key may have signed across a
+    // `revokeEpoch()`, so `from_epoch` is where it started and `until_epoch`
+    // is the generation current as it retires. `INSERT OR IGNORE` still
+    // guards immutability — now of one KEY's record, where before it silently
+    // discarded a second key retired inside the same epoch.
     const oldEpochRows = this.ctx.storage.sql
-      .exec("SELECT epoch FROM state WHERE id = 'authority'")
-      .toArray() as Array<{ epoch: number }>;
+      .exec(
+        "SELECT s.epoch AS epoch, k.from_epoch AS from_epoch FROM state s, keys k WHERE s.id = 'authority' AND k.id = 'authority'",
+      )
+      .toArray() as Array<{ epoch: number; from_epoch: number }>;
+    const untilEpoch = oldEpochRows[0]!.epoch;
     this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO retired_keys (epoch, key_id, public_raw, retired_at) VALUES (?, ?, ?, ?)",
-      oldEpochRows[0]!.epoch,
+      "INSERT OR IGNORE INTO retired_keys (key_id, public_raw, from_epoch, until_epoch, retired_at) VALUES (?, ?, ?, ?, ?)",
       oldKeyId,
       oldPubKeyB64,
+      oldEpochRows[0]!.from_epoch,
+      untilEpoch,
       Math.floor(Date.now() / 1000),
     );
 
@@ -1499,9 +1622,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.#signingKey = null;
     this.#verifyKey = null;
 
-    // Increment epoch
+    // seqno only. The epoch belongs to revokeEpoch().
     this.ctx.storage.sql.exec(
-      "UPDATE state SET epoch = epoch + 1, seqno = seqno + 1 WHERE id = 'authority'",
+      "UPDATE state SET seqno = seqno + 1 WHERE id = 'authority'",
     );
 
     // Generate new key (#getOrCreateSigningKey will create since we deleted)
@@ -1517,6 +1640,53 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray() as Array<{ epoch: number }>;
 
     return { newKeyId, epoch: rows[0]!.epoch };
+  }
+
+  /**
+   * Advance the revocation generation: void every credential issued so far,
+   * keep the signing key (notme-77a024).
+   *
+   * This is the unit between "wait for expiry" and "there is no lever". Every
+   * tier of the chain already carries `OID_EPOCH` and every verifier checks
+   * it, so a bump invalidates outstanding certificates and tokens at their
+   * next verification without the authority enumerating them.
+   *
+   * WHAT IT IS NOT. It is class-level and immediate-ish, not targeted: it
+   * cannot revoke one task, one tier, or one principal. Those are the grant
+   * (revoked at the authorization gate by `liveScopes`) and the chain
+   * (revoke a tier and every task cert beneath it fails path validation by
+   * issuer — intrinsic X.509, no index required). Reaching for this lever to
+   * do a targeted job is the error it exists to make unnecessary.
+   *
+   * THE KEY SURVIVES, deliberately. Receipts naming earlier epochs stay
+   * verifiable, which is the difference between revoking credentials and
+   * destroying evidence. Interlace RECEIPTS.md §2.3 makes historical
+   * resolution a MUST precisely so an actor cannot defeat an audit by
+   * rotating; a revocation lever that forced a rotation handed that back.
+   *
+   * CALLERS SEE `EPOCH_MISMATCH` and retry once against fresh
+   * `getReceiptFacts()` — the one retryable code, already specified for this
+   * shape (ADR-014). No operator HTTP route, matching `rotate()`: both are
+   * service-binding operations, and a public door onto mass revocation is a
+   * denial-of-service surface with an authentication bug away from being
+   * free.
+   */
+  async revokeEpoch(): Promise<{ epoch: number; seqno: number }> {
+    this.#ensureSchema();
+    this.ctx.storage.sql.exec(
+      "UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'",
+    );
+    // Publish straight away: the bundle is how a verifier learns the epoch
+    // moved, so leaving it stale makes the lever a no-op until the next
+    // alarm fires — and an alarm is exactly what cannot be relied on here
+    // (production once measured totalFires: 0 for 130 days, notme-4896d8).
+    // The returned numbers come FROM the published bundle, because
+    // generateBundle() advances seqno itself and the operator needs the
+    // generation a verifier will actually read.
+    const bundle = await this.#publishBundle();
+    const { epoch, seqno } = bundle;
+    console.warn({ event: "authority.epoch_revoked", epoch, seqno });
+    return { epoch, seqno };
   }
 
   // ── Passkey operations (delegates to passkey module, uses DO's SQLite) ──
@@ -2292,6 +2462,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
   }
 
+  /**
+   * Sign the current bundle and publish it to the KV the edge reads.
+   *
+   * ECMAScript #private: a `private` method stays live on the DO's RPC
+   * surface (ADR-016), and nothing outside this object should be able to
+   * force a republish. Shared by `alarm()` and `revokeEpoch()` so the two
+   * cannot drift — a revocation that published a differently-shaped bundle
+   * than the refresh path would be a very bad day to debug.
+   *
+   * No CA_BUNDLE_CACHE binding is a real configuration, not a failure: the
+   * bundle is still signed and the state still advances.
+   */
+  async #publishBundle(): Promise<CABundle> {
+    const bundle = await this.generateBundle();
+    if (this.env.CA_BUNDLE_CACHE) {
+      await this.env.CA_BUNDLE_CACHE.put(
+        "bundle:current",
+        JSON.stringify(bundle),
+      );
+    }
+    return bundle;
+  }
+
   override async alarm(): Promise<void> {
     const now = Date.now();
     this.#ensureAlarmHealthSchema();
@@ -2348,13 +2541,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     let success = false;
     let outcome: string;
     try {
-      const bundle = await this.generateBundle();
-      if (this.env.CA_BUNDLE_CACHE) {
-        await this.env.CA_BUNDLE_CACHE.put(
-          "bundle:current",
-          JSON.stringify(bundle),
-        );
-      }
+      await this.#publishBundle();
       success = true;
       outcome = "success";
     } catch (e) {

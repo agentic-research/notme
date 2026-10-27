@@ -484,9 +484,69 @@ What notme has today is **epoch-based bundle revocation** (`revocation.ts`):
 coarse (a whole issuance class), pull-based, and gated on `BUNDLE_MAX_AGE_MS`.
 There is no CRL, no OCSP, and no per-credential status. So the honest current
 answer is **TTL-only for anything finer than an epoch**, and the ADR says so
-rather than implying the hierarchy above already works. Choosing among signed
-revocation epochs, a CRL distribution point, OCSP, or trust-bundle refresh is
-`notme-77a024`'s remaining work.
+rather than implying the hierarchy above already works.
+
+#### D7 — The epoch is a lever, and pulling it costs no evidence
+
+**Decided 2026-10-26, closing `notme-77a024`.** Signed revocation epochs, of
+the three options this ADR listed. Not a CRL or OCSP: both require notme to
+answer at verification time, which `ADR-020` forbids making mandatory and
+which the offline-verification goal rules out anyway.
+
+The defect was not the choice of mechanism but that the chosen one **could
+not be operated**. `rotate()` advanced the epoch in the same statement that
+replaced the signing key, so the two axes were one:
+
+| | before | now |
+|---|---|---|
+| mass revocation | required destroying the signing key | `revokeEpoch()`, key untouched |
+| key rotation | silently mass-revoked | `rotate()`, epoch untouched |
+
+Both directions were harmful. Revoking cost the signing key — the one
+irreversible action available — and past the key archive's retention that
+makes every receipt naming an earlier epoch unverifiable, which is the
+audit-defeat Interlace `RECEIPTS.md` §2.3 names as a MUST-not. **A lever that
+destroys your own evidence does not get pulled**, so in practice notme had no
+mass revocation at all. And in the other direction a routine key rotation
+voided every outstanding credential, because `checkRevocation` tests the
+epoch (step 5) before the key id (step 6) — so the previous-key grace window
+built for `notme-54f84b` guarded a branch no token could reach.
+
+> **The epoch is the revocation generation and moves only on
+> `revokeEpoch()`. The key id says which key signed and moves only on
+> `rotate()`. Neither implies the other.**
+
+**PROPAGATION BOUND: `BUNDLE_MAX_AGE_MS` — five minutes.** A verifier that
+can reach the bundle enforces the new generation within one refresh;
+`isBundleStale()` refuses a bundle older than that, so the bound is enforced
+rather than hoped for. `revokeEpoch()` publishes synchronously instead of
+waiting for `alarm()`, because an alarm is the one component here with a
+measured history of never firing (`notme-4896d8`: `totalFires: 0` across 130
+days). A verifier that cannot reach the bundle has TTL and nothing else —
+unchanged, and still the honest answer.
+
+**WHAT THE LEVER IS NOT.** Class-level, never targeted: it cannot revoke one
+task, one tier, or one principal, and reaching for it to do a targeted job is
+the error it exists to make unnecessary. Those jobs already have units — the
+**grant**, revoked at the authorization gate by `liveScopes`, and the
+**chain**, where revoking a tier fails every task credential beneath it by
+issuer under ordinary path validation, needing no index at all.
+
+**CONSEQUENCE THE SCHEMA PAID FOR.** `retired_keys` was keyed
+`epoch INTEGER PRIMARY KEY`, which is sound only while the two axes move
+together. Decoupled, a second rotation inside one epoch collides on that key —
+and the archive write is `INSERT OR IGNORE`, so the collision is **silent** and
+the second key's bytes are lost. That is the same audit-defeat failure in a new
+costume, reintroduced by the fix if the schema were left alone. The archive is
+therefore keyed on the key and records the inclusive **span** of epochs it
+served, and `getEpochPublicKey` returns the **set** of keys that served an
+epoch — resolution at audit time is by `actor_fp`, which the receipt carries,
+with the epoch as a filter. One number was never an index for two axes.
+
+**ALSO FIXED, found by the test that drove this.** The epoch comparison was
+one-sided (`token.epoch < bundle.epoch`), so a credential naming a *future*
+generation passed step 5 and then matched the current key id at step 6. It is
+equality now: an epoch is not a timestamp and has no skew to tolerate.
 
 #### "Offline verification" and "not revoked" cannot both be fully true
 

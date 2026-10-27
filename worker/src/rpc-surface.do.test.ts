@@ -209,7 +209,23 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //
       // The standard for the next removal: prefer taking a method off the
       // surface over relying on any property of the boundary.
-    ).toBe(47);
+      //
+      // 47 → 48: revokeEpoch (notme-77a024). Reviewed, and the review turns
+      // on a comparison rather than on the method alone: a leaked stub can
+      // already call `rotate()`, which voids the same credentials AND
+      // destroys the signing key. revokeEpoch is strictly the weaker of the
+      // two — it voids outstanding credentials and leaves every key intact,
+      // so receipts naming earlier epochs stay verifiable. The worst case
+      // available to a stub holder is therefore unchanged, and the new
+      // method is the non-destructive half of a capability already present.
+      //
+      // Not nothing, though: it is a denial of service a stub holder can
+      // trigger repeatedly, and each call publishes a bundle (one KV write).
+      // That is the honest cost of having the lever at all, and it is why
+      // there is no HTTP route onto it — an authentication bug on a public
+      // door would make mass revocation free, where a service binding is a
+      // deployment-time grant.
+    ).toBe(48);
   });
 });
 
