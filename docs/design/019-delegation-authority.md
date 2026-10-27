@@ -443,8 +443,29 @@ block).
 
 ## What it requires that is not built
 
-1. **The grant as a stored, referenceable object** with the D3 payload. Today
-   there are three `*_by` columns and no grant identity.
+1. **The grant as a stored, referenceable object** with the D3 payload.
+   PARTLY BUILT. `capability_grants` has a stable, referenceable `id` as of
+   2026-10-26: the table is append-only history with a partial unique index
+   admitting one LIVE grant per `(principal, scope)`, and `grantCapability`
+   is idempotent rather than replacing — so a re-grant appends beside the
+   revoked row instead of overwriting it, and an id, once taken, still names
+   the same grant. Before that, `INSERT OR REPLACE` against an all-rows
+   `UNIQUE(principal_id, scope)` erased the `revoked_at`/`revoked_by` of the
+   row it replaced and minted a fresh id each call, so the audit view lost
+   the one event it exists to show and nothing could reference a grant at
+   all. (Latent, not live: no route reached it — `grantCapability` has no RPC
+   method, and its two callers either refuse an existing principal or return
+   existing grants rather than re-granting.)
+
+   STILL MISSING is the D3 payload itself: `represented_principal`,
+   `parent_grant_id`, `audience`/`resources`, `purpose`/`goal_hash`,
+   `delegable`, `remaining_delegation_depth`. A grant is still a
+   `(principal, scope)` row with provenance, not a delegation object, and no
+   credential names its grant. **That work is gated, not merely unscheduled**
+   — open question 6 below asks what this adds over an in-toto layout, and
+   ADR-020 forbids inventing a format where composition would do. Building
+   the payload before answering it would be the invention ADR-020 exists to
+   prevent.
 2. ~~**The middle tier** — a mint path producing `CA=true, pathlen=0`.~~ Built 2026-08-27: `mintIssuingCaCert` + `POST /cert/issuing-ca`.
 3. ~~**A namespace mechanism**, per D5's open question.~~ Decided 2026-08-27:
    segment-prefix confinement on the URI SAN (see D5); built as part of the
