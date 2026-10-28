@@ -333,16 +333,36 @@ export class AuthService extends WorkerEntrypoint<any> {
     return authority.mintBridgeCert(proof, publicKeyPem, ttlMs);
   }
 
-  /** Mint a DPoP-bound access token. */
-  async mintDPoPToken(params: {
-    sub: string;
-    scope: string;
-    audience: string;
-    jkt: string;
-  }) {
-    const authority = this.#getAuthority();
-    return authority.mintDPoPToken(params);
-  }
+  /*
+   * mintDPoPToken WAS HERE AND IS DELETED (notme-d68da8).
+   *
+   * Its signature was `{ sub, scope, audience, jkt }` and it forwarded all
+   * four to the DO, which signed them with the master Ed25519 key. So a
+   * holder of this binding — per ADR-009, every agent Worker — named the
+   * subject, the scope AND the audience of a genuine `at+jwt` carrying
+   * notme's real issuer. src/allowed-audiences.ts states the rule it went
+   * around in its own docstring: "every endpoint that mints an access token
+   * must check the requested audience against this set." /token and
+   * /authorize/token both do, and both require a notme_session first.
+   *
+   * Measured, not hypothesised: rig/web verifies notme tokens on signature
+   * and exp alone — no aud, no iss, and cnf.jkt unread on the token-only
+   * path — sets `identity.id = claims.sub`, then compares that id to
+   * ADMIN_USER_ID. One call named rig's admin.
+   *
+   * THE SAME DEFECT AS mintBridgeCert ABOVE (notme-51ccd7), one method down,
+   * and the pin in rpc-surface.do.test.ts had already written the standard
+   * that catches it: reachability asks who may call, argument trust asks what
+   * the method concludes from what it is handed. That standard was stated for
+   * mintBridgeCert and not then applied to the rest of the list.
+   *
+   * Deleted rather than given a proof envelope, per the ADR-014 precedent for
+   * the arbitrary-sign() oracle: zero callers in notme, rig, signet, cloister,
+   * ley-line, ley-line-open, rosary or mache, and the live /token route calls
+   * the DO's own mintDPoPTokenOnce directly. An unused minting method here is
+   * one `env.AUTH.mintDPoPToken()` away from being reachable again, so it does
+   * not stay with a warning comment.
+   */
 
   /** Get the CA public key PEM. */
   async getPublicKeyPem() {

@@ -545,10 +545,21 @@ describe("contract.auth-service.rpc-surface", () => {
     const methods = Object.getOwnPropertyNames(AuthService.prototype).filter(
       (n) => n !== "constructor" && !n.startsWith("_"),
     );
+    // mintDPoPToken IS DELIBERATELY ABSENT (notme-d68da8). It was listed
+    // here, and this list says "a rename or removal is a breaking change to
+    // the consumer protocol" — so note what that framing did: it is a
+    // COMPATIBILITY pin, and the method it was protecting signed a
+    // caller-chosen `sub`, `scope` and `audience` with the master key. A
+    // backwards-compatibility assertion will defend a security defect as
+    // readily as a feature, and this one would have failed the fix.
+    //
+    // Removal was checked, not assumed: `grep -rn "mintDPoPToken"` over
+    // notme, rig, signet, cloister, ley-line, ley-line-open, rosary and mache
+    // finds no consumer. So nothing is broken by its absence, and this list
+    // now pins what SHOULD be callable rather than what happened to be.
     const expected = [
       // Authority lookups
       "mintBridgeCert",
-      "mintDPoPToken",
       "getPublicKeyPem",
       "getCACertificatePem",
       "getAuthorityState",

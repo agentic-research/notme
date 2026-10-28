@@ -65,6 +65,10 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       "getPrivateKey",
       "exportKey",
       "getEnv",
+      // notme-d68da8: minted an at+jwt for a caller-chosen sub, scope and
+      // audience. Named here as well as absent from the pin above, so
+      // re-adding it fails with a reason rather than a diff.
+      "mintDPoPToken",
     ]) {
       expect(surface, `${forbidden} must not be RPC-reachable`).not.toContain(
         forbidden,
@@ -79,6 +83,30 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
     // `fetch` is absent: it is inherited from WorkerEntrypoint, not an own
     // property of this prototype. Own properties are what an RPC caller
     // reaches by name, which is why this walks them specifically.
+    //
+    // 10 -> 9: mintDPoPToken REMOVED (notme-d68da8). The second removal in
+    // this file, and the second time the method NEXT TO mintBridgeCert turned
+    // out to believe its argument.
+    //
+    // Its signature was { sub, scope, audience, jkt } and it forwarded all
+    // four to the DO, which signed them with the master Ed25519 key. So a
+    // binding holder named the subject AND the scope AND the audience of a
+    // genuine at+jwt carrying notme's real iss. src/allowed-audiences.ts
+    // states the rule it broke in its own docstring — "every endpoint that
+    // mints an access token must check the requested audience against this
+    // set" — and both HTTP minting routes do; this one went around them,
+    // along with the notme_session cookie they both require.
+    //
+    // Measured consequence, not a hypothesis: rig/web verifies notme tokens
+    // on signature + exp alone (no aud, no iss, and cnf.jkt unread on the
+    // token-only path), sets identity.id = claims.sub, and compares that to
+    // ADMIN_USER_ID. One call named rig's admin.
+    //
+    // Deleted rather than hardened, per the sign() precedent in
+    // signing-authority.ts: zero callers anywhere (notme, rig, signet,
+    // cloister, ley-line, ley-line-open, rosary, mache), the live /token
+    // route calls the DO's mintDPoPTokenOnce directly, and an unused method
+    // here is one env.AUTH.mintDPoPToken() away from being reachable again.
     expect(rpcSurface(AuthService)).toEqual([
       "authenticate",
       "getAuthorityState",
@@ -86,7 +114,6 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       "getPublicKeyPem",
       "identity",
       "mintBridgeCert",
-      "mintDPoPToken",
       "proxy",
       "sign",
       "verifySession",

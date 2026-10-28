@@ -76,6 +76,15 @@ interface SigningAuthorityEnv {
    * production one while signing with the staging key.
    */
   SIGNET_AUTHORITY_URL?: string;
+  /**
+   * CSV of resource servers this deployment's tokens may be addressed to.
+   * Read here, not only in the routes, because `mintBridgeCert`'s
+   * `notme-access-token` proof accepts a token WITHOUT a route in front of it
+   * (rig-098326) — and src/allowed-audiences.ts's rule is that every path
+   * which mints or spends an access token checks this set. Empty or absent
+   * falls back to DEFAULT_ALLOWED_AUDIENCES.
+   */
+  ALLOWED_AUDIENCES?: string;
 }
 
 /**
@@ -195,7 +204,24 @@ const GHA_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
  */
 export type MintBridgeCertProof =
   | { kind: "gha-oidc"; token: string }
-  | { kind: "session-cookie"; cookie: string };
+  | { kind: "session-cookie"; cookie: string }
+  /**
+   * An `at+jwt` THIS authority signed, presented back to it (rig-098326).
+   *
+   * The kind exists because a bound Worker legitimately has nothing else to
+   * present. rig/web holds an AUTH binding and used to pass a `userId`; it has
+   * no GitHub Actions token, and `notme_session` is scoped to notme.bot so a
+   * browser never sends it to rosary.bot. What it can hold is a token notme
+   * already minted to an authenticated principal — session-gated and
+   * audience-checked at `/token` and `/authorize/token` — which the DO
+   * re-verifies against its own key, reading the subject out of the claims.
+   *
+   * NOT SAFE BEFORE notme-d68da8. `AuthService.mintDPoPToken` let a binding
+   * holder sign a caller-chosen `sub` with the master key, so a token could be
+   * forged and fed straight back in here. Deleting that method is what makes
+   * a signature mean something; the two changes ship together on purpose.
+   */
+  | { kind: "notme-access-token"; token: string };
 
 /**
  * Why a mint was refused. Exhaustive; switch on it.
@@ -222,6 +248,7 @@ export type MintBridgeCertProof =
 export type BridgeCertRefusal =
   | "invalid_gha_token"
   | "invalid_session"
+  | "invalid_access_token"
   | "unknown_proof_kind";
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
@@ -1502,6 +1529,45 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         return { ok: false, reason: "invalid_session" };
       }
       subject = session.principalId;
+    } else if (proof?.kind === "notme-access-token") {
+      // Verified against THIS authority's own key, so a token from another
+      // deployment (or another DO id, which owns a different master key) is
+      // refused on signature rather than believed on its claims.
+      //
+      // AUDIENCE AND SCOPE ARE CHECKED HERE, not upstream, because this path
+      // has no route in front of it. `/token` and `/authorize/token` both call
+      // getAllowedAudiences(env) and both require a session cookie first; a
+      // service binding goes around both. Without these two checks a token
+      // minted for one resource server is spendable at every other, and a
+      // read-only token becomes a certificate.
+      const { verifyKey } = await this.#getOrCreateSigningKey();
+      const { verifyAccessToken, issuerFromEnv } = await import("./auth/token");
+      const { getAllowedAudiences } = await import("./allowed-audiences");
+      try {
+        const claims = await verifyAccessToken(
+          proof.token,
+          verifyKey,
+          issuerFromEnv(this.env),
+        );
+        // Every mint site asserts a subject; a token without one must not
+        // become a certificate named "".
+        if (!claims.sub) throw new Error("missing sub");
+        if (!getAllowedAudiences(this.env).has(claims.aud)) {
+          throw new Error("audience not allowed");
+        }
+        // `scope` is a space-delimited list (RFC 6749 §3.3). SPLIT it — a
+        // substring test would accept "notbridgeCertish".
+        if (!(claims.scope ?? "").split(" ").includes("bridgeCert")) {
+          throw new Error("missing bridgeCert scope");
+        }
+        subject = claims.sub;
+      } catch (e) {
+        console.warn({
+          event: "mint.access_token_proof_rejected",
+          detail: (e as Error)?.message,
+        });
+        return { ok: false, reason: "invalid_access_token" };
+      }
     } else {
       // Exhaustive at RUNTIME as well as in the type. A caller reaching this
       // DO over RPC is not bound by our types — `proof` may be a string, as
