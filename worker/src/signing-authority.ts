@@ -350,23 +350,6 @@ function randomUserCode(): string {
   return `${out.slice(0, 4).join("")}-${out.slice(4).join("")}`;
 }
 
-/**
- * What the machine signs to collect its tier. Domain-separated, because the
- * same Ed25519 key type signs other bindings elsewhere in this authority and
- * a proof for one must never verify as a proof for another.
- */
-export function tierEnrolmentBinding(spki: Uint8Array, deviceCodeHashHex: string): Uint8Array {
-  const tag = new TextEncoder().encode("notme/tier-enrol/v1\0");
-  const codeHash = Uint8Array.from(
-    deviceCodeHashHex.match(/../g)!.map((h) => parseInt(h, 16)),
-  );
-  const out = new Uint8Array(tag.length + spki.length + codeHash.length);
-  out.set(tag, 0);
-  out.set(spki, tag.length);
-  out.set(codeHash, tag.length + spki.length);
-  return out;
-}
-
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #initialized = false;
   #signingKey: CryptoKey | null = null;
@@ -1970,7 +1953,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const key = await importPublicKey(row.public_key_pem);
     const spki = new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
     const { verifyEd25519PopProof } = await import("./auth/pop");
-    if (!(await verifyEd25519PopProof(tierEnrolmentBinding(spki, deviceCodeHash), key, params.proof))) {
+    const { tierEnrolmentBinding } = await import("./auth/tier-enrolment-binding");
+    const codeHashBytes = Uint8Array.from(deviceCodeHash.match(/../g)!.map((h) => parseInt(h, 16)));
+    if (!(await verifyEd25519PopProof(tierEnrolmentBinding(spki, codeHashBytes), key, params.proof))) {
       return { ok: false, reason: "invalid_proof" };
     }
 
