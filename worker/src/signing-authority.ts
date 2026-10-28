@@ -816,17 +816,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // root to pathlen=1, production kept serving its March-2026 pathlen:0
       // cert for five months, and every Issuing CA tier minted under it was
       // unverifiable by any stock validator (notme-1b1db4). Re-issuing here
-      // is safe and non-destructive: same key, same epoch — leaves verify by
-      // key, so nothing in flight is invalidated.
+      // keeps the key and epoch, so verifiers that check by key are
+      // unaffected. Path validators also check the root's window at the
+      // signing time, which is why the re-issued root takes its notBefore
+      // from the key, not from now (notme-0c494f).
       try {
         const { X509Certificate, BasicConstraintsExtension } = await import(
           "@peculiar/x509"
         );
         const x = new X509Certificate(cached[0]!.pem);
         const bc = x.getExtension(BasicConstraintsExtension);
-        if (bc?.ca && bc.pathLength === CA_PATH_LEN) return cached[0]!.pem;
+        // ...and a window that starts no later than the key did. A root
+        // re-issued with notBefore = now strands every signature the key made
+        // before the re-issue (notme-0c494f): see #keyStart.
+        const windowOk = x.notBefore.getTime() <= this.#keyStart().getTime();
+        if (bc?.ca && bc.pathLength === CA_PATH_LEN && windowOk) {
+          return cached[0]!.pem;
+        }
         console.warn(
-          `[ca] cached root has pathlen ${bc?.pathLength ?? "none"}, code mints ${CA_PATH_LEN} — re-issuing under the same key`,
+          `[ca] cached root has pathlen ${bc?.pathLength ?? "none"} (code mints ${CA_PATH_LEN}), notBefore ${x.notBefore.toISOString()} (key began ${this.#keyStart().toISOString()}) — re-issuing under the same key`,
         );
       } catch {
         /* regenerate */
@@ -834,9 +842,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
 
     const { signingKey, verifyKey } = await this.#getOrCreateSigningKey();
-    const now = new Date();
+    const notBefore = this.#keyStart();
     const notAfter = new Date(
-      now.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
+      notBefore.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
     );
     const serial = crypto
       .getRandomValues(new Uint8Array(16))
@@ -844,7 +852,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const cert = await X509CertificateGenerator.createSelfSigned({
       name: caSubjectForEnv(this.env),
-      notBefore: now,
+      notBefore,
       notAfter,
       signingAlgorithm: ED25519,
       keys: { privateKey: signingKey, publicKey: verifyKey },
@@ -866,6 +874,26 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       currentKeyId,
     );
     return pem;
+  }
+
+  /**
+   * When the current key began signing, from keys.created_at: the root's
+   * notBefore (notme-0c494f).
+   *
+   * RFC 5280 path validation checks every chain element at the verification
+   * time, and a signature verifier (cosign, git) uses the SIGNING time. The
+   * root's window must therefore cover everything the key ever signed, and
+   * nothing it signed predates the key. Deriving the window from the key
+   * rather than from the moment of issue makes a re-issue under the same key
+   * (notme-1b1db4's pathlen heal) unable to strand an existing signature.
+   */
+  #keyStart(): Date {
+    const row = this.ctx.storage.sql
+      .exec("SELECT created_at FROM keys WHERE id = 'authority'")
+      .toArray()[0] as { created_at: string } | undefined;
+    // SQLite datetime('now'): "YYYY-MM-DD HH:MM:SS", UTC, no zone marker.
+    const t = row ? Date.parse(`${row.created_at.replace(" ", "T")}Z`) : NaN;
+    return Number.isNaN(t) ? new Date() : new Date(t);
   }
 
   // Return the raw 32-byte Ed25519 public key as base64 (for CABundle.keys).
