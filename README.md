@@ -1,7 +1,7 @@
 <!--
 @doc-check
 @types: CABundle, BridgeCertResult, CertScope
-@endpoints: POST /cert, POST /cert/gha, POST /token, GET /authorize, GET /me, POST /invites, GET /.well-known/signet-authority.json, GET /.well-known/jwks.json, GET /.well-known/ca-bundle.pem, GET /api/docs
+@endpoints: POST /cert, POST /cert/gha, POST /cert/nonce, POST /token, GET /authorize, GET /me, POST /invites, POST /cert/issuing-ca/device, POST /cert/issuing-ca/renew, GET /enroll, POST /bootstrap/claim, GET /.well-known/signet-authority.json, GET /.well-known/jwks.json, GET /.well-known/ca-bundle.pem, GET /api/docs
 -->
 # notme
 
@@ -58,7 +58,7 @@ graph TD
     Signet{"Proof-of-Possession"}:::signet
 
     Signet --> F1["Agent Identity Model<br/>(separate from human)"]:::feature
-    Signet --> F2["5-minute Ephemeral Tokens<br/>(no renewal, just expire)"]:::feature
+    Signet --> F2["5-minute Ephemeral Credentials<br/>(re-issued, never extended)"]:::feature
     Signet --> F3["Secretless Local Authority<br/>(keys never leave process memory)"]:::feature
 
     F1 & F2 & F3 --> End((Stolen Token = 5 Minutes Max<br/>Private Key = Never Leaves Memory)):::signet
@@ -105,6 +105,66 @@ graph LR
 
 the authority doesn't care how you authenticated. it cares that you did. any auth layer feeds into the same protocol — the output is a scoped, ephemeral, proof-of-possession token. the signing key never leaves process memory.
 
+## agents, machines and tasks
+
+an agent never holds your identity, and never holds the power to mint one. three tiers, each narrower than the last:
+
+```mermaid
+graph LR
+    classDef human fill:#1c1810,stroke:#00d4e8,stroke-width:2px,color:#e8dcc8
+    classDef machine fill:#242018,stroke:#f0d040,stroke-width:2px,color:#f0d040
+    classDef task fill:#1c1810,stroke:#48c868,stroke-width:2px,color:#48c868
+
+    You["you<br/>passkey"]:::human
+    Tier["machine (tier)<br/>CA · pathlen 0 · 1 h<br/>renews itself ≤ 7 days"]:::machine
+    T1["task<br/>rosary-056d96<br/>5 min · goal-committed"]:::task
+    T2["subtask<br/>rosary-056d96/step-2"]:::task
+
+    You -->|"approve once<br/>(compare fingerprint)"| Tier
+    Tier -->|"mints offline"| T1
+    Tier -->|"mints, narrower"| T2
+    T1 -.->|"parent"| T2
+```
+
+- **you** approve a machine once, with a passkey. that's the only human step.
+- **the machine** holds a *tier*: a short-lived CA that can mint task certs but no further CAs. it is approved with a **renewal horizon** (1, 7 or 30 days, default 7) and renews itself, by proof of possession, for as long as that approval holds.
+- **each task** gets its own cert pair, minted offline by the machine: identity `…/principal/<you>/<task>`, 5 minutes by default, carrying the task id and a SHA-256 of its goal (OID `.1.9`). a task cert is a leaf (`CA:FALSE`): it cannot issue anything.
+- **subtasks** are derived from a parent task by the machine — never by the agent — and can only narrow: scopes ⊆ the parent's, lifetime ≤ the parent's, name prefixed by the parent's. a re-mint is the same operation keeping the parent's name.
+
+**scopes only narrow, and it is checked at every mint:** your *live* grants ∩ what a cert may carry (`bridgeCert`, `sign:git`, `sign:attestation` — never `certMint` or `authorityManage`) → the tier → each task → each subtask.
+
+**pause and resume.** a VM that pauses past its tier's lifetime resumes, renews with no human, and carries on. it needs a human again only when the approval ends — and it says why:
+
+| renewal refused | because | to continue |
+|---|---|---|
+| `revoked` | you revoked the machine | `enroll` again |
+| `horizon_passed` | the 1/7/30 days ran out | `enroll` again |
+| `epoch_changed` | the authority's mass-revocation lever was pulled | `enroll` again |
+| `approval_withdrawn` | you no longer hold `certMint`, or the granted scopes | restore the grant, or `enroll` |
+
+**revocation levers, narrowest first:**
+
+| lever | reaches | takes effect |
+|---|---|---|
+| `task-cert revoke --task X` | X and everything under it, on that machine | next mint; issued certs live out ≤ 5 min |
+| `POST /cert/issuing-ca/enrollments/revoke` | one machine | next renewal (≤ 1 h) |
+| revoke a grant | every machine that grant approved | next renewal |
+| `POST /admin/revoke-epoch` | everything this authority issued | ≤ 5 min for online verifiers |
+
+### try it
+
+```bash
+task task-cert -- enroll                     # prints a link + fingerprint; approve with your passkey
+task task-cert -- mint --task build --goal "ship the release" --scopes bridgeCert,sign:git
+task task-cert -- mint --parent build --task compile --goal "compile"   # a subtask, narrower
+task task-cert -- verify --cert ~/.notme/tasks/build/compile/signing.pem
+task task-cert -- status                     # tier, renewal horizon, mints, revocations
+```
+
+keys and certs live under `~/.notme/` (dir 0700, keys 0600), never in the working directory. every mint is recorded in `~/.notme/tasks/ledger.jsonl`. `openssl verify -CAfile root.pem -untrusted ~/.notme/tier/tier.pem task.pem` checks a task cert without any notme code.
+
+**in CI**, a GitHub Actions job needs no enrollment: its OIDC token is the evidence. `POST /cert/gha` exchanges it for a cert pair, and `POST /token` (RFC 8693 token exchange) for a DPoP-bound access token.
+
 ## what's here
 
 ```
@@ -114,10 +174,10 @@ worker/             identity authority — auth.notme.bot (CF Worker + Durable O
   e2e/                Playwright contract tests (virtual authenticator)
 proxy/              Rust mTLS forward proxy — bridge cert lives in process memory,
                     workerd Workers fetch() through it. TCP or UDS listen.
-action/             GHA action — OIDC → access token (zero secrets, zero files)
+action/             GHA action — OIDC → bridge cert pair (zero secrets, zero files)
+scripts/task-cert/  machine-side CLI — enroll, renew, mint tasks and subtasks, verify
 gen/ts/             shared SDK — base64url, validateClaims, computeJwkThumbprint
 schema/             cap'n proto type definitions (CABundle, GHAClaims, etc.)
-vault/              credential vault Worker (HKDF + AES-GCM envelope encryption)
 packages/           container image pipeline (melange + apko, 40MB OCI)
 docs/design/        design specs (007-secretless-local-proxy)
 ```
@@ -128,9 +188,18 @@ see [ARCHITECTURE.md](ARCHITECTURE.md) for the full subsystem map, data flow, an
 
 | method | path | what |
 |--------|------|------|
-| `POST` | `/cert/gha` | GHA OIDC → signed access token (secretless — no private key returned) |
-| `POST` | `/cert` | any proof (passkey session, OIDC, bootstrap) → access token |
-| `POST` | `/token` | DPoP-bound token issuance (RFC 9449) |
+| `POST` | `/cert/gha` | GHA OIDC → bridge cert pair (secretless — keys generated by the caller) |
+| `POST` | `/cert` | passkey session (+ nonce), linked OIDC identity, or bootstrap → cert pair or token |
+| `POST` | `/cert/nonce` | session-bound nonce for a cert-pair proof |
+| `POST` | `/cert/passkey` | passkey session (+ nonce) → bridge cert pair |
+| `POST` | `/token` | DPoP-bound access token (RFC 9449): browser session, or RFC 8693 token exchange of a GHA OIDC token |
+| `POST` | `/cert/issuing-ca/device` | a machine starts enrollment → code + fingerprint |
+| `GET` | `/enroll` | approve a machine with your passkey; choose its renewal horizon |
+| `POST` | `/cert/issuing-ca/device/token` | the machine collects its tier |
+| `POST` | `/cert/issuing-ca/renew` | the machine renews its tier, no human, while the approval holds |
+| `GET` | `/cert/issuing-ca/enrollments` | your machines |
+| `POST` | `/cert/issuing-ca/enrollments/revoke` | stop a machine renewing |
+| `POST` | `/bootstrap/claim` | first boot: the named workflow approves a passkey claim |
 | `GET` | `/authorize` | OAuth-style redirect for cross-origin token issuance |
 | `POST` | `/auth/passkey/register/*` | WebAuthn passkey registration |
 | `POST` | `/auth/passkey/login/*` | WebAuthn passkey login |
@@ -208,7 +277,15 @@ cp wrangler.toml.example wrangler.toml
 wrangler deploy
 ```
 
-CA key is generated on first request. In ephemeral mode (local/container), the private key exists only in process memory — `cat *.sqlite | strings | grep '"d"'` returns nothing. First passkey registration requires a bootstrap code (visible in workerd stdout or `wrangler tail`).
+CA key is generated on first request. In ephemeral mode (local/container), the private key exists only in process memory — `cat *.sqlite | strings | grep '"d"'` returns nothing.
+
+**first boot — no secret.** set `BOOTSTRAP_GHA_SUBJECT` (a var, e.g. `repo:you/notme:ref:refs/heads/main`), open `/login`, and register a passkey: on an authority with no administrator it becomes a **claim** holding nothing, and the page shows a code. then
+
+```bash
+gh workflow run claim-authority.yml -f code=XXXX-XXXX
+```
+
+and sign in again — you are the administrator. nothing is set, typed or logged; GitHub attests the deployer, your passkey holds the credential. `BOOTSTRAP_CODE` (a secret) remains as break-glass. see [docs/FLOWS.md §3](docs/FLOWS.md).
 
 ## testing
 
