@@ -4,6 +4,7 @@
  *
  *   task-cert enroll [--authority URL] [--dir DIR]   (alias: enrol)
  *   task-cert mint   --task ID --goal TEXT [--scopes a,b] [--ttl-min N] [--out DIR] [--dir DIR]
+ *                    (--out defaults to ~/.notme/tasks/<task>)
  *   task-cert verify --cert FILE [--dir DIR]
  *   task-cert status [--dir DIR]
  *
@@ -92,7 +93,10 @@ async function mint() {
     scopes: a.scopes ? a.scopes.split(",") : undefined,
     ttlMs: a["ttl-min"] ? Number(a["ttl-min"]) * 60_000 : undefined,
   });
-  const out = a.out || `task-${a.task}`;
+  // Default OUTSIDE the working directory. These are private keys, and the
+  // working directory is usually a repo: notme's deny-by-default .gitignore
+  // happens to cover it, most repos' do not.
+  const out = a.out || join(homedir(), ".notme", "tasks", a.task);
   mkdirSync(out, { recursive: true, mode: 0o700 });
   writeFileSync(join(out, "signing.pem"), t.certificates.signing);
   writeFileSync(join(out, "mtls.pem"), t.certificates.mtls);
