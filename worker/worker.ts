@@ -1006,7 +1006,7 @@ async function handlePasskey(
 
       // Deployer gets all; an invited user gets exactly what the invite says.
       const scopes = result.isFirstUser
-        ? ["bridgeCert", "authorityManage", "certMint"]
+        ? [...(await import("./src/auth/admin-scopes")).ADMIN_SCOPES]
         : (invitedScopes ?? ["bridgeCert"]);
 
       return Response.json({ ...result, userId, scopes });

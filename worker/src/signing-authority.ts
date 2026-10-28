@@ -266,6 +266,8 @@ const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
+import { ADMIN_SCOPES, PRIOR_ADMIN_SCOPES, SIGNING_SCOPES } from "./auth/admin-scopes";
+import { ensurePrincipalSchema, grantCapability } from "./auth/principals";
 import type { CommitmentErrorCode } from "./receipts/commitment";
 import type { DelegatedJwtErrorCode } from "./jwt/delegated-claims";
 
@@ -579,6 +581,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       )
     `);
     this.#initialized = true;
+    // Once per DO start: existing deployers get the signing scopes the admin
+    // set now includes (notme-486e8a). Idempotent and revocation-respecting.
+    this.#migrateAdminSigningScopes();
   }
 
   static async #keyIdFromSpki(spkiB64: string): Promise<string> {
@@ -2389,6 +2394,64 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * was). Only a principal with no row at all is created, and only then does
    * `isFirstUser` decide whether the admin scopes are granted.
    */
+  /**
+   * Give existing deployers the signing scopes the admin set now includes
+   * (notme-486e8a). Runs once per DO start and is safe to call again.
+   *
+   * WHO: only a principal holding the WHOLE prior deployer set
+   * (bridgeCert + authorityManage + certMint, all live). A partial admin was
+   * never a deployer and is left alone.
+   *
+   * WHAT: sign:git and sign:attestation — but only a scope the principal has
+   * NO row for, live or revoked. A deliberate revocation must stick; a
+   * migration that re-granted on every cold start would make revoking your
+   * own signing scope impossible.
+   *
+   * A leaked stub calling this gains nothing a deployer could not already do:
+   * it only ever grants signing purposes to principals that already hold
+   * authorityManage and certMint. Recorded as granted_by
+   * "migration:notme-486e8a", so listGrants shows where it came from.
+   */
+  async migrateAdminSigningScopes(): Promise<{ granted: number }> {
+    return { granted: this.#migrateAdminSigningScopes() };
+  }
+
+  #migrateAdminSigningScopes(): number {
+    const sql = this.ctx.storage.sql;
+    ensurePrincipalSchema(sql);
+    const live = (scope: string) =>
+      new Set(
+        (sql
+          .exec(
+            "SELECT principal_id FROM capability_grants WHERE scope = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))",
+            scope,
+          )
+          .toArray() as Array<{ principal_id: string }>).map((r) => r.principal_id),
+      );
+    const holders = PRIOR_ADMIN_SCOPES.map(live);
+    const deployers = [...holders[0]!].filter((pid) => holders.every((h) => h.has(pid)));
+    let granted = 0;
+    for (const pid of deployers) {
+      for (const scope of SIGNING_SCOPES) {
+        const [{ n }] = [
+          ...sql.exec<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM capability_grants WHERE principal_id = ? AND scope = ?",
+            pid,
+            scope,
+          ),
+        ];
+        if (n === 0) {
+          grantCapability(sql, pid, scope, "migration:notme-486e8a");
+          granted++;
+        }
+      }
+    }
+    if (granted > 0) {
+      console.warn({ event: "admin.signing_scopes_migrated", granted, deployers: deployers.length });
+    }
+    return granted;
+  }
+
   async ensurePasskeyPrincipal(
     principalId: string,
     isFirstUser: boolean,
@@ -2398,7 +2461,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       await this.createPrincipalWithCapabilities(
         principalId,
         isFirstUser
-          ? ["bridgeCert", "authorityManage", "certMint"]
+          ? [...ADMIN_SCOPES]
           : ["bridgeCert"],
         "passkey-registration",
       );
@@ -2698,7 +2761,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const principalId = crypto.randomUUID();
     await this.createPrincipalWithCapabilities(
       principalId,
-      ["bridgeCert", "authorityManage", "certMint"],
+      [...ADMIN_SCOPES],
       `gha-oidc:${attestedSubject}`,
     );
 

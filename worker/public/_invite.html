@@ -67,6 +67,14 @@
       <span>certMint<small>Mint delegation tiers — required by
       POST /cert/issuing-ca (ADR-019 D4).</small></span>
     </label>
+    <label>
+      <input type="checkbox" name="s" value="sign:git" />
+      <span>sign:git<small>Sign git commits with an issued certificate.</small></span>
+    </label>
+    <label>
+      <input type="checkbox" name="s" value="sign:attestation" />
+      <span>sign:attestation<small>Sign DSSE attestations with an issued certificate.</small></span>
+    </label>
   </fieldset>
 
   <fieldset>

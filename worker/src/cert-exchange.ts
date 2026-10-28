@@ -175,7 +175,7 @@ export async function handleCertExchange(
       );
     }
     principalId = crypto.randomUUID();
-    grantedScopes = ["bridgeCert", "authorityManage", "certMint"];
+    grantedScopes = [...(await import("./auth/admin-scopes")).ADMIN_SCOPES];
     authMethod = "bootstrap";
     // Persist the admin this exchange mints a credential for. Pre-fix,
     // principalId was local-only: the sole bootstrap code was burned, a live

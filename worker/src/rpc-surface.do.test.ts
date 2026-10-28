@@ -308,7 +308,14 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //   consume — single-use, atomic, principal-bound. A leaked stub could
       //             burn a principal's outstanding nonces (≤120s each): a
       //             nuisance, strictly weaker than revokeEpoch.
-    ).toBe(54);
+      //
+      // 54 → 55: migrateAdminSigningScopes (notme-486e8a). Grants ONLY
+      // sign:git / sign:attestation, ONLY to principals already holding the
+      // whole deployer set (authorityManage + certMint + bridgeCert), and
+      // never a scope the principal has any row for (so a revocation sticks).
+      // A leaked stub gains nothing: those principals could already mint and
+      // administer; signing purposes are a narrowing of bridgeCert.
+    ).toBe(55);
   });
 });
 
