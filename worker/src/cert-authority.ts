@@ -79,7 +79,10 @@ const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigne
 // cert" rather than erroring — which is how a derived-identity check
 // degrades back into a trust-the-caller one (notme-6ad276).
 export const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
-const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
+// Exported, like OID_SUBJECT, because a cross-repo contract now depends on
+// this extension being PRESENT (see the profile-discriminator note below) and
+// the test that pins it must read exactly what minting wrote.
+export const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
 export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
 export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
@@ -95,29 +98,108 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 //
 // THE ARC IS SHARED AND THE MEANINGS DISAGREE. notme, signet and
 // ley-line-open all allocate under the IANA example/private-experiment arc
-// 1.3.6.1.4.1.99999 with no registry between them. Measured 2026-09-09
-// against LLO's rs/ll-open/sign/src/cert_chain.rs:
+// 1.3.6.1.4.1.99999 with no registry between them. ADR-005 designates THIS
+// FILE as the registry, so all three allocations belong in the table below.
+// Measured 2026-09-09 against LLO's rs/ll-open/sign/src/cert_chain.rs and
+// 2026-10-27 against signet's pkg/sigid/identity.go + cmd/signet/verify.go:
 //
-//   OID    notme                          ley-line-open
-//   .1.1   subject                        —
-//   .1.2   issuance time                  —
-//   .1.3   scopes (SEQ OF UTF8String)     —
-//   .1.4   epoch (INTEGER)                epoch (INTEGER)        AGREE
-//   .1.5   authMethod (UTF8String)        interlace-peer         *** COLLIDES
-//   .1.6   peer binding (32 RAW bytes)    interlace-scope        *** COLLIDES
-//   .1.7   — (task scope moved off it)    confinementDigest      DO NOT REUSE
-//   .1.8   principal kind                 —
-//   .1.9   task scope                     —
+//   OID    notme                        signet                ley-line-open
+//   .1.1   subject                      subject        AGREE  —
+//   .1.2   issuance time                issuance time  AGREE  —
+//   .1.3   scopes (SEQ OF UTF8String)   capabilities    *** COLLIDES  —
+//   .1.4   epoch (INTEGER)              —                     epoch   AGREE
+//   .1.5   authMethod (UTF8String)      agent name      *** COLLIDES  interlace-peer  *** COLLIDES
+//   .1.6   peer binding (32 RAW bytes)  scope           *** COLLIDES  interlace-scope *** COLLIDES
+//   .1.7   — (task scope moved off it)  —                     confinementDigest  DO NOT REUSE
+//   .1.8   principal kind               (recognised only)     —
+//   .1.9   task scope                   —                     —
 //
-// .1.6 fails loudly at LLO (it runs Utf8StringRef::from_der over our raw
-// binding bytes). .1.5 is worse: same TYPE, different MEANING, so it parses
-// silently and LLO reads our authMethod as a peer fingerprint — no error,
-// wrong value, in an identity-correlation field.
+// SIGNET'S .1.5/.1.6 COLLISION WAS LIVE, unlike LLO's. LLO's sat behind an
+// earlier RFC 5280 rejection (see below); nothing shielded signet's.
+// `cmd/signet/verify.go` reads the extensions BEFORE verifying the chain, and
+// Go's x509 handles our critical BasicConstraints natively, so every notme
+// certificate presented to `signet verify` was reported with
+// `Agent = "gha-oidc"` (or "passkey", or whatever authMethod wrote) and a
+// `Scope` of 32 raw peer-binding bytes rendered as a string. Measured in
+// signet's cmd/signet/verify_notme_profile_test.go, which observed exactly
+// that before the fix. Both facts were INVENTED — worse than reporting
+// nothing, because a caller branching on `result.Agent` is told a workload
+// identity is a named agent.
 //
-// An earlier version of this table said ".1.1–.1.6 notme + signet, .1.7
-// LLO". That was wrong, and it was wrong in the direction that makes a
-// collision look resolved. Tracked at ley-line-open-9ac66d; the real fix is
-// a per-project PEN (notme-229dc3), which is free and takes days.
+// FIXED ON THE READ SIDE, in signet, by the same profile-discriminator shape
+// LLO adopted: a certificate carrying .1.8 is a notme certificate and its
+// .1.5/.1.6 are never reported. NOT by renumbering, because notme cannot
+// vacate .1.6 — cloister's WASM verifier already reads the peer binding
+// there, so moving the number breaks a shipped consumer to tidy an
+// allocation.
+//
+// WHICH PUTS A STRICTER CONTRACT ON .1.8 THAN LLO PUTS ON ITS FIVE MARKERS.
+// LLO checks `.any()` of five, so losing one is survivable. signet can only
+// use .1.8: it writes .1.1 and .1.2 itself, so those cannot tell the two
+// apart. .1.8 alone decides it, with no redundancy — pinned on all four mint
+// paths by llo-profile-contract.do.test.ts (signet-790ca1).
+//
+// .1.3 COLLIDES TOO and is NOT yet fixed: signet reserves it for
+// `OIDSignetCapabilities` (pkg/attest/x509/bridge.go) while notme writes a
+// SEQUENCE OF UTF8String of scopes. Inert today only because
+// cmd/signet/verify.go does not read .1.3 — so this one is latent, which is
+// what the LLO entry was mistaken for twice. Tracked, not fixed here.
+//
+// CORRECTED 2026-10-27 (notme-6070fa, relayed from LLO PR #489 and verified
+// against LLO's own source on both sides of the fix).
+//
+// An earlier version of this comment said .1.5 "parses silently and LLO
+// reads our authMethod as a peer fingerprint — no error, wrong value, in an
+// identity-correlation field". THAT MISREAD NEVER HAPPENED, and the reason
+// matters: LLO's known-critical-extension set contained no
+// ID_CE_BASIC_CONSTRAINTS, and notme marks BasicConstraints critical, so
+// every real notme certificate was REJECTED as carrying an unknown critical
+// extension (RFC 5280 §4.2) before any .1.x extension was read at all. The
+// collision was real as an allocation conflict and inert in practice,
+// sitting behind an earlier rejection. Describing it as a live silent
+// misread overstated it — in the direction that makes a hazard sound
+// confirmed rather than latent, which is its own kind of wrong.
+//
+// Nor will it happen now. LLO #489 decides a certificate's PROFILE from its
+// SIGNED extensions, so the choice cannot be stripped without breaking the
+// signature:
+//
+//     Signet profile  iff it carries at least one of .1.1, .1.2, …
+//     Interlace profile  otherwise
+//     Under the Signet profile, .1.5 and .1.6 are NEVER reported.
+//
+// THAT MAKES THE MARKER EXTENSIONS A CROSS-REPO CONTRACT, and the single
+// most surprising consequence in this file: they look like decorative audit
+// metadata — a subject the SAN already carries, a timestamp notBefore
+// already carries — but they are what tells a third-party verifier it holds
+// a notme certificate rather than a cloister one.
+//
+// The discriminator is a SET, and any ONE member selects it. An earlier
+// version of this comment said dropping .1.1/.1.2 from a mint path
+// reclassifies that path as Interlace. IT DOES NOT. Measured against LLO's
+// `oid_signet::MARKERS` + `classify_profile` (branch
+// fix/9ac66d-interlace-oid-profiles, NOT yet released): the set is .1.1,
+// .1.2, .1.3, .1.8, .1.9 and the check is `.any()`. Every notme mint path
+// emits .1.1, .1.2 AND .1.8, so the contract is satisfied three times over
+// and losing any single extension is survivable. The real hazard is a sweep
+// that strips ALL markers from a path — harder to do by accident, and the
+// thing actually worth watching for.
+//
+// So this is the second overstatement in this comment's history, in the same
+// direction as the first: a latent allocation conflict described as a
+// confirmed live misread.
+//
+// llo-profile-contract.do.test.ts pins .1.1/.1.2 on all four mint paths
+// (mutation-verified). That pin stands on its own footing — they are notme's
+// own identity contract, read by signet and cross-checked against the URI
+// SAN (notme-729801) — not on LLO's classifier. Pinning LLO's marker SET
+// waits for LLO's release, since the set can still move before then
+// (notme-6070fa).
+//
+// An even earlier version of this table said ".1.1–.1.6 notme + signet, .1.7
+// LLO". That was also wrong, and also in the direction that makes a
+// collision look resolved. The real fix remains a per-project PEN
+// (notme-229dc3), which is free and takes days.
 export const OID_PRINCIPAL_KIND = `${OID_PEN}.1.8`; // UTF8String: human|agent|workload|organization
 export const OID_TASK_SCOPE = `${OID_PEN}.1.9`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
 
@@ -803,7 +885,27 @@ export async function mintTaskCertPair(
   // Lifetime: never past the tier's own expiry.
   const requestedTtl = opts.ttlMs ?? 5 * 60 * 1000;
   const untilTierExpiry = tier.notAfter.getTime() - Date.now();
-  const ttlMs = Math.max(0, Math.min(requestedTtl, untilTierExpiry));
+  // REFUSE AN EXPIRED TIER rather than minting against it.
+  //
+  // This is the pause/resume path. A microVM suspended for longer than the
+  // tier's lifetime resumes holding a tier past its own notAfter, and the
+  // clamp used to be `Math.max(0, Math.min(...))` — so a negative remaining
+  // lifetime floored to zero and the mint SUCCEEDED, returning a certificate
+  // whose notBefore equals its notAfter. Valid for zero seconds,
+  // indistinguishable from a working credential at the call site, and failing
+  // later at whoever first used it with an expiry error naming the TASK
+  // rather than the expired tier that caused it.
+  //
+  // The caller's recovery for an expired tier is to re-enrol the machine, and
+  // nothing in a zero-second certificate says so. Minting a corpse is worse
+  // than refusing. (`Math.max(0, …)` is gone with the throw: it existed only
+  // to paper over this case.)
+  if (untilTierExpiry <= 0) {
+    throw new Error(
+      `tier certificate expired at ${tier.notAfter.toISOString()} — re-enrol the machine before minting task credentials`,
+    );
+  }
+  const ttlMs = Math.min(requestedTtl, untilTierExpiry);
 
   const authMethodExt = tier.getExtension(OID_AUTH_METHOD);
   const authMethod = authMethodExt

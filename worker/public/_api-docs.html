@@ -440,6 +440,28 @@
             the public halves; the response is certificates.
           </div>
           <div class="ep-note">
+            <strong>Use <code>identity</code> from this response; do not
+            construct it.</strong> It is the exact string a verifier matches
+            &mdash; <code>cosign verify-blob --certificate-identity</code>
+            compares by equality &mdash; and it is byte-identical to the URI
+            SAN in both certificates. Capture it in CI and pass it through
+            rather than hardcoding a literal.
+            <br /><br />
+            If you must derive it offline, the rule is
+            <code>wimse://&lt;trust-domain&gt;/principal/&lt;urlencode(oidc
+            sub)&gt;</code>. The trust domain follows the deployment, so it
+            is not always <code>notme.bot</code>, and the OIDC
+            <code>sub</code> is percent-encoded &mdash; the slash in
+            <code>owner/repo</code> becomes <code>%2F</code>, which defeats
+            path-shaped regexes written against the older form.
+            <br /><br />
+            <strong>The <code>/gha/&lt;owner&gt;/&lt;repo&gt;</code> identity
+            shape is gone.</strong> It encoded the attestation mechanism where
+            other routes put an authentication ceremony, so one principal
+            arriving two ways minted two identities (ADR-019 D2). Anything
+            still pinning that form will fail to verify.
+          </div>
+          <div class="ep-note">
             Owners are allowed by <code>GHA_ALLOWED_OWNERS</code>, which has
             no default &mdash; an authority that has not declared whose
             workflows it trusts trusts none. The token is spent on first use

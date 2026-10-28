@@ -355,8 +355,21 @@ export async function checkRevocation(
     return { revoked: true, reason: "rollback_attack" };
   }
 
-  // 5. Epoch check — token issued before CA rotation
-  if (token.epoch < bundle.epoch) {
+  // 5. Epoch check — the token's revocation generation must be the current
+  // one. BOTH directions, which it did not used to be (notme-77a024):
+  //
+  //   BELOW  the generation was revoked by `revokeEpoch()`. This is the lever.
+  //   ABOVE  the authority has never issued under that generation. Nothing
+  //          legitimate produces it — notme derives the epoch itself and
+  //          never hands the field to a caller — so a forward-dated epoch is
+  //          a bug or a forgery. Before this, `<` alone let one past step 5
+  //          and the current keyId then satisfied step 6, so a token claiming
+  //          epoch 99 against a live epoch 2 verified.
+  //
+  // Equality, not a window: an epoch is not a timestamp and there is no skew
+  // to tolerate. Key rotation no longer moves it, so the previous-key grace
+  // window (step 6) is what covers a rotation — not a loosened epoch.
+  if (token.epoch !== bundle.epoch) {
     return { revoked: true, reason: "epoch_mismatch" };
   }
 

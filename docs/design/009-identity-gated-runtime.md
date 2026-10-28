@@ -162,11 +162,13 @@ The agent Worker calls the notme Worker via the `NOTME` service binding. notme e
 
 ```typescript
 export class AuthService extends WorkerEntrypoint {
-  // Mint a bridge cert (signing stays inside the DO)
-  async mintBridgeCert(subject, publicKeyPem, ttlMs?): Promise<BridgeCertResult>
-
-  // Mint a DPoP-bound access token
-  async mintDPoPToken(params: { sub, scope, audience, jkt }): Promise<string>
+  // Mint a bridge cert for the subject the PROOF names. Takes evidence, not a
+  // name: the DO re-verifies the envelope and derives the subject from the
+  // verified claims (notme-51ccd7). This listing said `subject` until
+  // rig-098326 — see the note below.
+  async mintBridgeCert(proof: MintBridgeCertProof, publicKeyPem, ttlMs?)
+    : Promise<{ ok: true; certificate; expires_at; subject; authority }
+            | { ok: false; reason: BridgeCertRefusal }>
 
   // Get the authority's public key
   async getPublicKeyPem(): Promise<string>
@@ -181,6 +183,25 @@ export class AuthService extends WorkerEntrypoint {
   async verifySession(cookie): Promise<Session | null>
 }
 ```
+
+**`mintDPoPToken` was on this surface and is gone (notme-d68da8).** It took
+`{ sub, scope, audience, jkt }` and had the DO sign all four with the master
+Ed25519 key. This ADR is where that exposure was decided, so this is where the
+correction belongs: the binding holder this document grants the AUTH binding to
+— "every agent Worker" — could therefore name the subject, the scope and the
+audience of a genuine `at+jwt` carrying notme's real issuer, going around both
+the session gate and the `getAllowedAudiences` check that `/token` and
+`/authorize/token` enforce. rig/web, which holds a binding today, verifies
+notme tokens on signature and `exp` alone and compares `claims.sub` to its
+`ADMIN_USER_ID`: one call named rig's admin. Deleted rather than hardened — it
+had no callers in any repo, and the live `/token` route calls the DO's
+`mintDPoPTokenOnce` directly. Access tokens are now obtainable only through the
+two session-gated HTTP routes.
+
+The same correction applies to the `mintBridgeCert` line above, which this
+document described as taking a `subject` string until rig-098326 went looking.
+Both defects are the one failure mode: this ADR reasoned carefully about WHO
+may hold the binding and not at all about WHAT the methods behind it believe.
 
 ### New methods (this spec)
 

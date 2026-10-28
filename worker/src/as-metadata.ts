@@ -25,7 +25,7 @@ import { ALL_SCOPES } from "@notme/contract";
  *
  * Only verified token-issuance paths belong here:
  *   github_actions_oidc — /cert/gha, validateGHAToken
- *   dpop                — mintDPoPToken
+ *   dpop                — /token, via SigningAuthority.mintDPoPTokenOnce
  * Session-establishment methods (passkey/invite/oidc:github) are auth
  * methods, not grants, and are deliberately not conflated with these.
  */

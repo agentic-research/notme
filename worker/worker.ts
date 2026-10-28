@@ -3,6 +3,7 @@
 
 export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
+import type { MintBridgeCertProof } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
@@ -23,8 +24,12 @@ import { ED25519, type Platform } from "./src/platform";
 //   service = "notme-bot"
 //   entrypoint = "AuthService"
 //
-// Then call: await env.AUTH.mintBridgeCert(subject, publicKeyPem)
-// No HTTP, no public URL, no CORS, no tokens needed.
+// Then call, passing EVIDENCE rather than a subject (notme-51ccd7):
+//   await env.AUTH.mintBridgeCert({ kind: "gha-oidc", token }, publicKeyPem)
+//   await env.AUTH.mintBridgeCert({ kind: "session-cookie", cookie }, pem)
+// The authority re-verifies the proof and derives the subject itself, so a
+// binding holder cannot mint a certificate for an identity it has not
+// proved. No HTTP, no public URL, no CORS, no tokens needed.
 
 // ── Held credentials type ─────────────────────────────────────────────────
 // Per-RPC-session — stored on `this.#heldCerts` so concurrent / sequential
@@ -303,22 +308,61 @@ export class AuthService extends WorkerEntrypoint<any> {
     return this.env.SIGNING_AUTHORITY.get(id);
   }
 
-  /** Mint a bridge cert for a verified subject. */
-  async mintBridgeCert(subject: string, publicKeyPem: string, ttlMs?: number) {
+  /**
+   * Mint a bridge cert for the subject the PROOF names (notme-51ccd7).
+   *
+   * This used to read "for a verified subject" and take that subject as a
+   * string — nothing verified it, and the word was doing the work a check
+   * should have. A holder of this binding could name any subject; per
+   * ADR-009 that is every agent Worker.
+   *
+   * The envelope is passed through unexamined ON PURPOSE. This entrypoint
+   * must not be the thing that decides the subject is genuine, because it is
+   * the surface an attacker reaches; the DO re-verifies and derives it.
+   *
+   * Returns `{ ok: false, reason }` rather than throwing — switch on it. A
+   * rejected proof is an expected outcome, and a DO method that throws is
+   * double-reported by workerd (see `BridgeCertRefusal`).
+   */
+  async mintBridgeCert(
+    proof: MintBridgeCertProof,
+    publicKeyPem: string,
+    ttlMs?: number,
+  ) {
     const authority = this.#getAuthority();
-    return authority.mintBridgeCert(subject, publicKeyPem, ttlMs);
+    return authority.mintBridgeCert(proof, publicKeyPem, ttlMs);
   }
 
-  /** Mint a DPoP-bound access token. */
-  async mintDPoPToken(params: {
-    sub: string;
-    scope: string;
-    audience: string;
-    jkt: string;
-  }) {
-    const authority = this.#getAuthority();
-    return authority.mintDPoPToken(params);
-  }
+  /*
+   * mintDPoPToken WAS HERE AND IS DELETED (notme-d68da8).
+   *
+   * Its signature was `{ sub, scope, audience, jkt }` and it forwarded all
+   * four to the DO, which signed them with the master Ed25519 key. So a
+   * holder of this binding — per ADR-009, every agent Worker — named the
+   * subject, the scope AND the audience of a genuine `at+jwt` carrying
+   * notme's real issuer. src/allowed-audiences.ts states the rule it went
+   * around in its own docstring: "every endpoint that mints an access token
+   * must check the requested audience against this set." /token and
+   * /authorize/token both do, and both require a notme_session first.
+   *
+   * Measured, not hypothesised: rig/web verifies notme tokens on signature
+   * and exp alone — no aud, no iss, and cnf.jkt unread on the token-only
+   * path — sets `identity.id = claims.sub`, then compares that id to
+   * ADMIN_USER_ID. One call named rig's admin.
+   *
+   * THE SAME DEFECT AS mintBridgeCert ABOVE (notme-51ccd7), one method down,
+   * and the pin in rpc-surface.do.test.ts had already written the standard
+   * that catches it: reachability asks who may call, argument trust asks what
+   * the method concludes from what it is handed. That standard was stated for
+   * mintBridgeCert and not then applied to the rest of the list.
+   *
+   * Deleted rather than given a proof envelope, per the ADR-014 precedent for
+   * the arbitrary-sign() oracle: zero callers in notme, rig, signet, cloister,
+   * ley-line, ley-line-open, rosary or mache, and the live /token route calls
+   * the DO's own mintDPoPTokenOnce directly. An unused minting method here is
+   * one `env.AUTH.mintDPoPToken()` away from being reachable again, so it does
+   * not stay with a warning comment.
+   */
 
   /** Get the CA public key PEM. */
   async getPublicKeyPem() {
@@ -2167,6 +2211,65 @@ export default {
         return Response.json(await authority.getAlarmHealth());
       }
 
+      // POST /admin/revoke-epoch — pull the mass-revocation lever
+      //
+      // `revokeEpoch()` advances the revocation generation and republishes
+      // the CA bundle synchronously. Per ADR-019 D7 it is the ONLY mass
+      // revocation notme has, and D7's whole subject was that the previous
+      // mechanism "could not be operated" because revoking cost the signing
+      // key and destroyed the evidence for every past receipt.
+      //
+      // It then shipped as an RPC method with NO ROUTE — the same defect, in
+      // the same bead, that left resetAlarmHealth() uninvocable while
+      // production served a rejected bundle for 130 days (see above). Fixing
+      // the mechanism and leaving it unreachable is not fixing it.
+      //
+      // authorityManage-gated and POST-only: this invalidates every
+      // outstanding credential of the current generation, so reachable
+      // unauthenticated it is a denial-of-service primitive against the whole
+      // authority. Gating is pinned by admin-revoke-epoch-route.do.test.ts.
+      if (pathname === "/admin/revoke-epoch") {
+        // AUTH BEFORE METHOD, same reason as /admin/alarm-health: answering
+        // 405 first would confirm to an anonymous caller that this authority
+        // exposes a mass-revocation endpoint.
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        if (!cookie) return jsonErr("sign in first", 401);
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const sessionSecret = await authority.getSessionSecret();
+        const session = await verifySessionCookie(cookie, sessionSecret);
+        if (!session) return jsonErr("invalid session", 401);
+        // LIVE against the grant store, so a revoked grant shuts this door on
+        // the next request rather than when the cookie expires.
+        const { liveScopes } = await import("./src/auth/session");
+        if (!(await liveScopes(session, authority)).includes("authorityManage")) {
+          return jsonErr("authorityManage scope required", 403);
+        }
+        if (request.method !== "POST") {
+          return jsonErr("method not allowed", 405);
+        }
+        const result = await authority.revokeEpoch();
+        // Dynamic import to match this file's idiom — the constant is only
+        // needed on the one request that pulls the lever.
+        const { BUNDLE_MAX_AGE_MS } = await import("./src/revocation");
+        // Return the propagation bound with the result. An operator who pulls
+        // this needs to know WHEN it takes effect, and the honest answer is
+        // bounded only for verifiers that can reach the bundle — one
+        // BUNDLE_MAX_AGE_MS refresh. A verifier that cannot has TTL and
+        // nothing else (ADR-019 D7).
+        return Response.json({
+          ...result,
+          propagation: {
+            boundMs: BUNDLE_MAX_AGE_MS,
+            note: "Verifiers that can reach the CA bundle enforce the new generation within one refresh. Offline verifiers have TTL only.",
+          },
+        });
+      }
+
       // POST /invites — create an invite (requires authorityManage scope)
       // GET /invites — the form. authorityManage-gated BEFORE the asset is
       // served, so an unprivileged caller never sees it.
@@ -3774,6 +3877,34 @@ export default {
         headers,
       });
       return cachePut(request, result, "Accept");
+    }
+
+    // /why moved to the blog at q-q.dev.
+    //
+    // The page itself lives in the PRIVATE agentic-research/notme.bot repo,
+    // which declares a worker of the same name on these same two routes —
+    // so the two repos are two sources for ONE deployment and the last
+    // deploy wins. This repo is what is live (production's nav.js matches
+    // this repo's, and has no "why" entry), and this repo has no why.html,
+    // which is why /why has been 404ing. Nothing pointed at it: the
+    // deployed nav and sitemap predate the page, so only a typed URL
+    // reached the 404.
+    //
+    // 302 AND SHORT-CACHED, UNLIKE EVERY OTHER REDIRECT BELOW. Those are
+    // settled renames and use 301 with `max-age=31536000, immutable`. This
+    // destination is NOT settled: the post is not published on q-q.dev yet,
+    // so the target is the blog root and will become the post's own URL. An
+    // immutable 301 would make browsers ignore that change for a year.
+    // Flip both when the post lands (notme-4e02fb).
+    if (url.pathname === "/why") {
+      const resp = new Response(null, {
+        status: 302,
+        headers: {
+          Location: "https://q-q.dev/",
+          "Cache-Control": "public, max-age=600",
+        },
+      });
+      return cachePut(request, resp);
     }
 
     // Redirects for renamed pages — cached at edge with long TTL
