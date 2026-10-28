@@ -48,6 +48,7 @@ import { describe, expect, it } from "vitest";
 import {
   OID_SUBJECT,
   OID_ISSUANCE_TIME,
+  OID_PRINCIPAL_KIND,
   mintGHABridgeCert,
   mintBridgeCertPair,
   mintIssuingCaCert,
@@ -69,22 +70,32 @@ async function pem(key: CryptoKey): Promise<string> {
   return `-----BEGIN PUBLIC KEY-----\n${b64.match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
 }
 
-/** Assert both discriminator extensions are present on one certificate. */
+/** Assert every discriminator extension is present on one certificate. */
 function expectDiscriminator(certPem: string, path: string) {
   const cert = new X509Certificate(certPem);
   for (const [oid, label] of [
     [OID_SUBJECT, "OID_SUBJECT (.1.1)"],
     [OID_ISSUANCE_TIME, "OID_ISSUANCE_TIME (.1.2)"],
+    [OID_PRINCIPAL_KIND, "OID_PRINCIPAL_KIND (.1.8)"],
   ] as const) {
     expect(
       cert.getExtension(oid),
       `${path} emitted no ${label}. This is notme's identity contract: ` +
         `signet reads .1.1/.1.2 by name, and identity-contract.do.test.ts ` +
         `cross-checks .1.1 against the URI SAN the API returns as ` +
-        `\`identity\`. They are also two of the five markers LLO uses to ` +
+        `\`identity\`. They are also three of the five markers LLO uses to ` +
         `classify a cert as the Signet rather than the Interlace profile — ` +
         `a cert carrying NONE of the five has .1.5/.1.6 read with the wrong ` +
-        `meaning. See notme-6070fa / notme-729801 / LLO PR #489.`,
+        `meaning. See notme-6070fa / notme-729801 / LLO PR #489.\n\n` +
+        `.1.8 CARRIES A SECOND, STRICTER CONTRACT (signet-790ca1): it is the ` +
+        `ONLY signal signet can use to tell a notme certificate from one of ` +
+        `its own, because signet's authority writes .1.1 and .1.2 too. ` +
+        `signet's verifier reports no Agent and no Scope when .1.8 is ` +
+        `present; drop it from this path and \`signet verify\` goes back to ` +
+        `reporting the authMethod as an agent name and 32 raw peer-binding ` +
+        `bytes as a scope — measured, not inferred, in signet's ` +
+        `cmd/signet/verify_notme_profile_test.go. Unlike LLO's .any() over ` +
+        `five markers, this one has NO redundancy: .1.8 alone decides it.`,
     ).toBeTruthy();
   }
 }
@@ -92,7 +103,7 @@ function expectDiscriminator(certPem: string, path: string) {
 const MACHINE_ID = "wimse://notme.bot/passkey/alice";
 const GOAL = "a".repeat(64);
 
-describe("every mint path carries the LLO profile discriminator (notme-6070fa)", () => {
+describe("every mint path carries the profile discriminators (notme-6070fa, signet-790ca1)", () => {
   it("mintGHABridgeCert", async () => {
     const ca = await gen();
     const subject = await gen();

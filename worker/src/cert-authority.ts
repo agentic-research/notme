@@ -98,19 +98,52 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 //
 // THE ARC IS SHARED AND THE MEANINGS DISAGREE. notme, signet and
 // ley-line-open all allocate under the IANA example/private-experiment arc
-// 1.3.6.1.4.1.99999 with no registry between them. Measured 2026-09-09
-// against LLO's rs/ll-open/sign/src/cert_chain.rs:
+// 1.3.6.1.4.1.99999 with no registry between them. ADR-005 designates THIS
+// FILE as the registry, so all three allocations belong in the table below.
+// Measured 2026-09-09 against LLO's rs/ll-open/sign/src/cert_chain.rs and
+// 2026-10-27 against signet's pkg/sigid/identity.go + cmd/signet/verify.go:
 //
-//   OID    notme                          ley-line-open
-//   .1.1   subject                        —
-//   .1.2   issuance time                  —
-//   .1.3   scopes (SEQ OF UTF8String)     —
-//   .1.4   epoch (INTEGER)                epoch (INTEGER)        AGREE
-//   .1.5   authMethod (UTF8String)        interlace-peer         *** COLLIDES
-//   .1.6   peer binding (32 RAW bytes)    interlace-scope        *** COLLIDES
-//   .1.7   — (task scope moved off it)    confinementDigest      DO NOT REUSE
-//   .1.8   principal kind                 —
-//   .1.9   task scope                     —
+//   OID    notme                        signet                ley-line-open
+//   .1.1   subject                      subject        AGREE  —
+//   .1.2   issuance time                issuance time  AGREE  —
+//   .1.3   scopes (SEQ OF UTF8String)   capabilities    *** COLLIDES  —
+//   .1.4   epoch (INTEGER)              —                     epoch   AGREE
+//   .1.5   authMethod (UTF8String)      agent name      *** COLLIDES  interlace-peer  *** COLLIDES
+//   .1.6   peer binding (32 RAW bytes)  scope           *** COLLIDES  interlace-scope *** COLLIDES
+//   .1.7   — (task scope moved off it)  —                     confinementDigest  DO NOT REUSE
+//   .1.8   principal kind               (recognised only)     —
+//   .1.9   task scope                   —                     —
+//
+// SIGNET'S .1.5/.1.6 COLLISION WAS LIVE, unlike LLO's. LLO's sat behind an
+// earlier RFC 5280 rejection (see below); nothing shielded signet's.
+// `cmd/signet/verify.go` reads the extensions BEFORE verifying the chain, and
+// Go's x509 handles our critical BasicConstraints natively, so every notme
+// certificate presented to `signet verify` was reported with
+// `Agent = "gha-oidc"` (or "passkey", or whatever authMethod wrote) and a
+// `Scope` of 32 raw peer-binding bytes rendered as a string. Measured in
+// signet's cmd/signet/verify_notme_profile_test.go, which observed exactly
+// that before the fix. Both facts were INVENTED — worse than reporting
+// nothing, because a caller branching on `result.Agent` is told a workload
+// identity is a named agent.
+//
+// FIXED ON THE READ SIDE, in signet, by the same profile-discriminator shape
+// LLO adopted: a certificate carrying .1.8 is a notme certificate and its
+// .1.5/.1.6 are never reported. NOT by renumbering, because notme cannot
+// vacate .1.6 — cloister's WASM verifier already reads the peer binding
+// there, so moving the number breaks a shipped consumer to tidy an
+// allocation.
+//
+// WHICH PUTS A STRICTER CONTRACT ON .1.8 THAN LLO PUTS ON ITS FIVE MARKERS.
+// LLO checks `.any()` of five, so losing one is survivable. signet can only
+// use .1.8: it writes .1.1 and .1.2 itself, so those cannot tell the two
+// apart. .1.8 alone decides it, with no redundancy — pinned on all four mint
+// paths by llo-profile-contract.do.test.ts (signet-790ca1).
+//
+// .1.3 COLLIDES TOO and is NOT yet fixed: signet reserves it for
+// `OIDSignetCapabilities` (pkg/attest/x509/bridge.go) while notme writes a
+// SEQUENCE OF UTF8String of scopes. Inert today only because
+// cmd/signet/verify.go does not read .1.3 — so this one is latent, which is
+// what the LLO entry was mistaken for twice. Tracked, not fixed here.
 //
 // CORRECTED 2026-10-27 (notme-6070fa, relayed from LLO PR #489 and verified
 // against LLO's own source on both sides of the fix).
