@@ -42,18 +42,28 @@ async function adminSession(scopes: string[]): Promise<string> {
   const stub = env.SIGNING_AUTHORITY.get(
     env.SIGNING_AUTHORITY.idFromName("default"),
   );
+  // Backed by a real grant: /cert reads LIVE grants now (notme-486e8a). A
+  // fresh principal per session, holding exactly what its cookie claims.
+  const principalId = `principal-cert-scope-test-${crypto.randomUUID()}`;
+  await stub.createPrincipalWithCapabilities(principalId, scopes);
   const secret = await stub.getSessionSecret();
-  return createSessionCookie(
-    { principalId: "principal-cert-scope-test", scopes, authMethod: "passkey" },
-    secret,
-  );
+  return createSessionCookie({ principalId, scopes, authMethod: "passkey" }, secret);
 }
 
 /**
- * A PoP request for /cert. NOTE the binding differs from /cert/passkey: this
- * route hashes mtls_spki ‖ signing_spki with NO session term.
+ * A PoP request for /cert's session branch. This used to bind
+ * mtls_spki ‖ signing_spki with NO session term — documented here as the
+ * route's shape, and it was the replay hole /cert/passkey's session term was
+ * written to prevent. Both routes now bind the same session nonce
+ * (notme-486e8a); the binding is written out by hand so the test checks the
+ * route against an independent implementation.
  */
-async function mintRequest() {
+async function mintRequest(cookie: string) {
+  const nres = await worker.fetch(
+    new Request(`${ORIGIN}/cert/nonce`, { method: "POST", headers: { cookie } }),
+    { ...env, ...LOCAL_ENV },
+  );
+  const { nonce } = (await nres.json()) as { nonce: string };
   const mtls = (await crypto.subtle.generateKey(
     { name: "ECDSA", namedCurve: "P-256" },
     true,
@@ -73,11 +83,18 @@ async function mintRequest() {
     signing.publicKey,
   )) as ArrayBuffer;
 
-  const input = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
-  input.set(new Uint8Array(mtlsSpki), 0);
-  input.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
+  const tag = new TextEncoder().encode("notme/cert-pair/v1\0");
+  const nonceHash = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce)),
+  );
+  const input = new Uint8Array(tag.length + mtlsSpki.byteLength + signingSpki.byteLength + 32);
+  input.set(tag, 0);
+  input.set(new Uint8Array(mtlsSpki), tag.length);
+  input.set(new Uint8Array(signingSpki), tag.length + mtlsSpki.byteLength);
+  input.set(nonceHash, tag.length + mtlsSpki.byteLength + signingSpki.byteLength);
   // Sign the PRE-IMAGE, not its digest (notme-a011d2).
   return {
+    nonce,
     public_keys: { mtls: pem(mtlsSpki), signing: pem(signingSpki) },
     proofs: {
       mtls: b64u(
@@ -124,7 +141,7 @@ describe("POST /cert honours CERT_ELIGIBLE_SCOPES (notme-18dfd0)", () => {
       {
         proof: { type: "session" },
         scopes: ["certMint", "authorityManage"],
-        ...(await mintRequest()),
+        ...(await mintRequest(cookie)),
       },
       cookie,
     );
@@ -150,7 +167,7 @@ describe("POST /cert honours CERT_ELIGIBLE_SCOPES (notme-18dfd0)", () => {
       {
         proof: { type: "session" },
         scopes: ["bridgeCert", "certMint"],
-        ...(await mintRequest()),
+        ...(await mintRequest(cookie)),
       },
       cookie,
     );
@@ -169,7 +186,7 @@ describe("POST /cert honours CERT_ELIGIBLE_SCOPES (notme-18dfd0)", () => {
       {
         proof: { type: "session" },
         scopes: ["bridgeCert", "certMint", "authorityManage"],
-        ...(await mintRequest()),
+        ...(await mintRequest(cookie)),
       },
       cookie,
     );
@@ -178,6 +195,26 @@ describe("POST /cert honours CERT_ELIGIBLE_SCOPES (notme-18dfd0)", () => {
     // /cert/passkey yields exactly ["bridgeCert"] for this session
     // (passkey-cert.do.test.ts pins it). Two routes, one artifact, one answer.
     expect(body.scopes).toEqual(["bridgeCert"]);
+  });
+});
+
+describe("POST /cert session cert pairs cannot be replayed under another session (notme-486e8a)", () => {
+  it("a victim's captured keys+proofs, posted with an attacker's session, are refused", async () => {
+    // Before the nonce, this branch bound only mtls_spki || signing_spki, so
+    // this exact request MINTED — a cert for the victim's keys under the
+    // attacker's identity.
+    const victim = await adminSession(["bridgeCert"]);
+    const attacker = await adminSession(["bridgeCert"]);
+    const captured = await mintRequest(victim);
+    const res = await postCert({ proof: { type: "session" }, ...captured }, attacker);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ error: "invalid_nonce" });
+  });
+
+  it("requires the nonce with public_keys on a session proof", async () => {
+    const cookie = await adminSession(["bridgeCert"]);
+    const { nonce: _n, ...rest } = await mintRequest(cookie);
+    expect((await postCert({ proof: { type: "session" }, ...rest }, cookie)).status).toBe(400);
   });
 });
 

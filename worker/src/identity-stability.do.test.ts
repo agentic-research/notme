@@ -17,12 +17,15 @@
  * asserted together below, because keeping one without the other is how this
  * gets re-broken.
  */
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { X509Certificate } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
 import worker from "../worker";
 import { createSessionCookie } from "./auth/session";
 import { certPrincipalKind, principalIdentity } from "./cert-authority";
+import { certPairBinding } from "./auth/cert-pair-binding";
+import { getPrincipal } from "./auth/principals";
+import type { SigningAuthority } from "./signing-authority";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
@@ -33,6 +36,13 @@ const authority = () =>
   env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
 
 async function sessionCookie(authMethod: string) {
+  // Backed by a real grant — /cert/passkey reads LIVE grants (notme-486e8a).
+  await runInDurableObject(authority(), (a) => {
+    const sa = a as SigningAuthority;
+    if (!getPrincipal(sa["ctx"].storage.sql, PRINCIPAL)) {
+      return sa.createPrincipalWithCapabilities(PRINCIPAL, ["bridgeCert"]);
+    }
+  });
   const secret = await authority().getSessionSecret();
   return createSessionCookie(
     { principalId: PRINCIPAL, scopes: ["bridgeCert"], authMethod },
@@ -55,15 +65,17 @@ async function mintRequest(cookie: string) {
   )) as CryptoKeyPair;
   const mtlsSpki = (await crypto.subtle.exportKey("spki", mtls.publicKey)) as ArrayBuffer;
   const signingSpki = (await crypto.subtle.exportKey("spki", signing.publicKey)) as ArrayBuffer;
-  // The route hashes the cookie VALUE, not the Set-Cookie string.
-  const value = cookie.slice("notme_session=".length).split(";")[0]!;
-  const cookieHash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  const binding = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength + 32);
-  binding.set(new Uint8Array(mtlsSpki), 0);
-  binding.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
-  binding.set(new Uint8Array(cookieHash), mtlsSpki.byteLength + signingSpki.byteLength);
+  // The session term is a nonce fetched with the cookie, as a browser does
+  // (notme-486e8a) — this used to slice the raw cookie and hash it, which only
+  // a test can do. The binding itself is imported: this file is about
+  // identity stability; passkey-cert.do.test.ts checks the binding
+  // independently.
+  const nres = await post("/cert/nonce", {}, cookie);
+  const { nonce } = (await nres.json()) as { nonce: string };
+  const binding = await certPairBinding(new Uint8Array(mtlsSpki), new Uint8Array(signingSpki), nonce);
   const b64 = (b: ArrayBuffer) => btoa(String.fromCharCode(...new Uint8Array(b)));
   return {
+    nonce,
     public_keys: { mtls: pem(mtlsSpki), signing: pem(signingSpki) },
     proofs: {
       mtls: b64(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, mtls.privateKey, binding)),

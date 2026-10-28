@@ -9,10 +9,12 @@
  * being a copy.
  */
 
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker from "../worker";
 import { createSessionCookie } from "./auth/session";
+import { getPrincipal, grantCapability } from "./auth/principals";
+import type { SigningAuthority } from "./signing-authority";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
@@ -39,31 +41,49 @@ function pem(spki: ArrayBuffer, label: string): string {
 async function sessionCookie(
   scopes: string[],
   authMethod = "passkey",
+  principalId = "principal-passkey-test",
 ): Promise<string> {
   const stub = env.SIGNING_AUTHORITY.get(
     env.SIGNING_AUTHORITY.idFromName("default"),
   );
+  // The cookie is a cache of the grant, never the source: the route reads
+  // LIVE grants (notme-486e8a), so each cookie is backed by a real one. Grants
+  // only accumulate on a principal, and the route intersects them with the
+  // cookie, so a test's cookie still bounds what it can claim.
+  // createPrincipalWithCapabilities refuses an existing principal, and there
+  // is (deliberately) no grant RPC, so grant through the DO's own storage
+  // module — idempotent, and off the pinned surface.
+  await runInDurableObject(stub, (a) => {
+    const sql = (a as SigningAuthority)["ctx"].storage.sql;
+    if (!getPrincipal(sql, principalId)) return (a as SigningAuthority).createPrincipalWithCapabilities(principalId, scopes);
+    for (const scope of scopes) grantCapability(sql, principalId, scope, "test");
+  });
   const secret = await stub.getSessionSecret();
-  return createSessionCookie(
-    { principalId: "principal-passkey-test", scopes, authMethod },
-    secret,
-  );
+  return createSessionCookie({ principalId, scopes, authMethod }, secret);
 }
 
 /**
- * The session VALUE, which is what the route binds to.
+ * A session-bound nonce, fetched the way a BROWSER can (notme-486e8a).
  *
- * `parseCookie(header, name)` returns the value, not `name=value`, so the
- * binding must be computed over the same thing. Hashing the full header string
- * here produced a 401 that read as "bad proof" — the proofs were fine and the
- * two sides were hashing different bytes.
+ * The binding used to be SHA-256 of the session cookie. This helper's
+ * predecessor, sessionValue(), sliced the raw cookie out of the header to hash
+ * it — something only a test can do: notme_session is HttpOnly, so no browser
+ * script can read it, and the route was uncallable by any real client. The
+ * nonce is fetched with the cookie (sent automatically, same-origin) and is
+ * bound to that session's principal server-side.
  */
-function sessionValue(cookie: string): string {
-  return cookie.slice("notme_session=".length).split(";")[0];
+async function fetchNonce(cookie: string): Promise<string> {
+  const res = await worker.fetch(
+    new Request(`${ORIGIN}/cert/nonce`, { method: "POST", headers: { cookie } }),
+    { ...env, ...LOCAL_ENV },
+  );
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { nonce: string }).nonce;
 }
 
 /** Generate keys and the PoP proofs the route requires. */
-async function mintRequest(cookie: string) {
+async function mintRequest(cookie: string, nonce?: string) {
+  nonce ??= await fetchNonce(cookie);
   const mtls = (await crypto.subtle.generateKey(
     { name: "ECDSA", namedCurve: "P-256" },
     true,
@@ -82,23 +102,24 @@ async function mintRequest(cookie: string) {
     "spki",
     signing.publicKey,
   )) as ArrayBuffer;
-  const sessionHash = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(sessionValue(cookie)),
+  // Written out by hand rather than imported, so this test checks the
+  // route's binding against an independent implementation of it.
+  const tag = new TextEncoder().encode("notme/cert-pair/v1\0");
+  const nonceHash = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce)),
   );
   const input = new Uint8Array(
-    mtlsSpki.byteLength + signingSpki.byteLength + 32,
+    tag.length + mtlsSpki.byteLength + signingSpki.byteLength + 32,
   );
-  input.set(new Uint8Array(mtlsSpki), 0);
-  input.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
-  input.set(
-    new Uint8Array(sessionHash),
-    mtlsSpki.byteLength + signingSpki.byteLength,
-  );
+  input.set(tag, 0);
+  input.set(new Uint8Array(mtlsSpki), tag.length);
+  input.set(new Uint8Array(signingSpki), tag.length + mtlsSpki.byteLength);
+  input.set(nonceHash, tag.length + mtlsSpki.byteLength + signingSpki.byteLength);
   // Sign the PRE-IMAGE, not its digest (notme-a011d2). WebCrypto ECDSA
   // applies SHA-256 itself, so signing a digest here would produce a proof
   // over two hashes that only another WebCrypto caller could reproduce.
   return {
+    nonce,
     public_keys: {
       mtls: pem(mtlsSpki, "PUBLIC KEY"),
       signing: pem(signingSpki, "PUBLIC KEY"),
@@ -200,17 +221,53 @@ describe("POST /cert/passkey", () => {
   });
 
   it("rejects proofs bound to a DIFFERENT session", async () => {
-    // The binding includes SHA-256 of the session cookie precisely so a
-    // captured public-keys+proofs pair cannot be replayed under someone
-    // else's session to bind their key to your identity.
-    const victim = await sessionCookie(["bridgeCert"]);
-    const attacker = await sessionCookie(["bridgeCert"]);
+    // The point of the session term: a captured public-keys+proofs pair must
+    // not be replayable under someone else's session, binding the victim's
+    // key to the attacker's identity.
+    //
+    // This test used to mint victim and attacker cookies for the SAME
+    // principal within the same second — identical cookies — and then
+    // `if (victim === attacker) return;`. It returned before asserting
+    // anything, on every run. Different principals now, and no escape hatch.
+    const victim = await sessionCookie(["bridgeCert"], "passkey", "principal-victim");
+    const attacker = await sessionCookie(["bridgeCert"], "passkey", "principal-attacker");
+    expect(victim).not.toBe(attacker);
     const capturedFromVictim = await mintRequest(victim);
-
-    // Same principal id, so the cookies differ only by their HMAC — if the
-    // binding ignored the session, this would succeed.
-    if (victim === attacker) return; // identical cookie: nothing to prove
     const res = await post(capturedFromVictim, attacker);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ error: "invalid_nonce" });
+  });
+
+  it("requires a nonce", async () => {
+    const cookie = await sessionCookie(["bridgeCert"]);
+    const { nonce: _n, ...withoutNonce } = await mintRequest(cookie);
+    expect((await post(withoutNonce, cookie)).status).toBe(400);
+  });
+
+  it("a nonce is single-use", async () => {
+    const cookie = await sessionCookie(["bridgeCert"]);
+    const nonce = await fetchNonce(cookie);
+    expect((await post(await mintRequest(cookie, nonce), cookie)).status).toBe(200);
+    const again = await post(await mintRequest(cookie, nonce), cookie);
+    expect(again.status).toBe(401);
+    expect(await again.json()).toMatchObject({ error: "invalid_nonce" });
+  });
+
+  it("a forged proof does not burn the nonce", async () => {
+    // Otherwise anyone who saw a nonce in flight could deny the real holder.
+    const cookie = await sessionCookie(["bridgeCert"]);
+    const nonce = await fetchNonce(cookie);
+    const bad = await mintRequest(cookie, nonce);
+    bad.proofs.mtls = b64u(new Uint8Array(64).fill(0x01));
+    expect((await post(bad, cookie)).status).toBe(401);
+    expect((await post(await mintRequest(cookie, nonce), cookie)).status).toBe(200);
+  });
+
+  it("issuing a nonce requires a session", async () => {
+    const res = await worker.fetch(
+      new Request(`${ORIGIN}/cert/nonce`, { method: "POST" }),
+      { ...env, ...LOCAL_ENV },
+    );
     expect(res.status).toBe(401);
   });
 

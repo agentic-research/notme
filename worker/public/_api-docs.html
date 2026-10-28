@@ -492,6 +492,13 @@
             the session did not use.
           </div>
           <div class="ep-note">
+            Fetch a nonce first with <code>POST /cert/nonce</code> (same-origin;
+            the session cookie is sent automatically) and sign
+            <code>"notme/cert-pair/v1\0" || mtls_spki || signing_spki ||
+            SHA-256(nonce)</code> with both keys. The nonce is single-use,
+            lasts 120&nbsp;s, and is bound to your session.
+          </div>
+          <div class="ep-note">
             Session scopes are INTERSECTED with an allowlist rather than
             passed through. A deployer session carries
             <code>authorityManage</code> and <code>certMint</code>; a

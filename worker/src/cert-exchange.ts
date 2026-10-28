@@ -28,6 +28,9 @@ export interface CertExchangeRequest {
   scopes?: string[];
   // 008: optional PoP cert exchange — if present, returns cert pair instead of token
   public_keys?: { mtls: string; signing: string };
+  // Required with public_keys on the SESSION proof: the session term of the
+  // binding, from POST /cert/nonce (notme-486e8a).
+  nonce?: string;
   proofs?: { mtls: string; signing: string };
 }
 
@@ -96,7 +99,10 @@ export async function handleCertExchange(
       return Response.json({ error: "invalid session" }, { status: 401 });
     }
     principalId = session.principalId;
-    grantedScopes = session.scopes;
+    // LIVE grants, not the cookie's copy (notme-486e8a): a revoked scope
+    // stops at once, not when the cookie expires.
+    const { liveScopes } = await import("./auth/session");
+    grantedScopes = await liveScopes(session, authority);
     // Same guard as /cert/passkey (worker.ts): provenance is derived from the
     // session, and a cert that cannot state it honestly must not be minted.
     // Defaulting to "passkey" here would launder an invite- or OIDC-authed
@@ -221,13 +227,32 @@ export async function handleCertExchange(
       return Response.json({ error: "invalid public key: " + e.message }, { status: 400 });
     }
 
-    // Verify PoP proofs against a binding payload
-    // For /cert, binding = SHA-256(mtls_spki || signing_spki) — no OIDC JWT in this path
+    // Verify PoP proofs against a binding payload.
+    //
+    // SESSION proofs bind a session-scoped nonce (notme-486e8a). They used to
+    // bind only mtls_spki || signing_spki — a function of the keys alone — so
+    // anyone holding a valid session could replay a victim's captured
+    // keys+proofs and bind the victim's keys to their OWN identity: the exact
+    // attack /cert/passkey's session term was written to stop. BOOTSTRAP
+    // proofs keep the keys-only binding: the code is single-use and was
+    // already consumed above, so there is no second session to replay under.
     const mtlsSpki = (await crypto.subtle.exportKey("spki", mtlsPubKey)) as ArrayBuffer;
     const signingSpki = (await crypto.subtle.exportKey("spki", signingPubKey)) as ArrayBuffer;
-    const bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
-    bindingInput.set(new Uint8Array(mtlsSpki), 0);
-    bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
+    let bindingInput: Uint8Array;
+    if (body.proof.type === "session") {
+      if (typeof body.nonce !== "string" || !body.nonce) {
+        return Response.json(
+          { error: "nonce required with public_keys on a session proof — POST /cert/nonce first" },
+          { status: 400 },
+        );
+      }
+      const { certPairBinding } = await import("./auth/cert-pair-binding");
+      bindingInput = await certPairBinding(new Uint8Array(mtlsSpki), new Uint8Array(signingSpki), body.nonce);
+    } else {
+      bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength);
+      bindingInput.set(new Uint8Array(mtlsSpki), 0);
+      bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
+    }
     // PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
     const pop = await verifyPopProofs(bindingInput, mtlsPubKey, signingPubKey, body.proofs);
     if (!pop.ok) {
@@ -235,6 +260,10 @@ export async function handleCertExchange(
         { error: `${pop.algorithm} proof-of-possession failed` },
         { status: 401 },
       );
+    }
+    // Spent only after the proofs verify; bound to this principal.
+    if (body.proof.type === "session" && !(await authority.consumePopNonce(body.nonce!, principalId))) {
+      return Response.json({ error: "invalid_nonce" }, { status: 401 });
     }
 
     const { wimseTrustDomain } = await import("../worker");

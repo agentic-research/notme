@@ -326,6 +326,7 @@ export type DelegatedJwtSignResult =
  */
 const CA_PATH_LEN = 1;
 
+const POP_NONCE_TTL_S = 120; // fetched and spent in one page interaction
 const TIER_ENROLMENT_TTL_S = 600; // RFC 8628 device codes are minutes, not hours
 const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
 const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"; // RFC 8628 §6.1: no vowels
@@ -1757,6 +1758,57 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ...result,
       authority: { epoch: state.epoch, key_id: state.keyId },
     };
+  }
+
+  // ── Session-bound PoP nonces (notme-486e8a) ────────────────────────────
+  //
+  // The session term in a cert-pair binding. Issued to a principal, single
+  // use, short-lived. Replaces SHA-256 of the HttpOnly session cookie, which
+  // no browser could compute.
+
+  #ensurePopNonceSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS pop_nonces (
+        nonce_hash   TEXT PRIMARY KEY,
+        principal_id TEXT NOT NULL,
+        expires_at   INTEGER NOT NULL
+      )
+    `);
+  }
+
+  async issuePopNonce(principalId: string): Promise<{ nonce: string; expiresIn: number }> {
+    this.#ensurePopNonceSchema();
+    const now = Math.floor(Date.now() / 1000);
+    this.ctx.storage.sql.exec("DELETE FROM pop_nonces WHERE expires_at <= ?", now);
+    const nonce = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce))));
+    this.ctx.storage.sql.exec(
+      "INSERT INTO pop_nonces (nonce_hash, principal_id, expires_at) VALUES (?, ?, ?)",
+      hash,
+      principalId,
+      now + POP_NONCE_TTL_S,
+    );
+    return { nonce, expiresIn: POP_NONCE_TTL_S };
+  }
+
+  /**
+   * Spend a nonce for this principal. Atomic: the DELETE is the check, so of
+   * two concurrent spends exactly one sees changes() = 1. A nonce issued to a
+   * DIFFERENT principal does not match — which is what defeats replay under
+   * another session.
+   */
+  async consumePopNonce(nonce: string, principalId: string): Promise<boolean> {
+    this.#ensurePopNonceSchema();
+    if (typeof nonce !== "string" || !nonce) return false;
+    const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce))));
+    this.ctx.storage.sql.exec(
+      "DELETE FROM pop_nonces WHERE nonce_hash = ? AND principal_id = ? AND expires_at > ?",
+      hash,
+      principalId,
+      Math.floor(Date.now() / 1000),
+    );
+    const [c] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+    return c.n === 1;
   }
 
   // ── Tier enrolment by device authorization (notme-486e8a) ──────────────

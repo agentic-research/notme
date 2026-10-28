@@ -298,7 +298,17 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //             class is unchanged.
       //   collect — trusts nothing it is handed: it verifies the PoP itself,
       //             against the key recorded at start, and consumes atomically.
-    ).toBe(52);
+      //
+      // 52 → 54: issuePopNonce, consumePopNonce (notme-486e8a). The session
+      // term for cert-pair bindings, replacing SHA-256 of the HttpOnly cookie.
+      //   issue   — takes a caller-supplied principal. A leaked stub can mint
+      //             nonces for anyone; a nonce alone grants nothing — it only
+      //             lets a matching PoP be accepted at a route that has
+      //             ALREADY verified that principal's session.
+      //   consume — single-use, atomic, principal-bound. A leaked stub could
+      //             burn a principal's outstanding nonces (≤120s each): a
+      //             nuisance, strictly weaker than revokeEpoch.
+    ).toBe(54);
   });
 });
 

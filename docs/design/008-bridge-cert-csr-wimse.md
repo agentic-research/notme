@@ -233,6 +233,27 @@ Where `binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)`.
 > described above is not merely wrong, it is being withdrawn. Build against the
 > pre-image.
 
+> **SESSION ROUTES BIND A NONCE (2026-10-28, `notme-486e8a`).** The above is
+> the `/cert/gha` binding. The session routes — `/cert/passkey` and `/cert`'s
+> session branch — bind a server-issued nonce, fetched first with
+> `POST /cert/nonce` (same-origin; the session cookie is sent automatically):
+>
+> ```
+> binding_input = "notme/cert-pair/v1\0" || mtls_spki_der || signing_spki_der || SHA-256(nonce)
+> ```
+>
+> with `nonce` echoed in the request body. Normative source:
+> `worker/src/auth/cert-pair-binding.ts`. The nonce is single-use, expires in
+> 120 s, is bound to the session's principal, and is spent only after the
+> proofs verify.
+>
+> What it replaced, and why: `/cert/passkey` bound `SHA-256(notme_session)`,
+> but that cookie is HttpOnly and every session is issued only as
+> `Set-Cookie`, so no browser could compute the binding and the route was
+> uncallable. `/cert`'s session branch bound `mtls_spki || signing_spki` with
+> no session term at all, so a captured keys+proofs pair could be replayed
+> under another session to bind the victim's keys to the attacker's identity.
+
 Each proof is a signature over the same binding payload, proving:
 - The caller holds the P-256 private key
 - The caller holds the Ed25519 private key

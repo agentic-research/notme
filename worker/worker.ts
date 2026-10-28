@@ -2704,6 +2704,20 @@ export default {
       // what a grant should cost — a human present, one touch, unphishable,
       // nothing transcribed. It also works on a phone, where a filesystem, a
       // keychain helper and the signet binary all do not.
+      // POST /cert/nonce — the session term for a cert-pair binding
+      // (notme-486e8a). Same-origin; the HttpOnly cookie is sent
+      // automatically, so the browser never needs to read it.
+      if (pathname === "/cert/nonce" && request.method === "POST") {
+        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        if (!cookie) return jsonErr("session_required", 401);
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const session = await verifySessionCookie(cookie, await authority.getSessionSecret());
+        if (!session) return jsonErr("invalid_session", 401);
+        const { nonce, expiresIn } = await authority.issuePopNonce(session.principalId);
+        return Response.json({ nonce, expires_in: expiresIn }, { headers: { "Cache-Control": "no-store" } });
+      }
+
       if (pathname === "/cert/passkey" && request.method === "POST") {
         try {
           const cookie = parseCookie(
@@ -2718,6 +2732,7 @@ export default {
           }
 
           let body: {
+            nonce?: string;
             public_keys?: { mtls?: string; signing?: string };
             proofs?: { mtls?: string; signing?: string };
           } = {};
@@ -2725,6 +2740,9 @@ export default {
             body = (await request.json()) as typeof body;
           } catch {
             /* empty body */
+          }
+          if (typeof body.nonce !== "string" || !body.nonce) {
+            return jsonErr("nonce required — POST /cert/nonce first (notme-486e8a)", 400);
           }
           if (!body.public_keys?.mtls || !body.public_keys?.signing) {
             return jsonErr(
@@ -2774,18 +2792,14 @@ export default {
             "spki",
             signingPubKey,
           )) as ArrayBuffer;
-          const sessionHash = await crypto.subtle.digest(
-            "SHA-256",
-            new TextEncoder().encode(cookie),
-          );
-          const bindingInput = new Uint8Array(
-            mtlsSpki.byteLength + signingSpki.byteLength + 32,
-          );
-          bindingInput.set(new Uint8Array(mtlsSpki), 0);
-          bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
-          bindingInput.set(
-            new Uint8Array(sessionHash),
-            mtlsSpki.byteLength + signingSpki.byteLength,
+          // The session term is a server-issued nonce, not SHA-256 of the
+          // cookie: the cookie is HttpOnly, so no browser could ever compute
+          // that, and this route was uncallable (notme-486e8a).
+          const { certPairBinding } = await import("./src/auth/cert-pair-binding");
+          const bindingInput = await certPairBinding(
+            new Uint8Array(mtlsSpki),
+            new Uint8Array(signingSpki),
+            body.nonce,
           );
           // PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
           const pop = await verifyPopProofs(
@@ -2797,10 +2811,19 @@ export default {
           if (!pop.ok) {
             return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
           }
+          // Spend the nonce only AFTER the proofs verify, so a forged request
+          // cannot burn the real holder's nonce. Bound to THIS principal: a
+          // nonce issued to another session does not match — which is what
+          // defeats replaying a captured keys+proofs pair under it.
+          if (!(await authority.consumePopNonce(body.nonce, session.principalId))) {
+            return Response.json({ error: "invalid_nonce" }, { status: 401 });
+          }
 
+          // LIVE grants, not the cookie's copy (notme-486e8a).
+          const { liveScopes } = await import("./src/auth/session");
           const { certScopesForSession } =
             await import("./src/auth/passkey-cert-scopes");
-          const scopes = certScopesForSession(session.scopes);
+          const scopes = certScopesForSession(await liveScopes(session, authority));
           if (scopes.length === 0) {
             // The session holds nothing a cert may carry. Refuse rather than
             // mint an authority-less cert, which would look like success and
