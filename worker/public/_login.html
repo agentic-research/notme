@@ -177,6 +177,17 @@
     </button>
   </div>
 
+  <div id="claimDiv" class="hidden" style="margin-top:12px">
+    <p>This authority has no administrator yet. Your passkey is registered as a
+    <strong>claim</strong> and holds nothing until it is approved.</p>
+    <p style="margin-top:8px">Claim code: <code id="claimCode" style="font-size:1.25em"></code></p>
+    <p style="margin-top:8px">Approve it from the repository named by
+    <code>BOOTSTRAP_GHA_SUBJECT</code>:</p>
+    <pre id="claimCommand" style="white-space:pre-wrap;margin-top:4px"></pre>
+    <p style="margin-top:8px">Then sign in again with this passkey. Only run the
+    command with the code shown here.</p>
+  </div>
+
   <div class="term-footer">
     <a href="/">&#8592; back to authority</a>
   </div>
@@ -339,6 +350,17 @@ async function registerPasskey() {
     });
 
     if (!verifyRes.ok) throw new Error((await verifyRes.json()).error || 'registration failed');
+    var verified = await verifyRes.json();
+    // A claim on an authority with no administrator (notme-486e8a): the
+    // passkey holds nothing until the named workflow approves the code, so
+    // there is nowhere useful to redirect yet. Values go in via textContent.
+    if (verified.claim) {
+      document.getElementById('claimCode').textContent = verified.claim.code;
+      document.getElementById('claimCommand').textContent = verified.claim.command;
+      document.getElementById('claimDiv').classList.remove('hidden');
+      setStatus('registered as a claim — approve it to become administrator', 'info');
+      return;
+    }
     setStatus('registered — redirecting...', 'ok');
     setTimeout(function() { window.location.href = returnTo; }, 800);
   } catch(e) {

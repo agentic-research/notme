@@ -315,7 +315,22 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       // never a scope the principal has any row for (so a revocation sticks).
       // A leaked stub gains nothing: those principals could already mint and
       // administer; signing purposes are a narrowing of bridgeCert.
-    ).toBe(55);
+      //
+      // 55 → 59: bootstrapFromAttestation REMOVED; hasAdministrator,
+      // claimAvailable, markClaimRegistration, finalizeClaimRegistration,
+      // approveBootstrapClaim ADDED (notme-486e8a). The removed method made
+      // the attested workflow the admin, which no human could then act as.
+      //   hasAdministrator / claimAvailable — booleans, nothing secret.
+      //   mark / finalize — open or complete a claim holding ZERO grants;
+      //             bounded by a pending cap and TTLs.
+      //   approveBootstrapClaim — CREATES AN ADMINISTRATOR, so reviewed
+      //             hardest, as bootstrapFromAttestation was: it requires the
+      //             deployer to have set BOOTSTRAP_GHA_SUBJECT, the subject to
+      //             equal it (timing-safe), and NO live authorityManage holder
+      //             — which any authority a stub was stolen FROM has. On a
+      //             live authority it is a no-op by construction, the same
+      //             argument that admitted its predecessor.
+    ).toBe(59);
   });
 });
 

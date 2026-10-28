@@ -817,13 +817,12 @@ async function handleCertGHA(
   // (ADR-019 D2, notme-77438b). Owner and repo remain readable from `sub`
   // and from the workflow claims; principal_kind = "workload" is stamped as
   // its own extension.
-  // Attested first boot (notme-addef9, criterion E). AFTER the token is
-  // verified, the owner allowlist has passed and the JTI is spent — so this
-  // can only be reached by a caller GitHub actually signed for. The DO does
-  // the check-and-create atomically and refuses unless the deployer named
-  // this exact subject; on an authority that already has an administrator it
-  // is a no-op, so the normal CI path is unaffected.
-  const boot = await authority.bootstrapFromAttestation(claims.sub);
+  // NO BOOTSTRAP HERE any more (notme-486e8a). This route used to make the
+  // attested workflow the administrator as a side effect of a cert request —
+  // and since a release job typically shares the bootstrap subject, the first
+  // /cert/gha on a fresh authority installed an admin no human could act as
+  // and closed registration to everyone. Bootstrap is now POST
+  // /bootstrap/claim: the workflow APPROVES a human's passkey claim.
 
   const identity = principalIdentity(wimseTrustDomain(env), claims.sub);
 
@@ -853,7 +852,6 @@ async function handleCertGHA(
     // Present only when THIS call bootstrapped the authority. The cert still
     // carries bridgeCert alone — capabilities live on the principal, and a
     // cert carries only what is safe to export (passkey-cert-scopes.ts).
-    ...(boot.bootstrapped ? { principal_id: boot.principalId } : {}),
     claims: {
       repository: claims.repository,
       ref: claims.ref,
@@ -909,6 +907,22 @@ async function handlePasskey(
         host,
       );
 
+      // CLAIM REGISTRATION (notme-486e8a). No bootstrap code, no invite, and
+      // the authority has NO administrator while the attested-claim mechanism
+      // is armed: register the passkey as a claim holding nothing, to be
+      // approved by the workflow named in BOOTSTRAP_GHA_SUBJECT. Gated on "no
+      // administrator", not "first user" — otherwise whoever registered first
+      // and was never approved would lock the deployer out for good.
+      if (!body.bootstrapCode && !body.inviteToken && (await authority.claimAvailable())) {
+        const mark = await authority.markClaimRegistration(userId);
+        if (!mark.ok) {
+          return jsonErr(
+            mark.reason === "busy" ? "too many pending claims — retry shortly" : "claim unavailable",
+            mark.reason === "busy" ? 503 : 409,
+          );
+        }
+        return Response.json({ ...result, userId, scopes: [], claim: true });
+      }
       // First user requires bootstrap code (proves deployer ownership)
       // Everyone else can register freely — gets bridgeCert scope only
       if (result.isFirstUser && !body.bootstrapCode) {
@@ -944,8 +958,11 @@ async function handlePasskey(
               );
             }
             if (bootstrap.methods.includes("gha-oidc")) {
+              // Normally unreachable: with gha-oidc armed and no administrator,
+              // an unauthenticated registration becomes a claim above. Kept
+              // accurate for the one way here — a claim that was refused.
               offers.push(
-                "run the workflow named by BOOTSTRAP_GHA_SUBJECT, which bootstraps this authority via GitHub OIDC at /cert/gha",
+                "register a passkey as a claim and approve it with the workflow named by BOOTSTRAP_GHA_SUBJECT (claim-authority.yml)",
               );
             }
             return jsonErr(`bootstrap required — ${offers.join(", or ")}`, 401);
@@ -1030,6 +1047,30 @@ async function handlePasskey(
       );
       if (!result.verified) {
         return jsonErr("registration verification failed", 400);
+      }
+      // A claim registration holds NOTHING until the named workflow approves
+      // it (notme-486e8a) — even if it is the first credential, which
+      // verifyRegistration would otherwise treat as the admin.
+      const claim = await authority.finalizeClaimRegistration(body.userId);
+      if (claim) {
+        const { createSessionCookie } = await import("./src/auth/session");
+        const cookie = await createSessionCookie(
+          { principalId: body.userId, scopes: [], authMethod: "passkey" },
+          await authority.getSessionSecret(),
+        );
+        return new Response(
+          JSON.stringify({
+            verified: true,
+            scopes: [],
+            claim: {
+              code: claim.code,
+              expires_in: claim.expiresIn,
+              command: `gh workflow run claim-authority.yml -f code=${claim.code}`,
+              note: "Run this from the repository named by BOOTSTRAP_GHA_SUBJECT, then sign in again with this passkey.",
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json", "Set-Cookie": cookie } },
+        );
       }
 
       // Scopes come from the GRANT STORE — never from the client body (scope
@@ -3175,6 +3216,55 @@ export default {
       }
 
       // POST /cert/gha — GHA OIDC JWT → bridge cert (legacy, kept for compat)
+      // POST /bootstrap/claim — the named workflow approves a passkey claim
+      // (notme-486e8a). `Authorization: Bearer <GitHub Actions OIDC token,
+      // aud=GHA_CERT_AUDIENCE>`, body `{ code }`. Run by
+      // .github/workflows/claim-authority.yml. The token is verified HERE
+      // (signature, audience, jti) and the DO checks the subject against
+      // BOOTSTRAP_GHA_SUBJECT, so the attestation is never decorative.
+      if (pathname === "/bootstrap/claim" && request.method === "POST") {
+        const auth = request.headers.get("authorization") || "";
+        const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+        if (!token) return jsonErr("Bearer GitHub Actions OIDC token required", 401);
+        const cfg = getConfig(env);
+        const { validateGHAToken } = await import("./src/gha-oidc");
+        let claims: any;
+        try {
+          claims = await validateGHAToken(token, cfg.ghaCertAudience);
+        } catch {
+          return jsonErr("invalid token", 401);
+        }
+        if (!claims.jti) return jsonErr("jti claim required for replay protection", 400);
+        // Same keyspace as /cert/gha, /cert and /token: one token, one spend.
+        const jtiKey = `jti:${claims.jti}`;
+        if (await platform.cache.get(jtiKey)) return jsonErr("token already used", 401);
+        await platform.cache.put(jtiKey, "1", {
+          expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+        });
+        let body: { code?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.approveBootstrapClaim(
+          typeof body.code === "string" ? body.code : "",
+          claims.sub,
+        );
+        if (!r.ok) {
+          const map = {
+            not_configured: [403, "BOOTSTRAP_GHA_SUBJECT is not set on this deployment"],
+            subject_mismatch: [403, "this workflow is not the one BOOTSTRAP_GHA_SUBJECT names"],
+            governed: [409, "this authority already has an administrator"],
+            no_such_claim: [404, "no such claim code — it may have expired; register again"],
+          } as const;
+          const [status, msg] = map[r.reason as keyof typeof map];
+          return jsonErr(msg, status);
+        }
+        return Response.json({ ok: true, principal_id: r.principalId });
+      }
+
       if (pathname === "/cert/gha") {
         return handleCertGHA(request, env, platform);
       }

@@ -129,62 +129,77 @@ served budget disagrees (no rotation, nothing in flight breaks), and
 
 ```mermaid
 graph TD
-    A["fresh authority"] --> B{"governable?<br/>(a credential or federated identity exists)"}
+    A["fresh authority"] --> B{"an administrator exists?<br/>(a live authorityManage grant)"}
     B -->|yes| C["closed — sign in, or ask for an invite"]
-    B -->|no| D{"which mechanisms are armed?"}
+    B -->|no| D{"which mechanism is armed?"}
+    D -->|BOOTSTRAP_GHA_SUBJECT| F["register a passkey → CLAIM code<br/>(holds nothing yet)"]
+    F --> G["gh workflow run claim-authority.yml -f code=…<br/>(the named workflow's OIDC token approves it)"]
+    G --> H["that passkey's principal holds the admin set;<br/>sign in again"]
+    D -->|BOOTSTRAP_CODE only| I["secret — present the code to register"]
     D -->|neither| E["unconfigured — arm one and retry"]
-    D -->|BOOTSTRAP_GHA_SUBJECT| F["attested — run THAT workflow"]
-    D -->|BOOTSTRAP_CODE| G["secret — present the code to register"]
-    F --> H["admin principal created,<br/>GitHub identity LINKED to it"]
-    G --> I["first user gets<br/>bridgeCert + authorityManage + certMint"]
 ```
 
-**The default path is attestation, not a secret.** Set
-`BOOTSTRAP_GHA_SUBJECT` to one GitHub workflow identity — the full OIDC
-`sub`, e.g. `repo:owner/name:ref:refs/heads/main` — and the first run of that
-workflow bootstraps the authority through `/cert/gha`. It is a **var, not a
-secret**: an identity has nothing to leak and nothing to read out of a log,
-and the security comes from GitHub's signature over the token. That is the
-posture notme argues for everywhere else and did not practise at first boot.
+**The default path is attestation, not a secret — and a human finishes it.**
+Set `BOOTSTRAP_GHA_SUBJECT` to one GitHub workflow identity (the full OIDC
+`sub`, e.g. `repo:owner/name:ref:refs/heads/main`). Then:
 
-**The ref segment is trigger-dependent, and mismatching it fails silently.**
+1. open `/login` and register a passkey. With no administrator, it is
+   registered as a **claim** holding nothing, and the page shows a code;
+2. `gh workflow run claim-authority.yml -f code=XXXX-XXXX` from that repo;
+3. sign in again with the same passkey — you are the administrator.
+
+The human holds the credential (it never leaves their authenticator), GitHub
+attests the deployer (the workflow's token must carry exactly that `sub`), and
+nothing secret is set, typed or logged. `BOOTSTRAP_GHA_SUBJECT` is a **var,
+not a secret**: an identity has nothing to leak. The code is not a secret
+either — approving it requires the workflow's identity — but check the code you
+pass is the one your own login page shows, because approving someone else's
+makes *them* the administrator.
+
+**What this replaced, and why it was a dead end (`notme-486e8a`).** The
+attested bootstrap used to run as a side effect of `/cert/gha` and make the
+*workflow* the administrator, with a note that the human would then "attach a
+passkey by taking an invite from it". But `/invites` accepts only a browser
+session and a workflow never has one, so the authority ended up governed by an
+identity no human could act as — and, since a credential now existed, closed
+to every human registration. The only way in was the `BOOTSTRAP_CODE` secret
+this mechanism was meant to replace. `/cert/gha` now has no administrative
+side effect.
+
+**Gated on "no administrator", not "no credential".** Anyone may open a claim
+while no administrator exists; only the code the named workflow approves
+counts, and approval voids every other pending claim. Under a "first
+credential" gate, a stranger who registered first and was never approved
+would lock the deployer out permanently.
+
+**The ref segment is trigger-dependent, and a mismatch refuses the claim.**
 A branch run produces `…:ref:refs/heads/main`; a tag run produces
 `…:ref:refs/tags/v1.2.3`. Verified against a real value — the cert production
 minted for `agentic-research/signet` on 2026-08-07 carries
-`CN=repo:agentic-research/signet:ref:refs/tags/v0.3.0`. Arm the form your
-bootstrap workflow actually produces; if it does not match, bootstrap never
-fires and nothing says why.
+`CN=repo:agentic-research/signet:ref:refs/tags/v0.3.0`. Arm the form the claim
+workflow actually produces when you dispatch it.
 
 **Why exact-subject and not the owner allowlist.** `GHA_ALLOWED_OWNERS`
 answers *may this workflow get a credential*; anyone with push access to any
-repo under that owner clears it. *May it become the administrator* is a
+repo under that owner clears it. *May it make someone the administrator* is a
 different question, so the deployer names one workflow.
-
-**The bootstrap LINKS the attested identity to the principal.** A principal
-carries grants; it is not a way to sign in. Creating one without linking
-leaves an admin row nobody can authenticate as — the authority still reports
-`armed`, because `hasAuthenticator` counts credentials and federated
-identities, never principals. That is a credential-shaped hole dressed as a
-fix, and it is what the first version of this did.
 
 **Proven with a real token, not a fixture.**
 `.github/workflows/bootstrap-e2e.yml` runs the Worker locally inside an
 Actions job — the one place a genuine GitHub-signed OIDC token exists — and
-asserts the *transition*: ungovernable → real token → an authority that
-reports an administrator, then a second run that mints no second one. It
-cannot be pointed at staging, whose `GHA_ALLOWED_OWNERS` must differ from
-production's (`notme-1532eb`); the local CA is born in the job and dies with
-it, which is what makes the real owner allowlist safe there and nowhere else.
+drives the whole claim with a software WebAuthn authenticator: claim
+registration holding nothing → the real workflow token approves it → sign in →
+that session issues an invite → registration is invite-only and a second
+approval is refused. It cannot be pointed at staging, whose
+`GHA_ALLOWED_OWNERS` must differ from production's (`notme-1532eb`); the local
+CA is born in the job and dies with it.
 
 Asking about bootstrap state is a **read** — it mints nothing. Previously the
 first unauthenticated request caused an admin code to be minted and logged, so
 any stranger chose the moment a credential appeared (`notme-addef9`).
 
-**The 401 offers only what is armed.** It once said "check Worker logs
-(wrangler tail)"; the replacement pointed at `/cert/gha`, which minted
-`bridgeCert` and created no administrator — so the message that fixed a lie
-told a different one. It now names the mechanisms `getBootstrapState()`
-actually reports.
+`BOOTSTRAP_CODE` remains the explicit operator break-glass — including
+recovery when the last administrator credential is lost.
 
 ---
 

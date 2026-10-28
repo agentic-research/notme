@@ -328,6 +328,9 @@ export type DelegatedJwtSignResult =
  */
 const CA_PATH_LEN = 1;
 
+const CLAIM_REGISTRATION_TTL_S = 600; // options → verify of one WebAuthn ceremony
+const CLAIM_CODE_TTL_S = 1800; // long enough to go run a workflow
+const CLAIM_CAP = 100; // pending claim registrations; storage-exhaustion bound
 const POP_NONCE_TTL_S = 120; // fetched and spent in one page interaction
 const TIER_ENROLMENT_TTL_S = 600; // RFC 8628 device codes are minutes, not hours
 const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
@@ -2700,92 +2703,161 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * `BOOTSTRAP_CODE`, which requires control of the deployment rather than
    * merely the ability to send an HTTP request.
    */
+  // ── Bootstrap by attested claim (notme-486e8a) ─────────────────────────
+  //
+  // REPLACES bootstrapFromAttestation, which made the attested WORKFLOW the
+  // administrator as a side effect of /cert/gha. Its comment said the human
+  // would then "attach a passkey by taking an invite from it" — but /invites
+  // accepts only a browser session and a workflow never has one, so the
+  // authority ended up governed by an identity no human could act as, and
+  // closed to everyone else. The fix inverts the roles: the HUMAN registers a
+  // passkey and holds nothing; the named workflow APPROVES that passkey's
+  // claim code with its GitHub OIDC token. The human holds the credential,
+  // GitHub attests the deployer, and nothing secret crosses a log.
+  //
+  // Gated on "no administrator exists" — a live authorityManage grant — and
+  // NOT on "no credential exists". Under the old gate a stranger who
+  // registered first and was never approved would close the door on the
+  // deployer for good. Anyone may open a claim; only an approved one counts.
+
+  #ensureClaimSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap_claim_registrations (
+        user_id    TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap_claims (
+        code         TEXT PRIMARY KEY,
+        principal_id TEXT NOT NULL,
+        expires_at   INTEGER NOT NULL
+      )
+    `);
+  }
+
+  #hasAdministrator(): boolean {
+    const sql = this.ctx.storage.sql;
+    ensurePrincipalSchema(sql);
+    const [{ n }] = [
+      ...sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM capability_grants WHERE scope = 'authorityManage' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))",
+      ),
+    ];
+    return n > 0;
+  }
+
+  /** Does any principal hold a live authorityManage grant? */
+  async hasAdministrator(): Promise<boolean> {
+    return this.#hasAdministrator();
+  }
+
+  /** May an unauthenticated passkey registration open a claim right now? */
+  async claimAvailable(): Promise<boolean> {
+    return bootstrapAttestedSubject(this.env) !== null && !this.#hasAdministrator();
+  }
+
   /**
-   * First boot by ATTESTATION rather than by a shared secret (notme-addef9,
-   * Goal Zero criterion E).
-   *
-   * The register/options 401 has been telling fresh deployers to "bootstrap
-   * via GitHub OIDC at /cert/gha" since the log-scraping message was
-   * removed. That route verifies a real GitHub-signed token and then mints
-   * `bridgeCert` with no principal and no `authorityManage`, so following
-   * the advice left the authority with zero administrators. This is the
-   * method that makes the sentence true.
-   *
-   * Three conditions, all required:
-   *   1. the deployer named exactly one workflow identity (`BOOTSTRAP_GHA_SUBJECT`)
-   *   2. the attested `sub` equals it — not the owner allowlist, which is a
-   *      much wider set than "may administer this authority"
-   *   3. no principal exists yet
-   *
-   * IN THE DO, not the route, because (2) and (3) must be atomic with the
-   * create. Two workflows racing a fresh authority would otherwise both read
-   * "no principals" and both become admin; a Durable Object is
-   * single-threaded, so the read-check-write cannot interleave.
-   *
-   * The caller is trusted to have VERIFIED the token — this method takes an
-   * attested subject, never a raw one. It is unexported from the worker's
-   * perspective for that reason: the JWKS/audience/allowlist checks live at
-   * the route, and calling this with an unverified string would make the
-   * attestation decorative.
+   * Mark a registration (by its WebAuthn user id) as a claim, so verify knows
+   * not to grant it anything. Bounded: an open endpoint that writes rows is a
+   * storage-exhaustion vector.
    */
-  async bootstrapFromAttestation(
-    attestedSubject: string,
-  ): Promise<{ bootstrapped: boolean; principalId: string | null }> {
-    const expected = bootstrapAttestedSubject(this.env);
-
-    // Not a secret, but compared the same way as one: an identity match that
-    // gates administrator creation should not leak its prefix by timing.
-    const { timingSafeEqual } = await import("./auth/timing-safe");
-    const subjectsMatch =
-      expected !== null && (await timingSafeEqual(attestedSubject, expected));
-
-    const { ensurePasskeySchema } = await import("./auth/passkey");
-    const { ensurePrincipalSchema, principalCount } = await import(
-      "./auth/principals"
+  async markClaimRegistration(userId: string): Promise<{ ok: true } | { ok: false; reason: "unavailable" | "busy" }> {
+    if (!(await this.claimAvailable())) return { ok: false, reason: "unavailable" };
+    this.#ensureClaimSchema();
+    const now = Math.floor(Date.now() / 1000);
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM bootstrap_claim_registrations WHERE expires_at <= ?", now);
+    sql.exec("DELETE FROM bootstrap_claims WHERE expires_at <= ?", now);
+    const [{ n }] = [...sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM bootstrap_claim_registrations")];
+    if (n >= CLAIM_CAP) return { ok: false, reason: "busy" };
+    sql.exec(
+      "INSERT OR REPLACE INTO bootstrap_claim_registrations (user_id, expires_at) VALUES (?, ?)",
+      userId,
+      now + CLAIM_REGISTRATION_TTL_S,
     );
-    ensurePrincipalSchema(this.ctx.storage.sql);
-    const authorityIsGovernable =
-      principalCount(this.ctx.storage.sql) > 0 ||
-      this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema);
+    return { ok: true };
+  }
 
+  /**
+   * After a claim registration's WebAuthn ceremony verifies: create the
+   * principal with NO grants, clear the first-credential admin flag
+   * passkey verification set, and issue the claim code. null when the
+   * registration was not a claim.
+   */
+  async finalizeClaimRegistration(userId: string): Promise<{ code: string; expiresIn: number } | null> {
+    this.#ensureClaimSchema();
+    const sql = this.ctx.storage.sql;
+    const now = Math.floor(Date.now() / 1000);
+    sql.exec(
+      "DELETE FROM bootstrap_claim_registrations WHERE user_id = ? AND expires_at > ?",
+      userId,
+      now,
+    );
+    const [c] = [...sql.exec<{ n: number }>("SELECT changes() AS n")];
+    if (c.n !== 1) return null;
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    ensurePasskeySchema(sql);
+    // verifyRegistration marks the FIRST credential is_admin=1. A claim is
+    // not an admin until approved, whatever order it registered in.
+    sql.exec("UPDATE passkey_users SET is_admin = 0 WHERE user_id = ?", userId);
+    const { createPrincipal } = await import("./auth/principals");
+    createPrincipal(sql, userId, undefined, "bootstrap-claim");
+    const code = randomUserCode();
+    sql.exec(
+      "INSERT INTO bootstrap_claims (code, principal_id, expires_at) VALUES (?, ?, ?)",
+      code,
+      userId,
+      now + CLAIM_CODE_TTL_S,
+    );
+    return { code, expiresIn: CLAIM_CODE_TTL_S };
+  }
+
+  /**
+   * The named workflow approves a claim. The caller is trusted to have
+   * VERIFIED the GitHub token (signature, audience, jti) — this takes an
+   * attested subject, never a raw one.
+   */
+  async approveBootstrapClaim(
+    code: string,
+    attestedSubject: string,
+  ): Promise<
+    | { ok: true; principalId: string }
+    | { ok: false; reason: "not_configured" | "subject_mismatch" | "governed" | "no_such_claim" }
+  > {
+    const expected = bootstrapAttestedSubject(this.env);
+    if (expected === null) return { ok: false, reason: "not_configured" };
+    const { timingSafeEqual } = await import("./auth/timing-safe");
+    const subjectsMatch = await timingSafeEqual(attestedSubject, expected);
+    if (!subjectsMatch) return { ok: false, reason: "subject_mismatch" };
     if (
       !mayBootstrapFromAttestation({
         configuredSubject: expected,
         subjectsMatch,
-        authorityIsGovernable,
+        authorityIsGovernable: this.#hasAdministrator(),
       })
     ) {
-      return { bootstrapped: false, principalId: null };
+      return { ok: false, reason: "governed" };
     }
-
-    const principalId = crypto.randomUUID();
-    await this.createPrincipalWithCapabilities(
-      principalId,
-      [...ADMIN_SCOPES],
-      `gha-oidc:${attestedSubject}`,
-    );
-
-    // LINK THE ATTESTED IDENTITY, or this creates an administrator nobody
-    // can authenticate as. A principal carries grants; it is not a way to
-    // sign in. Without this the authority holds an admin row, still reports
-    // `armed` (hasAuthenticator counts credentials and federated identities,
-    // never principals), and no human or workflow can act as it — a
-    // credential-shaped hole dressed as a fix.
-    //
-    // With it, the workflow that bootstrapped can come back through the same
-    // attested route, and the human attaches a passkey by taking an invite
-    // from it — which is the flow notme-addef9 described and the reason the
-    // OIDC path was called the intended one.
-    await this.linkFederatedId(
-      principalId,
-      GHA_OIDC_ISSUER,
-      attestedSubject,
-    );
-
-    console.log(
-      `[bootstrap] attested first boot: principal=${principalId} subject=${attestedSubject}`,
-    );
-    return { bootstrapped: true, principalId };
+    this.#ensureClaimSchema();
+    const sql = this.ctx.storage.sql;
+    const row = sql
+      .exec(
+        "SELECT principal_id FROM bootstrap_claims WHERE code = ? AND expires_at > ?",
+        String(code).toUpperCase(),
+        Math.floor(Date.now() / 1000),
+      )
+      .toArray()[0] as { principal_id: string } | undefined;
+    if (!row) return { ok: false, reason: "no_such_claim" };
+    for (const scope of ADMIN_SCOPES) {
+      grantCapability(sql, row.principal_id, scope, `gha-oidc:${attestedSubject}`);
+    }
+    // The door closes: every other pending claim is void. Their principals
+    // keep zero grants.
+    sql.exec("DELETE FROM bootstrap_claims");
+    sql.exec("DELETE FROM bootstrap_claim_registrations");
+    console.warn({ event: "bootstrap.claimed", principalId: row.principal_id, attestedSubject });
+    return { ok: true, principalId: row.principal_id };
   }
 
   async getBootstrapState(): Promise<BootstrapReadState> {

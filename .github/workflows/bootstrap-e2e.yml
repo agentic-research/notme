@@ -29,7 +29,8 @@ on:
       - "worker/src/auth/bootstrap-policy.ts"
       - "worker/src/gha-oidc.ts"
       - "worker/wrangler.e2e.toml"
-      - "scripts/bootstrap-e2e.mjs"
+      - "scripts/bootstrap-e2e.mts"
+      - "worker/src/__tests__/helpers/software-authenticator.ts"
       - ".github/workflows/bootstrap-e2e.yml"
 
 permissions: {}
@@ -88,14 +89,24 @@ jobs:
           echo "subject: $SUB"
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          # A SECOND token for the "second approval is refused" check: every
+          # jti is single-use (shared across /cert/gha, /cert, /token and
+          # /bootstrap/claim), so reusing the first would test replay, not
+          # governance.
+          TOKEN2=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=notme.bot" | jq -r '.value')
+          echo "::add-mask::$TOKEN2"
+          echo "token2=$TOKEN2" >> "$GITHUB_OUTPUT"
           echo "sub=$SUB" >> "$GITHUB_OUTPUT"
 
-      - name: Bootstrap a fresh authority with the real token, end to end
+      - name: Claim a fresh authority — passkey + real workflow token, end to end
         working-directory: worker
         timeout-minutes: 5
         env:
           BOOTSTRAP_SUB: ${{ steps.oidc.outputs.sub }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          OIDC_TOKEN_2: ${{ steps.oidc.outputs.token2 }}
           AUTH_BASE: http://localhost:8787
           # No telemetry prompt, and never reach for an account: this Worker
           # is local-only and has no Cloudflare resources to resolve.
@@ -142,7 +153,7 @@ jobs:
             echo "--- wrangler log ---"; cat /tmp/wrangler.log; exit 1
           fi
 
-          node ../scripts/bootstrap-e2e.mjs
+          pnpm exec tsx ../scripts/bootstrap-e2e.mts
           status=$?
           if [ "$status" -ne 0 ]; then
             echo "--- wrangler log ---"; cat /tmp/wrangler.log

@@ -138,67 +138,39 @@ function freshAuthority(name: string) {
   return env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
 }
 
-describe("attested first boot (notme-addef9, criterion E)", () => {
-  // ORDER MATTERS in this block, and that is a property of the subject, not
-  // a smell: bootstrap is a one-time door. The route resolves
-  // idFromName("default") internally, so every case here shares one
-  // authority and the sequence below walks it from fresh to governed. The
-  // POLICY cases — which subjects are refused — live in the next block
-  // against their own instances, because proving "refused because the
-  // subject did not match" needs an authority that is not already closed.
+describe("attested first boot (notme-addef9, criterion E — revised by notme-486e8a)", () => {
+  // REVISED. This block used to assert that a matching workflow calling
+  // /cert/gha BECAME the administrator. That was the dead end: a workflow
+  // never holds a session, /invites accepts only one, so the authority was
+  // governed by an identity no human could act as and closed to everyone
+  // else. The workflow now APPROVES a human's passkey claim instead —
+  // end to end in bootstrap-claim.do.test.ts. What stays here is criterion
+  // E's own promise: first boot needs no secret out of a log, and /cert/gha
+  // is a certificate endpoint with no administrative side effect.
 
-  it("the 401 offers only mechanisms that are ARMED, and never a log", async () => {
-    // Runs first, on the still-fresh authority. This message is the one the
-    // bead was filed about: it used to say "check Worker logs (wrangler
-    // tail)", then pointed at /cert/gha, which minted bridgeCert and created
-    // no administrator at all.
+  it("an unauthenticated first registration becomes a CLAIM — never an admin, never a log", async () => {
+    // Runs first, on the still-fresh authority. This message is the one
+    // notme-addef9 was filed about: it used to say "check Worker logs".
     const res = await worker.fetch(
       new Request(`${ORIGIN}/auth/passkey/register/options`, {
         method: "POST", headers: { "content-type": "application/json" }, body: "{}",
       }),
       { ...env, SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN },
     );
-    expect(res.status).toBe(401);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toMatch(/BOOTSTRAP_CODE/);
-    expect(body.error).toMatch(/BOOTSTRAP_GHA_SUBJECT/);
-    expect(body.error).not.toMatch(/check Worker logs|wrangler tail/i);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { claim?: boolean; scopes: string[] };
+    expect(body.claim).toBe(true);
+    expect(body.scopes).toEqual([]);
+    expect(JSON.stringify(body)).not.toMatch(/check Worker logs|wrangler tail/i);
   });
 
-  it("a matching workflow bootstraps the authority — it becomes governable", async () => {
+  it("a matching workflow calling /cert/gha gets a cert and creates NO administrator", async () => {
     const res = await certGha(await ghaToken());
     expect(res.status, await res.clone().text()).toBe(200);
     const body = (await res.json()) as { scopes: string[]; principal_id?: string };
-
-    // Governable: an administrator exists AND can authenticate as itself.
-    // A principal with grants and no linked identity would leave this
-    // "armed" — an admin row nobody can sign in as.
-    const state = await freshAuthority("default").getBootstrapState();
-    expect(state.status).toBe("closed");
-
-    expect(body.principal_id).toBeTruthy();
-    const held = await freshAuthority("default").getPrincipalScopes(body.principal_id!);
-    expect(held).toEqual(expect.arrayContaining(["bridgeCert", "authorityManage", "certMint"]));
-
-    // Capabilities live on the principal; the CERT carries only what is safe
-    // to export — the same rule every other mint path follows.
-    expect(body.scopes).toEqual(["bridgeCert"]);
-  });
-
-  it("the bootstrapped admin is reachable by its attested identity", async () => {
-    // The link is what makes the principal usable rather than orphaned.
-    const found = await freshAuthority("default").findPrincipalByOIDC(
-      "https://token.actions.githubusercontent.com", SUBJECT,
-    );
-    expect(found).toBeTruthy();
-  });
-
-  it("bootstraps ONCE — a later run gets a cert but no second administrator", async () => {
-    const res = await certGha(await ghaToken());
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { principal_id?: string };
-    // No principal_id: nothing was bootstrapped this time.
     expect(body.principal_id).toBeUndefined();
+    expect(body.scopes).toEqual(["bridgeCert"]);
+    expect(await freshAuthority("default").hasAdministrator()).toBe(false);
   });
 
   it("still rejects a token this authority cannot verify", async () => {
@@ -208,34 +180,45 @@ describe("attested first boot (notme-addef9, criterion E)", () => {
   });
 });
 
-describe("who may bootstrap — policy, on authorities of its own", () => {
-  it("REFUSES a subject the operator did not name, on a FRESH authority", async () => {
-    // Owner-allowlisted is not the same as authorised-to-administer: anyone
-    // with push access to any repo under the owner clears the allowlist.
-    // This authority is fresh, so a refusal here can only be the subject
-    // check — not "already closed".
-    const stub = freshAuthority("boot-wrong-subject");
-    const before = await stub.getBootstrapState();
-    expect(before.status).toBe("armed");
+describe("who may approve a claim — policy, on authorities of its own", () => {
+  /** A claim on a fresh authority, created the way verify creates one. */
+  async function claimOn(stub: ReturnType<typeof freshAuthority>, pid: string) {
+    expect((await stub.markClaimRegistration(pid)).ok).toBe(true);
+    const c = await stub.finalizeClaimRegistration(pid);
+    expect(c).not.toBeNull();
+    return c!.code;
+  }
 
-    const r = await stub.bootstrapFromAttestation(
-      `repo:${OWNER}/some-other-repo:ref:refs/heads/main`,
-    );
-    expect(r.bootstrapped).toBe(false);
-    expect((await stub.getBootstrapState()).status).toBe("armed");
+  it("REFUSES a subject the operator did not name, on a FRESH authority", async () => {
+    // Owner-allowlisted is not authorised-to-administer: anyone with push
+    // access to any repo under the owner clears the allowlist. The
+    // authority is fresh, so the refusal can only be the subject check.
+    const stub = freshAuthority("claim-wrong-subject");
+    const code = await claimOn(stub, "claimant-1");
+    const r = await stub.approveBootstrapClaim(code, `repo:${OWNER}/some-other-repo:ref:refs/heads/main`);
+    expect(r).toEqual({ ok: false, reason: "subject_mismatch" });
+    expect(await stub.hasAdministrator()).toBe(false);
   });
 
   it("REFUSES once an administrator exists, even for the named subject", async () => {
-    const stub = freshAuthority("boot-once-only");
-    expect((await stub.bootstrapFromAttestation(SUBJECT)).bootstrapped).toBe(true);
-    const second = await stub.bootstrapFromAttestation(SUBJECT);
-    expect(second.bootstrapped).toBe(false);
-    expect(second.principalId).toBeNull();
+    const stub = freshAuthority("claim-once-only");
+    const first = await claimOn(stub, "claimant-a");
+    const second = await claimOn(stub, "claimant-b");
+    expect(await stub.approveBootstrapClaim(first, SUBJECT)).toEqual({ ok: true, principalId: "claimant-a" });
+    expect(await stub.approveBootstrapClaim(second, SUBJECT)).toEqual({ ok: false, reason: "governed" });
+    expect(await stub.getPrincipalScopes("claimant-b")).toEqual([]);
   });
 
-  it("reports gha-oidc as an armed METHOD, so the 401 can name it truthfully", async () => {
-    const state = await freshAuthority("boot-methods").getBootstrapState();
-    expect(state.status).toBe("armed");
-    expect((state as { methods: string[] }).methods).toContain("gha-oidc");
+  it("a claim cannot be opened once an administrator exists", async () => {
+    const stub = freshAuthority("claim-closed");
+    await stub.createPrincipalWithCapabilities("admin", ["bridgeCert", "authorityManage", "certMint"]);
+    expect(await stub.claimAvailable()).toBe(false);
+    expect(await stub.markClaimRegistration("late")).toEqual({ ok: false, reason: "unavailable" });
+  });
+
+  it("finalize is a no-op for a registration that was not a claim", async () => {
+    // So an ordinary invite or bootstrap-code registration is never turned
+    // into a zero-scope claimant by accident.
+    expect(await freshAuthority("claim-not-marked").finalizeClaimRegistration("nobody")).toBeNull();
   });
 });
