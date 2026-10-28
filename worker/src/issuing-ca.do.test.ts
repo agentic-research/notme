@@ -27,13 +27,23 @@ import { createSessionCookie } from "./auth/session";
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
 
+// The cookie's scopes are BACKED by real grants. This helper used to mint a
+// cookie claiming certMint with no grant behind it, and the route accepted it
+// because it read certMint from the cookie rather than from the live grant
+// (notme-486e8a). Now the route checks liveScopes, so a fixture has to state
+// the grant it relies on — which is what the deployment would have.
+// A fresh principal per session, holding exactly the scopes its cookie claims.
+let PRINCIPAL = "";
+
 async function sessionFor(scopes: string[]): Promise<string> {
   const stub = env.SIGNING_AUTHORITY.get(
     env.SIGNING_AUTHORITY.idFromName("default"),
   );
+  PRINCIPAL = `principal-issuing-test-${crypto.randomUUID()}`;
+  await stub.createPrincipalWithCapabilities(PRINCIPAL, scopes);
   const secret = await stub.getSessionSecret();
   return createSessionCookie(
-    { principalId: "principal-issuing-test", scopes, authMethod: "passkey" },
+    { principalId: PRINCIPAL, scopes, authMethod: "passkey" },
     secret,
   );
 }
@@ -104,6 +114,20 @@ describe("POST /cert/issuing-ca", () => {
     expect(res.status).toBe(403);
   });
 
+  it("reads certMint from the LIVE grant, not the cookie (notme-486e8a)", async () => {
+    // A cookie claiming certMint whose grant was never made (or was revoked).
+    // The route used to read session.scopes and minted a tier for it.
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+    const pid = `principal-issuing-test-${crypto.randomUUID()}`;
+    await stub.createPrincipalWithCapabilities(pid, ["bridgeCert"]);
+    const cookie = await createSessionCookie(
+      { principalId: pid, scopes: ["bridgeCert", "certMint"], authMethod: "passkey" },
+      await stub.getSessionSecret(),
+    );
+    const res = await post(await issuingRequest(cookie), cookie);
+    expect(res.status).toBe(403);
+  });
+
   it("rejects a proof over the binding DIGEST — no legacy window here", async () => {
     const cookie = await sessionFor(["bridgeCert", "certMint"]);
     const res = await post(
@@ -129,7 +153,7 @@ describe("POST /cert/issuing-ca", () => {
       scopes: string[];
       principal_id: string;
     };
-    expect(body.principal_id).toBe("principal-issuing-test");
+    expect(body.principal_id).toBe(PRINCIPAL);
     // authorityManage was requested AND held — but a certificate may not
     // carry it, same rule as every leaf route.
     expect(body.scopes).toEqual(["bridgeCert"]);

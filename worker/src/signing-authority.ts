@@ -326,6 +326,47 @@ export type DelegatedJwtSignResult =
  */
 const CA_PATH_LEN = 1;
 
+const TIER_ENROLMENT_TTL_S = 600; // RFC 8628 device codes are minutes, not hours
+const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
+const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"; // RFC 8628 §6.1: no vowels
+
+function hex(b: Uint8Array): string {
+  return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function b64url(b: Uint8Array): string {
+  return btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function randomUserCode(): string {
+  // Rejection-free: 20 symbols, so take each byte mod 20 only when it falls
+  // below 240 (the largest multiple of 20 under 256), avoiding modulo bias.
+  const out: string[] = [];
+  while (out.length < 8) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(16))) {
+      if (byte < 240 && out.length < 8) out.push(USER_CODE_ALPHABET[byte % 20]!);
+    }
+  }
+  return `${out.slice(0, 4).join("")}-${out.slice(4).join("")}`;
+}
+
+/**
+ * What the machine signs to collect its tier. Domain-separated, because the
+ * same Ed25519 key type signs other bindings elsewhere in this authority and
+ * a proof for one must never verify as a proof for another.
+ */
+export function tierEnrolmentBinding(spki: Uint8Array, deviceCodeHashHex: string): Uint8Array {
+  const tag = new TextEncoder().encode("notme/tier-enrol/v1\0");
+  const codeHash = Uint8Array.from(
+    deviceCodeHashHex.match(/../g)!.map((h) => parseInt(h, 16)),
+  );
+  const out = new Uint8Array(tag.length + spki.length + codeHash.length);
+  out.set(tag, 0);
+  out.set(spki, tag.length);
+  out.set(codeHash, tag.length + spki.length);
+  return out;
+}
+
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #initialized = false;
   #signingKey: CryptoKey | null = null;
@@ -1733,6 +1774,225 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ...result,
       authority: { epoch: state.epoch, key_id: state.keyId },
     };
+  }
+
+  // ── Tier enrolment by device authorization (notme-486e8a) ──────────────
+  //
+  // /cert/issuing-ca bound its proof to SHA-256 of the HttpOnly session
+  // cookie, which no client can read, so a tier was never enrollable. This is
+  // the RFC 8628 shape instead: the MACHINE holds the tier key and the device
+  // code; the HUMAN approves a short user code in a passkey session, after
+  // comparing the key fingerprint; the machine collects with a proof over the
+  // device code, which never appears in a browser.
+  //
+  // State lives here, not in KV, so approval and collection are atomic and
+  // collection is single-use — the same reason mintDPoPTokenOnce consumes in
+  // SQLite.
+
+  #ensureTierEnrolmentSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tier_enrolments (
+        device_code_hash TEXT PRIMARY KEY,
+        user_code        TEXT NOT NULL UNIQUE,
+        public_key_pem   TEXT NOT NULL,
+        key_fingerprint  TEXT NOT NULL,
+        requested_scopes TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        principal_id     TEXT,
+        identity         TEXT,
+        auth_method      TEXT,
+        granted_scopes   TEXT,
+        expires_at       INTEGER NOT NULL
+      )
+    `);
+  }
+
+  /**
+   * Record a machine's request for a tier. Unauthenticated BY NATURE — the
+   * machine has no credential yet — so it grants nothing: it stores a public
+   * key and waits for a human. Bounded, because an open endpoint that writes
+   * rows is a storage-exhaustion vector: expired rows are pruned on every
+   * start and the pending set is capped.
+   */
+  async startTierEnrolment(params: {
+    publicKeyPem: string;
+    requestedScopes: string[];
+  }): Promise<
+    | { ok: true; deviceCode: string; userCode: string; keyFingerprint: string; expiresIn: number }
+    | { ok: false; reason: "invalid_key" | "busy" }
+  > {
+    this.#ensureTierEnrolmentSchema();
+    const { importPublicKey } = await import("./cert-authority");
+    let key: CryptoKey;
+    try {
+      key = await importPublicKey(params.publicKeyPem);
+    } catch {
+      return { ok: false, reason: "invalid_key" };
+    }
+    if (key.algorithm.name !== "Ed25519") return { ok: false, reason: "invalid_key" };
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
+    const keyFingerprint = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", spki)));
+
+    const now = Math.floor(Date.now() / 1000);
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM tier_enrolments WHERE expires_at <= ?", now);
+    const [{ n }] = [
+      ...sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tier_enrolments"),
+    ];
+    if (n >= TIER_ENROLMENT_CAP) return { ok: false, reason: "busy" };
+
+    const deviceCode = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const deviceCodeHash = hex(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(deviceCode))),
+    );
+    // RFC 8628 §6.1: a short code from an alphabet with no vowels (no
+    // accidental words) and no look-alikes, so a human can read it across.
+    const userCode = randomUserCode();
+    sql.exec(
+      `INSERT INTO tier_enrolments
+         (device_code_hash, user_code, public_key_pem, key_fingerprint,
+          requested_scopes, status, expires_at)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+      deviceCodeHash,
+      userCode,
+      params.publicKeyPem,
+      keyFingerprint,
+      JSON.stringify(params.requestedScopes),
+      now + TIER_ENROLMENT_TTL_S,
+    );
+    return { ok: true, deviceCode, userCode, keyFingerprint, expiresIn: TIER_ENROLMENT_TTL_S };
+  }
+
+  /** What the approval page shows. No device code, no identity. */
+  async getTierEnrolment(userCode: string): Promise<
+    | { keyFingerprint: string; requestedScopes: string[]; status: string; expiresAt: number }
+    | null
+  > {
+    this.#ensureTierEnrolmentSchema();
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT key_fingerprint, requested_scopes, status, expires_at FROM tier_enrolments WHERE user_code = ?",
+        userCode,
+      )
+      .toArray()[0] as
+      | { key_fingerprint: string; requested_scopes: string; status: string; expires_at: number }
+      | undefined;
+    if (!row) return null;
+    return {
+      keyFingerprint: row.key_fingerprint,
+      requestedScopes: JSON.parse(row.requested_scopes),
+      status: row.status,
+      expiresAt: row.expires_at,
+    };
+  }
+
+  /**
+   * Bind a pending enrolment to the approving human. The ROUTE decides who
+   * may approve and what scopes survive; this records it. A leaked stub could
+   * approve for any principal — and could already call mintIssuingCa for any
+   * subject directly, so the capability class is unchanged.
+   */
+  async approveTierEnrolment(params: {
+    userCode: string;
+    principalId: string;
+    identity: string;
+    authMethod: string;
+    scopes: string[];
+  }): Promise<{ ok: true } | { ok: false; reason: "not_found" | "expired" | "not_pending" }> {
+    this.#ensureTierEnrolmentSchema();
+    const now = Math.floor(Date.now() / 1000);
+    const row = this.ctx.storage.sql
+      .exec("SELECT status, expires_at FROM tier_enrolments WHERE user_code = ?", params.userCode)
+      .toArray()[0] as { status: string; expires_at: number } | undefined;
+    if (!row) return { ok: false, reason: "not_found" };
+    if (row.expires_at <= now) return { ok: false, reason: "expired" };
+    if (row.status !== "pending") return { ok: false, reason: "not_pending" };
+    this.ctx.storage.sql.exec(
+      `UPDATE tier_enrolments
+          SET status = 'approved', principal_id = ?, identity = ?, auth_method = ?, granted_scopes = ?
+        WHERE user_code = ? AND status = 'pending'`,
+      params.principalId,
+      params.identity,
+      params.authMethod,
+      JSON.stringify(params.scopes),
+      params.userCode,
+    );
+    return { ok: true };
+  }
+
+  /**
+   * The machine collects its tier. The proof is verified HERE, against the
+   * key recorded at start, over `"notme/tier-enrol/v1\0" || SPKI ||
+   * SHA-256(device_code)`. A bad proof does not consume the enrolment — a
+   * thief holding the device code but not the key must not be able to burn
+   * the real holder's approval. A good one consumes it before minting.
+   */
+  async collectTierEnrolment(params: { deviceCode: string; proof: string }): Promise<
+    | ({ ok: true; principalId: string; authMethod: string } &
+        import("./cert-authority").IssuingCaCertResult & {
+          authority: { epoch: number; key_id: string };
+        })
+    | {
+        ok: false;
+        reason: "authorization_pending" | "expired_token" | "invalid_grant" | "invalid_proof";
+      }
+  > {
+    this.#ensureTierEnrolmentSchema();
+    if (typeof params.deviceCode !== "string" || params.deviceCode.length === 0) {
+      return { ok: false, reason: "invalid_grant" };
+    }
+    const deviceCodeHash = hex(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(params.deviceCode)),
+      ),
+    );
+    const row = this.ctx.storage.sql
+      .exec("SELECT * FROM tier_enrolments WHERE device_code_hash = ?", deviceCodeHash)
+      .toArray()[0] as
+      | {
+          public_key_pem: string;
+          status: string;
+          principal_id: string;
+          identity: string;
+          auth_method: string;
+          granted_scopes: string;
+          expires_at: number;
+        }
+      | undefined;
+    if (!row) return { ok: false, reason: "invalid_grant" };
+    if (row.expires_at <= Math.floor(Date.now() / 1000)) {
+      return { ok: false, reason: "expired_token" };
+    }
+    if (row.status === "pending") return { ok: false, reason: "authorization_pending" };
+    if (row.status !== "approved") return { ok: false, reason: "invalid_grant" };
+
+    const { importPublicKey } = await import("./cert-authority");
+    const key = await importPublicKey(row.public_key_pem);
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
+    const { verifyEd25519PopProof } = await import("./auth/pop");
+    if (!(await verifyEd25519PopProof(tierEnrolmentBinding(spki, deviceCodeHash), key, params.proof))) {
+      return { ok: false, reason: "invalid_proof" };
+    }
+
+    // Consume first, atomically: of two concurrent collects with a valid
+    // proof, exactly one sees changes() = 1.
+    this.ctx.storage.sql.exec(
+      "UPDATE tier_enrolments SET status = 'consumed' WHERE device_code_hash = ? AND status = 'approved'",
+      deviceCodeHash,
+    );
+    const [change] = [
+      ...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n"),
+    ];
+    if (change.n !== 1) return { ok: false, reason: "invalid_grant" };
+
+    const result = await this.mintIssuingCa({
+      subject: row.principal_id,
+      identity: row.identity,
+      publicKeyPem: row.public_key_pem,
+      scopes: JSON.parse(row.granted_scopes),
+      authMethod: row.auth_method,
+    });
+    return { ok: true, principalId: row.principal_id, authMethod: row.auth_method, ...result };
   }
 
   // Current epoch and keyId for embedding in issued certs.

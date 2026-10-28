@@ -1133,6 +1133,63 @@ function parseCookie(cookieHeader: string, name: string): string | null {
 // All params are injected via data attributes on a hidden div — no inline
 // script variables, no eval. The JS reads them via dataset.
 
+/**
+ * The tier-enrolment approval page (notme-486e8a). The fingerprint is the
+ * point: device flow's known weakness is a human approving SOMEONE ELSE'S
+ * code, and comparing the key fingerprint the machine printed is the check
+ * that defeats it. Values reach the script as data attributes, never as
+ * script text.
+ */
+function enrolPageHtml(
+  userCode: string,
+  fingerprint: string,
+  scopes: string[],
+  status: string,
+): string {
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const fp = fingerprint.slice(0, 16).match(/..../g)!.join(" ");
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>enrol a machine — auth.notme.bot</title>
+  <style>
+    body { background:#1c1810; color:#e8dcc8; font-family:ui-monospace,monospace; max-width:560px; margin:10vh auto; padding:0 20px; line-height:1.6 }
+    code { color:#f0c674; font-size:1.25em }
+    button { margin-top:20px; padding:10px 18px; font:inherit; background:#e8dcc8; color:#1c1810; border:0; cursor:pointer }
+    .muted { color:#9a8f7c; font-size:.9em }
+  </style>
+</head>
+<body data-code="${esc(userCode)}">
+  <h1>Enrol a machine</h1>
+  <p>A machine is asking to act on your behalf. It will be able to mint task certificates offline, under your identity, for up to 24 hours.</p>
+  <p>Code: <code>${esc(userCode)}</code></p>
+  <p>Key fingerprint: <code>${esc(fp)}</code></p>
+  <p class="muted">Approve only if this fingerprint matches what the machine printed. If you did not start this, close the page.</p>
+  <p class="muted">Requested scopes: ${esc(scopes.join(", ") || "bridgeCert")} — certMint is never delegated.</p>
+  ${status === "pending" ? '<button id="approve">approve</button>' : `<p>This enrolment is already ${esc(status)}.</p>`}
+  <p id="out" class="muted"></p>
+  <script>
+    var b = document.getElementById('approve');
+    if (b) b.addEventListener('click', async function () {
+      b.disabled = true;
+      var res = await fetch('/cert/issuing-ca/device/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_code: document.body.dataset.code })
+      });
+      var data = await res.json().catch(function () { return {}; });
+      document.getElementById('out').textContent = res.ok
+        ? 'Approved. Return to the machine — it will collect the certificate.'
+        : (data.error || 'failed');
+    });
+  </script>
+</body>
+</html>`;
+}
+
 function authorizePageHtml(
   redirectUri: string,
   audience: string,
@@ -2821,6 +2878,156 @@ export default {
       // the artifact is long-lived and exportable — so requested scopes pass
       // narrowScopes(session, requested) then CERT_ELIGIBLE_SCOPES, same as
       // /cert and /cert/passkey. certMint itself is never carried.
+      // ── Tier enrolment by device authorization (notme-486e8a) ─────────
+      //
+      // The way a MACHINE gets a delegation tier. /cert/issuing-ca below binds
+      // its proof to SHA-256 of the HttpOnly session cookie, which no client
+      // can read — so it was never callable and a tier was never enrollable.
+      // Here the machine holds the key and the device code, and the human
+      // approves a short user code in a passkey session after comparing the
+      // key fingerprint shown on both screens (RFC 8628 shape).
+
+      // POST /cert/issuing-ca/device — machine starts. Unauthenticated by
+      // nature; it grants nothing until a human approves.
+      if (pathname === "/cert/issuing-ca/device" && request.method === "POST") {
+        let body: { public_key?: unknown; scopes?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        if (typeof body.public_key !== "string" || !body.public_key) {
+          return jsonErr("public_key required (Ed25519 SPKI PEM)", 400);
+        }
+        const requested =
+          Array.isArray(body.scopes) && body.scopes.every((x) => typeof x === "string")
+            ? (body.scopes as string[])
+            : ["bridgeCert"];
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.startTierEnrolment({
+          publicKeyPem: body.public_key,
+          requestedScopes: requested,
+        });
+        if (!r.ok) {
+          return r.reason === "busy"
+            ? jsonErr("too many pending enrolments — retry shortly", 503)
+            : jsonErr("public_key must be an Ed25519 SPKI PEM", 400);
+        }
+        const origin = new URL(request.url).origin;
+        return Response.json({
+          device_code: r.deviceCode,
+          user_code: r.userCode,
+          verification_uri: `${origin}/enrol?code=${r.userCode}`,
+          key_fingerprint: r.keyFingerprint,
+          expires_in: r.expiresIn,
+          interval: 5,
+        });
+      }
+
+      // GET /enrol?code=XXXX-XXXX — the human's approval page.
+      if (pathname === "/enrol" && request.method === "GET") {
+        const code = (new URL(request.url).searchParams.get("code") || "").toUpperCase();
+        const siteUrl = env.SITE_URL || "https://notme.bot";
+        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const { verifySessionCookie } = await import("./src/auth/session");
+        const session = cookie
+          ? await verifySessionCookie(cookie, await authority.getSessionSecret())
+          : null;
+        if (!session) {
+          return Response.redirect(
+            `${siteUrl}/login?return_to=${encodeURIComponent(`/enrol?code=${code}`)}`,
+            302,
+          );
+        }
+        if (!/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/.test(code)) {
+          return jsonErr("malformed enrolment code", 400);
+        }
+        const e = await authority.getTierEnrolment(code);
+        if (!e) return jsonErr("no such enrolment — it may have expired", 404);
+        return new Response(enrolPageHtml(code, e.keyFingerprint, e.requestedScopes, e.status), {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Frame-Options": "DENY",
+          },
+        });
+      }
+
+      // POST /cert/issuing-ca/device/approve — the human approves. Same-origin
+      // with a SameSite=Strict session, so a cross-site page cannot submit it.
+      if (pathname === "/cert/issuing-ca/device/approve" && request.method === "POST") {
+        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        if (!cookie) return jsonErr("session_required", 401);
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const { verifySessionCookie, liveScopes } = await import("./src/auth/session");
+        const session = await verifySessionCookie(cookie, await authority.getSessionSecret());
+        if (!session) return jsonErr("invalid_session", 401);
+        // LIVE grants, not the cookie's copy: a revoked certMint stops
+        // working now, not when the cookie expires.
+        const live = await liveScopes(session, authority);
+        if (!live.includes("certMint")) return jsonErr("certMint scope required", 403);
+        if (typeof session.authMethod !== "string" || !session.authMethod) {
+          return jsonErr("session carries no authMethod", 401);
+        }
+        let body: { user_code?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        const userCode = typeof body.user_code === "string" ? body.user_code.toUpperCase() : "";
+        const pending = await authority.getTierEnrolment(userCode);
+        if (!pending) return jsonErr("no such enrolment", 404);
+        const { narrowScopes } = await import("./src/auth/scope-chain");
+        const { certScopesForSession } = await import("./src/auth/passkey-cert-scopes");
+        // The tier is exportable and long-lived relative to a session, so it
+        // carries only what is safe to export — never certMint itself.
+        const scopes = certScopesForSession(narrowScopes(live, pending.requestedScopes));
+        if (scopes.length === 0) {
+          return jsonErr("no requested scope is cert-eligible and held (need bridgeCert)", 403);
+        }
+        const r = await authority.approveTierEnrolment({
+          userCode,
+          principalId: session.principalId,
+          identity: principalIdentity(wimseTrustDomain(env), session.principalId),
+          authMethod: session.authMethod,
+          scopes,
+        });
+        if (!r.ok) {
+          return jsonErr(
+            r.reason === "expired" ? "enrolment expired" : r.reason === "not_found" ? "no such enrolment" : "enrolment already decided",
+            r.reason === "not_found" ? 404 : 409,
+          );
+        }
+        return Response.json({ ok: true, scopes });
+      }
+
+      // POST /cert/issuing-ca/device/token — the machine collects. Error
+      // names are RFC 8628 §3.5's, so a generic device-flow client can poll.
+      if (pathname === "/cert/issuing-ca/device/token" && request.method === "POST") {
+        let body: { device_code?: unknown; proof?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.collectTierEnrolment({
+          deviceCode: typeof body.device_code === "string" ? body.device_code : "",
+          proof: typeof body.proof === "string" ? body.proof : "",
+        });
+        if (!r.ok) {
+          return Response.json(
+            { error: r.reason === "invalid_proof" ? "invalid_proof" : r.reason },
+            { status: r.reason === "invalid_proof" ? 401 : 400 },
+          );
+        }
+        const { ok: _ok, principalId, authMethod, ...tier } = r;
+        return Response.json({ ...tier, principal_id: principalId, auth_method: authMethod });
+      }
+
       if (pathname === "/cert/issuing-ca" && request.method === "POST") {
         try {
           const cookie = parseCookie(
@@ -2841,7 +3048,11 @@ export default {
           if (!session) {
             return Response.json({ error: "invalid_session" }, { status: 401 });
           }
-          if (!(session.scopes ?? []).includes("certMint")) {
+          // LIVE grant, not the cookie's copy (notme-486e8a). This read
+          // session.scopes, so a revoked certMint kept minting tiers until
+          // the cookie expired.
+          const { liveScopes } = await import("./src/auth/session");
+          if (!(await liveScopes(session, authority)).includes("certMint")) {
             return jsonErr("certMint scope required", 403);
           }
 

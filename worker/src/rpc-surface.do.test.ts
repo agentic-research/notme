@@ -278,7 +278,27 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       // Reachability is about who may call; argument trust is about what the
       // method concludes from what it is handed. A method can be perfectly
       // safe to expose and still be unsafe to believe.
-    ).toBe(48);
+      //
+      // 48 → 52: startTierEnrolment, getTierEnrolment, approveTierEnrolment,
+      // collectTierEnrolment (notme-486e8a). Reviewed on BOTH axes this file
+      // asks about, since notme-51ccd7 showed reachability alone is not a
+      // review.
+      //
+      //   start   — reachability: anyone, by design (the machine has no
+      //             credential yet). Argument trust: it believes nothing — it
+      //             stores a public key and grants nothing. Storage is bounded
+      //             (expired rows pruned per call, total capped).
+      //   get     — returns fingerprint, requested scopes, status, expiry for
+      //             a user code. No device code, no identity.
+      //   approve — the dangerous one: it records a caller-supplied principal
+      //             and scopes. The ROUTE decides both (live certMint grant,
+      //             scopes narrowed through certScopesForSession). A leaked
+      //             stub could approve for anyone — and could already call
+      //             mintIssuingCa for any subject directly, so the capability
+      //             class is unchanged.
+      //   collect — trusts nothing it is handed: it verifies the PoP itself,
+      //             against the key recorded at start, and consumes atomically.
+    ).toBe(52);
   });
 });
 
