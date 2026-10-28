@@ -572,7 +572,7 @@
             "https://auth.notme.bot/cert/gha", "ca_bundle_endpoint":
             "https://auth.notme.bot/.well-known/ca-bundle.pem",
             "algorithms_supported": ["Ed25519"], "grant_types_supported": [
-            "github_actions_oidc", "dpop" ], "cert_types_supported":
+            "urn:ietf:params:oauth:grant-type:token-exchange" ], "cert_types_supported":
             ["bridge_certificate"], "token_endpoint":
             "https://auth.notme.bot/token", "jwks_uri":
             "https://auth.notme.bot/.well-known/jwks.json",
@@ -719,33 +719,45 @@
         certificate binding your public key to your verified identity.
       </p>
       <p>
-        Two grant types are advertised, and they are the only two implemented:
+        One grant type is advertised, and it is the one the token endpoint
+        implements:
       </p>
       <div style="margin-bottom: 24px">
         <div class="ep-field">
-          <span class="ep-field-name">github_actions_oidc</span
+          <span class="ep-field-name">urn:ietf:params:oauth:grant-type:token-exchange</span
           ><span class="ep-field-desc"
-            >CI workflow → <code>POST /cert/gha</code> with a GitHub OIDC JWT
-            (no stored secret)</span
-          >
-        </div>
-        <div class="ep-field">
-          <span class="ep-field-name">dpop</span
-          ><span class="ep-field-desc"
-            >Sender-constrained access token → <code>POST /token</code> with a
-            DPoP proof (RFC 9449)</span
+            >RFC 8693. CI workflow → <code>POST /token</code>, form-encoded, with
+            <code>subject_token</code> = a GitHub Actions OIDC JWT
+            (<code>aud=notme.bot</code>), <code>subject_token_type</code> =
+            <code>…:token-type:id_token</code>, an <code>audience</code>, and a
+            DPoP proof (RFC 9449). Returns a DPoP-bound access token for the
+            workflow's identity carrying <code>bridgeCert</code>. The subject
+            token's <code>jti</code> is single-use across <code>/token</code>,
+            <code>/cert/gha</code> and <code>/cert</code>.</span
           >
         </div>
       </div>
+      <p>
+        Not grants, and not listed as grants: <code>POST /cert/gha</code>
+        exchanges a GitHub OIDC JWT for a <em>certificate</em> (advertised as
+        <code>cert_gha_endpoint</code>), and DPoP is a token-binding scheme
+        (advertised as <code>dpop_signing_alg_values_supported</code>). This
+        list used to read <code>github_actions_oidc, dpop</code> — neither a
+        grant type, and the token endpoint accepted neither. The browser
+        session flow (no <code>grant_type</code>) is first-party and not
+        advertised, for the same reason <code>authorization_endpoint</code> is
+        withheld.
+      </p>
       <p>
         Everything else that gets you in is an <em>authentication method</em>,
         not a grant, and the two are deliberately not conflated: passkey,
         invite, and <code>oidc:github</code> establish a session; a grant
         issues a token. An earlier revision of this page advertised
         <code>oidc_token_exchange</code> and <code>github_pat</code> as grant
-        types. Neither was ever implemented — the discovery document now
-        derives its list from a single constant in the code, so a published
-        capability claim and the code cannot drift apart again.
+        types. Neither was ever implemented. The discovery document derives its
+        list from a single constant — which keeps the documents consistent with
+        each other, not with the code; a test now posts each advertised grant
+        to <code>/token</code>, which is what keeps it true.
       </p>
       <p>
         <strong>No endpoint returns a private key.</strong> The caller

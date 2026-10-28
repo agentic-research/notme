@@ -666,6 +666,8 @@ export function getAllowedOwners(env: {
   );
 }
 
+const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
+
 function jsonErr(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
 }
@@ -3538,12 +3540,25 @@ export default {
               }
 
               // Parse body for audience — validated against module-scope ALLOWED_AUDIENCES
-              let audience = "";
+              // JSON (the first-party session flow) or form-encoded (RFC 8693
+              // token exchange, form-encoded per RFC 6749 §4.1.3).
+              let fields: Record<string, string> = {};
               try {
-                const body = (await request.json()) as { audience?: string };
-                audience = body.audience || "";
+                const ct = request.headers.get("content-type") || "";
+                fields = ct.includes("application/x-www-form-urlencoded")
+                  ? Object.fromEntries(new URLSearchParams(await request.text()))
+                  : ((await request.json()) as Record<string, string>);
               } catch {
                 /* empty body */
+              }
+              const audience = typeof fields.audience === "string" ? fields.audience : "";
+              const grantType = typeof fields.grant_type === "string" ? fields.grant_type : "";
+              // Discovery advertises exactly this grant (as-metadata.ts). An
+              // absent grant_type is the first-party session flow, which is
+              // deliberately not advertised; anything else is refused by its
+              // RFC 6749 §5.2 name rather than silently treated as a session.
+              if (grantType && grantType !== TOKEN_EXCHANGE_GRANT) {
+                return Response.json({ error: "unsupported_grant_type" }, { status: 400 });
               }
 
               if (!audience) {
@@ -3570,33 +3585,79 @@ export default {
               // (src/auth/dpop-nonce.ts), and re-fetching it below would be a
               // second DO round-trip for a value already in hand.
               let sessionSecret: string | null = null;
+              // Set for token exchange: the subject token's jti and exp, spent
+              // only after the DPoP proof verifies.
+              let exchanged: { jti: string; exp: number } | null = null;
 
-              // Try session cookie first (browser/passkey users)
-              const cookie = parseCookie(
-                request.headers.get("cookie") || "",
-                "notme_session",
-              );
-              if (cookie) {
-                const { verifySessionCookie } =
-                  await import("./src/auth/session");
-                const secret: string = await authority.getSessionSecret();
-                sessionSecret = secret;
-                const session = await verifySessionCookie(cookie, secret);
-                if (session) {
-                  principalId = session.principalId;
-                  scopes = session.scopes;
+              if (grantType === TOKEN_EXCHANGE_GRANT) {
+                // RFC 8693, a GitHub Actions OIDC token as the subject
+                // (notme-486e8a). Discovery used to advertise
+                // "github_actions_oidc" here while this endpoint accepted only
+                // a session cookie. The checks are /cert/gha's, because it is
+                // the same evidence buying a different artifact: GitHub's
+                // signature, our audience, the owner allowlist, a jti.
+                const tokenType = fields.subject_token_type || "";
+                if (
+                  tokenType !== "urn:ietf:params:oauth:token-type:id_token" &&
+                  tokenType !== "urn:ietf:params:oauth:token-type:jwt"
+                ) {
+                  return Response.json(
+                    { error: "invalid_request", error_description: "subject_token_type must be id_token or jwt" },
+                    { status: 400 },
+                  );
                 }
-              }
-
-              // X-Client-Cert path REMOVED — mTLS not configured in wrangler.toml,
-              // so the header is attacker-controlled. Re-enable only when CF mTLS
-              // bindings are active and CF injects the cert (not the client).
-
-              if (!principalId) {
-                return Response.json(
-                  { error: "session_required" },
-                  { status: 401 },
+                const cfg = getConfig(env);
+                const { validateGHAToken } = await import("./src/gha-oidc");
+                let claims: any;
+                try {
+                  claims = await validateGHAToken(fields.subject_token || "", cfg.ghaCertAudience);
+                } catch {
+                  // Coarse on purpose, as mintBridgeCert's refusals are.
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                if (
+                  !claims.jti ||
+                  !getAllowedOwners(env).has(String(claims.repository_owner).toLowerCase())
+                ) {
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                // A workload identity, exactly as /cert/gha mints: the GitHub
+                // subject, carrying bridgeCert — enough to be mint evidence
+                // (rig's notme-access-token proof), nothing more.
+                principalId = claims.sub;
+                scopes = ["bridgeCert"];
+                exchanged = { jti: claims.jti, exp: Number(claims.exp) || 0 };
+                sessionSecret = await authority.getSessionSecret();
+              } else {
+                // Session cookie (browser/passkey users)
+                const cookie = parseCookie(
+                  request.headers.get("cookie") || "",
+                  "notme_session",
                 );
+                if (cookie) {
+                  const { verifySessionCookie, liveScopes } =
+                    await import("./src/auth/session");
+                  const secret: string = await authority.getSessionSecret();
+                  sessionSecret = secret;
+                  const session = await verifySessionCookie(cookie, secret);
+                  if (session) {
+                    principalId = session.principalId;
+                    // LIVE grants, not the cookie's copy (notme-486e8a): a
+                    // revoked scope must not keep appearing in fresh tokens.
+                    scopes = await liveScopes(session, authority);
+                  }
+                }
+
+                // X-Client-Cert path REMOVED — mTLS not configured in wrangler.toml,
+                // so the header is attacker-controlled. Re-enable only when CF mTLS
+                // bindings are active and CF injects the cert (not the client).
+
+                if (!principalId) {
+                  return Response.json(
+                    { error: "session_required" },
+                    { status: 401 },
+                  );
+                }
               }
 
               // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
@@ -3677,6 +3738,17 @@ export default {
               // Atomically consume the proof JTI and mint inside the singleton DO.
               // SQLite uniqueness closes the cross-edge read/write race that an
               // eventually-consistent KV cache cannot.
+              if (exchanged) {
+                // Spent after the DPoP proof verified, in the keyspace /cert/gha
+                // and /cert's oidc proof use: one GitHub token, one spend.
+                const key = `jti:${exchanged.jti}`;
+                if (await platform.cache.get(key)) {
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                await platform.cache.put(key, "1", {
+                  expirationTtl: Math.max(60, exchanged.exp - Math.floor(Date.now() / 1000)),
+                });
+              }
               const mintResult = await authority.mintDPoPTokenOnce({
                 sub: principalId,
                 scope: scopes.join(" "),
@@ -3710,6 +3782,10 @@ export default {
                   access_token: mintResult.accessToken,
                   token_type: "DPoP",
                   expires_in: 300,
+                  // RFC 8693 §2.2.1: REQUIRED in a token-exchange response.
+                  ...(exchanged
+                    ? { issued_token_type: "urn:ietf:params:oauth:token-type:access_token" }
+                    : {}),
                 },
                 { headers: successHeaders },
               );
