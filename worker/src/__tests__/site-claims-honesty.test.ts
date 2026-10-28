@@ -30,7 +30,11 @@ const pages = readdirSync(publicDir)
   .filter((f) => f.endsWith(".html"))
   .map((f) => ({ name: f, text: readFileSync(`${publicDir}/${f}`, "utf8") }));
 
-const wrangler = readFileSync(`${workerDir}/wrangler.toml`, "utf8");
+// The committed template, not wrangler.toml: the real config is gitignored
+// (it carries Cloudflare resource IDs), so reading it made this test fail on
+// every checkout that is not a deploy machine, CI included (notme-0fff62).
+// The template declares the same bindings; it just omits the IDs.
+const wrangler = readFileSync(`${workerDir}/wrangler.toml.example`, "utf8");
 
 describe("site claims stay coupled to what the code does", () => {
   it("names no Durable Object class that is not actually bound", () => {
