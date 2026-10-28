@@ -1198,7 +1198,7 @@ function enrolPageHtml(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>enrol a machine — auth.notme.bot</title>
+  <title>enroll a machine — auth.notme.bot</title>
   <style>
     body { background:#1c1810; color:#e8dcc8; font-family:ui-monospace,monospace; max-width:560px; margin:10vh auto; padding:0 20px; line-height:1.6 }
     code { color:#f0c674; font-size:1.25em }
@@ -1207,7 +1207,7 @@ function enrolPageHtml(
   </style>
 </head>
 <body data-code="${esc(userCode)}">
-  <h1>Enrol a machine</h1>
+  <h1>Enroll a machine</h1>
   <p>A machine is asking to act on your behalf. It will be able to mint task certificates offline, under your identity, for up to 24 hours.</p>
   <p>Code: <code>${esc(userCode)}</code></p>
   <p>Key fingerprint: <code>${esc(fp)}</code></p>
@@ -2039,7 +2039,7 @@ export default {
           "notme_session",
         );
         if (!cookie) {
-          return Response.redirect(`${siteUrl}/login`, 302);
+          return Response.redirect(`${authorityUrl}/login`, 302);
         }
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
@@ -2047,7 +2047,7 @@ export default {
         const sessionSecret = await authority.getSessionSecret();
         const session = await verifySessionCookie(cookie, sessionSecret);
         if (!session) {
-          return Response.redirect(`${siteUrl}/login`, 302);
+          return Response.redirect(`${authorityUrl}/login`, 302);
         }
         if (wantsJson(request)) {
           return Response.json({
@@ -2961,17 +2961,17 @@ export default {
         return Response.json({
           device_code: r.deviceCode,
           user_code: r.userCode,
-          verification_uri: `${origin}/enrol?code=${r.userCode}`,
+          verification_uri: `${origin}/enroll?code=${r.userCode}`,
           key_fingerprint: r.keyFingerprint,
           expires_in: r.expiresIn,
           interval: 5,
         });
       }
 
-      // GET /enrol?code=XXXX-XXXX — the human's approval page.
-      if (pathname === "/enrol" && request.method === "GET") {
+      // GET /enroll?code=XXXX-XXXX — the human's approval page. `/enrol`
+      // (the first spelling, which shipped in a live URL) stays an alias.
+      if ((pathname === "/enroll" || pathname === "/enrol") && request.method === "GET") {
         const code = (new URL(request.url).searchParams.get("code") || "").toUpperCase();
-        const siteUrl = env.SITE_URL || "https://notme.bot";
         const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
         const { verifySessionCookie } = await import("./src/auth/session");
@@ -2980,7 +2980,11 @@ export default {
           : null;
         if (!session) {
           return Response.redirect(
-            `${siteUrl}/login?return_to=${encodeURIComponent(`/enrol?code=${code}`)}`,
+            // The AUTHORITY's /login, not SITE_URL's (notme-486e8a): the
+            // passkey ceremony and the session cookie live on this host.
+            // Every login redirect here used SITE_URL — in production
+            // https://notme.bot/login, a 404.
+            `${authorityUrl}/login?return_to=${encodeURIComponent(`/enroll?code=${code}`)}`,
             302,
           );
         }
@@ -3301,7 +3305,7 @@ export default {
           // No session — redirect to login, then come back
           const returnTo = `/authorize?${url.searchParams.toString()}`;
           return Response.redirect(
-            `${siteUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
+            `${authorityUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
             302,
           );
         }
@@ -3314,7 +3318,7 @@ export default {
         if (!session) {
           const returnTo = `/authorize?${url.searchParams.toString()}`;
           return Response.redirect(
-            `${siteUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
+            `${authorityUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
             302,
           );
         }

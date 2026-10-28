@@ -105,7 +105,7 @@ describe("starting an enrolment (notme-486e8a)", () => {
     const e = await started();
     expect(e.device_code.length).toBeGreaterThanOrEqual(43);
     expect(e.user_code).toMatch(/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/);
-    expect(e.verification_uri).toBe(`${ORIGIN}/enrol?code=${e.user_code}`);
+    expect(e.verification_uri).toBe(`${ORIGIN}/enroll?code=${e.user_code}`);
     // The fingerprint the human compares: SHA-256 of the SPKI, hex.
     const fp = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", e.key.spki)))
       .map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -145,7 +145,7 @@ describe("the human approves with a passkey session", () => {
   it("serves an approval page that shows the fingerprint to compare", async () => {
     const e = await started();
     const { cookie } = await humanWith(["bridgeCert", "certMint"]);
-    const res = await call(`${ORIGIN}/enrol?code=${e.user_code}`, { headers: { cookie } });
+    const res = await call(`${ORIGIN}/enroll?code=${e.user_code}`, { headers: { cookie } });
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain(e.user_code);

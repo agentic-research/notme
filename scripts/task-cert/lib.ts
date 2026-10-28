@@ -3,7 +3,7 @@
  * delegation tier and mint task certificates offline.
  *
  * The flow it implements:
- *   1. enrol — generate a tier keypair HERE; ask the authority for a device
+ *   1. enroll — generate a tier keypair HERE; ask the authority for a device
  *      enrolment; a human approves the user code with their passkey; collect
  *      the tier with a proof over the device code.
  *   2. mint  — per task, with no network: a cert pair whose identity is

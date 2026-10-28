@@ -136,7 +136,7 @@ cookie, which no client can read, so nothing could call it — and the same was
 true of `/cert/issuing-ca`, this ADR's D4 tier. Both now work: the passkey
 route binds a session nonce from `POST /cert/nonce`, and the tier is enrolled
 by device authorization (`POST /cert/issuing-ca/device`, approved with a
-passkey at `/enrol`). `/cert/gha` is case 3 and carries **no represented principal
+passkey at `/enroll`). `/cert/gha` is case 3 and carries **no represented principal
 at all**: `worker.ts:746` builds the identity from `repository_owner` and the
 repo name, and mints with `subject: claims.sub` and `scopes: ["bridgeCert"]` —
 so the cert says *what ran*, never *whose authority it ran under*. That is

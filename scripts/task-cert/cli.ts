@@ -2,16 +2,16 @@
 /**
  * notme task certificates from a machine (notme-486e8a).
  *
- *   task-cert enrol  [--authority URL] [--dir DIR]
+ *   task-cert enroll [--authority URL] [--dir DIR]   (alias: enrol)
  *   task-cert mint   --task ID --goal TEXT [--scopes a,b] [--ttl-min N] [--out DIR] [--dir DIR]
  *   task-cert verify --cert FILE [--dir DIR]
  *   task-cert status [--dir DIR]
  *
  * State lives in --dir (default ~/.notme/tier): the tier cert, its private
- * key (0600, PKCS#8), the authority root pinned at enrol time, and metadata.
+ * key (0600, PKCS#8), the authority root pinned at enroll time, and metadata.
  *
  * TRUST, stated plainly: the root is fetched over TLS from the authority at
- * enrol time and pinned. After that, mint and verify never touch the network.
+ * enroll time and pinned. After that, mint and verify never touch the network.
  * The private key on disk is the tier — anyone who reads it can mint task
  * certs as you until it expires (≤24h). It is protected by file permissions
  * only.
@@ -40,11 +40,11 @@ const authority = (a.authority || "https://auth.notme.bot").replace(/\/$/, "");
 
 function need(f: string) {
   const p = join(dir, f);
-  if (!existsSync(p)) throw new Error(`no ${f} in ${dir} — run \`task-cert enrol\` first`);
+  if (!existsSync(p)) throw new Error(`no ${f} in ${dir} — run \`task-cert enroll\` first`);
   return readFileSync(p, "utf8");
 }
 
-async function enrol() {
+async function enroll() {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const key = await generateTierKey();
   const start = await startEnrolment(authority, key.pem, a.scopes ? a.scopes.split(",") : undefined);
@@ -114,12 +114,13 @@ async function verify() {
 async function status() {
   const meta = JSON.parse(need("tier.json"));
   const left = meta.expires_at * 1000 - Date.now();
-  console.log(`${meta.identity}\n  ${left > 0 ? `expires in ${Math.round(left / 60000)} min` : "EXPIRED — run enrol again"}`);
+  console.log(`${meta.identity}\n  ${left > 0 ? `expires in ${Math.round(left / 60000)} min` : "EXPIRED — run enroll again"}`);
 }
 
-const run = { enrol, mint, verify, status }[cmd ?? ""];
+// `enrol` is the first spelling, kept so existing instructions still work.
+const run = { enroll, enrol: enroll, mint, verify, status }[cmd ?? ""];
 if (!run) {
-  console.error("usage: task-cert <enrol|mint|verify|status> [...]  (see header of scripts/task-cert/cli.ts)");
+  console.error("usage: task-cert <enroll|mint|verify|status> [...]  (see header of scripts/task-cert/cli.ts)");
   process.exit(2);
 }
 Promise.resolve(run()).catch((e) => {

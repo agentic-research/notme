@@ -437,8 +437,8 @@ tasks:
       - 'echo "Direct path (skips canary): task worker:deploy && task worker:verify"'
 
   task-cert:
-    desc: "Machine-side task certificates — enrol (passkey approval) | mint | verify | status (notme-486e8a)"
-    # e.g. task task-cert -- enrol
+    desc: "Machine-side task certificates — enroll (passkey approval) | mint | verify | status (notme-486e8a)"
+    # e.g. task task-cert -- enroll
     #      task task-cert -- mint --task rosary-056d96 --goal "..."
     #      task task-cert -- verify --cert task-rosary-056d96/signing.pem
     cmds:
