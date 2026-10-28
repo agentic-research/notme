@@ -2674,7 +2674,7 @@ export default {
       // This is the core signet protocol endpoint.
       if (pathname === "/cert" && request.method === "POST") {
         const { handleCertExchange } = await import("./src/cert-exchange");
-        return handleCertExchange(request, env);
+        return handleCertExchange(request, env, platform);
       }
 
       // POST /cert/passkey — authenticated session → bridge cert pair.

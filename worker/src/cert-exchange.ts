@@ -63,6 +63,10 @@ export interface TokenExchangeResponse {
 export async function handleCertExchange(
   request: Request,
   env: any,
+  // Only the OIDC proof needs it: its jti is single-use, in the same
+  // keyspace /cert/gha uses (`jti:<jti>`), so a GitHub token is spendable
+  // once across both routes.
+  platform?: { cache: { get(k: string): Promise<string | null>; put(k: string, v: string, o?: { expirationTtl?: number }): Promise<void> } },
 ): Promise<Response> {
   if (request.method !== "POST") {
     return Response.json({ error: "method not allowed" }, { status: 405 });
@@ -80,6 +84,9 @@ export async function handleCertExchange(
   let principalId: string;
   let grantedScopes: string[];
   let authMethod: string;
+  // Set only for OIDC proofs: the token the PoP binds, and its jti/exp for
+  // single-use accounting after the proofs verify.
+  let oidc: { token: string; jti: string; exp: number } | null = null;
 
   // ── Resolve proof to principal ──
 
@@ -118,21 +125,46 @@ export async function handleCertExchange(
     }
     authMethod = session.authMethod;
   } else if (body.proof.type === "oidc") {
-    // OIDC principal lookup not yet wired to DO RPC.
-    // Verify the token (to fail fast on bad input), then return 501.
+    // ADR-019 case 3: automation acting under a PRINCIPAL's authority. The
+    // verified OIDC identity resolves to the principal it was LINKED to
+    // (by redeeming an invite with this OIDC proof); /cert/gha, by contrast,
+    // mints a workload identity that represents no principal.
+    //
+    // This branch used to verify the token and return 501 — while the API
+    // docs advertised `oidc` as a supported proof type with an example.
     const { verifyOIDC } = await import("./auth/verify-proof");
+    let identity: { issuer: string; subject: string };
     try {
-      await verifyOIDC(body.proof.token, "notme.bot");
+      identity = await verifyOIDC(body.proof.token, "notme.bot");
     } catch (e: any) {
+      return Response.json({ error: "invalid token: " + e.message }, { status: 401 });
+    }
+    const claims = JSON.parse(
+      atob(body.proof.token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/")),
+    ) as { jti?: unknown; exp?: unknown };
+    if (typeof claims.jti !== "string" || !claims.jti) {
+      return Response.json({ error: "jti claim required for replay protection" }, { status: 400 });
+    }
+    if (!body.public_keys?.mtls || !body.public_keys?.signing || !body.proofs?.mtls || !body.proofs?.signing) {
+      // A cert pair is what this proof buys. The token branch below is the
+      // session's; an OIDC token already IS a bearer token.
       return Response.json(
-        { error: "invalid token: " + e.message },
-        { status: 401 },
+        { error: "an oidc proof exchanges for a cert pair — send public_keys and proofs" },
+        { status: 400 },
       );
     }
-    return Response.json(
-      { error: "oidc_not_implemented", message: "OIDC proof path not yet wired to DO — use passkey or GHA OIDC at /cert/gha" },
-      { status: 501 },
-    );
+    const found = await authority.findPrincipalByOIDC(identity.issuer, identity.subject);
+    if (!found) {
+      return Response.json(
+        { error: "unknown identity — link it first by redeeming an invite with this OIDC proof" },
+        { status: 403 },
+      );
+    }
+    principalId = found;
+    // LIVE grants — there is no cookie here to mistake for the source.
+    grantedScopes = await authority.getPrincipalScopes(found);
+    authMethod = `oidc:${identity.issuer}`;
+    oidc = { token: body.proof.token, jti: claims.jti, exp: Number(claims.exp) || 0 };
   } else if (body.proof.type === "bootstrap") {
     // Bootstrap code — deployer only
     const valid = await authority.consumeBootstrapCode(body.proof.code);
@@ -239,7 +271,15 @@ export async function handleCertExchange(
     const mtlsSpki = (await crypto.subtle.exportKey("spki", mtlsPubKey)) as ArrayBuffer;
     const signingSpki = (await crypto.subtle.exportKey("spki", signingPubKey)) as ArrayBuffer;
     let bindingInput: Uint8Array;
-    if (body.proof.type === "session") {
+    if (oidc) {
+      // Same binding as /cert/gha: captured proofs cannot be paired with
+      // another token.
+      const tokenHash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(oidc.token));
+      bindingInput = new Uint8Array(mtlsSpki.byteLength + signingSpki.byteLength + 32);
+      bindingInput.set(new Uint8Array(mtlsSpki), 0);
+      bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
+      bindingInput.set(new Uint8Array(tokenHash), mtlsSpki.byteLength + signingSpki.byteLength);
+    } else if (body.proof.type === "session") {
       if (typeof body.nonce !== "string" || !body.nonce) {
         return Response.json(
           { error: "nonce required with public_keys on a session proof — POST /cert/nonce first" },
@@ -264,6 +304,19 @@ export async function handleCertExchange(
     // Spent only after the proofs verify; bound to this principal.
     if (body.proof.type === "session" && !(await authority.consumePopNonce(body.nonce!, principalId))) {
       return Response.json({ error: "invalid_nonce" }, { status: 401 });
+    }
+    // The OIDC token's jti, likewise spent only after the proofs verify, so a
+    // forged request cannot burn the real holder's token.
+    if (oidc) {
+      if (!platform) {
+        return Response.json({ error: "replay protection unavailable" }, { status: 500 });
+      }
+      const key = `jti:${oidc.jti}`;
+      if (await platform.cache.get(key)) {
+        return Response.json({ error: "token already used" }, { status: 401 });
+      }
+      const ttl = Math.max(60, oidc.exp - Math.floor(Date.now() / 1000));
+      await platform.cache.put(key, "1", { expirationTtl: ttl });
     }
 
     const { wimseTrustDomain } = await import("../worker");
