@@ -63,6 +63,7 @@ import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
 import { principalIdentity } from "./src/cert-authority";
 import { buildInfo } from "./src/build-version";
+import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
 
 function isDeniedDestination(url: string): boolean {
   try {
@@ -1585,18 +1586,6 @@ const HANDOFF_SCHEMA = {
   },
 };
 
-function wantsJson(request: Request): boolean {
-  const accept = request.headers.get("Accept") || "";
-  // Explicitly request JSON, for API tools
-  if (
-    accept.includes("application/json") ||
-    accept.includes("application/schema+json")
-  ) {
-    return true;
-  }
-  // For all other requests (including browsers), default to HTML
-  return false;
-}
 
 function renderPredicateHtml(schema: Record<string, unknown>): Response {
   const title = schema.title as string;
@@ -1789,20 +1778,6 @@ export function siteHostFromEnv(siteUrl: string | undefined): string {
 // edge cache entirely. We use the Cache API to store and serve them at the edge.
 // Cache key includes Accept header for content-negotiated routes.
 
-function cacheKey(request: Request, vary?: string): Request {
-  // For content-negotiated routes, include Accept in the cache key so
-  // JSON and HTML responses are cached separately. Preserve caller query
-  // parameters so deployment verification can bypass entries created by an
-  // older Worker version. `_cache=v2` invalidates the v1 keys, which dropped
-  // the query string and classified application/schema+json as HTML.
-  if (vary === "Accept") {
-    const url = new URL(request.url);
-    url.searchParams.set("_accept", wantsJson(request) ? "json" : "html");
-    url.searchParams.set("_cache", "v2");
-    return new Request(url.toString(), request);
-  }
-  return request;
-}
 
 // Edge cache disabled when cacheApiOutbound is not configured (local workerd).
 let cacheEnabled = true;
@@ -1840,6 +1815,9 @@ async function cacheMatch(
 
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
+    // Every cache key carries the build, so a deploy is never answered from
+    // the previous version's entries (notme-486e8a, src/cache-key.ts).
+    setCacheBuild(env);
     // ── CORS: handle preflight + restrict origins ──
     const requestOrigin = request.headers.get("Origin") || "";
     const CORS_ALLOWED_ORIGINS = new Set([
