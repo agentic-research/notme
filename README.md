@@ -11,9 +11,9 @@ your agents are you. they shouldn't be.
 
 every AI coding tool uses your credentials. your PAT, your SSH key, your OAuth token. when the agent is compromised, the attacker is you. there's no separation, no scope, no revocation.
 
-notme is the identity layer that fixes this. agents get their own cryptographic identity — scoped, ephemeral, revocable (one grant, one principal, effective on the next request), distinct from the human who deployed them.
+notme is the identity layer that fixes this. agents get their own cryptographic identity — scoped, ephemeral, revocable (a grant on the next request, a machine at its next renewal), distinct from the human who deployed them.
 
-under the hood, notme is an identity **normalizer**. bring any auth you already passed — a passkey, a GitHub Actions OIDC token, a PAT, mTLS — and it re-issues that identity as a **standard** credential the rest of your stack already speaks: an X.509 bridge certificate (mTLS today; scoped for git signing and attestation) or a DPoP-bound OAuth access token ([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449)) for HTTP and MCP. one Ed25519 authority signs both; the key never leaves process memory.
+under the hood, notme is an identity **normalizer**. bring auth you already passed — a passkey, a GitHub Actions OIDC token, or an OIDC identity you've linked to your passkey — and it re-issues that identity as a **standard** credential the rest of your stack already speaks: an X.509 bridge certificate (mTLS today; scoped for git signing and attestation) or a DPoP-bound OAuth access token ([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449)) for HTTP and MCP. one Ed25519 authority signs both, and its private key is never exported — no HTTP route or RPC method returns it.
 
 mechanically it's a bridge **certificate authority** *and* an OAuth **authorization server** over a single root — and deliberately **not** an OpenID provider. it never vends a third party a bearer claim about who you are; it converts auth you already proved into proof-of-possession you can't hand off by copying.
 
@@ -59,9 +59,9 @@ graph TD
 
     Signet --> F1["Agent Identity Model<br/>(separate from human)"]:::feature
     Signet --> F2["5-minute Ephemeral Credentials<br/>(re-issued, never extended)"]:::feature
-    Signet --> F3["Secretless Local Authority<br/>(keys never leave process memory)"]:::feature
+    Signet --> F3["Secretless Authority<br/>(private keys never exported)"]:::feature
 
-    F1 & F2 & F3 --> End((Stolen Token = 5 Minutes Max<br/>Private Key = Never Leaves Memory)):::signet
+    F1 & F2 & F3 --> End((Stolen Token or Cert = 5 Minutes Max<br/>Private Keys = Never Exported)):::signet
 ```
 
 ## how it works
@@ -75,35 +75,35 @@ graph LR
 
     subgraph auth_layer ["any auth layer"]
         Passkey["passkey / WebAuthn"]:::auth
-        OIDC["GHA OIDC / k8s OIDC"]:::auth
-        CFAccess["CF Access / mTLS"]:::auth
-        Custom["your auth"]:::auth
+        OIDC["GitHub Actions OIDC"]:::auth
+        Linked["linked OIDC identity"]:::auth
     end
 
     subgraph signet_protocol ["signet protocol"]
         Verify["identity verified?"]:::protocol
-        Sign["authority signs token<br/>(Ed25519, key never exported)"]:::protocol
+        Sign["authority signs<br/>(Ed25519, key never exported)"]:::protocol
     end
 
     subgraph result ["what you get"]
-        Token["access token<br/>5 min · scoped · revocable<br/>proof-of-possession (DPoP)"]:::token
+        Cert["bridge cert pair<br/>mTLS + signing · 5 min · scoped<br/>your keys, never sent"]:::token
+        Token["access token<br/>5 min · scoped<br/>proof-of-possession (DPoP)"]:::token
     end
 
     Passkey --> Verify
     OIDC --> Verify
-    CFAccess --> Verify
-    Custom --> Verify
+    Linked --> Verify
 
     Verify -->|"yes"| Sign
+    Sign --> Cert
     Sign --> Token
 
-    Token --> Git["sign commits"]:::use
-    Token --> MCP["auth to MCP"]:::use
-    Token --> APAS["APAS attestation"]:::use
-    Token --> API["API requests"]:::use
+    Cert --> Git["sign commits"]:::use
+    Cert --> APAS["APAS attestation"]:::use
+    Cert --> MCP["mTLS to MCP"]:::use
+    Token --> API["HTTP / MCP requests"]:::use
 ```
 
-the authority doesn't care how you authenticated. it cares that you did. any auth layer feeds into the same protocol — the output is a scoped, ephemeral, proof-of-possession token. the signing key never leaves process memory.
+the authority doesn't care how you authenticated. it cares that you did. each supported proof feeds the same protocol — the output is a scoped, ephemeral, proof-of-possession credential: a cert pair over keys you generated, or a DPoP-bound token. the authority's signing key is never exported.
 
 ## agents, machines and tasks
 
@@ -142,6 +142,8 @@ graph LR
 | `epoch_changed` | the authority's mass-revocation lever was pulled | `enroll` again |
 | `approval_withdrawn` | you no longer hold `certMint`, or the granted scopes | restore the grant, or `enroll` |
 
+the machine's tier key is the approval: whoever holds it can renew until you revoke the machine or the horizon passes. pick the shortest horizon that covers your pauses.
+
 **revocation levers, narrowest first:**
 
 | lever | reaches | takes effect |
@@ -178,8 +180,8 @@ action/             GHA action — OIDC → bridge cert pair (zero secrets, zero
 scripts/task-cert/  machine-side CLI — enroll, renew, mint tasks and subtasks, verify
 gen/ts/             shared SDK — base64url, validateClaims, computeJwkThumbprint
 schema/             cap'n proto type definitions (CABundle, GHAClaims, etc.)
-packages/           container image pipeline (melange + apko, 40MB OCI)
-docs/design/        design specs (007-secretless-local-proxy)
+packages/           container image pipeline (melange + apko) + workspace libs (contract, dpop)
+docs/design/        ADRs 005–022
 ```
 
 see [ARCHITECTURE.md](ARCHITECTURE.md) for the full subsystem map, data flow, and security model.
@@ -206,7 +208,7 @@ see [ARCHITECTURE.md](ARCHITECTURE.md) for the full subsystem map, data flow, an
 | `GET` | `/me` | current session info (JSON or HTML) |
 | `POST` | `/invites` | create scoped invite (requires authorityManage) |
 | `GET/POST` | `/join` | redeem invite |
-| `POST` | `/connect/*` | link federated identity (OIDC provider) |
+| `GET/POST` | `/connections` | link an OIDC identity or X.509 cert to your passkey |
 | `GET` | `/.well-known/signet-authority.json` | authority discovery |
 | `GET` | `/.well-known/jwks.json` | Ed25519 public key (JWK Set) |
 | `GET` | `/.well-known/ca-bundle.pem` | X.509 CA certificate |
@@ -217,14 +219,14 @@ three ways — same code, same behavior.
 
 **local (workerd)**
 ```bash
-cd worker && npm ci && npm run build:local
-npx workerd serve config.capnp --experimental
+pnpm install
+task worker:serve      # builds the dpop lib + bundle, then runs workerd
 # → http://localhost:8788
 ```
 
 **container (published image)**
 ```bash
-docker run -p 8788:8788 ghcr.io/agentic-research/notme:0.1.0
+docker run -p 8788:8788 ghcr.io/agentic-research/notme:0.2.0
 curl localhost:8788/health    # → 200 ok
 ```
 
@@ -232,7 +234,7 @@ Multi-arch (x86_64 + aarch64), distroless, and cosign-signed. Verify the
 signature before running it:
 
 ```bash
-cosign verify ghcr.io/agentic-research/notme:0.1.0 \
+cosign verify ghcr.io/agentic-research/notme:0.2.0 \
   --certificate-identity-regexp '^https://github\.com/agentic-research/notme/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -247,7 +249,7 @@ The mTLS forward proxy ships as its own image, since a cloister cluster runs
 it as a separate bundle:
 
 ```bash
-docker run ghcr.io/agentic-research/notme-proxy:0.1.0 \
+docker run ghcr.io/agentic-research/notme-proxy:0.2.0 \
   --cert /run/notme/bridge-cert.pem \
   --key  /run/notme/bridge-key.pem \
   --listen 127.0.0.1:1080
@@ -277,7 +279,7 @@ cp wrangler.toml.example wrangler.toml
 wrangler deploy
 ```
 
-CA key is generated on first request. In ephemeral mode (local/container), the private key exists only in process memory — `cat *.sqlite | strings | grep '"d"'` returns nothing.
+CA key is generated on first request. On Cloudflare it persists in the Durable Object's storage (encrypted at rest by Cloudflare; set `NOTME_KEK_SECRET` to also wrap it under a key you hold). In ephemeral mode (local/container), the private key exists only in process memory — `cat *.sqlite | strings | grep '"d"'` returns nothing.
 
 **first boot — no secret.** set `BOOTSTRAP_GHA_SUBJECT` (a var, e.g. `repo:you/notme:ref:refs/heads/main`), open `/login`, and register a passkey: on an authority with no administrator it becomes a **claim** holding nothing, and the page shows a code. then
 
@@ -290,12 +292,11 @@ and sign in again — you are the administrator. nothing is set, typed or logged
 ## testing
 
 ```bash
-cd worker
-npx vitest run         # 400 tests (unit + adversarial)
-npm run test:do        # 32 real-Durable-Object tests (vitest-pool-workers)
-bash test-local.sh     # workerd smoke test
-bash test-e2e.sh       # Playwright e2e (virtual authenticator)
-cd ../proxy && cargo test  # Rust tests (parser, UDS bind, perms)
+task worker:check      # typecheck + unit/adversarial tests + real-Durable-Object tests
+task docs:check        # every annotated doc claim checked against the code
+task proxy:check       # Rust proxy: build, test, clippy
+cd worker && bash test-local.sh   # workerd smoke test
+cd worker && bash test-e2e.sh     # Playwright e2e (virtual authenticator)
 ```
 
 ## repo layout
@@ -307,11 +308,10 @@ cd ../proxy && cargo test  # Rust tests (parser, UDS bind, perms)
 | `action/` | GitHub Action — `notme/action@<sha>`. CI-side identity exchange. | [action/README.md](action/README.md) |
 | `schema/` | Cap'n Proto schemas — declared single source of truth for cross-language types. | [schema/README.md](schema/README.md) |
 | `gen/` | Generated TS + Go from `schema/`. Don't edit manually. | [gen/README.md](gen/README.md) |
-| `wasm/` | Empty slot for `leyline-sign` wasm32 artifact (gated on `ley-line-c764c6`). | [wasm/README.md](wasm/README.md) |
-| `scripts/` | Standalone tooling (`doc-check.ts` etc.). | [scripts/README.md](scripts/README.md) |
-| `packages/` | melange + apko — signed container bundles for self-hosted deployments. | [packages/README.md](packages/README.md) |
-| `docs/design/` | ADRs 005-009. | [docs/README.md](docs/README.md) |
-| `vault/` | Credential vault Worker — *moving to cloister; will become AGPL-3.0 there* | [vault/README.md](vault/README.md) |
+| `wasm/` | Empty and superseded — `leyline_sign.wasm` ships from ley-line-open instead. Kept as history. | [wasm/README.md](wasm/README.md) |
+| `scripts/` | Standalone tooling: `task-cert/` (machine-side CLI), `doc-check.ts`, etc. | [scripts/README.md](scripts/README.md) |
+| `packages/` | melange + apko signed container bundles, plus the `contract` and `dpop` workspace libraries. | [packages/README.md](packages/README.md) |
+| `docs/design/` | ADRs 005–022. | [docs/README.md](docs/README.md) |
 
 ## related
 
