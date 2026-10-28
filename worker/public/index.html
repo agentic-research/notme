@@ -834,12 +834,12 @@
             <tr>
               <td>identity</td>
               <td>your GitHub PAT</td>
-              <td>agent's own Ed25519 cert (ML-DSA-44 ready)</td>
+              <td>agent's own Ed25519 cert</td>
             </tr>
             <tr>
               <td>scope</td>
               <td>all your repos</td>
-              <td>per-repo scope in cert + orchestrator enforcement</td>
+              <td>repo identity in the cert subject; scopes in the cert chain, narrowing at each hop</td>
             </tr>
             <tr>
               <td>lifetime</td>
@@ -849,12 +849,12 @@
             <tr>
               <td>revocation</td>
               <td>rotate your token</td>
-              <td>near-real-time edge revoke</td>
+              <td>revoke the signing generation (within 5 min), or the principal's grants</td>
             </tr>
             <tr>
               <td>audit trail</td>
               <td>nothing</td>
-              <td>content-linked chain + in-toto/DSSE handoff envelopes</td>
+              <td>content-linked chain hash; in-toto/DSSE envelopes planned</td>
             </tr>
             <tr>
               <td>on compromise</td>

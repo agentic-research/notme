@@ -224,3 +224,234 @@ describe("a revoked admin cannot pass authority on from a stale cookie", () => {
     expect(((await res.json()) as { error: string }).error).toMatch(/certMint/);
   });
 });
+
+// ── The grant needs an IDENTITY, and history needs to survive a re-grant ────
+//
+// `capability_grants` declared `UNIQUE(principal_id, scope)` across ALL rows
+// and `grantCapability` wrote `INSERT OR REPLACE`. Together those make a
+// re-grant destructive in two ways:
+//
+//   1. IT ERASES THE REVOCATION. The replaced row carried `revoked_at` and
+//      `revoked_by`; the new one does not, so a scope deliberately taken
+//      away returns with no record it was ever removed. `listGrants`
+//      documents itself as "every grant ever made to a principal, revoked
+//      ones included — the audit view", and that was false in exactly the
+//      case an audit exists for.
+//   2. IT CHANGES THE GRANT ID. `id` is freshly generated per call, so
+//      nothing can REFERENCE a grant and still mean the same grant later —
+//      which is what blocks ADR-019 D3, a credential naming the grant that
+//      authorized it.
+//
+// LATENT, NOT LIVE, and the distinction is the point rather than an excuse:
+// no route reaches it. `grantCapability` has no RPC method and its only
+// callers are `createPrincipalWithCapabilities` (which fails on an existing
+// principal — the principals PRIMARY KEY, met while writing these tests) and
+// `ensurePasskeyPrincipal` (which returns existing grants rather than
+// re-granting). So this is fixed at the unit, where the next thing to be
+// built stands on it, not at a door an attacker can knock on today.
+//
+// Driven through `runInDurableObject` against the real DO SQLite rather than
+// by adding an RPC method: the unit under test is the exported function, and
+// widening a full-CA RPC surface to make a test convenient is the wrong
+// trade (rpc-surface.do.test.ts exists to ask that question).
+//
+// Same shape as the retired_keys defect fixed under notme-77a024: a
+// uniqueness constraint quietly collapsing history something else promises
+// to retain.
+describe("grant identity and history survive a re-grant (ADR-019 D3)", () => {
+  type GrantsApi = typeof import("./auth/principals");
+
+  /** Run the real principals module against this DO's real SQLite. */
+  async function withGrants<T>(
+    name: string,
+    fn: (api: GrantsApi, sql: unknown) => T,
+  ): Promise<T> {
+    const stub = authority(name);
+    return runInDurableObject(stub, async (auth) => {
+      const api = (await import("./auth/principals")) as GrantsApi;
+      // `ctx` is protected on DurableObject, so the cast is how every DO
+      // test in this repo reaches real storage (bootstrap-code.do.test.ts
+      // does the same). The point is to drive the production module against
+      // production SQLite, not to reimplement it against a stub.
+      return fn(api, (auth as any).ctx.storage.sql);
+    });
+  }
+
+  it("keeps the revoked grant as a row of its own when the scope is granted again", async () => {
+    const pid = crypto.randomUUID();
+    const grants = await withGrants("grant-regrant-history", (api, sql) => {
+      api.createPrincipal(sql, pid, "re-grant subject");
+      api.grantCapability(sql, pid, "bridgeCert", "granter-1");
+      expect(api.revokeCapability(sql, pid, "bridgeCert", "revoker-1").revoked).toBe(true);
+
+      // An operator re-grants the scope they revoked — a legitimate action.
+      api.grantCapability(sql, pid, "bridgeCert", "granter-2");
+      expect(api.getCapabilities(sql, pid)).toEqual(["bridgeCert"]);
+      return api.listGrants(sql, pid);
+    });
+
+    const bridge = grants.filter((g) => g.scope === "bridgeCert");
+    // TWO rows: the revocation happened and is still on the record.
+    expect(bridge).toHaveLength(2);
+    const revoked = bridge.filter((g) => g.revokedAt !== null);
+    const live = bridge.filter((g) => g.revokedAt === null);
+    expect(revoked).toHaveLength(1);
+    expect(live).toHaveLength(1);
+    expect(revoked[0]!.revokedBy).toBe("revoker-1");
+    expect(revoked[0]!.grantedBy).toBe("granter-1");
+    expect(live[0]!.grantedBy).toBe("granter-2");
+    // Distinct grants, distinct identities — the live one is not the revoked
+    // one wearing a new timestamp.
+    expect(live[0]!.id).not.toBe(revoked[0]!.id);
+  });
+
+  it("gives a live grant a stable id, so a credential could name it", async () => {
+    const pid = crypto.randomUUID();
+    const { first, after } = await withGrants("grant-stable-id", (api, sql) => {
+      api.createPrincipal(sql, pid, "stable id subject");
+      api.grantCapability(sql, pid, "bridgeCert", "granter-1");
+      const first = api.listGrants(sql, pid).find((g) => g.scope === "bridgeCert")!;
+
+      // Granting a scope the principal already holds live is a no-op, NOT a
+      // replacement. If the id moved here, a reference taken a moment
+      // earlier would now point at nothing.
+      api.grantCapability(sql, pid, "bridgeCert", "granter-2");
+      return {
+        first,
+        after: api.listGrants(sql, pid).filter((g) => g.scope === "bridgeCert"),
+      };
+    });
+
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe(first.id);
+    expect(after[0]!.grantedBy).toBe("granter-1"); // the original grant stands
+    expect(after[0]!.grantedAt).toBe(first.grantedAt);
+  });
+
+  // THE INDEX IS THE BACKSTOP, AND IT NEEDED ITS OWN TEST. Mutation-removing
+  // `capability_grants_one_live` left every other test in this file green,
+  // because `grantCapability`'s own live-check fires first — so the index was
+  // redundant defence that nothing could distinguish from decoration. The
+  // thing it actually guards is a caller that does NOT go through
+  // grantCapability, which is what this test is.
+  it("refuses a second live grant written straight to the table", async () => {
+    const pid = crypto.randomUUID();
+    await withGrants("grant-index-backstop", (api, sql) => {
+      const db = sql as { exec(q: string, ...a: unknown[]): unknown };
+      api.createPrincipal(sql, pid, "index backstop subject");
+      api.grantCapability(sql, pid, "bridgeCert", "granter-1");
+
+      expect(() =>
+        db.exec(
+          "INSERT INTO capability_grants (id, principal_id, scope, granted_by) VALUES (?, ?, 'bridgeCert', 'bypass')",
+          crypto.randomUUID(),
+          pid,
+        ),
+      ).toThrow(/UNIQUE|constraint/i);
+
+      // A second REVOKED row is fine — history is append-only, and the
+      // index deliberately does not cover it.
+      db.exec(
+        "INSERT INTO capability_grants (id, principal_id, scope, granted_by, revoked_at) VALUES (?, ?, 'bridgeCert', 'historic', '2026-01-01 00:00:00')",
+        crypto.randomUUID(),
+        pid,
+      );
+      expect(api.getCapabilities(sql, pid)).toEqual(["bridgeCert"]);
+    });
+  });
+
+  // THE MIGRATION IS THE RISKY PART, so it gets its own test. Every test
+  // above runs against a DO whose table was created new, in the post-fix
+  // shape — so none of them would notice if the rebuild were deleted. This
+  // one builds the OLD table by hand, puts live and revoked rows in it, and
+  // then lets ensurePrincipalSchema find them.
+  it("rebuilds an existing table that carries the old all-rows UNIQUE, losing no rows", async () => {
+    const pid = crypto.randomUUID();
+    const result = await withGrants("grant-migration", (api, sql) => {
+      const db = sql as {
+        exec(q: string, ...a: unknown[]): { toArray(): unknown[] };
+      };
+      db.exec("DROP TABLE IF EXISTS capability_grants");
+      db.exec(`
+        CREATE TABLE capability_grants (
+          id           TEXT PRIMARY KEY,
+          principal_id TEXT NOT NULL,
+          scope        TEXT NOT NULL,
+          granted_by   TEXT,
+          granted_at   TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at   TEXT,
+          revoked_at   TEXT,
+          revoked_by   TEXT,
+          UNIQUE(principal_id, scope)
+        )
+      `);
+      db.exec("DROP INDEX IF EXISTS capability_grants_one_live");
+      db.exec(
+        "INSERT INTO capability_grants (id, principal_id, scope, granted_by, granted_at) VALUES ('old-live', ?, 'bridgeCert', 'granter-0', '2026-01-01 00:00:00')",
+        pid,
+      );
+      db.exec(
+        "INSERT INTO capability_grants (id, principal_id, scope, granted_by, granted_at, revoked_at, revoked_by) VALUES ('old-revoked', ?, 'certMint', 'granter-0', '2026-01-02 00:00:00', '2026-01-03 00:00:00', 'revoker-0')",
+        pid,
+      );
+
+      // The migration runs here, on an authority that predates it.
+      api.ensurePrincipalSchema(sql);
+
+      // A re-grant of the revoked scope must now append rather than
+      // overwrite — the behaviour the rebuild exists to enable.
+      api.grantCapability(sql, pid, "certMint", "granter-1");
+
+      const ddl = (
+        db
+          .exec(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'capability_grants'",
+          )
+          .toArray() as Array<{ sql: string | null }>
+      )[0]?.sql;
+      return { grants: api.listGrants(sql, pid), ddl };
+    });
+
+    // Both pre-existing rows survived, ids intact — a migration that loses
+    // the revoked row destroys exactly the history this change protects.
+    const byId = new Map(result.grants.map((g) => [g.id, g]));
+    expect(byId.get("old-live")?.revokedAt).toBeNull();
+    expect(byId.get("old-live")?.grantedBy).toBe("granter-0");
+    expect(byId.get("old-revoked")?.revokedBy).toBe("revoker-0");
+    // And the constraint that caused the defect is gone from the new table.
+    expect(result.ddl).not.toContain("UNIQUE(principal_id, scope)");
+    // The appended grant proves the rebuild took effect, not just that the
+    // DDL text changed.
+    const certMint = result.grants.filter((g) => g.scope === "certMint");
+    expect(certMint).toHaveLength(2);
+    expect(certMint.filter((g) => g.revokedAt === null)).toHaveLength(1);
+  });
+
+  it("never holds two live grants for one scope", async () => {
+    const pid = crypto.randomUUID();
+    const { live, secondRevoke, scopesAfter } = await withGrants(
+      "grant-one-live",
+      (api, sql) => {
+        api.createPrincipal(sql, pid, "one live subject");
+        api.grantCapability(sql, pid, "certMint", "g1");
+        api.grantCapability(sql, pid, "certMint", "g2");
+        api.revokeCapability(sql, pid, "certMint", "r1");
+        api.grantCapability(sql, pid, "certMint", "g3");
+        return {
+          live: api
+            .listGrants(sql, pid)
+            .filter((g) => g.scope === "certMint" && g.revokedAt === null),
+          // One revoke must be enough to take the scope away. A second live
+          // row would leave the principal holding a scope they were
+          // stripped of — the partial unique index is what forbids it.
+          secondRevoke: api.revokeCapability(sql, pid, "certMint", "r2").revoked,
+          scopesAfter: api.getCapabilities(sql, pid),
+        };
+      },
+    );
+
+    expect(live).toHaveLength(1);
+    expect(secondRevoke).toBe(true);
+    expect(scopesAfter).not.toContain("certMint");
+  });
+});

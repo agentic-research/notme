@@ -37,6 +37,16 @@ import {
 
 interface SigningAuthorityEnv {
   CA_BUNDLE_CACHE?: KVNamespace;
+  /**
+   * Expected `aud` for a GitHub OIDC token presented to `mintBridgeCert`.
+   *
+   * READ FROM THE DO'S OWN ENV, never from the caller's proof envelope
+   * (notme-51ccd7). An audience a caller can supply is an audience a caller
+   * can widen, which would hand back the whole defect in a new wrapper —
+   * so `MintBridgeCertProof` deliberately has no `audience` field. Same
+   * default as the route's `getConfig` so the two cannot disagree.
+   */
+  GHA_CERT_AUDIENCE?: string;
   NOTME_KEY_STORAGE?: string;
   NOTME_KEK_SECRET?: string;
   /**
@@ -66,6 +76,15 @@ interface SigningAuthorityEnv {
    * production one while signing with the staging key.
    */
   SIGNET_AUTHORITY_URL?: string;
+  /**
+   * CSV of resource servers this deployment's tokens may be addressed to.
+   * Read here, not only in the routes, because `mintBridgeCert`'s
+   * `notme-access-token` proof accepts a token WITHOUT a route in front of it
+   * (rig-098326) — and src/allowed-audiences.ts's rule is that every path
+   * which mints or spends an access token checks this set. Empty or absent
+   * falls back to DEFAULT_ALLOWED_AUDIENCES.
+   */
+  ALLOWED_AUDIENCES?: string;
 }
 
 /**
@@ -155,6 +174,82 @@ export type BootstrapMethod = "secret" | "gha-oidc";
 
 /** GitHub's OIDC issuer — the provider recorded for an attested bootstrap. */
 const GHA_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
+
+/**
+ * Evidence that entitles a caller to a subject — NOT the subject itself
+ * (notme-51ccd7).
+ *
+ * `mintBridgeCert` used to take `subject: string`, so a holder of the AUTH
+ * service binding could name any subject and get a certificate for it.
+ * Measured before the fix: it returned
+ * `MINTED subject="wimse://notme.bot/i-am-whoever"`. The docstring said "for
+ * a verified subject" — an assumption about the caller standing in for a
+ * check.
+ *
+ * WHY THAT MATTERS, AND IT IS NOT ABOUT CODE STYLE. signet verifies a
+ * release by pinning the identity URI and requiring EQUALITY
+ * (`cosign verify-blob --certificate-identity`). Its security therefore
+ * rests entirely on that URI being unforgeable. If a binding holder can
+ * assert the subject, it can mint a certificate whose identity equals
+ * signet's pin for a key it controls, and the documented verification
+ * PASSES for an artifact that holder signed. That is a forged release
+ * signature, not a convenience.
+ *
+ * Keeping the capability and merely bounding it does not work either: the
+ * only namespace notme emits is `principal/<sub>`, which is exactly what a
+ * verifier pins, so "refuse the reserved namespaces" leaves nothing useful
+ * to assert.
+ *
+ * NO `audience` FIELD, deliberately — see `GHA_CERT_AUDIENCE` above.
+ */
+export type MintBridgeCertProof =
+  | { kind: "gha-oidc"; token: string }
+  | { kind: "session-cookie"; cookie: string }
+  /**
+   * An `at+jwt` THIS authority signed, presented back to it (rig-098326).
+   *
+   * The kind exists because a bound Worker legitimately has nothing else to
+   * present. rig/web holds an AUTH binding and used to pass a `userId`; it has
+   * no GitHub Actions token, and `notme_session` is scoped to notme.bot so a
+   * browser never sends it to rosary.bot. What it can hold is a token notme
+   * already minted to an authenticated principal — session-gated and
+   * audience-checked at `/token` and `/authorize/token` — which the DO
+   * re-verifies against its own key, reading the subject out of the claims.
+   *
+   * NOT SAFE BEFORE notme-d68da8. `AuthService.mintDPoPToken` let a binding
+   * holder sign a caller-chosen `sub` with the master key, so a token could be
+   * forged and fed straight back in here. Deleting that method is what makes
+   * a signature mean something; the two changes ship together on purpose.
+   */
+  | { kind: "notme-access-token"; token: string };
+
+/**
+ * Why a mint was refused. Exhaustive; switch on it.
+ *
+ * A RETURNED REASON, NOT A THROWN ERROR, for two reasons.
+ *
+ * The house pattern: `mintDPoPTokenOnce` returns
+ * `{ ok: false, reason: "proof_reused" }` and `signReceiptCommitment`
+ * returns a code union. A failed proof is an EXPECTED outcome of a
+ * well-formed call, not programmer error, and the caller needs to map it to
+ * a status code rather than parse an error string.
+ *
+ * And the runtime forces it: when a DO RPC method throws, workerd delivers
+ * the rejection to the caller AND raises it in the DO's own isolate. The
+ * caller's `.catch()` cannot own the second one, so vitest counted them as
+ * unhandled errors and the workers suite exited 1 with all 300 tests
+ * passing. Measured across three runs. Returning leaves nothing to reject.
+ *
+ * Deliberately COARSE: a caller learns that its evidence was rejected, not
+ * which claim failed. `validateGHAToken` throws messages like
+ * "wrong audience: <value>", and echoing those back to whoever supplied the
+ * token is free reconnaissance. The detail goes to the log.
+ */
+export type BridgeCertRefusal =
+  | "invalid_gha_token"
+  | "invalid_session"
+  | "invalid_access_token"
+  | "unknown_proof_kind";
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
@@ -305,6 +400,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO state (id, epoch, seqno) VALUES ('authority', 1, 1)",
     );
+    // Migration (v2 → v3): which epoch the LIVE key started serving.
+    //
+    // Needed because epoch and key identity were decoupled (notme-77a024):
+    // one key may now serve several epochs, so "the epoch" is no longer a
+    // property of the key and has to be recorded as the span it covered.
+    //
+    // The backfill is the current epoch, not 1. Under the old coupling
+    // `rotate()` bumped the epoch in the same statement that replaced the
+    // key, so an existing key began serving exactly at the epoch now
+    // current — and for a deployment that never rotated, that is epoch 1
+    // anyway. Defaulting to 1 instead would claim the live key served every
+    // earlier epoch too, which over-matches: `getEpochPublicKey(1)` would
+    // offer today's key for an epoch an archived key actually signed.
+    try {
+      this.ctx.storage.sql.exec("SELECT from_epoch FROM keys LIMIT 0");
+    } catch {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE keys ADD COLUMN from_epoch INTEGER NOT NULL DEFAULT 0",
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE keys SET from_epoch = (SELECT epoch FROM state WHERE id = 'authority') WHERE from_epoch = 0",
+      );
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS dpop_jtis (
         jti        TEXT PRIMARY KEY,
@@ -332,14 +450,62 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // for good, while a discovery endpoint can be added at any time. Serving
     // these at /.well-known/interlace/index.json per §2.3 is tracked
     // separately; persisting them cannot wait for it.
+    //
+    // KEYED ON THE KEY, NOT THE EPOCH (notme-77a024). The original shape was
+    // `epoch INTEGER PRIMARY KEY`, which is only sound while a rotation and
+    // an epoch bump are the same event. They are not any more: epoch is the
+    // revocation generation and moves only on `revokeEpoch()`, so a second
+    // rotation inside one epoch would collide on that primary key — and the
+    // archive write is `INSERT OR IGNORE`, so the collision is SILENT and the
+    // second key's bytes are simply lost. That is precisely the audit-defeat
+    // failure §2.3 names, reintroduced by the decoupling if the key stays.
+    //
+    // `from_epoch`/`until_epoch` are the inclusive span of epochs the key
+    // served. One key may cover several (it keeps signing across a
+    // revocation), and one epoch may have been served by several keys (it
+    // survives rotations) — so neither side is a function of the other, and
+    // resolution at audit time is by `actor_fp`, with the span as the filter.
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS retired_keys (
-        epoch      INTEGER PRIMARY KEY,
-        key_id     TEXT NOT NULL,
-        public_raw TEXT NOT NULL,
-        retired_at INTEGER NOT NULL
+        key_id      TEXT PRIMARY KEY,
+        public_raw  TEXT NOT NULL,
+        from_epoch  INTEGER NOT NULL,
+        until_epoch INTEGER NOT NULL,
+        retired_at  INTEGER NOT NULL
       )
     `);
+    // Migration (v1 → v2): rebuild an epoch-keyed archive onto the key.
+    //
+    // `CREATE TABLE IF NOT EXISTS` above is a no-op when the v1 table is
+    // already there, so the old shape has to be detected and rewritten.
+    // from_epoch = until_epoch = the recorded epoch is EXACT for v1 rows
+    // rather than a guess: under the coupling that wrote them, a key served
+    // exactly the one epoch it was retired at.
+    let retiredKeysIsV1 = false;
+    try {
+      this.ctx.storage.sql.exec("SELECT until_epoch FROM retired_keys LIMIT 0");
+    } catch {
+      retiredKeysIsV1 = true;
+    }
+    if (retiredKeysIsV1) {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE retired_keys_v2 (
+          key_id      TEXT PRIMARY KEY,
+          public_raw  TEXT NOT NULL,
+          from_epoch  INTEGER NOT NULL,
+          until_epoch INTEGER NOT NULL,
+          retired_at  INTEGER NOT NULL
+        )
+      `);
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO retired_keys_v2 (key_id, public_raw, from_epoch, until_epoch, retired_at) " +
+          "SELECT key_id, public_raw, epoch, epoch, retired_at FROM retired_keys",
+      );
+      this.ctx.storage.sql.exec("DROP TABLE retired_keys");
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE retired_keys_v2 RENAME TO retired_keys",
+      );
+    }
     // Delegated JWT signing keys, one per issuer (ADR-015).
     //
     // SEPARATE from the CA master, and that separation is the entire security
@@ -522,12 +688,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     );
     const keyId = await SigningAuthority.#keyIdFromSpki(publicSpkiB64);
 
+    // The epoch this key begins serving (notme-77a024). The epoch moves on
+    // `revokeEpoch()` alone, so a new key INHERITS the current generation
+    // rather than defining one — which is what lets `rotate()` leave the
+    // revocation state untouched.
+    const startEpoch =
+      (
+        this.ctx.storage.sql
+          .exec("SELECT epoch FROM state WHERE id = 'authority'")
+          .toArray() as Array<{ epoch: number }>
+      )[0]?.epoch ?? 1;
+
     if (isEphemeral) {
       // Store public key + key ID only — no private key material on disk
       this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', '', ?, ?)",
+        "INSERT OR REPLACE INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', '', ?, ?, ?)",
         publicSpkiB64,
         keyId,
+        startEpoch,
       );
       this.#signingKey = kp.privateKey;
       this.#verifyKey = kp.publicKey;
@@ -542,13 +720,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       )) as JsonWebKey;
       const kekForWrite = this.#getKek();
       this.ctx.storage.sql.exec(
-        "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
+        "INSERT INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', ?, ?, ?, ?)",
         await serialiseJwkForStorage(
           privateJwk,
           kekForWrite ? await kekForWrite : null,
         ),
         publicSpkiB64,
         keyId,
+        startEpoch,
       );
       // Re-import as non-extractable — JWK is stored, no need to keep extractable
       this.#signingKey = await crypto.subtle.importKey(
@@ -563,6 +742,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     await this.scheduleNextRefresh();
     return { signingKey: this.#signingKey, verifyKey: this.#verifyKey, keyId };
+  }
+
+  /**
+   * When the current authority key began signing, from `keys.created_at`.
+   *
+   * SQLite's `datetime('now')` is "YYYY-MM-DD HH:MM:SS" in UTC with no zone
+   * marker, so it is normalised to ISO-8601 before parsing. null when there
+   * is no key row or the value does not parse — never a guess, because a
+   * wrong start date is exactly the defect this exists to prevent.
+   *
+   * Every write that keeps a key keeps its created_at: re-sealing under a KEK
+   * and the key_id backfill are UPDATEs of other columns, and the only
+   * INSERT OR REPLACE is the ephemeral mode, whose key is genuinely new on
+   * each start.
+   */
+  #keyStart(): Date | null {
+    this.#ensureSchema();
+    const row = this.ctx.storage.sql
+      .exec("SELECT created_at FROM keys WHERE id = 'authority'")
+      .toArray()[0] as { created_at?: string } | undefined;
+    if (!row?.created_at) return null;
+    const d = new Date(row.created_at.replace(" ", "T") + "Z");
+    return Number.isNaN(d.getTime()) ? null : d;
   }
 
   #getKeyId(): string {
@@ -622,6 +824,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       )
     `);
     const currentKeyId = this.#getKeyId();
+    // The root's validity window belongs to the KEY, not to the moment the
+    // root happens to be (re-)issued (notme-0c494f). See keyStart below.
+    const keyStart = this.#keyStart();
     const cached = this.ctx.storage.sql
       .exec("SELECT pem, key_id FROM ca_cert WHERE id = 'cert'")
       .toArray() as Array<{ pem: string; key_id: string }>;
@@ -637,17 +842,32 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // root to pathlen=1, production kept serving its March-2026 pathlen:0
       // cert for five months, and every Issuing CA tier minted under it was
       // unverifiable by any stock validator (notme-1b1db4). Re-issuing here
-      // is safe and non-destructive: same key, same epoch — leaves verify by
-      // key, so nothing in flight is invalidated.
+      // keeps the key and the epoch. It is only non-destructive because the
+      // re-issued root keeps the KEY's notBefore — this comment used to say
+      // "leaves verify by key, so nothing in flight is invalidated", and the
+      // heal minted with notBefore=now, which stranded every signature made
+      // before it under RFC 5280 path validation (notme-0c494f).
       try {
         const { X509Certificate, BasicConstraintsExtension } = await import(
           "@peculiar/x509"
         );
         const x = new X509Certificate(cached[0]!.pem);
         const bc = x.getExtension(BasicConstraintsExtension);
-        if (bc?.ca && bc.pathLength === CA_PATH_LEN) return cached[0]!.pem;
+        // A root that starts AFTER its key began signing strands everything
+        // signed in between: RFC 5280 path validation requires the anchor to
+        // be valid at the verification time, and cosign verifies at the
+        // signing time. Production served exactly that — the heal below had
+        // minted with `notBefore: now` (notme-0c494f) — so this check is also
+        // what makes production self-heal on the first fetch after deploy.
+        const startsLate =
+          keyStart !== null && x.notBefore.getTime() > keyStart.getTime();
+        if (bc?.ca && bc.pathLength === CA_PATH_LEN && !startsLate) {
+          return cached[0]!.pem;
+        }
         console.warn(
-          `[ca] cached root has pathlen ${bc?.pathLength ?? "none"}, code mints ${CA_PATH_LEN} — re-issuing under the same key`,
+          startsLate
+            ? `[ca] cached root notBefore ${x.notBefore.toISOString()} is after the key's start ${keyStart!.toISOString()} — re-issuing under the same key`
+            : `[ca] cached root has pathlen ${bc?.pathLength ?? "none"}, code mints ${CA_PATH_LEN} — re-issuing under the same key`,
         );
       } catch {
         /* regenerate */
@@ -655,9 +875,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
 
     const { signingKey, verifyKey } = await this.#getOrCreateSigningKey();
-    const now = new Date();
+    // notBefore = when this key began signing. Nothing it signed predates
+    // that, so no re-issue under the same key can leave an earlier signature
+    // outside the anchor's window. The 1b1db4 heal used `now` and called it
+    // "non-destructive … leaves verify by key" — true for a signature check,
+    // false for path validation, which is what cosign does. A fresh key's
+    // start IS now, so the first issue is unchanged.
+    //
+    // Fallback is `now` only when the key row has no parseable start — a
+    // fresh row always has one (`created_at DEFAULT datetime('now')`).
+    const notBefore = keyStart ?? new Date();
     const notAfter = new Date(
-      now.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
+      notBefore.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
     );
     const serial = crypto
       .getRandomValues(new Uint8Array(16))
@@ -665,7 +894,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const cert = await X509CertificateGenerator.createSelfSigned({
       name: caSubjectForEnv(this.env),
-      notBefore: now,
+      notBefore,
       notAfter,
       signingAlgorithm: ED25519,
       keys: { privateKey: signingKey, publicKey: verifyKey },
@@ -837,10 +1066,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * answer for the current epoch, and it is keyed by keyId rather than epoch,
    * so historical resolution needs its own lookup.
    *
-   * Returns raw base64 Ed25519 public key bytes — the same form `actor_fp` is
-   * computed over — or null when the epoch is unknown. Null is honest rather
-   * than an error: an auditor must be able to distinguish "notme does not have
-   * this" from a transport failure.
+   * Returns EVERY key that served the epoch, raw base64 Ed25519 public key
+   * bytes — the same form `actor_fp` is computed over — and an empty array
+   * when none did. Empty is honest rather than an error: an auditor must be
+   * able to distinguish "notme does not have this" from a transport failure.
+   *
+   * A SET, not one key, since notme-77a024 decoupled the epoch from key
+   * identity: rotations no longer move the epoch, so several keys can have
+   * signed under one generation. The caller disambiguates by `actor_fp` =
+   * SHA-256(public key), which the receipt carries — so the fingerprint was
+   * always the real index and the epoch is the filter. Returning any single
+   * member would be a coin flip wearing a lookup's clothes.
    */
   /**
    * Every epoch's signing key — current and retired — for third-party
@@ -860,6 +1096,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async listEpochKeys(): Promise<
     Array<{
       epoch: number;
+      untilEpoch: number | null;
       keyId: string;
       publicRawB64: string;
       retiredAt: number | null;
@@ -869,35 +1106,42 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const retired = this.ctx.storage.sql
       .exec(
-        "SELECT epoch, key_id, public_raw, retired_at FROM retired_keys ORDER BY epoch ASC",
+        "SELECT key_id, public_raw, from_epoch, until_epoch, retired_at FROM retired_keys ORDER BY from_epoch ASC, key_id ASC",
       )
       .toArray() as Array<{
-      epoch: number;
       key_id: string;
       public_raw: string;
+      from_epoch: number;
+      until_epoch: number;
       retired_at: number;
     }>;
 
     const out: Array<{
       epoch: number;
+      untilEpoch: number | null;
       keyId: string;
       publicRawB64: string;
       retiredAt: number | null;
     }> = retired.map((r) => ({
-      epoch: r.epoch,
+      epoch: r.from_epoch,
+      untilEpoch: r.until_epoch,
       keyId: r.key_id,
       publicRawB64: r.public_raw,
       retiredAt: r.retired_at,
     }));
 
-    // The live epoch is not in retired_keys — it has not been retired.
-    const current = this.ctx.storage.sql
-      .exec("SELECT epoch FROM state WHERE id = 'authority'")
-      .toArray() as Array<{ epoch: number }>;
-    const currentEpoch = current[0]?.epoch;
-    if (typeof currentEpoch === "number") {
+    // The live key is not in retired_keys — it has not been retired. Its span
+    // is open-ended: `untilEpoch: null` means "still serving", which is
+    // different from "served up to the current epoch" and will stay true
+    // through the next revokeEpoch().
+    const live = this.ctx.storage.sql
+      .exec("SELECT from_epoch FROM keys WHERE id = 'authority'")
+      .toArray() as Array<{ from_epoch: number }>;
+    const liveFrom = live[0]?.from_epoch;
+    if (typeof liveFrom === "number") {
       out.push({
-        epoch: currentEpoch,
+        epoch: liveFrom,
+        untilEpoch: null,
         keyId: this.#getKeyId(),
         publicRawB64: await this.getPublicKeyRawB64(),
         retiredAt: null,
@@ -906,43 +1150,36 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return out;
   }
 
-  async getEpochPublicKey(
-    epoch: number,
-  ): Promise<{
-    keyId: string;
-    publicRawB64: string;
-    retiredAt: number | null;
-  } | null> {
+  async getEpochPublicKey(epoch: number): Promise<
+    Array<{
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }>
+  > {
     this.#ensureSchema();
-
+    // An epoch the authority has never reached has no keys, even though the
+    // live key's span is open-ended. `untilEpoch: null` means "has not
+    // retired", NOT "serves every number" — and answering for a future epoch
+    // would hand a verifier a working key for a generation that does not
+    // exist, which is the over-matching half of the same mistake the archive
+    // schema made in the other direction.
     const current = this.ctx.storage.sql
       .exec("SELECT epoch FROM state WHERE id = 'authority'")
       .toArray() as Array<{ epoch: number }>;
-    if (current[0]?.epoch === epoch) {
-      return {
-        keyId: this.#getKeyId(),
-        publicRawB64: await this.getPublicKeyRawB64(),
-        retiredAt: null, // still active
-      };
-    }
+    if (epoch > (current[0]?.epoch ?? 0)) return [];
 
-    const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT key_id, public_raw, retired_at FROM retired_keys WHERE epoch = ?",
-        epoch,
+    const keys = await this.listEpochKeys();
+    return keys
+      .filter(
+        (k) =>
+          epoch >= k.epoch && (k.untilEpoch === null || epoch <= k.untilEpoch),
       )
-      .toArray() as Array<{
-      key_id: string;
-      public_raw: string;
-      retired_at: number;
-    }>;
-    const row = rows[0];
-    if (!row) return null;
-    return {
-      keyId: row.key_id,
-      publicRawB64: row.public_raw,
-      retiredAt: row.retired_at,
-    };
+      .map((k) => ({
+        keyId: k.keyId,
+        publicRawB64: k.publicRawB64,
+        retiredAt: k.retiredAt,
+      }));
   }
 
   async getReceiptFacts(): Promise<{ actorFp: Uint8Array; epoch: number }> {
@@ -1280,16 +1517,121 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   // Mint a bridge cert inside the DO — CryptoKey never crosses the RPC boundary.
+  /**
+   * Mint a bridge cert for the subject the EVIDENCE names (notme-51ccd7).
+   *
+   * The DO re-verifies the proof inside its own method body and derives the
+   * subject from the verified claims. A caller cannot assert a subject, and
+   * there is no overload that lets it.
+   *
+   * DOUBLE-VERIFY IS INTENTIONAL. The worker in front of this may already
+   * have validated the same token or cookie; that check exists for early
+   * rejection and clean 401/403 responses. This one is the trust kernel. If
+   * only one may be trusted it is this one, because the worker is reachable
+   * by anything holding the binding and the DO is not.
+   *
+   * FORWARD-PORTED from the private agentic-research/notme.bot repo, which
+   * diagnosed and fixed the same defect on 2026-05-18 (commit 1d1ec7e, bead
+   * notme.bot-69a3a9) in a repo whose code never ran. Verified against
+   * signet's documented verification before porting rather than taken on
+   * that repo's authority — see the `MintBridgeCertProof` docstring.
+   */
   async mintBridgeCert(
-    subject: string,
+    proof: MintBridgeCertProof,
     publicKeyPem: string,
     ttlMs?: number,
-  ): Promise<{
-    certificate: string;
-    expires_at: number;
-    subject: string;
-    authority: { epoch: number; key_id: string };
-  }> {
+  ): Promise<
+    | {
+        ok: true;
+        certificate: string;
+        expires_at: number;
+        subject: string;
+        authority: { epoch: number; key_id: string };
+      }
+    | { ok: false; reason: BridgeCertRefusal }
+  > {
+    // Derive the subject. Every branch ends in a value this DO computed from
+    // something it checked itself, or in a refusal.
+    let subject: string;
+    if (proof?.kind === "gha-oidc") {
+      // Audience from OUR env, never the envelope (notme-51ccd7).
+      const expectedAudience = this.env.GHA_CERT_AUDIENCE ?? "notme.bot";
+      const { validateGHAToken } = await import("./gha-oidc");
+      try {
+        const claims = await validateGHAToken(proof.token, expectedAudience);
+        subject = claims.sub;
+      } catch (e) {
+        console.warn({
+          event: "mint.gha_proof_rejected",
+          detail: (e as Error)?.message,
+        });
+        return { ok: false, reason: "invalid_gha_token" };
+      }
+    } else if (proof?.kind === "session-cookie") {
+      // The secret is read inside the DO and does not leave it.
+      const { verifySessionCookie } = await import("./auth/session");
+      const session = await verifySessionCookie(
+        proof.cookie,
+        await this.getSessionSecret(),
+      );
+      if (!session) {
+        console.warn({ event: "mint.session_proof_rejected" });
+        return { ok: false, reason: "invalid_session" };
+      }
+      subject = session.principalId;
+    } else if (proof?.kind === "notme-access-token") {
+      // Verified against THIS authority's own key, so a token from another
+      // deployment (or another DO id, which owns a different master key) is
+      // refused on signature rather than believed on its claims.
+      //
+      // AUDIENCE AND SCOPE ARE CHECKED HERE, not upstream, because this path
+      // has no route in front of it. `/token` and `/authorize/token` both call
+      // getAllowedAudiences(env) and both require a session cookie first; a
+      // service binding goes around both. Without these two checks a token
+      // minted for one resource server is spendable at every other, and a
+      // read-only token becomes a certificate.
+      const { verifyKey } = await this.#getOrCreateSigningKey();
+      const { verifyAccessToken, issuerFromEnv } = await import("./auth/token");
+      const { getAllowedAudiences } = await import("./allowed-audiences");
+      try {
+        const claims = await verifyAccessToken(
+          proof.token,
+          verifyKey,
+          issuerFromEnv(this.env),
+        );
+        // Every mint site asserts a subject; a token without one must not
+        // become a certificate named "".
+        if (!claims.sub) throw new Error("missing sub");
+        if (!getAllowedAudiences(this.env).has(claims.aud)) {
+          throw new Error("audience not allowed");
+        }
+        // `scope` is a space-delimited list (RFC 6749 §3.3). SPLIT it — a
+        // substring test would accept "notbridgeCertish".
+        if (!(claims.scope ?? "").split(" ").includes("bridgeCert")) {
+          throw new Error("missing bridgeCert scope");
+        }
+        subject = claims.sub;
+      } catch (e) {
+        console.warn({
+          event: "mint.access_token_proof_rejected",
+          detail: (e as Error)?.message,
+        });
+        return { ok: false, reason: "invalid_access_token" };
+      }
+    } else {
+      // Exhaustive at RUNTIME as well as in the type. A caller reaching this
+      // DO over RPC is not bound by our types — `proof` may be a string, as
+      // it was under the old signature, or a shape invented today — so a
+      // third kind is refused rather than falling through to an undefined
+      // subject. `proof?.kind` rather than `proof.kind` because a string
+      // argument has no `kind` and a null one would throw on the read.
+      console.warn({
+        event: "mint.unknown_proof_kind",
+        kind: typeof proof === "object" ? (proof as { kind?: unknown })?.kind : typeof proof,
+      });
+      return { ok: false, reason: "unknown_proof_kind" };
+    }
+
     const { signingKey } = await this.#getOrCreateSigningKey();
     const state = await this.getAuthorityState();
     const { mintGHABridgeCert } = await import("./cert-authority");
@@ -1300,6 +1642,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ttlMs,
     );
     return {
+      ok: true,
       ...result,
       authority: { epoch: state.epoch, key_id: state.keyId },
     };
@@ -1460,8 +1803,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return { ...bundle, signature: sigB64 } as CABundle;
   }
 
-  // Rotate the CA key. Increments epoch, generates new keypair.
-  // Previous keyId is preserved in the bundle as prevKeyId for graceful transition.
+  /**
+   * Replace the CA key. Does NOT move the epoch (notme-77a024).
+   *
+   * Epoch and key identity are independent axes, and conflating them cost
+   * notme both levers at once:
+   *
+   *   - A ROUTINE ROTATION became a mass revocation nobody asked for.
+   *     `checkRevocation` tests epoch (step 5) before keyId (step 6), so
+   *     every token minted before the rotation died on `epoch_mismatch` and
+   *     the republished `prevKeyId` grace window built for notme-54f84b
+   *     guarded a branch no token could enter.
+   *   - A MASS REVOCATION required destroying the signing key, the one
+   *     irreversible action available — which past the archive's retention
+   *     made the actor's own receipts unverifiable. A lever that costs an
+   *     audit trail does not get pulled.
+   *
+   * So: rotation is about which key signs, `revokeEpoch()` is about which
+   * credentials are still good, and the grace window now works because a
+   * pre-rotation token carries the SAME epoch and a `prevKeyId` match.
+   *
+   * seqno still advances: the published bundle genuinely changed, and the
+   * rollback-protection DO must refuse the pre-rotation bundle afterwards.
+   */
   async rotate(): Promise<{ newKeyId: string; epoch: number }> {
     this.#ensureSchema();
     const oldKeyId = this.#getKeyId();
@@ -1483,14 +1847,24 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // INSERT OR IGNORE, not REPLACE: an epoch's public key is immutable once
     // recorded. Overwriting one would rewrite history, which is precisely the
     // capability an audit trail exists to deny.
+    //
+    // The span, not one epoch: this key may have signed across a
+    // `revokeEpoch()`, so `from_epoch` is where it started and `until_epoch`
+    // is the generation current as it retires. `INSERT OR IGNORE` still
+    // guards immutability — now of one KEY's record, where before it silently
+    // discarded a second key retired inside the same epoch.
     const oldEpochRows = this.ctx.storage.sql
-      .exec("SELECT epoch FROM state WHERE id = 'authority'")
-      .toArray() as Array<{ epoch: number }>;
+      .exec(
+        "SELECT s.epoch AS epoch, k.from_epoch AS from_epoch FROM state s, keys k WHERE s.id = 'authority' AND k.id = 'authority'",
+      )
+      .toArray() as Array<{ epoch: number; from_epoch: number }>;
+    const untilEpoch = oldEpochRows[0]!.epoch;
     this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO retired_keys (epoch, key_id, public_raw, retired_at) VALUES (?, ?, ?, ?)",
-      oldEpochRows[0]!.epoch,
+      "INSERT OR IGNORE INTO retired_keys (key_id, public_raw, from_epoch, until_epoch, retired_at) VALUES (?, ?, ?, ?, ?)",
       oldKeyId,
       oldPubKeyB64,
+      oldEpochRows[0]!.from_epoch,
+      untilEpoch,
       Math.floor(Date.now() / 1000),
     );
 
@@ -1499,9 +1873,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.#signingKey = null;
     this.#verifyKey = null;
 
-    // Increment epoch
+    // seqno only. The epoch belongs to revokeEpoch().
     this.ctx.storage.sql.exec(
-      "UPDATE state SET epoch = epoch + 1, seqno = seqno + 1 WHERE id = 'authority'",
+      "UPDATE state SET seqno = seqno + 1 WHERE id = 'authority'",
     );
 
     // Generate new key (#getOrCreateSigningKey will create since we deleted)
@@ -1517,6 +1891,67 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray() as Array<{ epoch: number }>;
 
     return { newKeyId, epoch: rows[0]!.epoch };
+  }
+
+  /**
+   * Advance the revocation generation: void every credential issued so far,
+   * keep the signing key (notme-77a024).
+   *
+   * This is the unit between "wait for expiry" and "there is no lever". Every
+   * tier of the chain already carries `OID_EPOCH` and every verifier checks
+   * it, so a bump invalidates outstanding certificates and tokens at their
+   * next verification without the authority enumerating them.
+   *
+   * WHAT IT IS NOT. Class-level, never targeted: it cannot revoke one task,
+   * one tier, or one principal.
+   *
+   * CORRECTION to the first version of this comment, which claimed the
+   * targeted job was already covered by "the chain — revoke a tier and every
+   * task cert beneath it fails path validation by issuer, intrinsic X.509, no
+   * index required". The X.509 mechanics are right and the LEVER DOES NOT
+   * EXIST: there is no CRL, no OCSP, and no per-certificate status anywhere
+   * in this repo, and the published bundle carries only epoch, seqno, keys,
+   * keyId, prevKeyId and issuedAt — no revoked-serial list. Nothing can mark
+   * one tier revoked, so nothing beneath one falls. That claim also
+   * contradicted the paragraph directly above it in ADR-019, which had
+   * always said the honest version: TTL-only for anything finer than an
+   * epoch.
+   *
+   * So the levers that EXIST are this one and the grant (`liveScopes` at the
+   * authorization gate, which governs what a session may do — not the
+   * validity of a certificate already in someone's hands). Killing one task
+   * or one machine is the open hole, and the shape ADR-019 D7 commits to is
+   * a renewal predicate rather than a revocation list.
+   *
+   * THE KEY SURVIVES, deliberately. Receipts naming earlier epochs stay
+   * verifiable, which is the difference between revoking credentials and
+   * destroying evidence. Interlace RECEIPTS.md §2.3 makes historical
+   * resolution a MUST precisely so an actor cannot defeat an audit by
+   * rotating; a revocation lever that forced a rotation handed that back.
+   *
+   * CALLERS SEE `EPOCH_MISMATCH` and retry once against fresh
+   * `getReceiptFacts()` — the one retryable code, already specified for this
+   * shape (ADR-014). No operator HTTP route, matching `rotate()`: both are
+   * service-binding operations, and a public door onto mass revocation is a
+   * denial-of-service surface with an authentication bug away from being
+   * free.
+   */
+  async revokeEpoch(): Promise<{ epoch: number; seqno: number }> {
+    this.#ensureSchema();
+    this.ctx.storage.sql.exec(
+      "UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'",
+    );
+    // Publish straight away: the bundle is how a verifier learns the epoch
+    // moved, so leaving it stale makes the lever a no-op until the next
+    // alarm fires — and an alarm is exactly what cannot be relied on here
+    // (production once measured totalFires: 0 for 130 days, notme-4896d8).
+    // The returned numbers come FROM the published bundle, because
+    // generateBundle() advances seqno itself and the operator needs the
+    // generation a verifier will actually read.
+    const bundle = await this.#publishBundle();
+    const { epoch, seqno } = bundle;
+    console.warn({ event: "authority.epoch_revoked", epoch, seqno });
+    return { epoch, seqno };
   }
 
   // ── Passkey operations (delegates to passkey module, uses DO's SQLite) ──
@@ -2292,6 +2727,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
   }
 
+  /**
+   * Sign the current bundle and publish it to the KV the edge reads.
+   *
+   * ECMAScript #private: a `private` method stays live on the DO's RPC
+   * surface (ADR-016), and nothing outside this object should be able to
+   * force a republish. Shared by `alarm()` and `revokeEpoch()` so the two
+   * cannot drift — a revocation that published a differently-shaped bundle
+   * than the refresh path would be a very bad day to debug.
+   *
+   * No CA_BUNDLE_CACHE binding is a real configuration, not a failure: the
+   * bundle is still signed and the state still advances.
+   */
+  async #publishBundle(): Promise<CABundle> {
+    const bundle = await this.generateBundle();
+    if (this.env.CA_BUNDLE_CACHE) {
+      await this.env.CA_BUNDLE_CACHE.put(
+        "bundle:current",
+        JSON.stringify(bundle),
+      );
+    }
+    return bundle;
+  }
+
   override async alarm(): Promise<void> {
     const now = Date.now();
     this.#ensureAlarmHealthSchema();
@@ -2348,13 +2806,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     let success = false;
     let outcome: string;
     try {
-      const bundle = await this.generateBundle();
-      if (this.env.CA_BUNDLE_CACHE) {
-        await this.env.CA_BUNDLE_CACHE.put(
-          "bundle:current",
-          JSON.stringify(bundle),
-        );
-      }
+      await this.#publishBundle();
       success = true;
       outcome = "success";
     } catch (e) {

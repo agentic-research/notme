@@ -6,7 +6,7 @@
     <title>research — your agents are you, cryptographically</title>
     <meta
       name="description"
-      content="9 of 10 AI coding tools use your credentials. 24 CVEs across major AI IDEs. No open-source agent identity standard exists. Full analysis."
+      content="9 of 10 AI coding tools use your credentials. 24 CVEs across major AI IDEs. No widely adopted open standard for coding-agent identity. Full analysis."
     />
     <meta
       property="og:title"
@@ -335,7 +335,9 @@
             every commit, every API call, every push your AI agent makes carries
             <strong>your identity</strong> with zero separation. the trivy
             breach proved mutable references and long-lived tokens are
-            catastrophic. no open-source standard exists. this is the gap.
+            catastrophic. no widely adopted open standard exists for coding-agent
+            identity primitives &mdash; SPIFFE/SPIRE, OAuth and OIDC each cover
+            part of the problem. this is the gap.
           </p>
           <div class="hero-actions">
             <a
@@ -557,8 +559,9 @@
         <p>
           Non-human identity is the fastest-growing segment in IAM. AI agent
           security is the most explosive new category. But
-          <strong>no open-source standard exists</strong> for agent identity
-          primitives.
+          <strong>no widely adopted open standard exists</strong> for
+          coding-agent identity primitives &mdash; the adjacent ones
+          (SPIFFE/SPIRE, OAuth/OIDC, SCIM) each solve part of it.
         </p>
 
         <div class="tier" style="--c: #f0d040">
@@ -769,7 +772,7 @@
             <tr>
               <td>identity</td>
               <td>your GitHub PAT</td>
-              <td>agent's own Ed25519 cert (ML-DSA-44 ready)</td>
+              <td>agent's own Ed25519 cert</td>
             </tr>
             <tr>
               <td>scope</td>
@@ -779,7 +782,7 @@
             <tr>
               <td>revocation</td>
               <td>rotate your token</td>
-              <td>near-real-time edge revoke</td>
+              <td>revoke the signing generation (within 5 min), or the principal's grants</td>
             </tr>
             <tr>
               <td>audit</td>

@@ -443,8 +443,29 @@ block).
 
 ## What it requires that is not built
 
-1. **The grant as a stored, referenceable object** with the D3 payload. Today
-   there are three `*_by` columns and no grant identity.
+1. **The grant as a stored, referenceable object** with the D3 payload.
+   PARTLY BUILT. `capability_grants` has a stable, referenceable `id` as of
+   2026-10-26: the table is append-only history with a partial unique index
+   admitting one LIVE grant per `(principal, scope)`, and `grantCapability`
+   is idempotent rather than replacing — so a re-grant appends beside the
+   revoked row instead of overwriting it, and an id, once taken, still names
+   the same grant. Before that, `INSERT OR REPLACE` against an all-rows
+   `UNIQUE(principal_id, scope)` erased the `revoked_at`/`revoked_by` of the
+   row it replaced and minted a fresh id each call, so the audit view lost
+   the one event it exists to show and nothing could reference a grant at
+   all. (Latent, not live: no route reached it — `grantCapability` has no RPC
+   method, and its two callers either refuse an existing principal or return
+   existing grants rather than re-granting.)
+
+   STILL MISSING is the D3 payload itself: `represented_principal`,
+   `parent_grant_id`, `audience`/`resources`, `purpose`/`goal_hash`,
+   `delegable`, `remaining_delegation_depth`. A grant is still a
+   `(principal, scope)` row with provenance, not a delegation object, and no
+   credential names its grant. **That work is gated, not merely unscheduled**
+   — open question 6 below asks what this adds over an in-toto layout, and
+   ADR-020 forbids inventing a format where composition would do. Building
+   the payload before answering it would be the invention ADR-020 exists to
+   prevent.
 2. ~~**The middle tier** — a mint path producing `CA=true, pathlen=0`.~~ Built 2026-08-27: `mintIssuingCaCert` + `POST /cert/issuing-ca`.
 3. ~~**A namespace mechanism**, per D5's open question.~~ Decided 2026-08-27:
    segment-prefix confinement on the URI SAN (see D5); built as part of the
@@ -484,9 +505,104 @@ What notme has today is **epoch-based bundle revocation** (`revocation.ts`):
 coarse (a whole issuance class), pull-based, and gated on `BUNDLE_MAX_AGE_MS`.
 There is no CRL, no OCSP, and no per-credential status. So the honest current
 answer is **TTL-only for anything finer than an epoch**, and the ADR says so
-rather than implying the hierarchy above already works. Choosing among signed
-revocation epochs, a CRL distribution point, OCSP, or trust-bundle refresh is
-`notme-77a024`'s remaining work.
+rather than implying the hierarchy above already works.
+
+#### D7 — The epoch is a lever, and pulling it costs no evidence
+
+**Decided 2026-10-26, closing `notme-77a024`.** Signed revocation epochs, of
+the three options this ADR listed. Not a CRL or OCSP: both require notme to
+answer at verification time, which `ADR-020` forbids making mandatory and
+which the offline-verification goal rules out anyway.
+
+The defect was not the choice of mechanism but that the chosen one **could
+not be operated**. `rotate()` advanced the epoch in the same statement that
+replaced the signing key, so the two axes were one:
+
+| | before | now |
+|---|---|---|
+| mass revocation | required destroying the signing key | `revokeEpoch()`, key untouched |
+| key rotation | silently mass-revoked | `rotate()`, epoch untouched |
+
+Both directions were harmful. Revoking cost the signing key — the one
+irreversible action available — and past the key archive's retention that
+makes every receipt naming an earlier epoch unverifiable, which is the
+audit-defeat Interlace `RECEIPTS.md` §2.3 names as a MUST-not. **A lever that
+destroys your own evidence does not get pulled**, so in practice notme had no
+mass revocation at all. And in the other direction a routine key rotation
+voided every outstanding credential, because `checkRevocation` tests the
+epoch (step 5) before the key id (step 6) — so the previous-key grace window
+built for `notme-54f84b` guarded a branch no token could reach.
+
+> **The epoch is the revocation generation and moves only on
+> `revokeEpoch()`. The key id says which key signed and moves only on
+> `rotate()`. Neither implies the other.**
+
+**AND THE LEVER NEEDED A HANDLE.** Decoupling the axes made the mechanism
+sound and left it unreachable: `revokeEpoch()` shipped as a Durable Object
+RPC method with no route and no caller outside the test suite, so the
+sentence above — "could not be operated" — stayed true for a different
+reason. That is the same defect this bead had already fixed one function
+earlier, for `resetAlarmHealth()`, whose absent route let production serve a
+rejected bundle for 130 days (`notme-4896d8`). Found 2026-10-27 while
+answering whether the release waits on ley-line-open; `grep -rn revokeEpoch`
+returned its own definition, nine test call sites, and nothing else.
+
+`POST /admin/revoke-epoch` now exposes it, `authorityManage`-gated with the
+auth check ahead of the method check, and it returns `BUNDLE_MAX_AGE_MS`
+alongside the new generation so an operator pulling it is told when it takes
+effect rather than assuming "now". Gating and effect are pinned by
+`admin-revoke-epoch-route.do.test.ts` — including that a second pull advances
+the generation again, because an idempotent revoke could not answer a second
+incident, and that a revoked grant shuts the door on the next request.
+
+**PROPAGATION BOUND: `BUNDLE_MAX_AGE_MS` — five minutes.** A verifier that
+can reach the bundle enforces the new generation within one refresh;
+`isBundleStale()` refuses a bundle older than that, so the bound is enforced
+rather than hoped for. `revokeEpoch()` publishes synchronously instead of
+waiting for `alarm()`, because an alarm is the one component here with a
+measured history of never firing (`notme-4896d8`: `totalFires: 0` across 130
+days). A verifier that cannot reach the bundle has TTL and nothing else —
+unchanged, and still the honest answer.
+
+**WHAT THE LEVER IS NOT.** Class-level, never targeted: it cannot revoke one
+task, one tier, or one principal.
+
+**AND THE FIRST VERSION OF THIS SECTION OVERSTATED WHAT COVERS THAT**, in the
+one direction that makes a hole look filled. It claimed the targeted job was
+already handled by "the chain, where revoking a tier fails every task
+credential beneath it by issuer under ordinary path validation, needing no
+index at all". The path-validation mechanics are correct; **the lever does not
+exist.** Measured 2026-10-27: no CRL, no OCSP, no per-certificate status
+anywhere in the worker, and `CABundle` carries `epoch`, `seqno`, `keys`,
+`keyId`, `prevKeyId`, `issuedAt`, `signature` — no revoked-serial list.
+Nothing can mark one tier revoked, so nothing beneath one falls. The claim
+also contradicted the paragraph two above it, which had said the honest thing
+all along.
+
+The levers that EXIST are this one and the **grant** (`liveScopes` at the
+authorization gate — which governs what a session may do, not the validity of
+a certificate already in someone's hands). **Killing one task, or one machine,
+is an open hole**, tracked at `notme-9f84e6`, and the shape this ADR commits
+to for it is a renewal predicate, not a revocation list — see "Enforcement is
+a short lease, never 'valid until done'" above. Reaching for the epoch to do a
+targeted job remains the error; the point is that the targeted lever has to be
+BUILT, not that it is already there.
+
+**CONSEQUENCE THE SCHEMA PAID FOR.** `retired_keys` was keyed
+`epoch INTEGER PRIMARY KEY`, which is sound only while the two axes move
+together. Decoupled, a second rotation inside one epoch collides on that key —
+and the archive write is `INSERT OR IGNORE`, so the collision is **silent** and
+the second key's bytes are lost. That is the same audit-defeat failure in a new
+costume, reintroduced by the fix if the schema were left alone. The archive is
+therefore keyed on the key and records the inclusive **span** of epochs it
+served, and `getEpochPublicKey` returns the **set** of keys that served an
+epoch — resolution at audit time is by `actor_fp`, which the receipt carries,
+with the epoch as a filter. One number was never an index for two axes.
+
+**ALSO FIXED, found by the test that drove this.** The epoch comparison was
+one-sided (`token.epoch < bundle.epoch`), so a credential naming a *future*
+generation passed step 5 and then matched the current key id at step 6. It is
+equality now: an epoch is not a timestamp and has no skew to tolerate.
 
 #### "Offline verification" and "not revoked" cannot both be fully true
 
@@ -627,6 +743,25 @@ missing" but **what APAS adds that a layout does not** — plausibly the
 delegation chain, the represented principal, and an actor that was itself
 delegated to mid-execution, none of which in-toto's functionary model covers.
 Extending that model is a stronger position than a parallel format.
+
+**PARTLY ANSWERED UPSTREAM, 2026-10-26 — and in the direction above.** APAS
+0.4 (signet `signet-ded9d4`, on branch, UNMERGED) makes an **in-toto Statement
+the mandatory baseline carrier**, with DSSE required at L2 and above, and
+assigns notme the predicate/schema namespace (`https://notme.bot/provenance/…`,
+its Appendix B). So "compose onto in-toto" is already the decided shape for the
+statement layer; what remains open is only the narrower question of whether the
+delegation chain, the represented principal and the mid-execution re-delegation
+fit a layout's functionary model or need a predicate of their own. Being
+assigned the predicate namespace means notme answers that as a predicate
+schema, which is composition, not a parallel format.
+
+Two consequences for the grant payload: it should be specified as a predicate
+under that namespace rather than as notme-internal columns first, and the
+sequencing waits on 0.4 merging — building against an unmerged document would
+pin notme to a draft. Tracked at `notme-230b40` (notme serves 0.3's
+`dispatch/v1` and owes 0.4's `activity/v1`; the rename from *dispatch* to
+*Activity* is itself the task-not-time distinction, since an Activity spans
+process replacement and resumption while a dispatch does not).
 
 **Federation** is a separate, horizontal axis and is out of scope here. notme
 already emits trust-domain-qualified identities; the accept side is missing.

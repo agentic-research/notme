@@ -245,12 +245,28 @@ Only two things invalidate it:
 
 1. **`EPOCH_MISMATCH` from `signReceipt`.** This is the signal. Re-read, retry
    once.
-2. **An explicit `rotate()`**, which is an operator action over admin RPC.
+2. **An explicit operator action over admin RPC.** There are two, and since
+   `notme-77a024` decoupled them they invalidate *different halves* of
+   `receiptFacts()` and surface as different codes:
+
+   | action | changes | code a stale caller sees | retryable |
+   |---|---|---|---|
+   | `revokeEpoch()` | `epoch` | `EPOCH_MISMATCH` | **yes — once** |
+   | `rotate()` | `actor_fp` | `ACTOR_FP_MISMATCH` | no |
+
+   The asymmetry is deliberate and worth stating because it is easy to read
+   the table as a bug. `actor_fp` is checked first (`commitment.ts`), so a
+   rotation has *always* surfaced as the non-retryable code — this is not a
+   regression introduced by the decoupling. A revocation is a generation a
+   caller can simply re-read and retry into; a key rotation means the
+   commitment was built against an authority identity that no longer signs,
+   and retrying the same bytes cannot fix that.
 
 No TTL is needed and polling is the wrong shape: `alarm()` calls
-`generateBundle()`, never `rotate()`, so the epoch does not move on a timer.
-(An earlier version of this ADR and a code comment both said rotation was
-"alarm-driven" — that was drift; corrected.)
+`generateBundle()`, never `rotate()` or `revokeEpoch()`, so the epoch does not
+move on a timer. (An earlier version of this ADR and a code comment both said
+rotation was "alarm-driven" — that was drift; corrected. Rotation no longer
+moves the epoch at all.)
 
 ### Bound the retry — one attempt
 

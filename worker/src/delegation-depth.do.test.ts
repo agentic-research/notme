@@ -315,3 +315,216 @@ describe("the SERVED root's budget matches the code's (notme-1b1db4)", () => {
     );
   });
 });
+
+// ── The root's validity belongs to the KEY, not to the moment of issue ──────
+// (notme-0c494f)
+//
+// MEASURED IN PRODUCTION by the signet session that filed this: the live
+// /.well-known/ca-bundle.pem had notBefore 2026-08-28T20:17:40Z; the copy
+// published with signet v0.3.0 had notBefore 2026-03-31T01:44:33Z. Identical
+// SPKI — the same key, re-issued. v0.3.0's leaf was valid 2026-08-07, BEFORE
+// the live root's notBefore, so `cosign verify-blob` against the live anchor
+// failed with "leaf certificate verification failed" and passed against the
+// old copy.
+//
+// The re-issue was the notme-1b1db4 heal above, which minted the replacement
+// with `notBefore: now` under a comment calling it "safe and non-destructive …
+// leaves verify by key, so nothing in flight is invalidated". That holds for a
+// verifier that checks a signature against a key. RFC 5280 path validation
+// does not stop there: every element of the chain must be valid AT THE
+// VERIFICATION TIME, and cosign verifies at the signing time. So every
+// artifact signed before the heal became unverifiable against the anchor
+// notme publishes — a heal that broke more than it fixed, invisibly.
+//
+// The rule now: notBefore = when the KEY began signing (keys.created_at).
+// Nothing the key signed can predate that, so no re-issue can strand it.
+describe("the root's notBefore is the key's start, not the re-issue time (notme-0c494f)", () => {
+  const KEY_START_SQL = "2026-03-31 01:44:33"; // production's key, per the bead
+  const KEY_START = new Date("2026-03-31T01:44:33Z");
+
+  /** Backdate this DO's key and return the stored signing key + CA name. */
+  async function backdateKey(a: SigningAuthority) {
+    await a.getCACertificatePem(); // force key + schema init
+    a["ctx"].storage.sql.exec(
+      "UPDATE keys SET created_at = ? WHERE id = 'authority'",
+      KEY_START_SQL,
+    );
+    const keyRow = a["ctx"].storage.sql
+      .exec("SELECT private_jwk FROM keys WHERE id = 'authority'")
+      .toArray()[0] as { private_jwk: string };
+    const signingKey = await crypto.subtle.importKey(
+      "jwk",
+      JSON.parse(keyRow.private_jwk),
+      ED25519,
+      false,
+      ["sign"],
+    );
+    const verifyKey = await crypto.subtle.importKey(
+      "spki",
+      pemToSpki(await a.getPublicKeyPem()),
+      ED25519,
+      true,
+      ["verify"],
+    );
+    return { signingKey, verifyKey };
+  }
+
+  /** Plant a root under the CURRENT key with the given notBefore/pathlen. */
+  async function plantRoot(
+    a: SigningAuthority,
+    keys: { signingKey: CryptoKey; verifyKey: CryptoKey },
+    notBefore: Date,
+    pathlen: number,
+  ) {
+    const state = await a.getAuthorityState();
+    const root = await X509CertificateGenerator.createSelfSigned({
+      name: "CN=signet-authority,O=notme",
+      notBefore,
+      notAfter: new Date(notBefore.getTime() + 86_400_000 * 3650),
+      signingAlgorithm: ED25519,
+      keys: { privateKey: keys.signingKey, publicKey: keys.verifyKey },
+      serialNumber: "0b",
+      extensions: [new BasicConstraintsExtension(true, pathlen, true)],
+    });
+    a["ctx"].storage.sql.exec("DELETE FROM ca_cert WHERE id = 'cert'");
+    a["ctx"].storage.sql.exec(
+      "INSERT INTO ca_cert (id, pem, key_id) VALUES ('cert', ?, ?)",
+      root.toString("pem"),
+      state.keyId,
+    );
+  }
+
+  it("a root re-issued under the same key carries the KEY's notBefore", async () => {
+    // The 1b1db4 trigger (pathlen mismatch) — the exact heal that caused this.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-pathlen-heal"),
+    );
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const keys = await backdateKey(a);
+      await plantRoot(a, keys, KEY_START, 0);
+    });
+    const pem = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).getCACertificatePem(),
+    );
+    const root = new X509Certificate(pem);
+    expect(root.getExtension(BasicConstraintsExtension)?.pathLength).toBe(1);
+    expect(root.notBefore.toISOString()).toBe(KEY_START.toISOString());
+  });
+
+  it("re-issues a cached root whose notBefore is LATER than the key's start — production's state", async () => {
+    // Correct pathlen, wrong notBefore: what production serves today. The
+    // pathlen check alone passes this root, so without a notBefore check the
+    // DO would serve it forever and never self-heal.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-late-cached"),
+    );
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const keys = await backdateKey(a);
+      await plantRoot(a, keys, new Date("2026-08-28T20:17:40Z"), 1);
+    });
+    const pem = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).getCACertificatePem(),
+    );
+    expect(new X509Certificate(pem).notBefore.toISOString()).toBe(
+      KEY_START.toISOString(),
+    );
+  });
+
+  it("serves a correct cached root unchanged — the heal is not a re-issue on every fetch", async () => {
+    // A cache that never hits would mint a new root (new serial) per request,
+    // so every verifier holding a previous copy would hold a different cert.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-stable"),
+    );
+    const first = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      await backdateKey(a);
+      // Drop the root cached before the backdate so the next fetch issues
+      // one against the backdated key start.
+      a["ctx"].storage.sql.exec("DELETE FROM ca_cert WHERE id = 'cert'");
+      return a.getCACertificatePem();
+    });
+    const second = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).getCACertificatePem(),
+    );
+    expect(second).toBe(first);
+    expect(new X509Certificate(first).notBefore.toISOString()).toBe(
+      KEY_START.toISOString(),
+    );
+  });
+
+  it("a fresh key's root starts at that key's creation", async () => {
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-fresh"),
+    );
+    const { pem, createdAt } = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const pem = await a.getCACertificatePem();
+      const row = a["ctx"].storage.sql
+        .exec("SELECT created_at FROM keys WHERE id = 'authority'")
+        .toArray()[0] as { created_at: string };
+      return { pem, createdAt: row.created_at };
+    });
+    expect(new X509Certificate(pem).notBefore.toISOString()).toBe(
+      new Date(createdAt.replace(" ", "T") + "Z").toISOString(),
+    );
+  });
+
+  it("a cert signed BEFORE the re-issue still chains — the bead's close condition", async () => {
+    // The property that actually broke. Signed in the past (as signet v0.3.0
+    // was, 2026-08-07), then the root is healed. RFC 5280: the root must be
+    // valid at the time the leaf is checked. Check it the way cosign does —
+    // at the leaf's own signing time.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-old-leaf"),
+    );
+    const leafPem = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const keys = await backdateKey(a);
+      const subjectKeys = (await crypto.subtle.generateKey(ED25519, true, [
+        "sign",
+        "verify",
+      ])) as CryptoKeyPair;
+      const signedAt = new Date("2026-08-07T15:51:00Z");
+      const leaf = await X509CertificateGenerator.create({
+        subject: "CN=signet-release,O=notme",
+        issuer: "CN=signet-authority,O=notme",
+        notBefore: signedAt,
+        notAfter: new Date(signedAt.getTime() + 5 * 60 * 1000),
+        signingAlgorithm: ED25519,
+        publicKey: subjectKeys.publicKey,
+        signingKey: keys.signingKey,
+        serialNumber: "0c",
+      });
+      // Production's state at the time of the failure: a healed root issued
+      // three weeks AFTER this leaf.
+      await plantRoot(a, keys, new Date("2026-08-28T20:17:40Z"), 1);
+      return leaf.toString("pem");
+    });
+
+    const { rootPem, keyPem } = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      return { rootPem: await a.getCACertificatePem(), keyPem: await a.getPublicKeyPem() };
+    });
+    const root = new X509Certificate(rootPem);
+    const leaf = new X509Certificate(leafPem);
+    // One minute into the leaf's window — when the signature was actually
+    // made. Not leaf.notBefore itself: @peculiar/x509 checks validity with a
+    // STRICT notBefore < t, so the boundary instant reads as invalid.
+    const at = new Date(leaf.notBefore.getTime() + 60_000);
+    const rootKey = await crypto.subtle.importKey(
+      "spki",
+      pemToSpki(keyPem),
+      ED25519,
+      true,
+      ["verify"],
+    );
+
+    // Signature: the leaf is the key's.
+    expect(await leaf.verify({ publicKey: rootKey, date: at })).toBe(true);
+    // And the anchor itself is valid at that moment — the check cosign failed.
+    expect(await root.verify({ date: at })).toBe(true);
+  });
+});

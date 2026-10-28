@@ -163,3 +163,68 @@ describe("verifyCertChain — name chaining is checked (found while building A5)
     ).rejects.toThrow(/issuer name/);
   });
 });
+
+// ── Resuming after a long pause: the tier has expired ───────────────────────
+//
+// THE PAUSE/RESUME QUESTION, asked of the code. A microVM suspended for
+// longer than its tier's lifetime (default 1h) resumes holding a tier that is
+// already past `notAfter`. The TTL clamp is
+// `Math.max(0, Math.min(requestedTtl, untilTierExpiry))`, so a negative
+// remaining lifetime floors to ZERO and the mint SUCCEEDS — handing back a
+// certificate whose notBefore equals its notAfter. Valid for zero seconds,
+// indistinguishable at the call site from a working credential, and it fails
+// later at whatever first tries to use it, with an expiry error that points
+// at the task rather than at the expired tier that actually caused it.
+//
+// Minting a corpse is worse than refusing: the caller's recovery for "my
+// tier expired" is to re-enrol the machine, and nothing in a zero-second
+// certificate tells it that.
+describe("a tier past its own notAfter cannot mint (pause/resume)", () => {
+  async function expiredTier(ageMs: number) {
+    const ca = await gen();
+    const keys = await gen();
+    const tier = await mintIssuingCaCert(
+      "alice", MACHINE_ID, await pem(keys.publicKey), ca.privateKey,
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey", ttlMs: -ageMs },
+    );
+    return { tier, keys };
+  }
+
+  const taskOpts = { task: "t", goalHash: GOAL, scopes: ["bridgeCert"], epoch: 1 };
+
+  it("refuses, naming the tier's expiry rather than minting a zero-second cert", async () => {
+    const { tier, keys } = await expiredTier(60_000);
+    const mtls = await genP256();
+    const signing = await gen();
+
+    await expect(
+      mintTaskCertPair(
+        tier.certificate, keys.privateKey,
+        await pem(mtls.publicKey), await pem(signing.publicKey), taskOpts,
+      ),
+    ).rejects.toThrow(/tier certificate expired/i);
+  });
+
+  it("still mints while the tier has life left, clamped to it", async () => {
+    // The control: the refusal must be about EXPIRY, not about a short tier.
+    // A tier with 30s left is usable, and the task inherits that bound.
+    const ca = await gen();
+    const keys = await gen();
+    const tier = await mintIssuingCaCert(
+      "alice", MACHINE_ID, await pem(keys.publicKey), ca.privateKey,
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey", ttlMs: 30_000 },
+    );
+    const mtls = await genP256();
+    const signing = await gen();
+
+    const task = await mintTaskCertPair(
+      tier.certificate, keys.privateKey,
+      await pem(mtls.publicKey), await pem(signing.publicKey),
+      { ...taskOpts, ttlMs: 5 * 60_000 },
+    );
+    const tierExp = new X509Certificate(tier.certificate).notAfter.getTime();
+    const taskExp = new X509Certificate(task.certificates.mtls).notAfter.getTime();
+    expect(taskExp).toBeLessThanOrEqual(tierExp);
+    expect(taskExp).toBeGreaterThan(Date.now()); // genuinely usable, not a corpse
+  });
+});
