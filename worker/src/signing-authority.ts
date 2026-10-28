@@ -744,6 +744,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return { signingKey: this.#signingKey, verifyKey: this.#verifyKey, keyId };
   }
 
+  /**
+   * When the current authority key began signing, from `keys.created_at`.
+   *
+   * SQLite's `datetime('now')` is "YYYY-MM-DD HH:MM:SS" in UTC with no zone
+   * marker, so it is normalised to ISO-8601 before parsing. null when there
+   * is no key row or the value does not parse — never a guess, because a
+   * wrong start date is exactly the defect this exists to prevent.
+   *
+   * Every write that keeps a key keeps its created_at: re-sealing under a KEK
+   * and the key_id backfill are UPDATEs of other columns, and the only
+   * INSERT OR REPLACE is the ephemeral mode, whose key is genuinely new on
+   * each start.
+   */
+  #keyStart(): Date | null {
+    this.#ensureSchema();
+    const row = this.ctx.storage.sql
+      .exec("SELECT created_at FROM keys WHERE id = 'authority'")
+      .toArray()[0] as { created_at?: string } | undefined;
+    if (!row?.created_at) return null;
+    const d = new Date(row.created_at.replace(" ", "T") + "Z");
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
   #getKeyId(): string {
     this.#ensureSchema();
     const rows = this.ctx.storage.sql
@@ -801,6 +824,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       )
     `);
     const currentKeyId = this.#getKeyId();
+    // The root's validity window belongs to the KEY, not to the moment the
+    // root happens to be (re-)issued (notme-0c494f). See keyStart below.
+    const keyStart = this.#keyStart();
     const cached = this.ctx.storage.sql
       .exec("SELECT pem, key_id FROM ca_cert WHERE id = 'cert'")
       .toArray() as Array<{ pem: string; key_id: string }>;
@@ -816,17 +842,32 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // root to pathlen=1, production kept serving its March-2026 pathlen:0
       // cert for five months, and every Issuing CA tier minted under it was
       // unverifiable by any stock validator (notme-1b1db4). Re-issuing here
-      // is safe and non-destructive: same key, same epoch — leaves verify by
-      // key, so nothing in flight is invalidated.
+      // keeps the key and the epoch. It is only non-destructive because the
+      // re-issued root keeps the KEY's notBefore — this comment used to say
+      // "leaves verify by key, so nothing in flight is invalidated", and the
+      // heal minted with notBefore=now, which stranded every signature made
+      // before it under RFC 5280 path validation (notme-0c494f).
       try {
         const { X509Certificate, BasicConstraintsExtension } = await import(
           "@peculiar/x509"
         );
         const x = new X509Certificate(cached[0]!.pem);
         const bc = x.getExtension(BasicConstraintsExtension);
-        if (bc?.ca && bc.pathLength === CA_PATH_LEN) return cached[0]!.pem;
+        // A root that starts AFTER its key began signing strands everything
+        // signed in between: RFC 5280 path validation requires the anchor to
+        // be valid at the verification time, and cosign verifies at the
+        // signing time. Production served exactly that — the heal below had
+        // minted with `notBefore: now` (notme-0c494f) — so this check is also
+        // what makes production self-heal on the first fetch after deploy.
+        const startsLate =
+          keyStart !== null && x.notBefore.getTime() > keyStart.getTime();
+        if (bc?.ca && bc.pathLength === CA_PATH_LEN && !startsLate) {
+          return cached[0]!.pem;
+        }
         console.warn(
-          `[ca] cached root has pathlen ${bc?.pathLength ?? "none"}, code mints ${CA_PATH_LEN} — re-issuing under the same key`,
+          startsLate
+            ? `[ca] cached root notBefore ${x.notBefore.toISOString()} is after the key's start ${keyStart!.toISOString()} — re-issuing under the same key`
+            : `[ca] cached root has pathlen ${bc?.pathLength ?? "none"}, code mints ${CA_PATH_LEN} — re-issuing under the same key`,
         );
       } catch {
         /* regenerate */
@@ -834,9 +875,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
 
     const { signingKey, verifyKey } = await this.#getOrCreateSigningKey();
-    const now = new Date();
+    // notBefore = when this key began signing. Nothing it signed predates
+    // that, so no re-issue under the same key can leave an earlier signature
+    // outside the anchor's window. The 1b1db4 heal used `now` and called it
+    // "non-destructive … leaves verify by key" — true for a signature check,
+    // false for path validation, which is what cosign does. A fresh key's
+    // start IS now, so the first issue is unchanged.
+    //
+    // Fallback is `now` only when the key row has no parseable start — a
+    // fresh row always has one (`created_at DEFAULT datetime('now')`).
+    const notBefore = keyStart ?? new Date();
     const notAfter = new Date(
-      now.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
+      notBefore.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
     );
     const serial = crypto
       .getRandomValues(new Uint8Array(16))
@@ -844,7 +894,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const cert = await X509CertificateGenerator.createSelfSigned({
       name: caSubjectForEnv(this.env),
-      notBefore: now,
+      notBefore,
       notAfter,
       signingAlgorithm: ED25519,
       keys: { privateKey: signingKey, publicKey: verifyKey },
