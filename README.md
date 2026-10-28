@@ -154,14 +154,14 @@ graph LR
 ### try it
 
 ```bash
-task task-cert -- enroll                     # prints a link + fingerprint; approve with your passkey
+task task-cert -- enroll --scopes bridgeCert,sign:git   # link + fingerprint; approve with your passkey
 task task-cert -- mint --task build --goal "ship the release" --scopes bridgeCert,sign:git
 task task-cert -- mint --parent build --task compile --goal "compile"   # a subtask, narrower
 task task-cert -- verify --cert ~/.notme/tasks/build/compile/signing.pem
 task task-cert -- status                     # tier, renewal horizon, mints, revocations
 ```
 
-keys and certs live under `~/.notme/` (dir 0700, keys 0600), never in the working directory. every mint is recorded in `~/.notme/tasks/ledger.jsonl`. `openssl verify -CAfile root.pem -untrusted ~/.notme/tier/tier.pem task.pem` checks a task cert without any notme code.
+a machine requests `bridgeCert` alone unless `enroll --scopes` asks for more, and gets only what you hold. keys and certs live under `~/.notme/` (dir 0700, keys 0600), never in the working directory. every mint is recorded in `~/.notme/tasks/ledger.jsonl`. `openssl verify -CAfile root.pem -untrusted ~/.notme/tier/tier.pem task.pem` checks a task cert without any notme code.
 
 **in CI**, a GitHub Actions job needs no enrollment: its OIDC token is the evidence. `POST /cert/gha` exchanges it for a cert pair, and `POST /token` (RFC 8693 token exchange) for a DPoP-bound access token.
 

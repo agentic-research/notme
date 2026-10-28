@@ -187,6 +187,16 @@ async function mint() {
     if (!existsSync(p)) throw new Error(`no parent task ${a.parent} — mint it first (${p})`);
     parent = readFileSync(p, "utf8");
   }
+  // The tier carries only what its enrollment requested (bridgeCert unless
+  // `enroll --scopes` asked for more). mintTask refuses an escalation either
+  // way; this only turns the refusal into the step that fixes it.
+  const missing = (a.scopes ? a.scopes.split(",") : []).filter((x) => !meta.scopes.includes(x));
+  if (missing.length) {
+    throw new Error(
+      `this machine's tier holds ${meta.scopes.join(", ")}, not ${missing.join(", ")}. ` +
+        `Re-enroll asking for it: enroll --scopes ${[...meta.scopes, ...missing].join(",")}`,
+    );
+  }
   const t = await mintTask(need("tier.pem"), await importPrivateKeyPem(need("tier.key.pem")), {
     task: a.task,
     goal: a.goal,
