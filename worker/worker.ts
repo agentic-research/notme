@@ -1213,7 +1213,16 @@ function enrolPageHtml(
   <p>Key fingerprint: <code>${esc(fp)}</code></p>
   <p class="muted">Approve only if this fingerprint matches what the machine printed. If you did not start this, close the page.</p>
   <p class="muted">Requested scopes: ${esc(scopes.join(", ") || "bridgeCert")} — certMint is never delegated.</p>
-  ${status === "pending" ? '<button id="approve">approve</button>' : `<p>This enrolment is already ${esc(status)}.</p>`}
+  ${status === "pending" ? `<p>
+    <label>It may renew without asking you again for
+      <select id="renew">
+        <option value="1">1 day</option>
+        <option value="7" selected>7 days</option>
+        <option value="30">30 days</option>
+      </select></label>
+  </p>
+  <p class="muted">So a machine that pauses and resumes is not blocked on you. You can revoke it at any time; renewal stops at once.</p>
+  <button id="approve">approve</button>` : `<p>This enrollment is already ${esc(status)}.</p>`}
   <p id="out" class="muted"></p>
   <script>
     var b = document.getElementById('approve');
@@ -1222,7 +1231,10 @@ function enrolPageHtml(
       var res = await fetch('/cert/issuing-ca/device/approve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_code: document.body.dataset.code })
+        body: JSON.stringify({
+          user_code: document.body.dataset.code,
+          renew_days: Number(document.getElementById('renew').value)
+        })
       });
       var data = await res.json().catch(function () { return {}; });
       document.getElementById('out').textContent = res.ok
@@ -3019,13 +3031,21 @@ export default {
         if (typeof session.authMethod !== "string" || !session.authMethod) {
           return jsonErr("session carries no authMethod", 401);
         }
-        let body: { user_code?: unknown } = {};
+        let body: { user_code?: unknown; renew_days?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
         } catch {
           /* empty body */
         }
         const userCode = typeof body.user_code === "string" ? body.user_code.toUpperCase() : "";
+        // The renewal horizon (notme-337d82): how long this machine may renew
+        // its tier WITHOUT a human — so a VM that pauses and resumes is not
+        // blocked on a person for an action already approved. A fixed menu,
+        // default 7 days (survives a weekend pause); not a free number.
+        const renewDays = body.renew_days === undefined ? 7 : body.renew_days;
+        if (renewDays !== 1 && renewDays !== 7 && renewDays !== 30) {
+          return jsonErr("renew_days must be 1, 7 or 30", 400);
+        }
         const pending = await authority.getTierEnrolment(userCode);
         if (!pending) return jsonErr("no such enrolment", 404);
         const { narrowScopes } = await import("./src/auth/scope-chain");
@@ -3042,6 +3062,7 @@ export default {
           identity: principalIdentity(wimseTrustDomain(env), session.principalId),
           authMethod: session.authMethod,
           scopes,
+          renewDays,
         });
         if (!r.ok) {
           return jsonErr(
@@ -3072,8 +3093,81 @@ export default {
             { status: r.reason === "invalid_proof" ? 401 : 400 },
           );
         }
-        const { ok: _ok, principalId, authMethod, ...tier } = r;
-        return Response.json({ ...tier, principal_id: principalId, auth_method: authMethod });
+        const { ok: _ok, principalId, authMethod, renewUntil, ...tier } = r;
+        return Response.json({
+          ...tier,
+          principal_id: principalId,
+          auth_method: authMethod,
+          renew_until: renewUntil,
+        });
+      }
+
+      // POST /cert/issuing-ca/renew — a machine renews its tier with no
+      // human, while the approval holds (notme-337d82). Body
+      // { public_key, iat, proof }; proof = Ed25519 over
+      // "notme/tier-renew/v1\0" || SPKI || uint64be(iat). Unauthenticated BY
+      // DESIGN: the proof of possession is the authentication, and the result
+      // is a public certificate for a key only the renewer holds.
+      if (pathname === "/cert/issuing-ca/renew" && request.method === "POST") {
+        let body: { public_key?: unknown; iat?: unknown; proof?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.renewTier({
+          publicKeyPem: typeof body.public_key === "string" ? body.public_key : "",
+          iat: typeof body.iat === "number" ? body.iat : NaN,
+          proof: typeof body.proof === "string" ? body.proof : "",
+        });
+        if (!r.ok) {
+          const status =
+            r.reason === "unknown_key" ? 404
+            : r.reason === "invalid_key" ? 400
+            : r.reason === "stale_proof" || r.reason === "invalid_proof" ? 401
+            : 403;
+          // revoked / horizon_passed / epoch_changed / approval_withdrawn all
+          // mean "a human must approve again" — named, so the machine can say
+          // which.
+          return Response.json({ error: r.reason }, { status });
+        }
+        const { ok: _ok, renewUntil, ...tier } = r;
+        return Response.json({ ...tier, renew_until: renewUntil });
+      }
+
+      // GET /cert/issuing-ca/enrollments — the signed-in human's machines.
+      // POST /cert/issuing-ca/enrollments/revoke { key_fingerprint } — stop
+      // one renewing. Its own approver may; an administrator may revoke any.
+      if (pathname === "/cert/issuing-ca/enrollments" || pathname === "/cert/issuing-ca/enrollments/revoke") {
+        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        if (!cookie) return jsonErr("session_required", 401);
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const { verifySessionCookie, liveScopes } = await import("./src/auth/session");
+        const session = await verifySessionCookie(cookie, await authority.getSessionSecret());
+        if (!session) return jsonErr("invalid_session", 401);
+        if (pathname === "/cert/issuing-ca/enrollments" && request.method === "GET") {
+          return Response.json(await authority.listTierEnrolments(session.principalId));
+        }
+        if (pathname === "/cert/issuing-ca/enrollments/revoke" && request.method === "POST") {
+          let body: { key_fingerprint?: unknown } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+          const fingerprint = typeof body.key_fingerprint === "string" ? body.key_fingerprint.toLowerCase() : "";
+          const isAdmin = (await liveScopes(session, authority)).includes("authorityManage");
+          const r = await authority.revokeTierEnrolment({
+            keyFingerprint: fingerprint,
+            byPrincipal: session.principalId,
+            anyPrincipal: isAdmin,
+          });
+          // 404, not 403, for someone else's machine: whether a fingerprint
+          // is enrolled under another principal is not this caller's business.
+          return r.ok ? Response.json({ ok: true }) : jsonErr("no such enrollment", 404);
+        }
+        return jsonErr("method not allowed", 405);
       }
 
       if (pathname === "/cert/issuing-ca" && request.method === "POST") {

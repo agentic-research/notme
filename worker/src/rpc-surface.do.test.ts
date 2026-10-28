@@ -330,7 +330,20 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //             — which any authority a stub was stolen FROM has. On a
       //             live authority it is a no-op by construction, the same
       //             argument that admitted its predecessor.
-    ).toBe(59);
+      //
+      // 59 → 62: renewTier, listTierEnrolments, revokeTierEnrolment
+      // (notme-337d82). Reviewed:
+      //   renewTier — verifies the PoP itself and every condition of the
+      //             human's approval (not revoked, inside the horizon, same
+      //             epoch, approver still holds certMint and the scopes). It
+      //             can only re-issue what was already approved, for the key
+      //             already approved, never past the horizon the human chose.
+      //   list    — fingerprints, horizons and scopes for a principal: an
+      //             audit view, nothing secret.
+      //   revoke  — only ever STOPS renewal (narrows). A leaked stub could
+      //             revoke machines: a denial of service strictly weaker than
+      //             revokeEpoch.
+    ).toBe(62);
   });
 });
 

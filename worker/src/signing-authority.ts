@@ -1848,6 +1848,20 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         expires_at       INTEGER NOT NULL
       )
     `);
+    // Renewal (notme-337d82): the enrollment is KEPT after collection and is
+    // what a machine renews against. expires_at stays the device-code expiry;
+    // these carry the approval's lifetime.
+    for (const col of [
+      "renew_until INTEGER",
+      "revoked_at INTEGER",
+      "approved_epoch INTEGER",
+    ]) {
+      try {
+        this.ctx.storage.sql.exec(`ALTER TABLE tier_enrolments ADD COLUMN ${col}`);
+      } catch {
+        /* already present */
+      }
+    }
   }
 
   /**
@@ -1878,9 +1892,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const now = Math.floor(Date.now() / 1000);
     const sql = this.ctx.storage.sql;
-    sql.exec("DELETE FROM tier_enrolments WHERE expires_at <= ?", now);
+    // Prune and cap only enrollments still in FLIGHT. An active enrollment is
+    // the record a machine renews against; its device code expiring is
+    // irrelevant to it, and pruning it would silently end renewal ten minutes
+    // after collection.
+    sql.exec(
+      "DELETE FROM tier_enrolments WHERE expires_at <= ? AND status IN ('pending', 'approved')",
+      now,
+    );
     const [{ n }] = [
-      ...sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tier_enrolments"),
+      ...sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM tier_enrolments WHERE status IN ('pending', 'approved')",
+      ),
     ];
     if (n >= TIER_ENROLMENT_CAP) return { ok: false, reason: "busy" };
 
@@ -1941,6 +1964,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     identity: string;
     authMethod: string;
     scopes: string[];
+    /** How long the machine may renew without a human (notme-337d82). */
+    renewDays: number;
   }): Promise<{ ok: true } | { ok: false; reason: "not_found" | "expired" | "not_pending" }> {
     this.#ensureTierEnrolmentSchema();
     const now = Math.floor(Date.now() / 1000);
@@ -1952,12 +1977,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     if (row.status !== "pending") return { ok: false, reason: "not_pending" };
     this.ctx.storage.sql.exec(
       `UPDATE tier_enrolments
-          SET status = 'approved', principal_id = ?, identity = ?, auth_method = ?, granted_scopes = ?
+          SET status = 'approved', principal_id = ?, identity = ?, auth_method = ?, granted_scopes = ?,
+              renew_until = ?, approved_epoch = ?
         WHERE user_code = ? AND status = 'pending'`,
       params.principalId,
       params.identity,
       params.authMethod,
       JSON.stringify(params.scopes),
+      now + params.renewDays * 86400,
+      (await this.getAuthorityState()).epoch,
       params.userCode,
     );
     return { ok: true };
@@ -1971,7 +1999,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * the real holder's approval. A good one consumes it before minting.
    */
   async collectTierEnrolment(params: { deviceCode: string; proof: string }): Promise<
-    | ({ ok: true; principalId: string; authMethod: string } &
+    | ({ ok: true; principalId: string; authMethod: string; renewUntil: number } &
         import("./cert-authority").IssuingCaCertResult & {
           authority: { epoch: number; key_id: string };
         })
@@ -2000,6 +2028,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           auth_method: string;
           granted_scopes: string;
           expires_at: number;
+          renew_until: number | null;
         }
       | undefined;
     if (!row) return { ok: false, reason: "invalid_grant" };
@@ -2022,7 +2051,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Consume first, atomically: of two concurrent collects with a valid
     // proof, exactly one sees changes() = 1.
     this.ctx.storage.sql.exec(
-      "UPDATE tier_enrolments SET status = 'consumed' WHERE device_code_hash = ? AND status = 'approved'",
+      // 'active', not 'consumed': the enrollment lives on as the record a
+      // machine renews against (notme-337d82). Single use still holds — a
+      // second collect finds status 'active' and is refused.
+      "UPDATE tier_enrolments SET status = 'active' WHERE device_code_hash = ? AND status = 'approved'",
       deviceCodeHash,
     );
     const [change] = [
@@ -2037,7 +2069,147 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       scopes: JSON.parse(row.granted_scopes),
       authMethod: row.auth_method,
     });
-    return { ok: true, principalId: row.principal_id, authMethod: row.auth_method, ...result };
+    return {
+      ok: true,
+      principalId: row.principal_id,
+      authMethod: row.auth_method,
+      renewUntil: row.renew_until ?? 0,
+      ...result,
+    };
+  }
+
+  // ── Tier renewal (notme-337d82) ─────────────────────────────────────────
+  //
+  // A machine renews its tier by proof of possession, without a human, for as
+  // long as the human's approval holds. This is the pause/resume case: a VM
+  // suspended past its tier's lifetime resumes, renews, and carries on, where
+  // before it needed a human to re-enroll — an approved action blocked on a
+  // person.
+  //
+  // Looked up by KEY, so renewal never needs the old (expired) tier cert.
+  // Refused — each for a reason a machine can act on — when the approval no
+  // longer holds: revoked, past the horizon, the epoch moved (so mass
+  // revocation still reaches machines), or the approver no longer holds
+  // certMint. The scopes renewed are the granted scopes still LIVE on the
+  // approver, so narrowing a grant narrows every machine at its next renewal.
+
+  async renewTier(params: { publicKeyPem: string; iat: number; proof: string }): Promise<
+    | ({ ok: true; renewUntil: number } & import("./cert-authority").IssuingCaCertResult & {
+        authority: { epoch: number; key_id: string };
+      })
+    | {
+        ok: false;
+        reason:
+          | "invalid_key"
+          | "unknown_key"
+          | "stale_proof"
+          | "invalid_proof"
+          | "revoked"
+          | "horizon_passed"
+          | "epoch_changed"
+          | "approval_withdrawn";
+      }
+  > {
+    this.#ensureTierEnrolmentSchema();
+    const { importPublicKey } = await import("./cert-authority");
+    let key: CryptoKey;
+    try {
+      key = await importPublicKey(params.publicKeyPem);
+    } catch {
+      return { ok: false, reason: "invalid_key" };
+    }
+    if (key.algorithm.name !== "Ed25519") return { ok: false, reason: "invalid_key" };
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
+    const fingerprint = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", spki)));
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT * FROM tier_enrolments WHERE key_fingerprint = ? AND status = 'active' ORDER BY renew_until DESC LIMIT 1",
+        fingerprint,
+      )
+      .toArray()[0] as
+      | {
+          principal_id: string;
+          identity: string;
+          auth_method: string;
+          granted_scopes: string;
+          renew_until: number | null;
+          revoked_at: number | null;
+          approved_epoch: number | null;
+          public_key_pem: string;
+        }
+      | undefined;
+    if (!row) return { ok: false, reason: "unknown_key" };
+
+    const now = Math.floor(Date.now() / 1000);
+    const { RENEWAL_SKEW_S, tierRenewalBinding } = await import("./auth/tier-enrolment-binding");
+    if (!Number.isSafeInteger(params.iat) || Math.abs(now - params.iat) > RENEWAL_SKEW_S) {
+      return { ok: false, reason: "stale_proof" };
+    }
+    const { verifyEd25519PopProof } = await import("./auth/pop");
+    if (!(await verifyEd25519PopProof(tierRenewalBinding(spki, params.iat), key, params.proof))) {
+      return { ok: false, reason: "invalid_proof" };
+    }
+
+    if (row.revoked_at !== null) return { ok: false, reason: "revoked" };
+    if (row.renew_until === null || row.renew_until <= now) return { ok: false, reason: "horizon_passed" };
+    const state = await this.getAuthorityState();
+    if (row.approved_epoch === null || row.approved_epoch !== state.epoch) {
+      return { ok: false, reason: "epoch_changed" };
+    }
+    const live = new Set(await this.getPrincipalScopes(row.principal_id));
+    if (!live.has("certMint")) return { ok: false, reason: "approval_withdrawn" };
+    const scopes = (JSON.parse(row.granted_scopes) as string[]).filter((s) => live.has(s));
+    if (scopes.length === 0) return { ok: false, reason: "approval_withdrawn" };
+
+    // Never past the horizon the human set.
+    const ttlMs = Math.min(60 * 60 * 1000, (row.renew_until - now) * 1000);
+    const result = await this.mintIssuingCa({
+      subject: row.principal_id,
+      identity: row.identity,
+      publicKeyPem: row.public_key_pem,
+      scopes,
+      authMethod: row.auth_method,
+      ttlMs,
+    });
+    return { ok: true, renewUntil: row.renew_until, ...result };
+  }
+
+  /** A principal's enrolled machines — what the human approved, and its state. */
+  async listTierEnrolments(principalId: string): Promise<
+    Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; scopes: string[] }>
+  > {
+    this.#ensureTierEnrolmentSchema();
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT key_fingerprint, status, renew_until, revoked_at, granted_scopes FROM tier_enrolments WHERE principal_id = ? AND status = 'active'",
+        principalId,
+      )
+      .toArray() as Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; granted_scopes: string }>;
+    return rows.map(({ granted_scopes, ...r }) => ({ ...r, scopes: JSON.parse(granted_scopes) }));
+  }
+
+  /**
+   * Stop a machine renewing. The ROUTE decides who may: the approver, or an
+   * administrator (`anyPrincipal`). Its current tier lives out its (≤1 h)
+   * lifetime; renewal is what this ends.
+   */
+  async revokeTierEnrolment(params: {
+    keyFingerprint: string;
+    byPrincipal: string;
+    anyPrincipal: boolean;
+  }): Promise<{ ok: boolean }> {
+    this.#ensureTierEnrolmentSchema();
+    this.ctx.storage.sql.exec(
+      `UPDATE tier_enrolments SET revoked_at = ?
+        WHERE key_fingerprint = ? AND status = 'active' AND revoked_at IS NULL
+          AND (? = 1 OR principal_id = ?)`,
+      Math.floor(Date.now() / 1000),
+      params.keyFingerprint,
+      params.anyPrincipal ? 1 : 0,
+      params.byPrincipal,
+    );
+    const [c] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+    return { ok: c.n > 0 };
   }
 
   // Current epoch and keyId for embedding in issued certs.
