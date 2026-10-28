@@ -16,10 +16,11 @@
  * would: scopes never exceed the tier's, lifetime never outlives it, an
  * expired tier is refused, and the tier key must match the tier cert.
  */
+import { join } from "node:path";
 import { X509Certificate, BasicConstraintsExtension } from "@peculiar/x509";
 import { mintTaskCertPair } from "../../worker/src/cert-authority";
 import { ED25519 } from "../../worker/src/platform";
-import { deviceCodeHash, tierEnrolmentBinding } from "../../worker/src/auth/tier-enrolment-binding";
+import { deviceCodeHash, tierEnrolmentBinding, tierRenewalBinding } from "../../worker/src/auth/tier-enrolment-binding";
 
 const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b));
 const b64url = (b: Uint8Array) => b64(b).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -138,7 +139,7 @@ async function spkiPemOf(key: CryptoKey): Promise<string> {
 export async function mintTask(
   tierPem: string,
   tierPrivateKey: CryptoKey,
-  opts: { task: string; goal: string; epoch: number; scopes?: string[]; ttlMs?: number },
+  opts: { task: string; goal: string; epoch: number; scopes?: string[]; ttlMs?: number; parent?: string },
 ) {
   const mtls = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
   const signing = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
@@ -148,7 +149,7 @@ export async function mintTask(
     tierPrivateKey,
     await spkiPemOf(mtls.publicKey),
     await spkiPemOf(signing.publicKey),
-    { task: opts.task, goalHash, scopes: opts.scopes ?? ["bridgeCert"], epoch: opts.epoch, ttlMs: opts.ttlMs },
+    { task: opts.task, goalHash, scopes: opts.scopes ?? ["bridgeCert"], epoch: opts.epoch, ttlMs: opts.ttlMs, parent: opts.parent },
   );
   return {
     ...result,
@@ -191,4 +192,46 @@ export async function verifyChain(
     if (!within(c)) return { ok: false, reason: `${name} is not valid at ${at.toISOString()}` };
   }
   return { ok: true };
+}
+
+// ── Renewal, subtasks, ledger, local revocation (notme-337d82, notme-9f84e6) ─
+
+/** The renewal proof — over the authority's shared binding, byte for byte. */
+export async function renewProof(privateKey: CryptoKey, spki: Uint8Array, iat: number): Promise<string> {
+  return b64url(new Uint8Array(await crypto.subtle.sign(ED25519, privateKey, tierRenewalBinding(spki, iat))));
+}
+
+/**
+ * Renew the tier with no human, while the approval holds. Throws with the
+ * authority's reason (revoked, horizon_passed, epoch_changed,
+ * approval_withdrawn) when a human must approve again.
+ */
+export async function renewTier(
+  authority: string,
+  key: { privateKey: CryptoKey; spki: Uint8Array; pem: string },
+  fetchFn: typeof fetch = fetch,
+): Promise<{ certificate: string; expires_at: number; renew_until: number; authority: { epoch: number } }> {
+  const iat = Math.floor(Date.now() / 1000);
+  const res = await fetchFn(`${authority}/cert/issuing-ca/renew`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ public_key: key.pem, iat, proof: await renewProof(key.privateKey, key.spki, iat) }),
+  });
+  const body = (await res.json().catch(() => ({}))) as any;
+  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  return body;
+}
+
+/**
+ * Is this task — or anything it derives from — locally revoked? Prefix match
+ * on SEGMENT boundaries: revoking `build` revokes `build/compile`, never
+ * `build2`, and never `build`'s ancestors.
+ */
+export function isRevokedTask(taskPath: string, revoked: readonly string[]): boolean {
+  return revoked.some((r) => taskPath === r || taskPath.startsWith(`${r}/`));
+}
+
+/** Where a task's files live: one directory per task-path segment. */
+export function taskOutDir(base: string, taskPath: string): string {
+  return join(base, ...taskPath.split("/"));
 }

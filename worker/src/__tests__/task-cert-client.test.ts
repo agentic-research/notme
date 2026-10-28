@@ -145,3 +145,41 @@ describe("minting a task certificate offline", () => {
     await expect(mintTask(tierPem, wrong.privateKey, { task: "t1", goal: "g", epoch: 3 })).rejects.toThrow();
   });
 });
+
+// ── renewal, subtasks, ledger, revocation (notme-337d82, notme-9f84e6) ──────
+import { renewProof, isRevokedTask, taskOutDir } from "../../../scripts/task-cert/lib";
+import { tierRenewalBinding } from "../auth/tier-enrolment-binding";
+
+describe("renewal proof", () => {
+  it("verifies under the SHARED renewal binding, bound to its timestamp", async () => {
+    const k = await generateTierKey();
+    const iat = 1_800_000_000;
+    const proof = await renewProof(k.privateKey, k.spki, iat);
+    const sig = Uint8Array.from(atob(proof.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (proof.length % 4)) % 4)), (c) => c.charCodeAt(0));
+    expect(await crypto.subtle.verify(ED25519, k.publicKey, sig, tierRenewalBinding(k.spki, iat))).toBe(true);
+    expect(await crypto.subtle.verify(ED25519, k.publicKey, sig, tierRenewalBinding(k.spki, iat + 1))).toBe(false);
+  });
+});
+
+describe("local revocation is by task PREFIX, on segment boundaries", () => {
+  const revoked = ["build", "deploy/prod"];
+  it("revokes the task itself and everything derived from it", () => {
+    expect(isRevokedTask("build", revoked)).toBe(true);
+    expect(isRevokedTask("build/compile", revoked)).toBe(true);
+    expect(isRevokedTask("build/compile/linker", revoked)).toBe(true);
+    expect(isRevokedTask("deploy/prod/canary", revoked)).toBe(true);
+  });
+  it("does not revoke a sibling that merely shares characters", () => {
+    expect(isRevokedTask("build2", revoked)).toBe(false);
+    expect(isRevokedTask("deploy/production", revoked)).toBe(false);
+  });
+  it("does not revoke an ancestor of a revoked task", () => {
+    expect(isRevokedTask("deploy", revoked)).toBe(false);
+  });
+});
+
+describe("task output paths", () => {
+  it("nest subtasks under their parent, one directory per segment", () => {
+    expect(taskOutDir("/home/u/.notme/tasks", "build/compile")).toBe("/home/u/.notme/tasks/build/compile");
+  });
+});
