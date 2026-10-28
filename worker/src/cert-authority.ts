@@ -843,6 +843,18 @@ export async function mintTaskCertPair(
     scopes: string[];
     epoch: number;
     ttlMs?: number;
+    /**
+     * A parent TASK certificate (PEM) to derive from — a subtask
+     * (notme-9f84e6). Omitted, this is a top-level task or a re-mint of one.
+     *
+     * Re-mints and subtasks are one operation: issuing a credential derived
+     * from an existing task credential. Both are minted by the TIER HOLDER,
+     * never by the agent — a task key signs nothing a verifier accepts — and
+     * both may only narrow: the child's scopes ⊆ the parent's, its notAfter
+     * ≤ the parent's, and its task path and identity extend the parent's, so
+     * revoking by prefix reaches everything derived from a task.
+     */
+    parent?: string;
   },
 ): Promise<BridgeCertPairResult> {
   const { X509Certificate, SubjectAlternativeNameExtension } = await import("@peculiar/x509");
@@ -870,19 +882,61 @@ export async function mintTaskCertPair(
   const san = tier.getExtension(SubjectAlternativeNameExtension);
   const tierIdentity = san?.names.items.find((n) => n.type === "url")?.value;
   if (!tierIdentity) throw new Error("tier certificate carries no identity URI");
-  const identity = `${tierIdentity}/${encodeURIComponent(opts.task)}`;
 
   const tierScopes = readScopes(tier);
   if (tierScopes === null) throw new Error("tier certificate carries no scopes");
+
+  // The bound every narrowing check is made against: the tier, or — for a
+  // subtask — the parent task, which is itself already within the tier.
+  let taskPath = opts.task;
+  let identity = `${tierIdentity}/${encodeURIComponent(opts.task)}`;
+  let boundScopes = tierScopes;
+  let boundNotAfter = tier.notAfter.getTime();
+  let boundName = "the tier";
+  if (opts.parent !== undefined) {
+    let parent: InstanceType<typeof X509Certificate>;
+    try {
+      parent = new X509Certificate(opts.parent);
+    } catch {
+      throw new Error("parent is not a certificate");
+    }
+    // Issued by THIS tier: name and signature both, so a parent from another
+    // tier (another machine, another human) cannot be extended here.
+    if (
+      parent.issuer !== tier.subject ||
+      !(await parent.verify({ publicKey: tierPublic, signatureOnly: true }))
+    ) {
+      throw new Error("parent task was not issued by this tier");
+    }
+    const parentScope = certTaskScope(parent);
+    if (!parentScope) throw new Error("parent is not a task certificate (no task scope)");
+    if (parent.notAfter.getTime() <= Date.now()) {
+      throw new Error(`parent task expired at ${parent.notAfter.toISOString()} — re-mint it first`);
+    }
+    const parentIdentity = parent
+      .getExtension(SubjectAlternativeNameExtension)
+      ?.names.items.find((n) => n.type === "url")?.value;
+    const parentScopes = readScopes(parent);
+    if (!parentIdentity || parentScopes === null) {
+      throw new Error("parent task carries no identity or scopes");
+    }
+    taskPath = `${parentScope.task}/${opts.task}`;
+    identity = `${parentIdentity}/${encodeURIComponent(opts.task)}`;
+    boundScopes = parentScopes;
+    boundNotAfter = parent.notAfter.getTime();
+    boundName = "the parent task";
+  }
+
   const requested = [...new Set(opts.scopes)];
-  const scopes = narrowScopes(tierScopes, requested);
+  const scopes = narrowScopes(boundScopes, requested);
   if (scopes.length !== requested.length) {
     throw new Error(
-      `scope escalation: ${escalatedScopes(tierScopes, requested).join(", ")} not held by the tier`,
+      `scope escalation: ${escalatedScopes(boundScopes, requested).join(", ")} not held by ${boundName}`,
     );
   }
 
-  // Lifetime: never past the tier's own expiry.
+  // Lifetime: never past the tier's own expiry — nor, for a subtask, the
+  // parent's.
   const requestedTtl = opts.ttlMs ?? 5 * 60 * 1000;
   const untilTierExpiry = tier.notAfter.getTime() - Date.now();
   // REFUSE AN EXPIRED TIER rather than minting against it.
@@ -905,7 +959,7 @@ export async function mintTaskCertPair(
       `tier certificate expired at ${tier.notAfter.toISOString()} — re-enrol the machine before minting task credentials`,
     );
   }
-  const ttlMs = Math.min(requestedTtl, untilTierExpiry);
+  const ttlMs = Math.min(requestedTtl, untilTierExpiry, boundNotAfter - Date.now());
 
   const authMethodExt = tier.getExtension(OID_AUTH_METHOD);
   const authMethod = authMethodExt
@@ -913,7 +967,7 @@ export async function mintTaskCertPair(
     : "task";
 
   return mintBridgeCertPair(
-    opts.task,
+    taskPath,
     identity,
     mtlsPublicKeyPem,
     signingPublicKeyPem,
@@ -927,7 +981,7 @@ export async function mintTaskCertPair(
       // A task is exercised by the same agent the tier names; the task scope
       // bounds WHAT it may do, it does not make the task a separate kind.
       principalKind: "agent",
-      extraExtensions: [new Extension(OID_TASK_SCOPE, false, derTaskScope(opts.task, opts.goalHash))],
+      extraExtensions: [new Extension(OID_TASK_SCOPE, false, derTaskScope(taskPath, opts.goalHash))],
     },
   );
 }
