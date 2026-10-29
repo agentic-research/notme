@@ -116,9 +116,18 @@ describe("renewal — the resumed machine, no human", () => {
     expect((await renew(m, undefined, thief.kp.privateKey)).status).toBe(401);
   });
 
-  it("refuses a stale proof — the timestamp must be fresh", async () => {
+  it("refuses a stale proof — older than the resend window, or beyond the skew ahead", async () => {
+    // At the current generation a request may be up to RENEWAL_RETRY_WINDOW_S
+    // (3600 s) old — the resend of one that never arrived — and at most
+    // RENEWAL_SKEW_S (120 s) ahead (notme-747cc7).
     const { m } = await enrolled();
-    expect((await renew(m, Math.floor(Date.now() / 1000) - 3600)).status).toBe(401);
+    const now = Math.floor(Date.now() / 1000);
+    const old = await renew(m, now - 3601);
+    expect(old.status).toBe(401);
+    expect(await old.json()).toMatchObject({ error: "stale_proof" });
+    const ahead = await renew(m, now + 121);
+    expect(ahead.status).toBe(401);
+    expect(await ahead.json()).toMatchObject({ error: "stale_proof" });
   });
 
   it("refuses a key that was never enrolled", async () => {
