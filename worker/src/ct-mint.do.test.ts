@@ -664,3 +664,230 @@ describe("ct.mint — tiers via collect and renew", () => {
     expect(collected.certificate).not.toBe(renewed.certificate);
   });
 });
+
+// ── Task 4: drain the backlog from the refresh alarm; report CT health ──────
+
+type DrainAuth = {
+  env: Record<string, unknown>;
+  alarm(): Promise<void>;
+  getCACertificatePem(): Promise<string>;
+  getAlarmHealth(): Promise<{
+    failureCount: number;
+    totalFires: number;
+    ct: {
+      backlog: number;
+      oldestUnloggedAgeS: number | null;
+      gaveUp: number;
+      lastError: string;
+      lastErrorAt: number;
+      unloggable: { count: number; lastAt: number };
+    };
+  }>;
+  mintBridgeCertPair(p: {
+    subject: string;
+    identity: string;
+    mtlsPublicKeyPem: string;
+    signingPublicKeyPem: string;
+    scopes: string[];
+    authMethod: string;
+  }): Promise<unknown>;
+  ctx: { storage: { sql: { exec(q: string, ...b: unknown[]): { toArray(): unknown[] } } } };
+};
+
+/**
+ * A fresh authority holding `n` backlog rows whose chains are REAL (the stub
+ * signs real SCTs and parses the leaf, so placeholder bytes would not do).
+ * They come from a genuine mint against a 500-ing log, then are cloned.
+ */
+async function withBacklog<T>(
+  n: number,
+  body: (a: DrainAuth) => Promise<T>,
+  opts: { unbind?: boolean } = {},
+): Promise<T> {
+  const name = `ct-drain-${++seq}-${crypto.randomUUID()}`;
+  const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+  const mtls = (await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const sign = (await crypto.subtle.generateKey(
+    { name: "Ed25519" }, true, ["sign", "verify"],
+  )) as CryptoKeyPair;
+  await setMode("500");
+  return runInDurableObject(stub, async (auth) => {
+    const a = auth as unknown as DrainAuth;
+    await a.mintBridgeCertPair({
+      subject: SUBJECT,
+      identity: `wimse://notme.bot/principal/${name}`,
+      mtlsPublicKeyPem: await spkiPem(mtls.publicKey),
+      signingPublicKeyPem: await spkiPem(sign.publicKey),
+      scopes: ["bridgeCert"],
+      authMethod: "gha-oidc",
+    });
+    const sql = a.ctx.storage.sql;
+    const seed = sql.exec("SELECT chain_json FROM ct_backlog ORDER BY id").toArray() as Array<{
+      chain_json: string;
+    }>;
+    expect(seed.length).toBe(2); // the failed mint backlogged both certs
+    sql.exec("DELETE FROM ct_backlog");
+    const base = Math.floor(Date.now() / 1000) - 1000;
+    for (let i = 0; i < n; i++) {
+      // created_at ascends with i, so row i is the i-th oldest.
+      sql.exec(
+        "INSERT INTO ct_backlog (chain_json, created_at) VALUES (?, ?)",
+        seed[i % 2]!.chain_json,
+        base + i,
+      );
+    }
+    await setMode("ok");
+    if (opts.unbind) {
+      const e = { ...a.env };
+      delete e.CT_LOG;
+      a.env = e;
+    }
+    return body(a);
+  });
+}
+
+const rowsOf = (a: DrainAuth) =>
+  a.ctx.storage.sql
+    .exec("SELECT id, attempts, logged_at FROM ct_backlog ORDER BY created_at, id")
+    .toArray() as Array<{ id: number; attempts: number; logged_at: number | null }>;
+
+describe("ct.drain — the refresh alarm empties the backlog", () => {
+  it("25 rows, log ok: one fire logs 20 (the OLDEST 20), the next logs the last 5", async () => {
+    await withBacklog(25, async (a) => {
+      await a.alarm();
+      let rows = rowsOf(a);
+      expect(rows.filter((r) => r.logged_at !== null).length).toBe(20);
+      expect(rows.slice(0, 20).every((r) => r.logged_at !== null)).toBe(true);
+      expect(rows.slice(20).every((r) => r.logged_at === null && r.attempts === 0)).toBe(true);
+      expect((await a.getAlarmHealth()).ct.backlog).toBe(5);
+
+      await a.alarm();
+      rows = rowsOf(a);
+      expect(rows.every((r) => r.logged_at !== null)).toBe(true);
+      const h = await a.getAlarmHealth();
+      expect(h.ct.backlog).toBe(0);
+      expect(h.ct.oldestUnloggedAgeS).toBeNull();
+      expect(h.failureCount).toBe(0);
+    });
+    // 25 rows, 2 fires: exactly 25 add-chain submissions reached the log.
+    const adds = (await received()).filter((r) => r.path.endsWith("/add-chain"));
+    expect(adds.length).toBe(25);
+  });
+
+  it("log 500: attempts increment, rows at 24 are skipped and counted in gaveUp, lastError is set", async () => {
+    await withBacklog(3, async (a) => {
+      const sql = a.ctx.storage.sql;
+      // Row 3 (newest) is already at the cap; it must not be submitted again.
+      sql.exec("UPDATE ct_backlog SET attempts = 24 WHERE id = (SELECT MAX(id) FROM ct_backlog)");
+      await setMode("500");
+      await a.alarm();
+      const rows = rowsOf(a);
+      expect(rows.map((r) => r.attempts)).toEqual([1, 1, 24]);
+      expect(rows.every((r) => r.logged_at === null)).toBe(true);
+      const h = await a.getAlarmHealth();
+      expect(h.ct.backlog).toBe(2);
+      expect(h.ct.gaveUp).toBe(1);
+      expect(h.ct.lastError).toMatch(/add-chain failed/);
+      expect(h.ct.lastErrorAt).toBeGreaterThan(0);
+      expect(typeof h.ct.oldestUnloggedAgeS).toBe("number");
+      expect(h.ct.oldestUnloggedAgeS!).toBeGreaterThanOrEqual(900);
+      expect(h.failureCount).toBe(0); // a log outage is not an alarm failure
+      // 2 rows submitted, the capped one was not.
+      const adds = (await received()).filter((r) => r.path.endsWith("/add-chain"));
+      expect(adds.length).toBe(2);
+
+      // Climb to the cap: a row at 23 gets one last try and then gives up.
+      sql.exec("UPDATE ct_backlog SET attempts = 23 WHERE attempts = 1");
+      await a.alarm();
+      const h2 = await a.getAlarmHealth();
+      expect(h2.ct.backlog).toBe(0);
+      expect(h2.ct.gaveUp).toBe(3);
+    });
+  });
+
+  it("a corrupt row is a failed attempt; the other rows still drain and the alarm is unharmed", async () => {
+    await withBacklog(3, async (a) => {
+      a.ctx.storage.sql.exec(
+        "INSERT INTO ct_backlog (chain_json, created_at) VALUES ('{not json', 1)",
+      );
+      await a.alarm();
+      const rows = rowsOf(a);
+      expect(rows[0]!.attempts).toBe(1); // oldest: the corrupt one
+      expect(rows[0]!.logged_at).toBeNull();
+      expect(rows.slice(1).every((r) => r.logged_at !== null)).toBe(true);
+      const h = await a.getAlarmHealth();
+      expect(h.failureCount).toBe(0);
+      expect(h.ct.lastError).toMatch(/backlog row/);
+    });
+  });
+
+  it("a drain that throws outright (backlog table gone) is not an alarm failure and does not throw", async () => {
+    await withBacklog(2, async (a) => {
+      a.ctx.storage.sql.exec("DROP TABLE ct_backlog");
+      await expect(a.alarm()).resolves.toBeUndefined();
+      a.ctx.storage.sql.exec(
+        "CREATE TABLE ct_backlog (id INTEGER PRIMARY KEY, chain_json TEXT NOT NULL, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, logged_at INTEGER)",
+      );
+      const h = await a.getAlarmHealth();
+      expect(h.failureCount).toBe(0);
+      expect(h.totalFires).toBeGreaterThanOrEqual(1);
+      expect(h.ct.lastError).toMatch(/^drain:/);
+    });
+  });
+
+  it("absent binding: the drain does nothing — no log call, rows untouched", async () => {
+    await withBacklog(3, async (a) => {
+      await a.alarm();
+      expect(rowsOf(a).every((r) => r.attempts === 0 && r.logged_at === null)).toBe(true);
+    }, { unbind: true });
+    expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(0);
+  });
+});
+
+describe("ct.health — what the operator sees", () => {
+  it("unloggable counts a mint whose root could not be read, and the mint is unchanged", async () => {
+    const name = `ct-unloggable-${++seq}-${crypto.randomUUID()}`;
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+    const mtls = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const sign = (await crypto.subtle.generateKey(
+      { name: "Ed25519" }, true, ["sign", "verify"],
+    )) as CryptoKeyPair;
+    await setMode("ok");
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as DrainAuth;
+      const before = await a.getAlarmHealth();
+      expect(before.ct.unloggable).toEqual({ count: 0, lastAt: 0 });
+      a.getCACertificatePem = async () => {
+        throw new Error("root unreadable (forced)");
+      };
+      const pair = (await a.mintBridgeCertPair({
+        subject: SUBJECT,
+        identity: `wimse://notme.bot/principal/${name}`,
+        mtlsPublicKeyPem: await spkiPem(mtls.publicKey),
+        signingPublicKeyPem: await spkiPem(sign.publicKey),
+        scopes: ["bridgeCert"],
+        authMethod: "gha-oidc",
+      })) as { certificates: { mtls: string; signing: string } };
+      expect(pair.certificates.mtls).toContain("BEGIN CERTIFICATE");
+      const h = await a.getAlarmHealth();
+      expect(h.ct.unloggable.count).toBe(1);
+      expect(h.ct.unloggable.lastAt).toBeGreaterThan(0);
+      expect(h.ct.lastError).toMatch(/root unreadable/);
+      expect(h.ct.backlog).toBe(0); // no row: nothing to record
+    });
+  });
+
+  it("a healthy, empty authority reports zeros", async () => {
+    await withBacklog(0, async (a) => {
+      const h = await a.getAlarmHealth();
+      expect(h.ct.backlog).toBe(0);
+      expect(h.ct.gaveUp).toBe(0);
+      expect(h.ct.oldestUnloggedAgeS).toBeNull();
+      expect(h.ct.unloggable.count).toBe(0);
+    });
+  });
+});

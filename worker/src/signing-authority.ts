@@ -38,6 +38,7 @@ import {
 import {
   DEFAULT_CT_LOG_PATH,
   DEFAULT_TIMEOUT_MS,
+  submitChain,
   submitPreChain,
 } from "./ct/log-client";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
@@ -274,6 +275,20 @@ export type BridgeCertRefusal =
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
+
+/** CT backlog health, reported under `ct` by getAlarmHealth (notme-1b46a8). */
+export interface CtHealth {
+  /** Unlogged rows still being retried (attempts < 24). */
+  backlog: number;
+  /** Age in seconds of the oldest of those rows; null when none. */
+  oldestUnloggedAgeS: number | null;
+  /** Unlogged rows that hit 24 attempts and are no longer retried. */
+  gaveUp: number;
+  lastError: string;
+  lastErrorAt: number;
+  /** Mints that went out unlogged with NO backlog row (root unreadable). */
+  unloggable: { count: number; lastAt: number };
+}
 
 // Circuit-breaker threshold for the alarm() loop. After this many consecutive
 // generateBundle() failures, alarm() stops re-arming itself. Manual recovery
@@ -1848,6 +1863,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         failed: scts.flatMap((s, i) => (s === null ? [i] : [])),
         of: scts.length,
       });
+      this.#ctRecord("error", "mint-time log submission failed; chains backlogged");
     }
 
     const fin = await p.mint(p.pin, () => []);
@@ -1875,8 +1891,172 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return await this.getCACertificatePem();
     } catch (err) {
       console.error({ event: "ct.root_unreadable", error: String(err) });
+      // Visible in health (`ct.unloggable`): this mint proceeds with no SCT and
+      // NO backlog row — there is no chain to record — so without a counter it
+      // would be invisible. Counting never changes the mint.
+      this.#ctRecord("unloggable", String(err));
       return null;
     }
+  }
+
+  // ── CT backlog drain + health (notme-1b46a8, Task 4) ──────────────────────
+
+  /** Rows submitted per alarm fire. */
+  static readonly CT_DRAIN_BATCH = 20;
+  /** Concurrent add-chain calls inside one fire: 20 rows / 4 = 5 waves of at
+   *  most DEFAULT_TIMEOUT_MS (2 s), so a fire's drain is bounded at ~10 s. */
+  static readonly CT_DRAIN_CONCURRENCY = 4;
+  /** A row stops being retried after this many failed attempts. */
+  static readonly CT_MAX_ATTEMPTS = 24;
+
+  #ctSchemaReady = false;
+  #ensureCtSchema(): void {
+    if (this.#ctSchemaReady) return;
+    // Same DDL as init: health can be read on an object that has not minted.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS ct_backlog (
+        id         INTEGER PRIMARY KEY,
+        chain_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attempts   INTEGER NOT NULL DEFAULT 0,
+        logged_at  INTEGER
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS ct_health (
+        id               TEXT PRIMARY KEY DEFAULT 'ct',
+        unloggable_count INTEGER NOT NULL DEFAULT 0,
+        unloggable_last_at INTEGER NOT NULL DEFAULT 0,
+        last_error       TEXT    NOT NULL DEFAULT '',
+        last_error_at    INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO ct_health (id) VALUES ('ct')");
+    this.#ctSchemaReady = true;
+  }
+
+  /** Record a CT observation for health. Never throws. */
+  #ctRecord(kind: "unloggable" | "error", msg: string): void {
+    try {
+      this.#ensureCtSchema();
+      const now = Math.floor(Date.now() / 1000);
+      if (kind === "unloggable") {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_health SET unloggable_count = unloggable_count + 1, unloggable_last_at = ?, last_error = ?, last_error_at = ? WHERE id = 'ct'",
+          now,
+          `root unreadable: ${msg}`.slice(0, 200),
+          now,
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_health SET last_error = ?, last_error_at = ? WHERE id = 'ct'",
+          msg.slice(0, 200),
+          now,
+        );
+      }
+    } catch (err) {
+      console.error({ event: "ct.health_write_failed", error: String(err) });
+    }
+  }
+
+  /**
+   * Submit up to CT_DRAIN_BATCH backlog rows (oldest first, attempts below
+   * CT_MAX_ATTEMPTS) to the log via add-chain, CT_DRAIN_CONCURRENCY at a time.
+   * Success sets logged_at; failure increments attempts and records lastError.
+   * A row that cannot even be parsed counts as a failed attempt, so it ages
+   * out instead of poisoning the batch. Callers wrap this in try/catch: a
+   * drain error is never an alarm failure.
+   */
+  async #drainCtBacklog(): Promise<void> {
+    const log = this.env.CT_LOG;
+    if (!log) return;
+    this.#ensureCtSchema();
+    const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT id, chain_json FROM ct_backlog WHERE logged_at IS NULL AND attempts < ? ORDER BY created_at, id LIMIT ?",
+        SigningAuthority.CT_MAX_ATTEMPTS,
+        SigningAuthority.CT_DRAIN_BATCH,
+      )
+      .toArray() as Array<{ id: number; chain_json: string }>;
+
+    const one = async (row: { id: number; chain_json: string }): Promise<void> => {
+      let ok = false;
+      try {
+        const chain = JSON.parse(row.chain_json) as string[];
+        ok = await submitChain(log, chain, DEFAULT_TIMEOUT_MS, path);
+        if (!ok) this.#ctRecord("error", `add-chain failed for backlog row ${row.id}`);
+      } catch (err) {
+        this.#ctRecord("error", `backlog row ${row.id}: ${String(err)}`);
+      }
+      if (ok) {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_backlog SET logged_at = ? WHERE id = ?",
+          Math.floor(Date.now() / 1000),
+          row.id,
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_backlog SET attempts = attempts + 1 WHERE id = ?",
+          row.id,
+        );
+      }
+    };
+
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < rows.length) {
+        const row = rows[next++]!;
+        try {
+          await one(row);
+        } catch (err) {
+          console.error({ event: "ct.drain_row_failed", id: row.id, error: String(err) });
+        }
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(SigningAuthority.CT_DRAIN_CONCURRENCY, rows.length) },
+        worker,
+      ),
+    );
+  }
+
+  #readCtHealth(): CtHealth {
+    this.#ensureCtSchema();
+    const sql = this.ctx.storage.sql;
+    const max = SigningAuthority.CT_MAX_ATTEMPTS;
+    const b = sql
+      .exec(
+        "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM ct_backlog WHERE logged_at IS NULL AND attempts < ?",
+        max,
+      )
+      .toArray()[0] as { n: number; oldest: number | null };
+    const g = sql
+      .exec(
+        "SELECT COUNT(*) AS n FROM ct_backlog WHERE logged_at IS NULL AND attempts >= ?",
+        max,
+      )
+      .toArray()[0] as { n: number };
+    const h = sql
+      .exec(
+        "SELECT unloggable_count, unloggable_last_at, last_error, last_error_at FROM ct_health WHERE id = 'ct'",
+      )
+      .toArray()[0] as {
+      unloggable_count: number;
+      unloggable_last_at: number;
+      last_error: string;
+      last_error_at: number;
+    };
+    return {
+      backlog: b.n,
+      oldestUnloggedAgeS:
+        b.oldest === null ? null : Math.max(0, Math.floor(Date.now() / 1000) - b.oldest),
+      gaveUp: g.n,
+      lastError: h.last_error,
+      lastErrorAt: h.last_error_at,
+      unloggable: { count: h.unloggable_count, lastAt: h.unloggable_last_at },
+    };
   }
 
   /**
@@ -3839,6 +4019,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       outcome = `error: ${msg.slice(0, 200)}`;
     }
 
+    // Drain the CT backlog. Deliberately OUTSIDE the refresh try and
+    // swallowed: a log problem is not a bundle-refresh failure, so it must
+    // never feed failure_count / the circuit breaker, and nothing here may
+    // throw out of alarm().
+    if (this.env.CT_LOG) {
+      try {
+        await this.#drainCtBacklog();
+      } catch (err) {
+        console.error({ event: "ct.drain_failed", error: String(err) });
+        this.#ctRecord("error", `drain: ${String(err)}`);
+      }
+    }
+
     // Atomic update — `total_fires = total_fires + 1` and (on failure)
     // `failure_count = failure_count + 1` happen in SQL, so concurrent fires
     // can't drop increments. failure_count resets to 0 on success.
@@ -3947,6 +4140,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     driftRatio: number;
     warmupComplete: boolean;
     circuitBreakerOpen: boolean;
+    ct: CtHealth;
   }> {
     const health = this.#readAlarmHealthRow();
     const now = Date.now();
@@ -3972,6 +4166,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         health.total_fires >= SigningAuthority.DRIFT_RATIO_WARMUP_FIRES,
       circuitBreakerOpen:
         health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES,
+      ct: this.#readCtHealth(),
     };
   }
 }
