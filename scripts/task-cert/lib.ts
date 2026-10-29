@@ -16,7 +16,7 @@
  * would: scopes never exceed the tier's, lifetime never outlives it, an
  * expired tier is refused, and the tier key must match the tier cert.
  */
-import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { X509Certificate, BasicConstraintsExtension } from "@peculiar/x509";
 import { mintTaskCertPair } from "../../worker/src/cert-authority";
@@ -273,7 +273,7 @@ export async function renewTier(
     pending?: PendingRenewal | null;
     savePending: (p: PendingRenewal) => void;
     /** Clear the pending request, but only if it is still THIS request (`body`). */
-    clearPending: (body: string) => void;
+    clearPending: (body: string) => void | Promise<void>;
     persist?: (r: RenewalResult) => void;
     /**
      * Re-reads the generation after the request is reserved. A peer that completed in between
@@ -303,7 +303,7 @@ export async function renewTier(
     });
     opts.savePending({ body, iat: now, generation: gen ?? 0 });
     if (opts.currentGeneration && (await opts.currentGeneration()) !== gen) {
-      opts.clearPending(body); // our own reservation, never sent
+      await opts.clearPending(body); // our own reservation, never sent
       throw new Error("another renewal completed meanwhile — try again");
     }
   }
@@ -326,14 +326,14 @@ export async function renewTier(
       (!sentGeneration || (Number.isInteger(out.generation) && out.generation >= 0));
     if (!valid) throw new Error("renewal response invalid — kept the pending request to retry");
     opts.persist?.(out);
-    opts.clearPending(body);
+    await opts.clearPending(body);
     return out;
   }
   const definitive =
     res.status >= 400 && res.status < 500 && !TRANSIENT_4XX.has(res.status) && typeof out?.error === "string";
   if (!definitive) throw new Error(`renewal not answered by the authority (HTTP ${res.status}) — try again`);
   if (resend) throw stateLost(out.error);
-  opts.clearPending(body);
+  await opts.clearPending(body);
   throw new AuthorityRefusal(out.error);
 }
 
@@ -344,10 +344,30 @@ const LOCK = "renew.lock";
 /** Far longer than a renewal's fetch timeout, so a live holder is never stolen from. */
 export const LOCK_STALE_MS = 600_000;
 
-/** Read the pending request. Unreadable means the state is lost; it must never lead to signing. */
+const CLEARING = `${PENDING}.clear-`;
+const clearingFiles = (dir: string): string[] => {
+  try {
+    return readdirSync(dir).filter((f) => f.startsWith(CLEARING));
+  } catch (e: any) {
+    if (e.code === "ENOENT") return [];
+    throw e;
+  }
+};
+
+/**
+ * Read the pending request. Unreadable means the state is lost; it must never lead to signing.
+ * A request renamed aside by clearOwnPending (mid-clear, or interrupted by a crash) still counts:
+ * the path is tested FIRST, then the directory, so a reader that misses the path during a
+ * rename (atomic) must find the renamed file.
+ */
 export function loadPending(dir: string): PendingRenewal | null {
   const p = join(dir, PENDING);
-  if (!existsSync(p)) return null;
+  if (!existsSync(p)) {
+    if (clearingFiles(dir).length > 0) {
+      throw stateLost("renewal state conflict — a pending renewal is mid-clear or was interrupted");
+    }
+    return null;
+  }
   try {
     const v = JSON.parse(readFileSync(p, "utf8"));
     if (typeof v?.body !== "string" || !Number.isFinite(v.iat) || !Number.isFinite(v.generation)) throw new Error("shape");
@@ -370,11 +390,11 @@ export function removePending(dir: string): void {
  * So: rename the file to a name only we know (exactly one renamer wins),
  * compare, and unlink only on a match; otherwise link it back.
  */
-export function clearOwnPending(
+export async function clearOwnPending(
   dir: string,
   body: string,
-  o: { token?: string; /** test hook: runs before a peer's file is linked back */ beforeLinkBack?: () => void } = {},
-): void {
+  o: { token?: string; /** test hook: runs before a peer's file is linked back */ beforeLinkBack?: () => void | Promise<void> } = {},
+): Promise<void> {
   const path = join(dir, PENDING);
   const moved = `${path}.clear-${o.token ?? crypto.randomUUID()}-${Math.random().toString(36).slice(2)}`;
   try {
@@ -391,7 +411,7 @@ export function clearOwnPending(
     unlinkSync(moved);
     return;
   }
-  o.beforeLinkBack?.();
+  await o.beforeLinkBack?.();
   try {
     linkSync(moved, path);
   } catch (e: any) {
@@ -499,7 +519,8 @@ function lockHandle(path: string, token: string) {
 export async function renewTierInDir(
   dir: string,
   load: () => Promise<{ authority: string; key: { privateKey: CryptoKey; spki: Uint8Array; pem: string }; generation?: number }>,
-  opts: { persist?: (r: RenewalResult) => void; fetchTimeoutMs?: number; lock?: LockOpts; /** test hook */ beforeReserve?: () => void },
+  opts: { persist?: (r: RenewalResult) => void; fetchTimeoutMs?: number; lock?: LockOpts;
+    /** test hooks */ beforeReserve?: () => void; beforeLinkBack?: () => void | Promise<void> },
   fetchFn: typeof fetch = fetch,
 ): Promise<RenewalResult> {
   const lock = acquireRenewLock(dir, opts.lock);
@@ -515,7 +536,7 @@ export async function renewTierInDir(
           opts.beforeReserve?.();
           savePendingExclusive(dir, p);
         },
-        clearPending: (body) => clearOwnPending(dir, body, { token: lock.token }),
+        clearPending: (body) => clearOwnPending(dir, body, { token: lock.token, beforeLinkBack: opts.beforeLinkBack }),
         currentGeneration: async () => (await load()).generation,
         persist: opts.persist,
         fetchTimeoutMs: opts.fetchTimeoutMs,
@@ -606,6 +627,7 @@ export function saveEnrolment(
     writeFileSync(join(dir, "root.pem"), e.rootPem);
     writeFileSync(join(dir, "tier.json"), JSON.stringify(e.meta, null, 2));
     removePending(dir); // unconditional by design: a new enrolment makes any pending request moot
+    for (const f of clearingFiles(dir)) { try { unlinkSync(join(dir, f)); } catch { /* already gone */ } }
   } finally {
     lock.release();
   }

@@ -598,24 +598,100 @@ describe("renewal with a generation", () => {
       expect(existsSync(join(dir2, "renew-pending.json"))).toBe(false);
     });
 
-    it("an owner-checked clear links a peer's pending back; a second one in its place is a conflict, both kept", () => {
+    it("an owner-checked clear links a peer's pending back; a second one in its place is a conflict, both kept", async () => {
       const dir = tmp();
       const PENDING = join(dir, "renew-pending.json");
       const other = JSON.stringify({ body: "other", iat: 1, generation: 1 });
       writeFileSync(PENDING, other);
-      clearOwnPending(dir, "mine");
+      await clearOwnPending(dir, "mine");
       expect(readFileSync(PENDING, "utf8")).toBe(other);
       expect(readdirSync(dir)).toEqual(["renew-pending.json"]);
       const third = JSON.stringify({ body: "third", iat: 2, generation: 2 });
-      expect(() => clearOwnPending(dir, "mine", { beforeLinkBack: () => writeFileSync(PENDING, third) }))
-        .toThrow("renewal state conflict — run `task-cert status`");
+      await expect(clearOwnPending(dir, "mine", { beforeLinkBack: () => writeFileSync(PENDING, third) }))
+        .rejects.toThrow("renewal state conflict — run `task-cert status`");
       expect(readFileSync(PENDING, "utf8")).toBe(third);
       const kept = readdirSync(dir).filter((f) => f.includes(".clear-"));
       expect(kept).toHaveLength(1);
       expect(readFileSync(join(dir, kept[0]!), "utf8")).toBe(other);
-      clearOwnPending(dir, "third");
+      await clearOwnPending(dir, "third");
       expect(existsSync(PENDING)).toBe(false);
-      expect(() => clearOwnPending(dir, "anything")).not.toThrow(); // nothing pending
+      await expect(clearOwnPending(dir, "anything")).resolves.toBeUndefined(); // nothing pending
+    });
+
+    it("a pending file renamed aside for clearing still blocks signing", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      writeFileSync(join(dir, "renew-pending.json.clear-someone-x"), JSON.stringify(pendingAt(1)));
+      let posts = 0;
+      await expect(inDir(dir, k, 3, withFetch(() => { posts++; return reply(200, okBody); })))
+        .rejects.toThrow(/renewal state lost \(renewal state conflict.*task-cert enroll/);
+      expect(posts).toBe(0);
+      expect(existsSync(join(dir, "renew-pending.json"))).toBe(false); // nothing was signed or reserved
+      expect(existsSync(join(dir, "renew.lock"))).toBe(false);
+    });
+
+    it("an interrupted clear (crash between rename and link-back) is recoverable only by re-enroll", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      const orphan = join(dir, "renew-pending.json.clear-crashed-y");
+      writeFileSync(orphan, JSON.stringify(pendingAt(1)));
+      const seen: string[] = [];
+      await expect(inDir(dir, k, 3, withFetch(() => reply(200, okBody), seen))).rejects.toThrow("renewal state conflict");
+      await expect(inDir(dir, k, 3, withFetch(() => reply(200, okBody), seen))).rejects.toThrow("renewal state conflict");
+      expect(seen).toEqual([]);
+      saveEnrolment(dir, { keyPem: "K", tierPem: "T", rootPem: "R", meta: { generation: 0 } });
+      expect(existsSync(orphan)).toBe(false);
+      await inDir(dir, k, 0, withFetch(() => reply(200, okBody), seen));
+      expect(seen).toHaveLength(1);
+      expect(JSON.parse(seen[0]!).generation).toBe(0);
+    });
+
+    it("the H2→H5 interleaving cannot POST a fork", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      const PENDING = join(dir, "renew-pending.json");
+      writeFileSync(join(dir, "tier.json"), JSON.stringify({ generation: 2 }));
+      const readGen = () => JSON.parse(readFileSync(join(dir, "tier.json"), "utf8")).generation as number;
+      const load = async () => ({ authority: "https://a", key: k, generation: readGen() });
+      const persist = (r: any) => writeFileSync(join(dir, "tier.json"), JSON.stringify({ generation: r.generation }));
+
+      // H2 reserves P2 at g=2, then is suspended inside its re-check.
+      let h2Loads = 0;
+      let wake!: () => void;
+      const asleep = new Promise<void>((r) => (wake = r));
+      let suspended = false;
+      const h2Load = async () => {
+        if (++h2Loads === 2) { suspended = true; await asleep; }
+        return load();
+      };
+      // When H2 later clears, it is paused between its rename and its link-back; H5 runs in that gap.
+      let h5Error: unknown;
+      let h5Posts = 0;
+      let gapSeen = false;
+      const h2 = renewTierInDir(dir, h2Load, {
+        persist,
+        beforeLinkBack: async () => {
+          gapSeen = !existsSync(PENDING);
+          h5Error = await renewTierInDir(dir, load, { persist }, withFetch(() => { h5Posts++; return reply(200, okBody); })).catch((e) => e);
+        },
+      }, withFetch(() => reply(200, okBody)));
+      const h2Done = h2.catch((e) => e);
+      await vi.waitFor(() => expect(suspended).toBe(true));
+
+      // H3 steals the stale lock, resends P2 (accepted: g 2→3), clears it.
+      utimesSync(join(dir, "renew.lock"), 1, 1);
+      await renewTierInDir(dir, load, { persist }, withFetch(() => reply(200, { ...okBody, generation: 3 })));
+      // H4 signs P4 at g=3; accepted, response lost.
+      await expect(renewTierInDir(dir, load, { persist }, (async () => { throw new Error("response lost"); }) as unknown as typeof fetch))
+        .rejects.toThrow("response lost");
+      const p4 = readFileSync(PENDING, "utf8");
+
+      wake();
+      expect(String(await h2Done)).toContain("another renewal completed meanwhile");
+      expect(gapSeen).toBe(true); // H5 really ran with renew-pending.json absent
+      expect(String(h5Error)).toContain("renewal state conflict");
+      expect(h5Posts).toBe(0);
+      expect(readFileSync(PENDING, "utf8")).toBe(p4);
     });
 
     it("enroll refuses before starting when a renewal holds the lock", async () => {
