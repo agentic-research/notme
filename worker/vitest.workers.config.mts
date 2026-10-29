@@ -1,5 +1,11 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { createRequire } from "node:module";
+import { dirname } from "node:path";
 import { defineConfig } from "vitest/config";
+
+// scripts/task-cert/lib.ts (repo root) is imported by fork-acceptance.do.test.ts
+// and resolves its deps from the repo root, where @peculiar/x509 is not hoisted.
+const x509Dir = dirname(createRequire(import.meta.url).resolve("@peculiar/x509/package.json"));
 
 // Separate pool config for real-Durable-Object tests (*.do.test.ts). The
 // default vitest.config.ts runs the plain-vitest suite (src/__tests__/**);
@@ -19,6 +25,7 @@ import { defineConfig } from "vitest/config";
 // taking what used to be `test.poolOptions.workers` as its argument — not the
 // old `defineWorkersProject` from the removed `/config` subpath.
 export default defineConfig({
+  resolve: { alias: { "@peculiar/x509": x509Dir } },
   plugins: [
     cloudflareTest({
       main: "./worker.ts",
