@@ -462,3 +462,205 @@ describe("ct.mint — bridge pairs", () => {
     await expectWorkingPair(r);
   });
 });
+
+// ── Task 3: tiers (Issuing CA certificates) ────────────────────────────────
+
+type TierAuthLike = AuthLike & {
+  mintIssuingCa(p: {
+    subject: string;
+    identity: string;
+    publicKeyPem: string;
+    scopes: string[];
+    authMethod: string;
+  }): Promise<{ certificate: string }>;
+};
+
+/** Mint a tier through the DO's public method on a fresh authority. */
+async function mintTier(opts: { unbind?: boolean } = {}) {
+  const name = `ct-tier-${++seq}-${crypto.randomUUID()}`;
+  const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+  const { ED25519 } = await import("./platform");
+  const tierKeys = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
+  const tierPem = await spkiPem(tierKeys.publicKey);
+  const identity = `wimse://notme.bot/principal/${name}`;
+
+  return runInDurableObject(stub, async (auth) => {
+    const a = auth as unknown as TierAuthLike;
+    if (opts.unbind) {
+      const e = { ...a.env };
+      delete e.CT_LOG;
+      a.env = e;
+    }
+    const t0 = Date.now();
+    const tier = await a.mintIssuingCa({
+      subject: name,
+      identity,
+      publicKeyPem: tierPem,
+      scopes: ["bridgeCert"],
+      authMethod: "passkey",
+    });
+    const elapsed = Date.now() - t0;
+    const ca = await a.getCACertificatePem(); // after the mint — see mint()
+    const backlog = a.ctx.storage.sql
+      .exec("SELECT chain_json, created_at, attempts, logged_at FROM ct_backlog ORDER BY id")
+      .toArray() as BacklogRow[];
+    const state = await a.getAuthorityState();
+    return { ca, tier: tier.certificate, backlog, elapsed, tierKeys, epoch: state.epoch };
+  });
+}
+
+type TierRun = Awaited<ReturnType<typeof mintTier>>;
+
+/** The tier still works as a CA: root → tier → task, by the real chain verifier. */
+async function expectTierIssues(r: TierRun) {
+  const { mintTaskCertPair } = await import("./cert-authority");
+  const { verifyCertChain } = await import("./auth/verify-chain");
+  const { ED25519 } = await import("./platform");
+  const mtls = (await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const sign = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
+  const task = await mintTaskCertPair(
+    r.tier, r.tierKeys.privateKey, await spkiPem(mtls.publicKey), await spkiPem(sign.publicKey),
+    { task: "t", goalHash: "a".repeat(64), scopes: ["bridgeCert"], epoch: r.epoch },
+  );
+  const v = await verifyCertChain(task.certificates.mtls, [r.tier], r.ca, r.epoch);
+  expect(v.depth).toBe(1);
+  const c = new X509Certificate(r.tier);
+  expect(c.issuer).toBe(new X509Certificate(r.ca).subject);
+}
+
+describe("ct.mint — tiers", () => {
+  it("absent: no binding → no poison, no SCT, no backlog row, no log call", async () => {
+    await setMode("ok");
+    const r = await mintTier({ unbind: true });
+    expect(oids(r.tier)).not.toContain(CT_SCT_LIST_OID);
+    expect(oids(r.tier)).not.toContain(CT_POISON_OID);
+    expect(r.backlog).toEqual([]);
+    expect(await received()).toEqual([]);
+    await expectTierIssues(r);
+  });
+
+  it("ok: the tier embeds an SCT that VERIFIES against its own bytes; no poison; no backlog", async () => {
+    const stubKey = await control("ok");
+    const r = await mintTier();
+    const got = await received();
+    expect(got).toHaveLength(1);
+    expect(got[0]!.path).toBe("/logs/notme/ct/v1/add-pre-chain");
+    expect(got[0]!.chain).toEqual([got[0]!.chain[0], pemBody(r.ca)]);
+
+    const fin = new X509Certificate(r.tier);
+    expect(fin.getExtension(CT_SCT_LIST_OID), "tier not logged").toBeTruthy();
+    expect(fin.getExtension(CT_POISON_OID), "the poison must come OFF").toBeFalsy();
+    const pre = new X509Certificate(fromB64(got[0]!.chain[0]!));
+    expect(pre.getExtension(CT_POISON_OID)?.critical).toBe(true);
+    expect(fin.serialNumber, "pin dropped: final serial differs from the precert's").toBe(pre.serialNumber);
+    expect(tbsWithout(fromB64(pemBody(r.tier)), CT_SCT_LIST_OID)).toEqual(
+      tbsWithout(fromB64(got[0]!.chain[0]!), CT_POISON_OID),
+    );
+
+    const logKey = await crypto.subtle.importKey(
+      "spki", fromB64(stubKey.spki), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"],
+    );
+    const scts = embeddedScts(r.tier);
+    expect(scts).toHaveLength(1);
+    expect(await sctVerifies(scts[0]!, r.tier, r.ca, logKey), "tier SCT vs tier bytes").toBe(true);
+    expect(r.backlog).toEqual([]);
+    await expectTierIssues(r);
+  });
+
+  for (const mode of ["500", "hang"] as const) {
+    it(`${mode}: the tier is minted without an SCT and ONE final chain is backlogged`, async () => {
+      await setMode(mode);
+      const r = await mintTier();
+      const c = new X509Certificate(r.tier);
+      expect(c.getExtension(CT_SCT_LIST_OID)).toBeFalsy();
+      expect(c.getExtension(CT_POISON_OID)).toBeFalsy();
+      expect(r.backlog).toHaveLength(1);
+      expect(JSON.parse(r.backlog[0]!.chain_json)).toEqual([pemBody(r.tier), pemBody(r.ca)]);
+      expect(r.backlog[0]!.attempts).toBe(0);
+      expect(r.backlog[0]!.logged_at).toBeNull();
+      if (mode === "hang") {
+        expect(r.elapsed).toBeGreaterThanOrEqual(CT_TIMEOUT_MS - 100);
+        expect(r.elapsed).toBeLessThan(CT_TIMEOUT_MS + 1500);
+      }
+      await expectTierIssues(r);
+    });
+  }
+});
+
+// ── Collect and renew, end to end through the routes ───────────────────────
+
+describe("ct.mint — tiers via collect and renew", () => {
+  it("both the collected tier and the renewed tier are logged, each verifying against its own bytes", async () => {
+    const { default: worker } = await import("../worker");
+    const { createSessionCookie } = await import("./auth/session");
+    const { tierEnrolmentBinding, deviceCodeHash, tierRenewalBindingV2 } = await import(
+      "./auth/tier-enrolment-binding"
+    );
+    const { ED25519 } = await import("./platform");
+    const ORIGIN = "http://localhost:8788";
+    const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+      (worker.fetch as (r: Request, e: unknown) => Promise<Response>)(
+        new Request(`${ORIGIN}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify(body),
+        }),
+        { ...env, SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN },
+      );
+    const b64u = (b: Uint8Array) =>
+      btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+
+    const stubKey = await control("ok");
+    const logKey = await crypto.subtle.importKey(
+      "spki", fromB64(stubKey.spki), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"],
+    );
+    const kp = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", kp.publicKey)) as ArrayBuffer);
+    const pem = await spkiPem(kp.publicKey);
+
+    const pid = `ct-renew-${crypto.randomUUID()}`;
+    const scopes = ["bridgeCert", "certMint"];
+    await (authority as unknown as { createPrincipalWithCapabilities(p: string, s: string[]): Promise<void> })
+      .createPrincipalWithCapabilities(pid, scopes);
+    const cookie = await createSessionCookie(
+      { principalId: pid, scopes, authMethod: "passkey" },
+      await (authority as unknown as { getSessionSecret(): Promise<string> }).getSessionSecret(),
+    );
+
+    const start = (await (await post("/cert/issuing-ca/device", { public_key: pem })).json()) as {
+      device_code: string;
+      user_code: string;
+    };
+    const ap = await post("/cert/issuing-ca/device/approve", { user_code: start.user_code }, { cookie });
+    expect(ap.status, await ap.clone().text()).toBe(200);
+    const proof = b64u(new Uint8Array(await crypto.subtle.sign(
+      ED25519, kp.privateKey, tierEnrolmentBinding(spki, await deviceCodeHash(start.device_code)),
+    )));
+    const tok = await post("/cert/issuing-ca/device/token", { device_code: start.device_code, proof });
+    expect(tok.status, await tok.clone().text()).toBe(200);
+    const collected = (await tok.json()) as { certificate: string; generation: number };
+
+    const iat = Math.floor(Date.now() / 1000);
+    const rproof = b64u(new Uint8Array(await crypto.subtle.sign(
+      ED25519, kp.privateKey, tierRenewalBindingV2(spki, iat, collected.generation),
+    )));
+    const rn = await post("/cert/issuing-ca/renew", {
+      public_key: pem, iat, generation: collected.generation, proof: rproof,
+    });
+    expect(rn.status, await rn.clone().text()).toBe(200);
+    const renewed = (await rn.json()) as { certificate: string };
+
+    const root = await (authority as unknown as { getCACertificatePem(): Promise<string> }).getCACertificatePem();
+    for (const [label, tier] of [["collected", collected.certificate], ["renewed", renewed.certificate]] as const) {
+      const c = new X509Certificate(tier);
+      expect(c.getExtension(CT_SCT_LIST_OID), `${label} tier not logged`).toBeTruthy();
+      expect(c.getExtension(CT_POISON_OID)).toBeFalsy();
+      const scts = embeddedScts(tier);
+      expect(await sctVerifies(scts[0]!, tier, root, logKey), `${label} SCT vs own bytes`).toBe(true);
+    }
+    expect(collected.certificate).not.toBe(renewed.certificate);
+  });
+});

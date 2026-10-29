@@ -707,14 +707,22 @@ export async function mintIssuingCaCert(
     issuerName?: string;
     /** Defaults to "agent": a tier is a machine, however a human armed it. */
     principalKind?: PrincipalKind;
+    /** Extra extensions — e.g. the CT poison or the embedded SCT list. */
+    extraExtensions?: Extension[];
+    /**
+     * Pin the fields a precertificate and its final certificate must share
+     * (RFC 6962 §3.2): serial and validity window. See mintBridgeCertPair's
+     * pin for why. Absent, the serial is random and the clock is read once.
+     */
+    pin?: { serial: string; notBefore: Date; notAfter: Date };
   },
 ): Promise<IssuingCaCertResult> {
   // Longer-lived than the 5-minute leaves by design (ADR-019 D4: "a
   // longer-lived machine tier"): the tier must outlive the tasks it signs
   // for, or every task cert chains to an expired parent at first use.
   const ttlMs = opts.ttlMs ?? 60 * 60 * 1000;
-  const now = new Date();
-  const expires = new Date(now.getTime() + ttlMs);
+  const now = opts.pin?.notBefore ?? new Date();
+  const expires = opts.pin?.notAfter ?? new Date(now.getTime() + ttlMs);
 
   const publicKey = await importPublicKey(publicKeyPem);
   if (publicKey.algorithm.name !== "Ed25519") {
@@ -736,9 +744,11 @@ export async function mintIssuingCaCert(
     signingAlgorithm: ED25519,
     publicKey,
     signingKey,
-    serialNumber: Array.from(serial)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join(""),
+    serialNumber:
+      opts.pin?.serial ??
+      Array.from(serial)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
     extensions: [
       BASIC_CONSTRAINTS_ISSUING,
       ISSUING_KEY_USAGE,
@@ -753,6 +763,7 @@ export async function mintIssuingCaCert(
         derUtf8String(opts.principalKind ?? "agent"),
       ),
       new Extension("2.5.29.17", true, sanDer),
+      ...(opts.extraExtensions ?? []),
     ],
   });
 

@@ -1909,20 +1909,37 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       );
     }
     const { signingKey } = await this.#getOrCreateSigningKey();
+    // Root PEM read right after the key that signs the tier — see
+    // mintBridgeCertPair. Read only when a log is bound.
+    const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
     const state = await this.getAuthorityState();
     const { mintIssuingCaCert } = await import("./cert-authority");
-    const result = await mintIssuingCaCert(
-      params.subject,
-      params.identity,
-      params.publicKeyPem,
-      signingKey,
-      {
-        scopes: params.scopes,
-        epoch: state.epoch,
-        authMethod: params.authMethod,
-        ttlMs: params.ttlMs,
+    const ttlMs = params.ttlMs ?? 60 * 60 * 1000;
+    const notBefore = new Date();
+    const result = await this.#mintLogged({
+      pin: {
+        serial: randomSerialHex(),
+        notBefore,
+        notAfter: new Date(notBefore.getTime() + ttlMs),
       },
-    );
+      mint: (pin, ct) =>
+        mintIssuingCaCert(
+          params.subject,
+          params.identity,
+          params.publicKeyPem,
+          signingKey,
+          {
+            scopes: params.scopes,
+            epoch: state.epoch,
+            authMethod: params.authMethod,
+            ttlMs: params.ttlMs,
+            pin,
+            extraExtensions: ct(0),
+          },
+        ),
+      pems: (r) => [r.certificate],
+      issuerPem,
+    });
     return {
       ...result,
       authority: { epoch: state.epoch, key_id: state.keyId },
