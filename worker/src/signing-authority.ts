@@ -1744,9 +1744,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
   > {
     const { signingKey } = await this.#getOrCreateSigningKey();
+    // Bridge pairs are root-issued: the default issuer, no issuerName. The
+    // CT chain's issuer is read HERE, right after the key that signs the
+    // pair, and handed to #mintLogged — so the chain names the root of the
+    // key that signed rather than whatever a later, independent read returns.
+    // Read only when a log is bound: unbound, minting does no extra work.
+    const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
     const state = await this.getAuthorityState();
     const { mintBridgeCertPair } = await import("./cert-authority");
-    // Bridge pairs are root-issued: the default issuer, no issuerName.
     const ttlMs = params.ttlMs ?? 5 * 60 * 1000;
     const notBefore = new Date();
     const result = await this.#mintLogged({
@@ -1775,6 +1780,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           },
         ),
       pems: (r) => [r.certificates.mtls, r.certificates.signing],
+      issuerPem,
     });
     return {
       ...result,
@@ -1789,7 +1795,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    *
    * `mint(pin, ct)` mints every certificate under `pin` and gives certificate
    * i the extensions `ct(i)`; `pems` lists the result's certificates in that
-   * same order. All issued by the root.
+   * same order, all issued by the CA in `issuerPem`.
    *
    * With CT_LOG bound:
    *   1. mint precertificates (`ct(i)` = the poison) under the pin;
@@ -1809,28 +1815,26 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     pin: P;
     mint: (pin: P | undefined, ct: (i: number) => Extension[]) => Promise<R>;
     pems: (r: R) => string[];
+    /** The issuing CA's PEM, read alongside the signing key; null if unread. */
+    issuerPem: string | null;
   }): Promise<R> {
     const log = this.env.CT_LOG;
     if (!log) return p.mint(undefined, () => []);
-
-    const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
-    let rootB64: string;
-    let scts: (SctResponse | null)[];
-    try {
-      rootB64 = pemToB64(await this.getCACertificatePem());
-      const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
-      scts = await Promise.all(
-        p.pems(pre).map((pem) =>
-          submitPreChain(log, [pemToB64(pem), rootB64], DEFAULT_TIMEOUT_MS, path),
-        ),
-      );
-    } catch (err) {
-      // The root read is the only thing above that can throw; a CA that
-      // cannot produce its root has bigger problems, but the mint still must
-      // not fail on the log's account. No root, no chain to backlog.
-      console.error({ event: "ct.submit_failed", error: String(err) });
+    if (p.issuerPem === null) {
+      // No issuer, no chain to submit or backlog. Never refuse on the log's
+      // account; #readRootForCt already logged why.
       return p.mint(p.pin, () => []);
     }
+    const rootB64 = pemToB64(p.issuerPem);
+
+    const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
+    const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
+    // submitPreChain never throws: every failure is null.
+    const scts = await Promise.all(
+      p.pems(pre).map((pem) =>
+        submitPreChain(log, [pemToB64(pem), rootB64], DEFAULT_TIMEOUT_MS, path),
+      ),
+    );
 
     if (scts.every((s): s is SctResponse => s !== null)) {
       try {
@@ -1860,6 +1864,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       console.error({ event: "ct.backlog_write_failed", error: String(err) });
     }
     return fin;
+  }
+
+  /**
+   * The root PEM for a CT chain, or null (logged) if it cannot be read. A
+   * failure here must not fail the mint — the log is never a reason to refuse.
+   */
+  async #readRootForCt(): Promise<string | null> {
+    try {
+      return await this.getCACertificatePem();
+    } catch (err) {
+      console.error({ event: "ct.root_unreadable", error: String(err) });
+      return null;
+    }
   }
 
   /**

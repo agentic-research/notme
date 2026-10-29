@@ -59,12 +59,16 @@ const ctLog = (): Fetcher => {
   return f;
 };
 
+/** Select the stub's behaviour; returns its log id and public key (SPKI). */
 async function setMode(mode: Mode): Promise<string> {
+  return (await control(mode)).id;
+}
+async function control(mode: Mode): Promise<{ id: string; spki: string }> {
   const r = await ctLog().fetch("https://ct-log/__control", {
     method: "POST",
     body: JSON.stringify({ mode }),
   });
-  return ((await r.json()) as { id: string }).id;
+  return (await r.json()) as { id: string; spki: string };
 }
 
 async function received(): Promise<Received[]> {
@@ -263,6 +267,66 @@ function embeddedScts(pem: string): Uint8Array[] {
   return out;
 }
 
+/**
+ * RFC 6962 §3.2 verification of one embedded SCT against one final cert —
+ * written here, in the test, because production never verifies an SCT.
+ *
+ * Rebuilds the digitally-signed struct the log signed for a precert_entry:
+ * version ‖ signature_type ‖ timestamp ‖ entry_type ‖ issuer_key_hash ‖
+ * uint24 TBS (the final cert's TBSCertificate with the SCT list removed) ‖
+ * uint16 extensions — then checks the ECDSA P-256 signature with the log key.
+ */
+async function sctVerifies(
+  sct: Uint8Array,
+  finalPem: string,
+  rootPem: string,
+  logKey: CryptoKey,
+): Promise<boolean> {
+  expect(sct[0], "SCT v1").toBe(0);
+  const ts = sct.subarray(33, 41);
+  const extLen = (sct[41]! << 8) | sct[42]!;
+  const ext = sct.subarray(43, 43 + extLen);
+  let at = 43 + extLen;
+  expect([sct[at], sct[at + 1]], "sha256/ecdsa").toEqual([4, 3]);
+  const sigLen = (sct[at + 2]! << 8) | sct[at + 3]!;
+  const sigDer = sct.subarray(at + 4, at + 4 + sigLen);
+  expect(at + 4 + sigLen).toBe(sct.length);
+
+  const tbs = tbsWithout(fromB64(pemBody(finalPem)), CT_SCT_LIST_OID);
+  const issuerSpki = new Uint8Array(new X509Certificate(rootPem).publicKey.rawData);
+  const issuerKeyHash = new Uint8Array(await crypto.subtle.digest("SHA-256", issuerSpki));
+  const signed = concat([
+    new Uint8Array([0, 0]), // v1, certificate_timestamp
+    ts,
+    new Uint8Array([0, 1]), // precert_entry
+    issuerKeyHash,
+    new Uint8Array([tbs.length >> 16, (tbs.length >> 8) & 0xff, tbs.length & 0xff]),
+    tbs,
+    new Uint8Array([extLen >> 8, extLen & 0xff]),
+    ext,
+  ]);
+  return crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    logKey,
+    ecdsaDerToRaw(sigDer),
+    signed,
+  );
+}
+
+/** DER ECDSA-Sig-Value → the raw r‖s WebCrypto verifies. */
+function ecdsaDerToRaw(der: Uint8Array): Uint8Array {
+  const seq = tlv(der, 0);
+  const [r, s] = children(der, seq);
+  const fixed = (t: Tlv) => {
+    let v = der.subarray(t.body, t.end);
+    while (v.length > 32 && v[0] === 0) v = v.subarray(1);
+    const out = new Uint8Array(32);
+    out.set(v, 32 - v.length);
+    return out;
+  };
+  return concat([fixed(r!), fixed(s!)]);
+}
+
 async function expectWorkingPair(r: Awaited<ReturnType<typeof mint>>) {
   const ca = new X509Certificate(r.ca);
   for (const [pem, pub] of [[r.mtls, r.mtlsPub], [r.signing, r.signPub]] as const) {
@@ -346,8 +410,8 @@ describe("ct.mint — bridge pairs", () => {
     await expectWorkingPair(r);
   });
 
-  it("RF2: each SCT signs the final cert's own bytes — §3.2 reconstruction equals the precert the log saw", async () => {
-    await setMode("ok");
+  it("RF2: each cert's SCT verifies against its OWN bytes (and not the other's); §3.2 reconstruction equals the precert the log saw", async () => {
+    const stubKey = await control("ok");
     const r = await mint();
     const got = await received();
     const pres = got.map((g) => fromB64(g.chain[0]!));
@@ -358,6 +422,21 @@ describe("ct.mint — bridge pairs", () => {
       expect(preDer).toBeTruthy();
       expect(tbsWithout(finDer, CT_SCT_LIST_OID)).toEqual(tbsWithout(preDer, CT_POISON_OID));
     }
+    // The decisive check: each cert's embedded SCT VERIFIES, under the stub
+    // log's key, against that cert's own reconstructed bytes — and the OTHER
+    // cert's SCT does not. TBS equality above proves the pin; this proves
+    // each SCT landed in the certificate it was issued for. A swapped
+    // perCertExtensions mapping passes the pin check and fails here.
+    const logKey = await crypto.subtle.importKey(
+      "spki", fromB64(stubKey.spki), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"],
+    );
+    const ownSpkiHash = new Uint8Array(await crypto.subtle.digest("SHA-256", fromB64(stubKey.spki)));
+    expect(btoa(String.fromCharCode(...ownSpkiHash)), "log id = SHA-256(log SPKI)").toBe(stubKey.id);
+    const sctOf = { mtls: embeddedScts(r.mtls)[0]!, signing: embeddedScts(r.signing)[0]! };
+    expect(await sctVerifies(sctOf.mtls, r.mtls, r.ca, logKey), "mTLS SCT vs mTLS cert").toBe(true);
+    expect(await sctVerifies(sctOf.signing, r.signing, r.ca, logKey), "signing SCT vs signing cert").toBe(true);
+    expect(await sctVerifies(sctOf.signing, r.mtls, r.ca, logKey), "signing SCT must NOT verify on mTLS").toBe(false);
+    expect(await sctVerifies(sctOf.mtls, r.signing, r.ca, logKey), "mTLS SCT must NOT verify on signing").toBe(false);
   });
 
   for (const mode of ["fail-signing", "ok-then-fail", "fail-second", "500"] as const) {
