@@ -1,6 +1,6 @@
 # The mint path — offline task certificates that copying cannot forge
 
-**Status:** design, awaiting approval (2026-10-28)
+**Status:** approved 2026-10-28; phase 1 implemented
 **Builds on:** ADR-019 (delegation authority), notme-337d82 (renewable tiers),
 notme-9f84e6 (derived tasks), notme-1b46a8 / notme-907299 (transparency),
 rosary-056d96 (per-dispatch identity)
