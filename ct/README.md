@@ -155,15 +155,17 @@ The certificates are real notme output from the real mint path, with the same
 extensions, algorithms and EKUs; only the issuing instance differs. That is
 what makes the proof valid and what keeps it from needing a production key.
 
-`reject_expired` is `false` on both local shards: notme leaves live five
-minutes, so a fixture minted minutes earlier would be refused for a reason that
-has nothing to do with the property under test. The production shard `notme`
-leaves it at azul's production default, `true` (written explicitly): submission
-happens at issuance, so an expired leaf is never legitimate there. One
-consequence to know about: the backlog drain submits late, and a row that sat
-in `ct_backlog` past its certificate's 5-minute life is expected to be refused
-by the log as expired (`reject_expired`), so it would be retried until
-`gaveUp` rather than logged. This has not been exercised against a real log.
+`reject_expired` is `false` on all three shards, including production. On the
+local shards a fixture minted minutes earlier would otherwise be refused. On
+production it is required by the backlog: at submission azul raises the lower
+bound on the leaf's `notAfter` to max(`temporal_interval.start_inclusive`, now)
+for both `add-chain` and `add-pre-chain` when `reject_expired` is true. A
+backlogged bridge cert lives 5 minutes and the alarm drains every 4, so it is
+expired by the time it is retried; with `true` the backlog could never log the
+certificates it exists for. With `false`, the temporal interval still bounds
+what is accepted: `end_exclusive` applies unconditionally, and the lower bound
+falls back to `start_inclusive`. (Behaviour read from azul's
+`frontend_worker.rs`; not exercised against a deployed log.)
 
 ## The production shard `notme`
 
@@ -175,7 +177,7 @@ In `config.notme.json`:
 | `temporal_interval` | 2026-01-01Z to 2027-07-01Z (end exclusive) | the log accepts only certificates whose `notAfter` falls in this window; a new shard is needed after it |
 | `require_server_auth_eku` | `false` | notme leaves are clientAuth or have no EKU. Needs the azul fork (below) |
 | `enable_ccadb_roots` | `false` | this log accepts notme's root and nothing from the WebPKI |
-| `reject_expired` | `true` | see above |
+| `reject_expired` | `false` | the backlog submits after the leaf has expired; `true` would refuse every drained row (see above) |
 | `submission_endpoint` / `monitoring_endpoint` | `https://REPLACE-ME.example/logs/notme/` | **placeholder.** JSON has no comments, so it is explained here: replace both with the URL the deployed log is actually served at (the notme-ct Worker's route, or the R2 public bucket for the monitoring endpoint) before deploying. The log publishes these URLs in its `metadata.json`. |
 
 The file was brought up to the schema in the azul checkout on the fork branch
@@ -204,7 +206,8 @@ it is written from azul's `AGENTS.md`, `scripts/create-log.sh` and
    deploy from that branch.** On upstream `main` every notme certificate is
    refused (clientAuth-only leaves). Once #322 merges, switch to azul `main`.
 2. `cp config.notme.json <azul>/crates/ct_worker/config.notme.json` after
-   replacing the two `REPLACE-ME` URLs, and
+   replacing the two `REPLACE-ME` URLs (`task ct:verify` exits 1 if the pin is
+   provisioned while any remain), and
    `cp trust/notme-root.pem <azul>/crates/ct_worker/roots.notme.pem`.
 3. In `<azul>/crates/ct_worker/wrangler.jsonc` add an `env.notme` block modelled
    on `env.dev` (account, route, `build.command` with `DEPLOY_ENV=notme`, the

@@ -61,6 +61,10 @@ SIGNET_AUTHORITY_URL = "https://auth.notme.bot"
 # Comma-separated list of GitHub org/user names allowed to exchange GHA OIDC tokens
 # for bridge certs at auth.notme.bot/cert/gha.
 GHA_ALLOWED_OWNERS = "your-org"
+# Base path of the log behind the CT_LOG service binding (below). Default is
+# /logs/notme; set it only if the shard is named differently in
+# ct/config.notme.json. Has no effect while CT_LOG is unbound.
+# CT_LOG_PATH = "/logs/notme"
 
 # ATTESTED FIRST BOOT (notme-addef9) — the default way a fresh authority gets
 # its administrator, and the reason no secret has to travel through a log.
@@ -130,9 +134,8 @@ class_name = "RevocationAuthority"
 # binding = "CT_LOG"
 # service = "static-ct-notme"
 #
-# Base path of the log behind CT_LOG. The default is /logs/notme, so set this
-# only if the log shard is named differently in ct/config.notme.json.
-# CT_LOG_PATH = "/logs/notme"   # a [vars] entry, not a [[services]] key
+# CT_LOG_PATH (the log's base path behind CT_LOG, default /logs/notme) is a
+# variable: see the commented line under [vars] above.
 
 [[migrations]]
 tag = "v1"

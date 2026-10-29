@@ -10,6 +10,8 @@
  *   0  pin matches the log, OR the pin is "not-provisioned" (nothing to check
  *      yet; CI must not break before the log exists), OR --write recorded it
  *   1  the log disagrees with the pin, could not be read, or the pin is malformed
+ *   1  also: the pin is provisioned (or being written) while the log config
+ *      still contains the REPLACE-ME placeholder URLs (--config overrides the path)
  *   2  --write refused: a DIFFERENT pin is already recorded
  *
  * What is compared is the `key` (base64 SPKI DER) and `log_id` from the log's
@@ -29,6 +31,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+export const DEFAULT_CONFIG = join(__dirname, "..", "ct", "config.notme.json");
 export const DEFAULT_PIN = join(__dirname, "..", "trust", "notme-ct-log.json");
 
 export interface ProvisionedPin {
@@ -129,6 +132,15 @@ export async function run(argv: string[]): Promise<number> {
   const pinPath = arg(argv, "--pin") ?? DEFAULT_PIN;
   const write = argv.includes("--write");
   const pin = JSON.parse(readFileSync(pinPath, "utf8"));
+  if (write || pin.status === "provisioned") {
+    const cfgPath = arg(argv, "--config") ?? DEFAULT_CONFIG;
+    if (readFileSync(cfgPath, "utf8").includes("REPLACE-ME")) {
+      console.error(
+        `${cfgPath} still contains the REPLACE-ME placeholder URLs; a log was deployed from a config that does not name where it is served.`,
+      );
+      return 1;
+    }
+  }
   const src = arg(argv, "--metadata") ?? process.env.CT_LOG_METADATA_URL ?? pin.metadata_url;
 
   if (write) {

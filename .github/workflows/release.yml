@@ -221,6 +221,27 @@ jobs:
             *) echo "::error::trust/notme-ct-log.json has unrecognised status '$status'"; exit 1 ;;
           esac
 
+      # Mirror of the root check above: never sign a log key the log does not
+      # serve. Only when the pin records a key; the placeholder has nothing to
+      # compare. Same checks as scripts/verify-ct-log.ts: key and log_id equal
+      # the pin, and log_id is SHA-256(key).
+      - name: Confirm the pinned CT log key is what the log serves
+        if: steps.ctpin.outputs.signed == 'true'
+        run: |
+          url=$(jq -r '.metadata_url' trust/notme-ct-log.json)
+          curl -fsS "$url?r=$GITHUB_RUN_ID" -o ct-live.json
+          live_key=$(jq -r '.key' ct-live.json); live_id=$(jq -r '.log_id' ct-live.json)
+          pin_key=$(jq -r '.key' trust/notme-ct-log.json); pin_id=$(jq -r '.log_id' trust/notme-ct-log.json)
+          calc_id=$(printf '%s' "$live_key" | base64 -d | openssl dgst -sha256 -binary | base64 -w0)
+          if [ "$live_key" != "$pin_key" ] || [ "$live_id" != "$pin_id" ] || [ "$calc_id" != "$live_id" ]; then
+            echo "::error::trust/notme-ct-log.json is not what $url serves (or its log_id is not SHA-256(key)). Run 'task ct:verify', fix the pin by review, and re-tag."
+            exit 1
+          fi
+          if grep -q REPLACE-ME ct/config.notme.json; then
+            echo "::error::ct/config.notme.json still has REPLACE-ME placeholders."
+            exit 1
+          fi
+
       - name: Sign
         run: |
           files="notme-root.pem notme-root.json"

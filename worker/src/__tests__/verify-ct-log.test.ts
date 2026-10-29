@@ -24,7 +24,10 @@ const metadata = () => {
     key: der.toString("base64"),
   };
 };
-const quiet = async (argv: string[]) => {
+const cleanCfg = put("cfg-clean.json", { logs: {} });
+const placeholderCfg = put("cfg-placeholder.json", { url: "https://REPLACE-ME.example/" });
+const quiet = async (argv0: string[]) => {
+  const argv = argv0.includes("--config") ? argv0 : [...argv0, "--config", cleanCfg];
   const spies = [vi.spyOn(console, "log"), vi.spyOn(console, "error")].map((s) =>
     s.mockImplementation(() => {}),
   );
@@ -84,6 +87,17 @@ describe("ct:verify", () => {
     const pin = pending();
     await quiet(["--pin", pin, "--write", "--metadata", put("m4.json", metadata())]);
     expect(await quiet(["--pin", pin, "--metadata", join(dir, "missing.json")])).toBe(1);
+  });
+
+  it("exits 1 when provisioned (or writing) while the config still has REPLACE-ME", async () => {
+    const md = put("mr.json", metadata());
+    const pin = pending();
+    expect(await quiet(["--pin", pin, "--write", "--metadata", md, "--config", placeholderCfg])).toBe(1);
+    expect(JSON.parse(readFileSync(pin, "utf8")).status).toBe("not-provisioned");
+    await quiet(["--pin", pin, "--write", "--metadata", md]);
+    expect(await quiet(["--pin", pin, "--metadata", md, "--config", placeholderCfg])).toBe(1);
+    // placeholder state stays 0 even with the placeholder config (today's state)
+    expect(await quiet(["--pin", pending(), "--config", placeholderCfg])).toBe(0);
   });
 
   it("the committed pin is in a state the script recognises", () => {
