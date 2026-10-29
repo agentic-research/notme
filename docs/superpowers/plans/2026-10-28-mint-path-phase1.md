@@ -41,6 +41,39 @@
 4. **The client never signs a fresh v2 request while a pending one exists.** After a lost response outlasting the retry window, it must stop with "renewal state lost, re-enroll" rather than fork itself. Test in Task 4.
 5. **A legacy enrollment** (no `generation` in `tier.json`, `binding_version` NULL) keeps renewing with v1. Its first v2 renewal locks v1 out. Test in Task 3.
 
+## Stage Checks (between every task)
+
+A task is complete only when **all** of these hold. The controller records
+the evidence in the ledger before dispatching the next task:
+
+1. **Red before green.** The new tests failed before implementation, for the
+   reason stated in the task. The output is captured in the report.
+2. **Green after.** The task's own tests pass, and so do these existing
+   suites:
+   - `tier-renewal.do.test.ts`
+   - `tier-enrolment.do.test.ts`
+   - `rpc-surface.do.test.ts`
+   - `task-cert-client.test.ts`
+3. **Mutations killed.** Each mutation the task lists was applied and made at
+   least one test fail, then reverted. The command and the failing test name
+   are in the report.
+4. **Typecheck clean.** `pnpm exec tsc --noEmit && pnpm exec tsc -p tsconfig.test.json` in `worker/`.
+5. **Independent review.** The task reviewer gives spec ✅ and quality
+   approved, or the findings are fixed and re-reviewed.
+
+## Falsifiable End Result
+
+Task 7 is the end-to-end proof. It **fails today**: run it before Tasks 1–6
+and it must fail. It **passes only when all of phase 1 works together**: the
+real `task-cert` client code against the real worker. If any of these
+regressed, Task 7 fails:
+
+- the counter;
+- the retry path;
+- fork revocation;
+- v1 retirement;
+- the client's persisted resend.
+
 ---
 
 ### Task 1: Binding v2 and the retry digest (pure)
@@ -286,3 +319,55 @@
   - cross-repo: signet `.1.10` enforcement, LLO `.1.7` writing and `.1.10` reading.
 
 - [ ] **Step 3: Commit and push** as `[notme-747cc7] docs: fork detection in the README, API docs and spec status`, then run `git push origin goalzero`.
+
+---
+
+### Task 7: End-to-end acceptance — the real client, a copied machine, a lost response
+
+**Files:**
+- Test: `worker/src/fork-acceptance.do.test.ts` (new)
+
+**Interfaces:**
+- Consumes:
+  - `renewTier` and `PendingRenewal` from `scripts/task-cert/lib.ts` (Task 4), imported by relative path, as `task-cert-client.test.ts` does;
+  - the worker's routes (Tasks 2, 3, 5).
+- `fetchFn` is a wrapper that sends the client's `Request` into `worker.fetch` with the pool's `env`. The client code runs unmodified against the real worker.
+
+- [ ] **Step 1: Write the scenario as one `describe`, with four `it`s.** Each enrolls a fresh machine through the real routes (start → approve → collect), then drives **only** the client's `renewTier`:
+
+  - `"the honest machine renews through a lost response"`:
+    1. The first `renewTier` call's `fetchFn` delivers the request to the worker but throws before returning the response. That simulates the lost response.
+    2. The second call, with the saved pending request, succeeds with `generation: 1`.
+    3. A third call, with no pending request and `generation: 1`, succeeds with `generation: 2`.
+  - `"a copied machine is caught at renewal, and both lines are shut off"`:
+    1. Copy the client state (key, `generation: 0`) to a second "machine".
+    2. The original renews and gets `generation: 1`.
+    3. The copy renews from `generation: 0` and throws `fork_detected`.
+    4. The original's next renewal throws `fork_detected`.
+    5. `GET /cert/issuing-ca/enrollments` shows `revoked_at` set.
+  - `"a captured request replayed later does not shut the machine off"`:
+    1. Record the body the fake fetch sent at generation 0, and let that renewal complete.
+    2. Renew again at generation 1.
+    3. POST the recorded body directly, with `Date.now` advanced past 120 s via `vi.setSystemTime`: the result is 401 `stale_proof`.
+    4. The machine still renews at generation 2.
+  - `"a legacy machine keeps working until its first v2 renewal"`:
+    1. Set `binding_version` NULL on the row.
+    2. The client with no `generation` renews with v1: 200.
+    3. It renews with v2: 200.
+    4. v1 is then refused.
+
+- [ ] **Step 2: Run it before Tasks 1–6 are merged**, or on a checkout of the base commit, and confirm it fails.
+
+  Run: `cd worker && pnpm exec vitest run --config vitest.workers.config.mts src/fork-acceptance.do.test.ts --testTimeout 30000`
+  Expected: FAIL (no `generation` in responses). Record this in the ledger as the falsification baseline.
+
+- [ ] **Step 3: Run it after Tasks 1–6.** Expected: 4 passed.
+
+- [ ] **Step 4: Cross-mutation check.** Revert, one at a time:
+  - Task 2's atomic `generation = ?` guard;
+  - Task 4's pending-resend branch;
+  - Task 3's v1 lock.
+
+  Each must make Task 7 fail. Record the failing `it` for each.
+
+- [ ] **Step 5: Commit** as `[notme-747cc7] test(tier): end-to-end — the real client against a copied machine and a lost response`.
