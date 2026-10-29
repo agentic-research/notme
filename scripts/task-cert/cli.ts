@@ -111,7 +111,7 @@ async function enroll() {
 
 const ENDED_REASONS = new Set([
   "revoked", "horizon_passed", "epoch_changed", "approval_withdrawn",
-  "fork_detected", "invalid_proof", "unknown_key", "stale_proof",
+  "fork_detected", "invalid_proof", "unknown_key",
 ]);
 
 /**
@@ -120,18 +120,24 @@ const ENDED_REASONS = new Set([
  */
 async function renewNow(quiet = false) {
   let out: { expires_at: number; renew_until: number } | undefined;
-  const meta = JSON.parse(need("tier.json"));
-  const tierCert = new X509Certificate(need("tier.pem"));
-  const spki = new Uint8Array(tierCert.publicKey.rawData);
-  const pem = `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...spki)).match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----\n`;
+  let meta: any;
   try {
     await renewTierInDir(
-      meta.authority ?? authority,
-      { privateKey: await importPrivateKeyPem(need("tier.key.pem")), spki, pem },
       dir,
+      // Read under the renew lock, so a renewal that waited never signs a stale generation.
+      async () => {
+        meta = JSON.parse(need("tier.json"));
+        const tierCert = new X509Certificate(need("tier.pem"));
+        const spki = new Uint8Array(tierCert.publicKey.rawData);
+        const pem = `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...spki)).match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----\n`;
+        return {
+          authority: meta.authority ?? authority,
+          key: { privateKey: await importPrivateKeyPem(need("tier.key.pem")), spki, pem },
+          // tier.json without a generation is a legacy enrolment: it renews with v1.
+          generation: meta.generation,
+        };
+      },
       {
-        // tier.json without a generation is a legacy enrolment: it renews with v1.
-        generation: meta.generation,
         // The new tier reaches disk before the pending request is dropped.
         persist: (r) => {
           writeFileSync(join(dir, "tier.pem"), r.certificate);
@@ -149,6 +155,9 @@ async function renewNow(quiet = false) {
     );
   } catch (e: any) {
     if (String(e.message).startsWith("renewal state lost")) throw e;
+    if (e instanceof AuthorityRefusal && e.reason === "stale_proof") {
+      throw new Error("the authority refused the timestamp — check this machine's clock");
+    }
     if (e instanceof AuthorityRefusal && ENDED_REASONS.has(e.reason)) {
       throw new Error(`the approval for this machine has ended (${e.reason}) — run \`task-cert enroll\` and approve again`);
     }

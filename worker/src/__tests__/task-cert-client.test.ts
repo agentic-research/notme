@@ -10,7 +10,7 @@
  */
 import { X509Certificate, X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mintIssuingCaCert } from "../cert-authority";
@@ -189,7 +189,7 @@ describe("task output paths", () => {
 
 // ── renewal with a generation (notme-747cc7) ────────────────────────────────
 import {
-  renewTier, renewTierInDir, saveEnrolment, loadPending, AuthorityRefusal, CLIENT_RESEND_WINDOW_S, type PendingRenewal,
+  renewTier, renewTierInDir, saveEnrolment, loadPending, acquireRenewLock, savePendingExclusive, AuthorityRefusal, CLIENT_RESEND_WINDOW_S, type PendingRenewal,
 } from "../../../scripts/task-cert/lib";
 import { tierRenewalBindingV2 } from "../auth/tier-enrolment-binding";
 
@@ -361,6 +361,8 @@ describe("renewal with a generation", () => {
 
   describe("on disk", () => {
     const tmp = () => mkdtempSync(join(tmpdir(), "task-cert-test-"));
+    const inDir = (dir: string, k: Awaited<ReturnType<typeof generateTierKey>>, generation: number | undefined, f: typeof fetch, o: { fetchTimeoutMs?: number; persist?: (r: any) => void } = {}) =>
+      renewTierInDir(dir, async () => ({ authority: "https://a", key: k, generation }), o, f);
 
     it("re-enrolling clears a stale pending file", () => {
       const dir = tmp();
@@ -377,9 +379,9 @@ describe("renewal with a generation", () => {
       let release!: () => void;
       const gate = new Promise<void>((r) => (release = r));
       const slow = withFetch(async () => { await gate; return reply(200, okBody); }, seen);
-      const first = renewTierInDir("https://a", k, dir, { generation: 2 }, slow);
+      const first = inDir(dir, k, 2, slow);
       await vi.waitFor(() => expect(seen).toHaveLength(1));
-      await expect(renewTierInDir("https://a", k, dir, { generation: 2 }, slow)).rejects.toThrow("in progress");
+      await expect(inDir(dir, k, 2, slow)).rejects.toThrow("in progress");
       expect(seen).toHaveLength(1);
       release();
       await first;
@@ -391,8 +393,8 @@ describe("renewal with a generation", () => {
       const dir = tmp();
       const k = await generateTierKey();
       const seen: string[] = [];
-      await expect(renewTierInDir("https://a", k, dir, { generation: 2 }, (async (_u: string, i: any) => { seen.push(i.body); throw new Error("down"); }) as unknown as typeof fetch)).rejects.toThrow("down");
-      await renewTierInDir("https://a", k, dir, { generation: 2 }, withFetch(() => reply(200, okBody), seen));
+      await expect(inDir(dir, k, 2, (async (_u: string, i: any) => { seen.push(i.body); throw new Error("down"); }) as unknown as typeof fetch)).rejects.toThrow("down");
+      await inDir(dir, k, 2, withFetch(() => reply(200, okBody), seen));
       expect(seen).toHaveLength(2);
       expect(seen[1]).toBe(seen[0]);
     });
@@ -402,11 +404,81 @@ describe("renewal with a generation", () => {
       writeFileSync(join(dir, "renew-pending.json"), "{not json");
       const k = await generateTierKey();
       let called = false;
-      await expect(renewTierInDir("https://a", k, dir, { generation: 2 }, withFetch(() => { called = true; return reply(200, okBody); })))
+      await expect(inDir(dir, k, 2, withFetch(() => { called = true; return reply(200, okBody); })))
         .rejects.toThrow("renewal state lost (pending request unreadable)");
       expect(called).toBe(false);
       expect(() => loadPending(dir)).toThrow("unreadable");
       expect(existsSync(join(dir, "renew.lock"))).toBe(false);
+    });
+
+    it("the generation is read under the lock", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      writeFileSync(join(dir, "tier.json"), JSON.stringify({ generation: 2 }));
+      const loads: string[] = [];
+      const load = async () => {
+        const g = JSON.parse(readFileSync(join(dir, "tier.json"), "utf8")).generation;
+        loads.push(`g${g}`);
+        return { authority: "https://a", key: k, generation: g };
+      };
+      const persist = (r: any) => writeFileSync(join(dir, "tier.json"), JSON.stringify({ generation: r.generation }));
+      const seen: string[] = [];
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const p1 = renewTierInDir(dir, load, { persist }, withFetch(async () => { await gate; return reply(200, { ...okBody, generation: 3 }); }, seen));
+      await vi.waitFor(() => expect(seen).toHaveLength(1));
+      await expect(renewTierInDir(dir, load, { persist }, withFetch(() => reply(200, okBody), seen))).rejects.toThrow("in progress");
+      expect(loads).toEqual(["g2"]); // the second never even read state while the first held the lock
+      release();
+      await p1;
+      await renewTierInDir(dir, load, { persist }, withFetch(() => reply(200, okBody), seen));
+      expect(loads).toEqual(["g2", "g3"]);
+      expect(JSON.parse(seen[1]!).generation).toBe(3);
+    });
+
+    it("a live lock is never stolen, even if empty", () => {
+      const dir = tmp();
+      writeFileSync(join(dir, "renew.lock"), "");
+      expect(() => acquireRenewLock(dir)).toThrow("in progress");
+      writeFileSync(join(dir, "renew.lock"), "garbage");
+      expect(() => acquireRenewLock(dir)).toThrow("in progress");
+    });
+
+    it("release does not remove someone else's lock", () => {
+      const dir = tmp();
+      const a = acquireRenewLock(dir);
+      writeFileSync(join(dir, "renew.lock"), "someone-else");
+      a.release();
+      expect(readFileSync(join(dir, "renew.lock"), "utf8")).toBe("someone-else");
+    });
+
+    it("a stale lock is stolen by exactly one of two stealers", () => {
+      const dir = tmp();
+      const lock = join(dir, "renew.lock");
+      writeFileSync(lock, "dead-holder");
+      utimesSync(lock, 1, 1);
+      let b: ReturnType<typeof acquireRenewLock> | undefined;
+      // Stealer A has judged the lock stale; before it moves, stealer B steals it and takes a fresh one.
+      expect(() => acquireRenewLock(dir, { onStale: () => { b = acquireRenewLock(dir, { onStale: undefined }); } })).toThrow("in progress");
+      expect(b).toBeDefined();
+      expect(readFileSync(lock, "utf8")).toBe(b!.token);
+    });
+
+    it("the fetch is aborted at the timeout and pending is kept", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      const hang = ((_u: string, init: any) =>
+        new Promise((_res, rej) => init.signal?.addEventListener("abort", () => rej(new DOMException("aborted", "TimeoutError"))))) as unknown as typeof fetch;
+      await expect(inDir(dir, k, 1, hang, { fetchTimeoutMs: 20 })).rejects.toThrow();
+      expect(loadPending(dir)).not.toBeNull();
+      expect(existsSync(join(dir, "renew.lock"))).toBe(false);
+    });
+
+    it("the link() backstop alone prevents a double sign", () => {
+      const dir = tmp();
+      savePendingExclusive(dir, pendingAt(1));
+      expect(() => savePendingExclusive(dir, { body: "second", iat: NOW, generation: 5 })).toThrow("already saved");
+      expect(loadPending(dir)!.body).toBe('{"sealed":1}');
     });
   });
 });

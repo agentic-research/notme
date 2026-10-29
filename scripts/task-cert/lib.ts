@@ -16,7 +16,7 @@
  * would: scopes never exceed the tier's, lifetime never outlives it, an
  * expired tier is refused, and the tier key must match the tier cert.
  */
-import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync, chmodSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { X509Certificate, BasicConstraintsExtension } from "@peculiar/x509";
 import { mintTaskCertPair } from "../../worker/src/cert-authority";
@@ -241,6 +241,8 @@ const stateLost = (why: string) => new Error(`renewal state lost (${why}) — ${
  */
 export const CLIENT_RESEND_WINDOW_S = RENEWAL_RETRY_WINDOW_S - RENEWAL_SKEW_S;
 
+export const RENEW_FETCH_TIMEOUT_MS = 30_000;
+
 // 4xx statuses that say "try again", not "no".
 const TRANSIENT_4XX = new Set([408, 425, 429]);
 
@@ -272,6 +274,8 @@ export async function renewTier(
     savePending: (p: PendingRenewal) => void;
     clearPending: () => void;
     persist?: (r: RenewalResult) => void;
+    /** Abort the POST after this long; an aborted request is not definitive. */
+    fetchTimeoutMs?: number;
   },
   fetchFn: typeof fetch = fetch,
 ): Promise<RenewalResult> {
@@ -302,6 +306,7 @@ export async function renewTier(
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
+    signal: AbortSignal.timeout(opts.fetchTimeoutMs ?? RENEW_FETCH_TIMEOUT_MS),
   });
   const out = (await res.json().catch(() => null)) as any;
 
@@ -326,7 +331,8 @@ export async function renewTier(
 
 const PENDING = "renew-pending.json";
 const LOCK = "renew.lock";
-const LOCK_STALE_MS = 120_000;
+/** Far longer than a renewal's fetch timeout, so a live holder is never stolen from. */
+export const LOCK_STALE_MS = 600_000;
 
 /** Read the pending request. Unreadable means the state is lost; it must never lead to signing. */
 export function loadPending(dir: string): PendingRenewal | null {
@@ -350,7 +356,7 @@ export function removePending(dir: string): void {
  * Write the pending request atomically AND exclusively: a private temp file,
  * then link() into place, which fails if the pending file already exists.
  */
-function savePendingExclusive(dir: string, p: PendingRenewal): void {
+export function savePendingExclusive(dir: string, p: PendingRenewal): void {
   const tmp = join(dir, `${PENDING}.${process.pid}.${Math.random().toString(36).slice(2)}`);
   writeFileSync(tmp, JSON.stringify(p), { mode: 0o600 });
   try {
@@ -363,53 +369,108 @@ function savePendingExclusive(dir: string, p: PendingRenewal): void {
   }
 }
 
-/** One renewal at a time per directory: a lock file created with O_EXCL, held for the whole renew. */
-async function withRenewLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+export type LockOpts = { staleMs?: number; /** test hook: runs after a lock is judged stale, before it is stolen */ onStale?: () => void };
+
+/**
+ * One renewal at a time per directory. The lock file holds a random owner
+ * token and is created atomically (temp file, then link(): EEXIST means held),
+ * so a reader never sees a half-written lock. Whether it is stale is decided
+ * ONLY by its mtime; an empty or unreadable lock is held. A stale lock is
+ * stolen by rename() to a unique name, which succeeds for exactly one stealer.
+ * Release unlinks only a lock that still carries the owner's token.
+ */
+export function acquireRenewLock(dir: string, o: LockOpts = {}): { token: string; release: () => void } {
   const path = join(dir, LOCK);
-  const take = () => {
-    const fd = openSync(path, "wx", 0o600);
-    writeSync(fd, String(Date.now()));
-    closeSync(fd);
+  const token = `${process.pid}-${crypto.randomUUID()}`;
+  const busy = () => new Error("another renewal is in progress — try again in a moment");
+  const tryTake = (): boolean => {
+    const tmp = `${path}.tmp-${token}`;
+    writeFileSync(tmp, token, { mode: 0o600 });
+    try {
+      linkSync(tmp, path);
+      return true;
+    } catch (e: any) {
+      if (e.code === "EEXIST") return false;
+      throw e;
+    } finally {
+      try { unlinkSync(tmp); } catch { /* best effort */ }
+    }
   };
-  try {
-    take();
-  } catch (e: any) {
-    if (e.code !== "EEXIST") throw e;
-    let at = 0;
-    try { at = Number(readFileSync(path, "utf8")); } catch { /* vanished: retry below */ }
-    if (at && Date.now() - at < LOCK_STALE_MS) throw new Error("another renewal is in progress — try again in a moment");
-    try { unlinkSync(path); } catch { /* raced */ }
-    try { take(); } catch { throw new Error("another renewal is in progress — try again in a moment"); }
+  if (!tryTake()) {
+    let mtime: number;
+    try {
+      mtime = statSync(path).mtimeMs;
+    } catch {
+      // Released between our attempts: one more try, otherwise someone else has it.
+      if (tryTake()) return lockHandle(path, token);
+      throw busy();
+    }
+    if (Date.now() - mtime < (o.staleMs ?? LOCK_STALE_MS)) throw busy();
+    o.onStale?.();
+    const moved = `${path}.stale-${token}`;
+    try {
+      renameSync(path, moved);
+    } catch {
+      // Another stealer (or the holder) got there first.
+      if (tryTake()) return lockHandle(path, token);
+      throw busy();
+    }
+    // We may have moved a lock that was taken fresh after we looked. If so, put it back.
+    let fresh = false;
+    try { fresh = Date.now() - statSync(moved).mtimeMs < (o.staleMs ?? LOCK_STALE_MS); } catch { /* gone */ }
+    if (fresh) {
+      try { linkSync(moved, path); } catch { /* someone holds the lock now */ }
+      try { unlinkSync(moved); } catch { /* best effort */ }
+      throw busy();
+    }
+    try { unlinkSync(moved); } catch { /* best effort */ }
+    if (!tryTake()) throw busy();
   }
-  try {
-    return await fn();
-  } finally {
-    try { unlinkSync(path); } catch { /* already gone */ }
-  }
+  return lockHandle(path, token);
 }
 
-/** renewTier backed by files in `dir`: locked, with the pending request persisted exclusively. */
-export function renewTierInDir(
-  authority: string,
-  key: { privateKey: CryptoKey; spki: Uint8Array; pem: string },
+function lockHandle(path: string, token: string) {
+  return {
+    token,
+    release: () => {
+      try {
+        if (readFileSync(path, "utf8") === token) unlinkSync(path);
+      } catch { /* not ours, or already gone */ }
+    },
+  };
+}
+
+/**
+ * renewTier backed by files in `dir`. EVERYTHING the renewal reads — the tier
+ * state `load` returns (its generation) and the pending request — is read
+ * UNDER the lock, so a renewal that waited behind another never signs at a
+ * generation the other has already advanced.
+ */
+export async function renewTierInDir(
   dir: string,
-  opts: { generation?: number; persist?: (r: RenewalResult) => void },
+  load: () => Promise<{ authority: string; key: { privateKey: CryptoKey; spki: Uint8Array; pem: string }; generation?: number }>,
+  opts: { persist?: (r: RenewalResult) => void; fetchTimeoutMs?: number; lock?: LockOpts },
   fetchFn: typeof fetch = fetch,
 ): Promise<RenewalResult> {
-  return withRenewLock(dir, () =>
-    renewTier(
+  const lock = acquireRenewLock(dir, opts.lock);
+  try {
+    const { authority, key, generation } = await load();
+    return await renewTier(
       authority,
       key,
       {
-        generation: opts.generation,
+        generation,
         pending: loadPending(dir),
         savePending: (p) => savePendingExclusive(dir, p),
         clearPending: () => removePending(dir),
         persist: opts.persist,
+        fetchTimeoutMs: opts.fetchTimeoutMs,
       },
       fetchFn,
-    ),
-  );
+    );
+  } finally {
+    lock.release();
+  }
 }
 
 /** Write a freshly enrolled tier. A new enrolment ends any pending renewal of the old one. */
