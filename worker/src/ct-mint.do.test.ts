@@ -21,12 +21,21 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { X509Certificate } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
-import { CT_POISON_OID, CT_SCT_LIST_OID } from "./ct/sct";
+import { CT_POISON_OID, CT_SCT_LIST_OID, type SctResponse } from "./ct/sct";
+import { parseLogPin, spkiOf, tbsWithout, verifySct, type LogPin } from "./ct/verify-sct";
 
 const SUBJECT = "repo:agentic-research/notme:ref:refs/heads/main";
 const CT_TIMEOUT_MS = 2000;
 
-type Mode = "ok" | "500" | "hang" | "ok-then-fail" | "fail-second" | "fail-signing";
+type Mode =
+  | "ok"
+  | "500"
+  | "hang"
+  | "ok-then-fail"
+  | "fail-second"
+  | "fail-signing"
+  | "wrong-id"
+  | "bad-sig";
 interface Received {
   path: string;
   chain: string[];
@@ -50,8 +59,19 @@ type AuthLike = {
     authMethod: string;
     ttlMs?: number;
   }): Promise<{ certificates: { mtls: string; signing: string } }>;
+  getAlarmHealth(): Promise<{ ct: CtHealthView }>;
   ctx: { storage: { sql: { exec(q: string): { toArray(): unknown[] } } } };
 };
+interface CtHealthView {
+  backlog: number;
+  oldestUnloggedAgeS: number | null;
+  gaveUp: number;
+  lastError: string;
+  lastErrorAt: number;
+  unloggable: { count: number; lastAt: number; reason: string };
+  embedFailed: { count: number; lastAt: number };
+  configError: string | null;
+}
 
 const ctLog = (): Fetcher => {
   const f = (env as unknown as { CT_LOG?: Fetcher }).CT_LOG;
@@ -89,8 +109,16 @@ let seq = 0;
  * Mint through the DO's public method, on a fresh authority so its backlog is
  * this test's alone. `unbind` deletes CT_LOG from that DO's env first: the
  * exact "absent binding" state, in the same isolate as the bound runs.
+ * `envPatch` overrides (undefined deletes) env vars such as CT_LOG_KEY;
+ * `before` runs inside the DO just before the mint.
  */
-async function mint(opts: { unbind?: boolean } = {}) {
+async function mint(
+  opts: {
+    unbind?: boolean;
+    envPatch?: Record<string, string | undefined>;
+    before?: (a: AuthLike) => Promise<void> | void;
+  } = {},
+) {
   const name = `ct-mint-${++seq}-${crypto.randomUUID()}`;
   const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
   const mtls = (await crypto.subtle.generateKey(
@@ -108,6 +136,18 @@ async function mint(opts: { unbind?: boolean } = {}) {
       const e = { ...a.env };
       delete e.CT_LOG;
       a.env = e;
+    }
+    if (opts.envPatch) {
+      const e = { ...a.env };
+      for (const [k, v] of Object.entries(opts.envPatch)) {
+        if (v === undefined) delete e[k];
+        else e[k] = v;
+      }
+      a.env = e;
+    }
+    if (opts.before) {
+      await a.getAuthorityState(); // init: the schema exists before `before` touches it
+      await opts.before(a);
     }
     const t0 = Date.now();
     const pair = await a.mintBridgeCertPair({
@@ -144,8 +184,10 @@ async function mint(opts: { unbind?: boolean } = {}) {
       { scopes: ["bridgeCert"], epoch: state.epoch, authMethod: "gha-oidc" },
     );
 
+    const health = (await a.getAlarmHealth()).ct;
     return {
       ca,
+      health,
       mtls: pair.certificates.mtls,
       signing: pair.certificates.signing,
       today,
@@ -159,172 +201,63 @@ async function mint(opts: { unbind?: boolean } = {}) {
 
 const oids = (pem: string) => new X509Certificate(pem).extensions.map((e) => e.type);
 
-// ── Minimal DER, enough to perform the RFC 6962 §3.2 reconstruction ────────
-
-interface Tlv {
-  tag: number;
-  start: number; // first byte of the TLV
-  body: number; // first byte of the content
-  end: number; // one past the last content byte
-}
-function tlv(d: Uint8Array, at: number): Tlv {
-  const tag = d[at]!;
-  let len = d[at + 1]!;
-  let body = at + 2;
-  if (len & 0x80) {
-    const n = len & 0x7f;
-    len = 0;
-    for (let i = 0; i < n; i++) len = len * 256 + d[at + 2 + i]!;
-    body = at + 2 + n;
-  }
-  return { tag, start: at, body, end: body + len };
-}
-function children(d: Uint8Array, t: Tlv): Tlv[] {
-  const out: Tlv[] = [];
-  for (let at = t.body; at < t.end; ) {
-    const c = tlv(d, at);
-    out.push(c);
-    at = c.end;
-  }
-  return out;
-}
-function encode(tag: number, content: Uint8Array): Uint8Array {
-  const n = content.length;
-  const len =
-    n < 0x80 ? [n] : n < 0x100 ? [0x81, n] : n < 0x10000 ? [0x82, n >> 8, n & 0xff] : null;
-  if (!len) throw new Error("test DER encoder: content too long");
-  const out = new Uint8Array(1 + len.length + n);
-  out[0] = tag;
-  out.set(len, 1);
-  out.set(content, 1 + len.length);
-  return out;
-}
-function concat(parts: Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
-  let at = 0;
-  for (const p of parts) {
-    out.set(p, at);
-    at += p.length;
-  }
-  return out;
-}
-function oidString(content: Uint8Array): string {
-  const arcs = [Math.floor(content[0]! / 40), content[0]! % 40];
-  let v = 0;
-  for (const b of content.subarray(1)) {
-    v = v * 128 + (b & 0x7f);
-    if (!(b & 0x80)) {
-      arcs.push(v);
-      v = 0;
-    }
-  }
-  return arcs.join(".");
-}
-
-/** The TBSCertificate of `certDer` with the extension `drop` removed. */
-function tbsWithout(certDer: Uint8Array, drop: string): Uint8Array {
-  const cert = tlv(certDer, 0);
-  const tbs = children(certDer, cert)[0]!;
-  const fields = children(certDer, tbs);
-  const extsField = fields.find((f) => f.tag === 0xa3);
-  if (!extsField) throw new Error("certificate has no extensions");
-  const seq = children(certDer, extsField)[0]!;
-  const exts = children(certDer, seq);
-  const kept = exts.filter((e) => {
-    const oid = children(certDer, e)[0]!;
-    return oidString(certDer.subarray(oid.body, oid.end)) !== drop;
-  });
-  if (kept.length !== exts.length - 1) {
-    throw new Error(`expected exactly one ${drop} extension`);
-  }
-  const newExts = encode(
-    0xa3,
-    encode(0x30, concat(kept.map((e) => certDer.subarray(e.start, e.end)))),
-  );
-  return encode(
-    0x30,
-    concat([
-      ...fields.filter((f) => f.tag !== 0xa3).map((f) => certDer.subarray(f.start, f.end)),
-      newExts,
-    ]),
-  );
-}
-
 /** The TLS-encoded SCTs inside an embedded SCT list extension. */
 function embeddedScts(pem: string): Uint8Array[] {
   const ext = new X509Certificate(pem).getExtension(CT_SCT_LIST_OID)!;
   const v = new Uint8Array(ext.value);
-  const inner = tlv(v, 0); // OCTET STRING wrapping the TLS list
-  expect(inner.tag).toBe(0x04);
-  const list = v.subarray(inner.body, inner.end);
+  // OCTET STRING wrapping the TLS list (short or 1/2-byte long form).
+  expect(v[0]).toBe(0x04);
+  const n = v[1]! & 0x80 ? v[1]! & 0x7f : 0;
+  const list = v.subarray(2 + n);
   expect((list[0]! << 8) | list[1]!).toBe(list.length - 2);
   const out: Uint8Array[] = [];
   for (let at = 2; at < list.length; ) {
-    const n = (list[at]! << 8) | list[at + 1]!;
-    out.push(list.subarray(at + 2, at + 2 + n));
-    at += 2 + n;
+    const len = (list[at]! << 8) | list[at + 1]!;
+    out.push(list.subarray(at + 2, at + 2 + len));
+    at += 2 + len;
   }
   return out;
 }
 
+/** An embedded (TLS-encoded) SCT back to the JSON shape a log returns. */
+function sctFromTls(sct: Uint8Array): SctResponse {
+  expect(sct[0], "SCT v1").toBe(0);
+  let ts = 0n;
+  for (const b of sct.subarray(33, 41)) ts = (ts << 8n) | BigInt(b);
+  const extLen = (sct[41]! << 8) | sct[42]!;
+  const b64 = (u: Uint8Array) => btoa(String.fromCharCode(...u));
+  return {
+    sct_version: 0,
+    id: b64(sct.subarray(1, 33)),
+    timestamp: Number(ts),
+    extensions: b64(sct.subarray(43, 43 + extLen)),
+    signature: b64(sct.subarray(43 + extLen)),
+  };
+}
+
+/** The stub log as the authority pins it. */
+async function stubPin(k: { id: string; spki: string }): Promise<LogPin> {
+  const pin = await parseLogPin(k.id, k.spki);
+  if ("error" in pin) throw new Error(pin.error);
+  return pin;
+}
+
 /**
- * RFC 6962 §3.2 verification of one embedded SCT against one final cert —
- * written here, in the test, because production never verifies an SCT.
- *
- * Rebuilds the digitally-signed struct the log signed for a precert_entry:
- * version ‖ signature_type ‖ timestamp ‖ entry_type ‖ issuer_key_hash ‖
- * uint24 TBS (the final cert's TBSCertificate with the SCT list removed) ‖
- * uint16 extensions — then checks the ECDSA P-256 signature with the log key.
+ * RFC 6962 §3.2 verification of one embedded SCT against one final cert,
+ * through PRODUCTION's verifySct (ct/verify-sct.ts): the precert_entry is
+ * the final cert's TBSCertificate with the SCT list removed — which equals
+ * the precert's TBS with the poison removed when the pin held — and
+ * issuer_key_hash is SHA-256 of the root's SPKI.
  */
 async function sctVerifies(
   sct: Uint8Array,
   finalPem: string,
   rootPem: string,
-  logKey: CryptoKey,
+  pin: LogPin,
 ): Promise<boolean> {
-  expect(sct[0], "SCT v1").toBe(0);
-  const ts = sct.subarray(33, 41);
-  const extLen = (sct[41]! << 8) | sct[42]!;
-  const ext = sct.subarray(43, 43 + extLen);
-  let at = 43 + extLen;
-  expect([sct[at], sct[at + 1]], "sha256/ecdsa").toEqual([4, 3]);
-  const sigLen = (sct[at + 2]! << 8) | sct[at + 3]!;
-  const sigDer = sct.subarray(at + 4, at + 4 + sigLen);
-  expect(at + 4 + sigLen).toBe(sct.length);
-
   const tbs = tbsWithout(fromB64(pemBody(finalPem)), CT_SCT_LIST_OID);
-  const issuerSpki = new Uint8Array(new X509Certificate(rootPem).publicKey.rawData);
-  const issuerKeyHash = new Uint8Array(await crypto.subtle.digest("SHA-256", issuerSpki));
-  const signed = concat([
-    new Uint8Array([0, 0]), // v1, certificate_timestamp
-    ts,
-    new Uint8Array([0, 1]), // precert_entry
-    issuerKeyHash,
-    new Uint8Array([tbs.length >> 16, (tbs.length >> 8) & 0xff, tbs.length & 0xff]),
-    tbs,
-    new Uint8Array([extLen >> 8, extLen & 0xff]),
-    ext,
-  ]);
-  return crypto.subtle.verify(
-    { name: "ECDSA", hash: "SHA-256" },
-    logKey,
-    ecdsaDerToRaw(sigDer),
-    signed,
-  );
-}
-
-/** DER ECDSA-Sig-Value → the raw r‖s WebCrypto verifies. */
-function ecdsaDerToRaw(der: Uint8Array): Uint8Array {
-  const seq = tlv(der, 0);
-  const [r, s] = children(der, seq);
-  const fixed = (t: Tlv) => {
-    let v = der.subarray(t.body, t.end);
-    while (v.length > 32 && v[0] === 0) v = v.subarray(1);
-    const out = new Uint8Array(32);
-    out.set(v, 32 - v.length);
-    return out;
-  };
-  return concat([fixed(r!), fixed(s!)]);
+  const issuerSpki = spkiOf(fromB64(pemBody(rootPem)));
+  return (await verifySct(sctFromTls(sct), { kind: "precert", tbs, issuerSpki }, pin)) === "ok";
 }
 
 async function expectWorkingPair(r: Awaited<ReturnType<typeof mint>>) {
@@ -427,9 +360,7 @@ describe("ct.mint — bridge pairs", () => {
     // cert's SCT does not. TBS equality above proves the pin; this proves
     // each SCT landed in the certificate it was issued for. A swapped
     // perCertExtensions mapping passes the pin check and fails here.
-    const logKey = await crypto.subtle.importKey(
-      "spki", fromB64(stubKey.spki), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"],
-    );
+    const logKey = await stubPin(stubKey);
     const ownSpkiHash = new Uint8Array(await crypto.subtle.digest("SHA-256", fromB64(stubKey.spki)));
     expect(btoa(String.fromCharCode(...ownSpkiHash)), "log id = SHA-256(log SPKI)").toBe(stubKey.id);
     const sctOf = { mtls: embeddedScts(r.mtls)[0]!, signing: embeddedScts(r.signing)[0]! };
@@ -447,6 +378,8 @@ describe("ct.mint — bridge pairs", () => {
       expect(await received()).toHaveLength(2);
       expectBacklogged(r);
       await expectWorkingPair(r);
+      // lastError names the HTTP status, not just "failed".
+      expect(r.health.lastError).toMatch(/add-pre-chain failed \(.*cert \d: HTTP 500.*\); chains backlogged/);
     });
   }
 
@@ -460,6 +393,79 @@ describe("ct.mint — bridge pairs", () => {
     expect(r.elapsed).toBeGreaterThanOrEqual(CT_TIMEOUT_MS - 100);
     expectBacklogged(r);
     await expectWorkingPair(r);
+    expect(r.health.lastError).toMatch(/cert 0: timeout.*cert 1: timeout/);
+  });
+});
+
+// ── Final review I1: an SCT is embedded only if it is from THE pinned log ──
+
+describe("ct.pin — only the pinned log's verified SCT is embedded", () => {
+  it("the right log: embedded, verifying under the pin; health clean", async () => {
+    const stubKey = await control("ok");
+    const r = await mint();
+    for (const pem of [r.mtls, r.signing]) {
+      expect(new X509Certificate(pem).getExtension(CT_SCT_LIST_OID)).toBeTruthy();
+      expect(await sctVerifies(embeddedScts(pem)[0]!, pem, r.ca, await stubPin(stubKey))).toBe(true);
+    }
+    expect(r.backlog).toEqual([]);
+    expect(r.health.configError).toBeNull();
+    expect(r.health.lastError).toBe("");
+    expect(r.health.unloggable.count).toBe(0);
+  });
+
+  for (const [mode, why] of [["wrong-id", "wrong log"], ["bad-sig", "bad signature"]] as const) {
+    it(`${mode}: a well-formed SCT the pin refuses is not embedded — both backlogged, lastError "${why}"`, async () => {
+      await setMode(mode);
+      const r = await mint();
+      expect(await received()).toHaveLength(2);
+      expectBacklogged(r);
+      await expectWorkingPair(r);
+      expect(r.health.lastError).toContain(`cert 0: ${why}`);
+      expect(r.health.lastError).toContain(`cert 1: ${why}`);
+      expect(r.health.backlog).toBe(2);
+    });
+  }
+
+  const OTHER_ID = btoa(String.fromCharCode(...new Uint8Array(32).fill(9)));
+  for (const [label, patch, reason] of [
+    ["CT_LOG_KEY missing", { CT_LOG_KEY: undefined }, /CT_LOG_KEY missing/],
+    ["CT_LOG_ID missing", { CT_LOG_ID: undefined }, /CT_LOG_ID missing/],
+    ["CT_LOG_ID is not SHA-256(CT_LOG_KEY)", { CT_LOG_ID: OTHER_ID }, /CT_LOG_ID is not SHA-256\(CT_LOG_KEY\)/],
+    ["CT_LOG_KEY not a P-256 key", { CT_LOG_KEY: btoa("not a key") }, /CT_LOG_KEY is not a P-256 SPKI/],
+  ] as const) {
+    it(`${label} while bound: nothing submitted, minted unlogged, counted in health`, async () => {
+      await setMode("ok");
+      const r = await mint({ envPatch: patch });
+      expect(await received(), "an unpinned authority must not submit").toEqual([]);
+      for (const pem of [r.mtls, r.signing]) {
+        expect(oids(pem)).not.toContain(CT_SCT_LIST_OID);
+        expect(oids(pem)).not.toContain(CT_POISON_OID);
+      }
+      expect(r.backlog).toEqual([]);
+      await expectWorkingPair(r);
+      expect(r.health.unloggable.count).toBe(1);
+      expect(r.health.unloggable.reason).toMatch(/^config: /);
+      expect(r.health.unloggable.reason).toMatch(reason);
+      expect(r.health.configError).toMatch(reason);
+    });
+  }
+});
+
+describe("ct.health — failures that used to reach only console.error", () => {
+  it("a failed backlog INSERT is counted as unloggable, and the mint still succeeds", async () => {
+    await setMode("500");
+    const r = await mint({
+      before: (a) => {
+        a.ctx.storage.sql.exec(
+          "CREATE TRIGGER ct_backlog_refuse BEFORE INSERT ON ct_backlog BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END",
+        );
+      },
+    });
+    await expectWorkingPair(r);
+    expect(r.backlog).toEqual([]);
+    expect(r.health.unloggable.count).toBe(1);
+    expect(r.health.unloggable.reason).toMatch(/^backlog write failed: .*forced insert failure/);
+    expect(r.health.embedFailed.count).toBe(0);
   });
 });
 
@@ -559,9 +565,7 @@ describe("ct.mint — tiers", () => {
       tbsWithout(fromB64(got[0]!.chain[0]!), CT_POISON_OID),
     );
 
-    const logKey = await crypto.subtle.importKey(
-      "spki", fromB64(stubKey.spki), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"],
-    );
+    const logKey = await stubPin(stubKey);
     const scts = embeddedScts(r.tier);
     expect(scts).toHaveLength(1);
     expect(await sctVerifies(scts[0]!, r.tier, r.ca, logKey), "tier SCT vs tier bytes").toBe(true);
@@ -614,9 +618,7 @@ describe("ct.mint — tiers via collect and renew", () => {
     const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
 
     const stubKey = await control("ok");
-    const logKey = await crypto.subtle.importKey(
-      "spki", fromB64(stubKey.spki), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"],
-    );
+    const logKey = await stubPin(stubKey);
     const kp = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
     const spki = new Uint8Array((await crypto.subtle.exportKey("spki", kp.publicKey)) as ArrayBuffer);
     const pem = await spkiPem(kp.publicKey);
@@ -674,14 +676,7 @@ type DrainAuth = {
   getAlarmHealth(): Promise<{
     failureCount: number;
     totalFires: number;
-    ct: {
-      backlog: number;
-      oldestUnloggedAgeS: number | null;
-      gaveUp: number;
-      lastError: string;
-      lastErrorAt: number;
-      unloggable: { count: number; lastAt: number };
-    };
+    ct: CtHealthView;
   }>;
   mintBridgeCertPair(p: {
     subject: string;
@@ -702,7 +697,7 @@ type DrainAuth = {
 async function withBacklog<T>(
   n: number,
   body: (a: DrainAuth) => Promise<T>,
-  opts: { unbind?: boolean } = {},
+  opts: { unbind?: boolean; envPatch?: Record<string, string | undefined> } = {},
 ): Promise<T> {
   const name = `ct-drain-${++seq}-${crypto.randomUUID()}`;
   const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
@@ -744,6 +739,14 @@ async function withBacklog<T>(
       delete e.CT_LOG;
       a.env = e;
     }
+    if (opts.envPatch) {
+      const e = { ...a.env };
+      for (const [k, v] of Object.entries(opts.envPatch)) {
+        if (v === undefined) delete e[k];
+        else e[k] = v;
+      }
+      a.env = e;
+    }
     return body(a);
   });
 }
@@ -779,8 +782,12 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
   it("log 500: attempts increment, rows at 24 are skipped and counted in gaveUp, lastError is set", async () => {
     await withBacklog(3, async (a) => {
       const sql = a.ctx.storage.sql;
-      // Row 3 (newest) is already at the cap; it must not be submitted again.
-      sql.exec("UPDATE ct_backlog SET attempts = 24 WHERE id = (SELECT MAX(id) FROM ct_backlog)");
+      // Row 3 (newest) is already at the cap and was tried a minute ago; it
+      // must not be submitted again (its slow retry is 24 h out).
+      sql.exec(
+        "UPDATE ct_backlog SET attempts = 24, last_attempt_at = ? WHERE id = (SELECT MAX(id) FROM ct_backlog)",
+        Math.floor(Date.now() / 1000) - 60,
+      );
       await setMode("500");
       await a.alarm();
       const rows = rowsOf(a);
@@ -789,7 +796,7 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
       const h = await a.getAlarmHealth();
       expect(h.ct.backlog).toBe(2);
       expect(h.ct.gaveUp).toBe(1);
-      expect(h.ct.lastError).toMatch(/add-chain failed/);
+      expect(h.ct.lastError).toMatch(/add-chain failed for backlog row \d+: HTTP 500/);
       expect(h.ct.lastErrorAt).toBeGreaterThan(0);
       expect(typeof h.ct.oldestUnloggedAgeS).toBe("number");
       expect(h.ct.oldestUnloggedAgeS!).toBeGreaterThanOrEqual(900);
@@ -837,12 +844,132 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
     });
   });
 
+  for (const [mode, why] of [["wrong-id", "wrong log"], ["bad-sig", "bad signature"]] as const) {
+    it(`I1 ${mode}: an add-chain answer the pin refuses does not mark the row logged`, async () => {
+      await withBacklog(2, async (a) => {
+        await setMode(mode);
+        await a.alarm();
+        const rows = rowsOf(a);
+        expect(rows.every((r) => r.logged_at === null && r.attempts === 1)).toBe(true);
+        const h = await a.getAlarmHealth();
+        expect(h.ct.backlog).toBe(2);
+        expect(h.ct.lastError).toMatch(new RegExp(`add-chain failed for backlog row \\d+: ${why}`));
+      });
+      expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(2);
+    });
+  }
+
+  it("I1: the drain submits nothing while CT_LOG_KEY is missing; rows untouched, reason recorded", async () => {
+    await withBacklog(2, async (a) => {
+      await a.alarm();
+      expect(rowsOf(a).every((r) => r.attempts === 0 && r.logged_at === null)).toBe(true);
+      const h = await a.getAlarmHealth();
+      expect(h.ct.lastError).toMatch(/drain skipped: config: CT_LOG_KEY missing/);
+      expect(h.ct.configError).toBe("CT_LOG_KEY missing");
+      expect(h.failureCount).toBe(0);
+    }, { envPatch: { CT_LOG_KEY: undefined } });
+    expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(0);
+  });
+
   it("absent binding: the drain does nothing — no log call, rows untouched", async () => {
     await withBacklog(3, async (a) => {
       await a.alarm();
       expect(rowsOf(a).every((r) => r.attempts === 0 && r.logged_at === null)).toBe(true);
     }, { unbind: true });
     expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(0);
+  });
+});
+
+// ── Final review I2: gaveUp rows are retried slowly, not abandoned ─────────
+
+const DAY_S = 24 * 60 * 60;
+const nowS = () => Math.floor(Date.now() / 1000);
+
+describe("ct.drain — rows past the attempt cap are retried once per 24 h", () => {
+  it("a gaveUp row last tried over 24 h ago is retried and logged; health counts it until then", async () => {
+    await withBacklog(1, async (a) => {
+      a.ctx.storage.sql.exec(
+        "UPDATE ct_backlog SET attempts = 24, last_attempt_at = ?",
+        nowS() - DAY_S - 60,
+      );
+      const before = await a.getAlarmHealth();
+      expect(before.ct.gaveUp).toBe(1);
+      expect(before.ct.backlog).toBe(0);
+      await a.alarm();
+      const [row] = rowsOf(a);
+      expect(row!.logged_at).not.toBeNull();
+      const after = await a.getAlarmHealth();
+      expect(after.ct.gaveUp).toBe(0);
+    });
+    expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(1);
+  });
+
+  it("a gaveUp row tried within 24 h is not retried; a failed slow retry waits another 24 h", async () => {
+    await withBacklog(2, async (a) => {
+      const sql = a.ctx.storage.sql;
+      const [r1, r2] = rowsOf(a);
+      sql.exec("UPDATE ct_backlog SET attempts = 30, last_attempt_at = ? WHERE id = ?", nowS() - DAY_S + 3600, r1!.id);
+      sql.exec("UPDATE ct_backlog SET attempts = 30, last_attempt_at = ? WHERE id = ?", nowS() - DAY_S - 60, r2!.id);
+      await setMode("500");
+      await a.alarm();
+      // Only the eligible row was submitted; it failed and is stamped now.
+      expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(1);
+      let rows = rowsOf(a);
+      expect(rows.map((r) => r.attempts)).toEqual([30, 31]);
+      expect(rows.every((r) => r.logged_at === null)).toBe(true);
+      expect((await a.getAlarmHealth()).ct.gaveUp).toBe(2);
+      // Next fire: neither is due.
+      await setMode("ok");
+      await a.alarm();
+      expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(0);
+      rows = rowsOf(a);
+      expect(rows.every((r) => r.logged_at === null)).toBe(true);
+    });
+  });
+
+  it("normal rows come first: 20 normal rows fill a fire ahead of an OLDER due gaveUp row", async () => {
+    await withBacklog(21, async (a) => {
+      const oldest = rowsOf(a)[0]!;
+      a.ctx.storage.sql.exec(
+        "UPDATE ct_backlog SET attempts = 24, last_attempt_at = ? WHERE id = ?",
+        nowS() - DAY_S - 60,
+        oldest.id,
+      );
+      await a.alarm();
+      let rows = rowsOf(a);
+      expect(rows[0]!.logged_at, "the gaveUp row waited for the normal rows").toBeNull();
+      expect(rows.slice(1).every((r) => r.logged_at !== null)).toBe(true);
+      await a.alarm();
+      rows = rowsOf(a);
+      expect(rows[0]!.logged_at, "and was logged on the next fire").not.toBeNull();
+    });
+  });
+
+  it("an old ct_backlog (no last_attempt_at) is migrated in place, and the drain's index is created", async () => {
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName(`ct-migrate-${crypto.randomUUID()}`),
+    );
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as DrainAuth;
+      const sql = a.ctx.storage.sql;
+      // The pre-I2 shape, with a row in it, before the authority initialises.
+      sql.exec(
+        "CREATE TABLE ct_backlog (id INTEGER PRIMARY KEY, chain_json TEXT NOT NULL, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, logged_at INTEGER)",
+      );
+      sql.exec("INSERT INTO ct_backlog (chain_json, created_at, attempts) VALUES ('[]', 1, 24)");
+      const h = await a.getAlarmHealth();
+      expect(h.ct.gaveUp).toBe(1);
+      const cols = (sql.exec("PRAGMA table_info(ct_backlog)").toArray() as Array<{ name: string }>).map(
+        (c) => c.name,
+      );
+      expect(cols).toContain("last_attempt_at");
+      expect(sql.exec("SELECT last_attempt_at FROM ct_backlog").toArray()).toEqual([{ last_attempt_at: null }]);
+      const idx = sql
+        .exec("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ct_backlog_drain'")
+        .toArray() as Array<{ sql: string }>;
+      expect(idx).toHaveLength(1);
+      expect(idx[0]!.sql).toMatch(/\(logged_at, attempts, created_at\)/);
+    });
   });
 });
 
@@ -860,7 +987,7 @@ describe("ct.health — what the operator sees", () => {
     await runInDurableObject(stub, async (auth) => {
       const a = auth as unknown as DrainAuth;
       const before = await a.getAlarmHealth();
-      expect(before.ct.unloggable).toEqual({ count: 0, lastAt: 0 });
+      expect(before.ct.unloggable).toEqual({ count: 0, lastAt: 0, reason: "" });
       a.getCACertificatePem = async () => {
         throw new Error("root unreadable (forced)");
       };

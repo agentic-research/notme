@@ -37,9 +37,17 @@ if curl -s -o /dev/null --max-time 3 http://127.0.0.1:1/; then
   echo "FAIL: something answers on 127.0.0.1:1, the proxy's dead port; step 2 would prove nothing" >&2; exit 1
 fi
 
+# The authority's pin (CT_LOG_ID / CT_LOG_KEY), from the log under test.
+# shellcheck disable=SC2016
+PIN="$(curl -s --max-time 10 "${CT_LOG_URL%/}/metadata.json" \
+  | node -e 'let s="";process.stdin.on("data",(d)=>s+=d).on("end",()=>{const m=JSON.parse(s);console.log(m.log_id+" "+m.key)})')"
+CT_LOG_ID="${PIN%% *}"
+CT_LOG_KEY="${PIN#* }"
+[ -n "${CT_LOG_ID}" ] && [ -n "${CT_LOG_KEY}" ] || { echo "FAIL: no log_id/key in metadata.json" >&2; exit 1; }
+
 S1=fail S2=fail S3=fail
 echo "== vitest (out: ${OUT}/vitest.log)"
-( cd "${ROOT}/worker" && CT_LOG_URL="${CT_LOG_URL}" pnpm exec vitest run \
+( cd "${ROOT}/worker" && CT_LOG_URL="${CT_LOG_URL}" CT_LOG_ID="${CT_LOG_ID}" CT_LOG_KEY="${CT_LOG_KEY}" pnpm exec vitest run \
     --config vitest.workers.ct-live.config.mts --silent=false --reporter=verbose ) \
   > "${OUT}/vitest.log" 2>&1
 VT=$?

@@ -81,18 +81,25 @@ async function readText(
   return new TextDecoder().decode(all);
 }
 
+/** A submission's outcome. `reason` is short and goes into health's lastError. */
+export type SubmitResult =
+  | { ok: true; sct: SctResponse }
+  | { ok: false; reason: string };
+
 /**
- * POST { chain } and return a validated SCT, or null on any failure. One
- * deadline bounds the fetch and the body read. The abort signal is passed to
- * fetch AND raced, so a binding that ignores abort cannot hold a mint, and a
- * late or stalled response is cancelled rather than left dangling.
+ * POST { chain } and return a validated SCT, or the reason there is none:
+ * "timeout", "HTTP <status>", "invalid SCT", or "network error". One deadline
+ * bounds the fetch and the body read. The abort signal is passed to fetch AND
+ * raced, so a binding that ignores abort cannot hold a mint, and a late or
+ * stalled response is cancelled rather than left dangling. Never throws.
  */
 async function call(
   log: Fetcher,
   path: string,
   chainB64: string[],
   timeoutMs: number,
-): Promise<SctResponse | null> {
+): Promise<SubmitResult> {
+  const fail = (reason: string): SubmitResult => ({ ok: false, reason });
   try {
     const ms = Number.isFinite(timeoutMs) ? Math.max(1, timeoutMs) : DEFAULT_TIMEOUT_MS;
     const signal = AbortSignal.timeout(ms);
@@ -102,18 +109,18 @@ async function call(
       hold.reader?.cancel().catch(() => {});
       if (!hold.reader) hold.res?.body?.cancel().catch(() => {});
     };
-    const deadline = new Promise<null>((resolve) =>
+    const deadline = new Promise<SubmitResult>((resolve) =>
       signal.addEventListener(
         "abort",
         () => {
           expired = true;
           cancelAll();
-          resolve(null);
+          resolve(fail("timeout"));
         },
         { once: true },
       ),
     );
-    const work = (async (): Promise<SctResponse | null> => {
+    const work = (async (): Promise<SubmitResult> => {
       try {
         const res = await log.fetch(`${BASE}${path}`, {
           method: "POST",
@@ -124,18 +131,46 @@ async function call(
         hold.res = res;
         if (expired || res.status !== 200 || !res.body) {
           await res.body?.cancel().catch(() => {});
-          return null;
+          return fail(expired ? "timeout" : res.status !== 200 ? `HTTP ${res.status}` : "invalid SCT");
         }
         const text = await readText(res.body, hold);
-        return text === null ? null : parseSct(JSON.parse(text));
+        if (text === null) return fail("invalid SCT");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          return fail("invalid SCT");
+        }
+        const sct = parseSct(parsed);
+        return sct ? { ok: true, sct } : fail("invalid SCT");
       } catch {
-        return null;
+        return fail(expired ? "timeout" : "network error");
       }
     })();
     return await Promise.race([work, deadline]);
   } catch {
-    return null;
+    return fail("network error");
   }
+}
+
+/** add-pre-chain with the outcome's reason. Never throws. */
+export async function postPreChain(
+  log: Fetcher,
+  chainB64: string[],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  pathPrefix = DEFAULT_CT_LOG_PATH,
+): Promise<SubmitResult> {
+  return call(log, `${pathPrefix}/ct/v1/add-pre-chain`, chainB64, timeoutMs);
+}
+
+/** add-chain with the outcome's reason. Never throws. */
+export async function postChain(
+  log: Fetcher,
+  chainB64: string[],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  pathPrefix = DEFAULT_CT_LOG_PATH,
+): Promise<SubmitResult> {
+  return call(log, `${pathPrefix}/ct/v1/add-chain`, chainB64, timeoutMs);
 }
 
 export async function submitPreChain(
@@ -144,15 +179,20 @@ export async function submitPreChain(
   timeoutMs = DEFAULT_TIMEOUT_MS,
   pathPrefix = DEFAULT_CT_LOG_PATH,
 ): Promise<SctResponse | null> {
-  return call(log, `${pathPrefix}/ct/v1/add-pre-chain`, chainB64, timeoutMs);
+  const r = await postPreChain(log, chainB64, timeoutMs, pathPrefix);
+  return r.ok ? r.sct : null;
 }
 
-/** add-chain also returns an SCT; true only when a valid one comes back. */
+/**
+ * add-chain also returns an SCT; true only when a well-formed one comes back.
+ * Shape only — the drain uses postChain and checks the SCT against the pinned
+ * log (verify-sct.ts) before it marks a row logged.
+ */
 export async function submitChain(
   log: Fetcher,
   chainB64: string[],
   timeoutMs = DEFAULT_TIMEOUT_MS,
   pathPrefix = DEFAULT_CT_LOG_PATH,
 ): Promise<boolean> {
-  return (await call(log, `${pathPrefix}/ct/v1/add-chain`, chainB64, timeoutMs)) !== null;
+  return (await postChain(log, chainB64, timeoutMs, pathPrefix)).ok;
 }

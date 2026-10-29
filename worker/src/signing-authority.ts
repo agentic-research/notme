@@ -38,9 +38,11 @@ import {
 import {
   DEFAULT_CT_LOG_PATH,
   DEFAULT_TIMEOUT_MS,
-  submitChain,
-  submitPreChain,
+  postChain,
+  postPreChain,
+  type SubmitResult,
 } from "./ct/log-client";
+import { parseLogPin, precertTbs, spkiOf, verifySct, type LogPin } from "./ct/verify-sct";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 import {
   deriveKek,
@@ -107,6 +109,15 @@ interface SigningAuthorityEnv {
   CT_LOG?: Fetcher;
   /** The log's base path behind CT_LOG. Defaults to `/logs/notme`. */
   CT_LOG_PATH?: string;
+  /**
+   * The pinned log (final review I1): base64 log id, and base64 SPKI DER of
+   * its P-256 key. REQUIRED when CT_LOG is bound — an SCT is embedded, or a
+   * backlog row marked logged, only if it carries this id and its signature
+   * verifies under this key. Missing or malformed: nothing is submitted, the
+   * mint goes out unlogged, and health reports `configError`.
+   */
+  CT_LOG_ID?: string;
+  CT_LOG_KEY?: string;
 }
 
 /**
@@ -282,12 +293,25 @@ export interface CtHealth {
   backlog: number;
   /** Age in seconds of the oldest of those rows; null when none. */
   oldestUnloggedAgeS: number | null;
-  /** Unlogged rows that hit 24 attempts and are no longer retried. */
+  /**
+   * Unlogged rows that hit 24 attempts. Still retried, at most once per 24 h
+   * per row (a root rotation or shard roll can strand them for longer than
+   * the fast retries last), and counted here until they are logged.
+   */
   gaveUp: number;
+  /** Last failure: what failed and why — "HTTP 503", "timeout", "invalid SCT", "wrong log", "bad signature". */
   lastError: string;
   lastErrorAt: number;
-  /** Mints that went out unlogged with NO backlog row (root unreadable). */
-  unloggable: { count: number; lastAt: number };
+  /**
+   * Mints that went out unlogged with NO backlog row, and the last reason:
+   * the root could not be read, CT_LOG_ID / CT_LOG_KEY are missing or
+   * malformed, or the backlog INSERT failed. The drain cannot recover these.
+   */
+  unloggable: { count: number; lastAt: number; reason: string };
+  /** Mints whose SCTs verified but could not be embedded; backlogged instead. */
+  embedFailed: { count: number; lastAt: number };
+  /** Why CT_LOG_ID / CT_LOG_KEY cannot be trusted; null when bound and valid, or unbound. */
+  configError: string | null;
 }
 
 // Circuit-breaker threshold for the alarm() loop. After this many consecutive
@@ -382,6 +406,10 @@ function randomSerialHex(): string {
 /** PEM certificate → base64 DER, as a CT chain carries it. */
 function pemToB64(pem: string): string {
   return pem.replace(/-----[A-Z ]+-----|\s/g, "");
+}
+
+function b64ToBytes(b64: string): Uint8Array {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
 
 function hex(b: Uint8Array): string {
@@ -636,15 +664,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // no SCT and still has to be recorded by the log via add-chain. Created
     // unconditionally (an empty table is free); rows are written only when
     // CT_LOG is bound and a submission failed.
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS ct_backlog (
-        id         INTEGER PRIMARY KEY,
-        chain_json TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        attempts   INTEGER NOT NULL DEFAULT 0,
-        logged_at  INTEGER
-      )
-    `);
+    this.#ensureCtBacklogSchema();
     this.#initialized = true;
     // Once per DO start: existing deployers get the signing scopes the admin
     // set now includes (notme-486e8a). Idempotent and revocation-respecting.
@@ -1840,30 +1860,58 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // account; #readRootForCt already logged why.
       return p.mint(p.pin, () => []);
     }
+    // Bound but unpinned: an SCT could not be checked, so nothing is
+    // submitted. The mint goes out unlogged and is counted — never refused.
+    const logPin = await this.#ctLogPin();
+    if ("error" in logPin) {
+      console.error({ event: "ct.config_invalid", error: logPin.error });
+      this.#ctRecord("unloggable", `config: ${logPin.error}`);
+      return p.mint(p.pin, () => []);
+    }
     const rootB64 = pemToB64(p.issuerPem);
+    let issuerSpki: Uint8Array;
+    try {
+      issuerSpki = spkiOf(b64ToBytes(rootB64));
+    } catch (err) {
+      this.#ctRecord("unloggable", `root unparseable: ${String(err)}`);
+      return p.mint(p.pin, () => []);
+    }
 
     const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
     const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
-    // submitPreChain never throws: every failure is null.
-    const scts = await Promise.all(
-      p.pems(pre).map((pem) =>
-        submitPreChain(log, [pemToB64(pem), rootB64], DEFAULT_TIMEOUT_MS, path),
-      ),
+    // Each submission is bounded by its timeout; verification after it is
+    // local crypto. postPreChain and verifySct never throw.
+    const results = await Promise.all(
+      p.pems(pre).map(async (pem): Promise<SubmitResult> => {
+        const precertB64 = pemToB64(pem);
+        const r = await postPreChain(log, [precertB64, rootB64], DEFAULT_TIMEOUT_MS, path);
+        if (!r.ok) return r;
+        let tbs: Uint8Array;
+        try {
+          tbs = precertTbs(b64ToBytes(precertB64));
+        } catch (err) {
+          return { ok: false, reason: `precert unparseable: ${String(err)}` };
+        }
+        const v = await verifySct(r.sct, { kind: "precert", tbs, issuerSpki }, logPin);
+        return v === "ok" ? r : { ok: false, reason: v };
+      }),
     );
 
-    if (scts.every((s): s is SctResponse => s !== null)) {
+    if (results.every((r) => r.ok)) {
+      const scts = results.map((r) => (r as { sct: SctResponse }).sct);
       try {
         return await p.mint(p.pin, (i) => [sctListExtension([serialiseSct(scts[i]!)])]);
       } catch (err) {
         console.error({ event: "ct.embed_failed", error: String(err) });
+        this.#ctRecord("embedFailed", `embed failed: ${String(err)}`);
       }
     } else {
-      console.warn({
-        event: "ct.unlogged",
-        failed: scts.flatMap((s, i) => (s === null ? [i] : [])),
-        of: scts.length,
-      });
-      this.#ctRecord("error", "mint-time log submission failed; chains backlogged");
+      const failed = results.flatMap((r, i) => (r.ok ? [] : [`cert ${i}: ${r.reason}`]));
+      console.warn({ event: "ct.unlogged", failed, of: results.length });
+      this.#ctRecord(
+        "error",
+        `add-pre-chain failed (${failed.join(", ")}); chains backlogged`,
+      );
     }
 
     const fin = await p.mint(p.pin, () => []);
@@ -1878,8 +1926,22 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       }
     } catch (err) {
       console.error({ event: "ct.backlog_write_failed", error: String(err) });
+      this.#ctRecord("unloggable", `backlog write failed: ${String(err)}`);
     }
     return fin;
+  }
+
+  /**
+   * The pinned log from CT_LOG_ID / CT_LOG_KEY, or why it cannot be trusted.
+   * Cached per value pair: the import and digest run once per DO lifetime.
+   */
+  #ctPinCache: { k: string; v: LogPin | { error: string } } | null = null;
+  async #ctLogPin(): Promise<LogPin | { error: string }> {
+    const k = `${this.env.CT_LOG_ID ?? ""}|${this.env.CT_LOG_KEY ?? ""}`;
+    if (this.#ctPinCache?.k !== k) {
+      this.#ctPinCache = { k, v: await parseLogPin(this.env.CT_LOG_ID, this.env.CT_LOG_KEY) };
+    }
+    return this.#ctPinCache.v;
   }
 
   /**
@@ -1894,7 +1956,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // Visible in health (`ct.unloggable`): this mint proceeds with no SCT and
       // NO backlog row — there is no chain to record — so without a counter it
       // would be invisible. Counting never changes the mint.
-      this.#ctRecord("unloggable", String(err));
+      this.#ctRecord("unloggable", `root unreadable: ${String(err)}`);
       return null;
     }
   }
@@ -1906,51 +1968,103 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   /** Concurrent add-chain calls inside one fire: 20 rows / 4 = 5 waves of at
    *  most DEFAULT_TIMEOUT_MS (2 s), so a fire's drain is bounded at ~10 s. */
   static readonly CT_DRAIN_CONCURRENCY = 4;
-  /** A row stops being retried after this many failed attempts. */
+  /** After this many failed attempts a row is "gaveUp": retried only once per CT_SLOW_RETRY_S. */
   static readonly CT_MAX_ATTEMPTS = 24;
+
+  /** A row past CT_MAX_ATTEMPTS is retried at most this often (final review I2). */
+  static readonly CT_SLOW_RETRY_S = 24 * 60 * 60;
+
+  /**
+   * ct_backlog, its last_attempt_at column (added the way the keys table's
+   * columns are), and the drain's index. Idempotent; called from init and
+   * from #ensureCtSchema.
+   */
+  #ensureCtBacklogSchema(): void {
+    const sql = this.ctx.storage.sql;
+    // Each row is a FINAL chain — [leaf, issuer], base64 DER — that carries
+    // no SCT and still has to be recorded by the log via add-chain. Created
+    // unconditionally (an empty table is free); rows are written only when
+    // CT_LOG is bound and a submission failed.
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS ct_backlog (
+        id              INTEGER PRIMARY KEY,
+        chain_json      TEXT NOT NULL,
+        created_at      INTEGER NOT NULL,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        logged_at       INTEGER,
+        last_attempt_at INTEGER
+      )
+    `);
+    // Migration: last_attempt_at, for the once-per-24h retry of rows past
+    // the attempt cap (I2). NULL on old rows: retried on the next fire.
+    try {
+      sql.exec("SELECT last_attempt_at FROM ct_backlog LIMIT 0");
+    } catch {
+      sql.exec("ALTER TABLE ct_backlog ADD COLUMN last_attempt_at INTEGER");
+    }
+    sql.exec(
+      "CREATE INDEX IF NOT EXISTS ct_backlog_drain ON ct_backlog (logged_at, attempts, created_at)",
+    );
+  }
 
   #ctSchemaReady = false;
   #ensureCtSchema(): void {
     if (this.#ctSchemaReady) return;
     // Same DDL as init: health can be read on an object that has not minted.
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS ct_backlog (
-        id         INTEGER PRIMARY KEY,
-        chain_json TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        attempts   INTEGER NOT NULL DEFAULT 0,
-        logged_at  INTEGER
-      )
-    `);
-    this.ctx.storage.sql.exec(`
+    this.#ensureCtBacklogSchema();
+    const sql = this.ctx.storage.sql;
+    sql.exec(`
       CREATE TABLE IF NOT EXISTS ct_health (
         id               TEXT PRIMARY KEY DEFAULT 'ct',
         unloggable_count INTEGER NOT NULL DEFAULT 0,
         unloggable_last_at INTEGER NOT NULL DEFAULT 0,
+        unloggable_reason TEXT NOT NULL DEFAULT '',
+        embed_failed_count INTEGER NOT NULL DEFAULT 0,
+        embed_failed_last_at INTEGER NOT NULL DEFAULT 0,
         last_error       TEXT    NOT NULL DEFAULT '',
         last_error_at    INTEGER NOT NULL DEFAULT 0
       )
     `);
-    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO ct_health (id) VALUES ('ct')");
+    for (const [col, ddl] of [
+      ["unloggable_reason", "TEXT NOT NULL DEFAULT ''"],
+      ["embed_failed_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["embed_failed_last_at", "INTEGER NOT NULL DEFAULT 0"],
+    ] as const) {
+      try {
+        sql.exec(`SELECT ${col} FROM ct_health LIMIT 0`);
+      } catch {
+        sql.exec(`ALTER TABLE ct_health ADD COLUMN ${col} ${ddl}`);
+      }
+    }
+    sql.exec("INSERT OR IGNORE INTO ct_health (id) VALUES ('ct')");
     this.#ctSchemaReady = true;
   }
 
   /** Record a CT observation for health. Never throws. */
-  #ctRecord(kind: "unloggable" | "error", msg: string): void {
+  #ctRecord(kind: "unloggable" | "embedFailed" | "error", msg: string): void {
     try {
       this.#ensureCtSchema();
       const now = Math.floor(Date.now() / 1000);
+      const m = msg.slice(0, 200);
       if (kind === "unloggable") {
         this.ctx.storage.sql.exec(
-          "UPDATE ct_health SET unloggable_count = unloggable_count + 1, unloggable_last_at = ?, last_error = ?, last_error_at = ? WHERE id = 'ct'",
+          "UPDATE ct_health SET unloggable_count = unloggable_count + 1, unloggable_last_at = ?, unloggable_reason = ?, last_error = ?, last_error_at = ? WHERE id = 'ct'",
           now,
-          `root unreadable: ${msg}`.slice(0, 200),
+          m,
+          m,
+          now,
+        );
+      } else if (kind === "embedFailed") {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_health SET embed_failed_count = embed_failed_count + 1, embed_failed_last_at = ?, last_error = ?, last_error_at = ? WHERE id = 'ct'",
+          now,
+          m,
           now,
         );
       } else {
         this.ctx.storage.sql.exec(
           "UPDATE ct_health SET last_error = ?, last_error_at = ? WHERE id = 'ct'",
-          msg.slice(0, 200),
+          m,
           now,
         );
       }
@@ -1960,22 +2074,42 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   /**
-   * Submit up to CT_DRAIN_BATCH backlog rows (oldest first, attempts below
-   * CT_MAX_ATTEMPTS) to the log via add-chain, CT_DRAIN_CONCURRENCY at a time.
-   * Success sets logged_at; failure increments attempts and records lastError.
+   * Submit up to CT_DRAIN_BATCH backlog rows to the log via add-chain,
+   * CT_DRAIN_CONCURRENCY at a time. Rows under CT_MAX_ATTEMPTS come first,
+   * oldest first; rows past it ("gaveUp") fill what is left of the batch, each
+   * at most once per CT_SLOW_RETRY_S — an outage over ~96 minutes, a root
+   * rotation or a shard roll must not strand a row for good.
+   *
+   * A row is marked logged only when the answer is an SCT from the pinned log
+   * whose signature verifies over the x509_entry for that row's certificate.
+   * Anything else increments attempts and records lastError with the reason.
    * A row that cannot even be parsed counts as a failed attempt, so it ages
-   * out instead of poisoning the batch. Callers wrap this in try/catch: a
-   * drain error is never an alarm failure.
+   * out instead of poisoning the batch. With CT_LOG_ID / CT_LOG_KEY invalid
+   * nothing is submitted and no row is touched. Callers wrap this in
+   * try/catch: a drain error is never an alarm failure.
    */
   async #drainCtBacklog(): Promise<void> {
     const log = this.env.CT_LOG;
     if (!log) return;
     this.#ensureCtSchema();
+    const logPin = await this.#ctLogPin();
+    if ("error" in logPin) {
+      this.#ctRecord("error", `drain skipped: config: ${logPin.error}`);
+      return;
+    }
     const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
+    const now = Math.floor(Date.now() / 1000);
+    const max = SigningAuthority.CT_MAX_ATTEMPTS;
     const rows = this.ctx.storage.sql
       .exec(
-        "SELECT id, chain_json FROM ct_backlog WHERE logged_at IS NULL AND attempts < ? ORDER BY created_at, id LIMIT ?",
-        SigningAuthority.CT_MAX_ATTEMPTS,
+        `SELECT id, chain_json FROM ct_backlog
+           WHERE logged_at IS NULL
+             AND (attempts < ? OR last_attempt_at IS NULL OR last_attempt_at <= ?)
+           ORDER BY (attempts >= ?), created_at, id
+           LIMIT ?`,
+        max,
+        now - SigningAuthority.CT_SLOW_RETRY_S,
+        max,
         SigningAuthority.CT_DRAIN_BATCH,
       )
       .toArray() as Array<{ id: number; chain_json: string }>;
@@ -1984,20 +2118,27 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       let ok = false;
       try {
         const chain = JSON.parse(row.chain_json) as string[];
-        ok = await submitChain(log, chain, DEFAULT_TIMEOUT_MS, path);
-        if (!ok) this.#ctRecord("error", `add-chain failed for backlog row ${row.id}`);
+        const r = await postChain(log, chain, DEFAULT_TIMEOUT_MS, path);
+        const why = r.ok
+          ? await verifySct(r.sct, { kind: "x509", certDer: b64ToBytes(chain[0]!) }, logPin)
+          : r.reason;
+        ok = why === "ok";
+        if (!ok) this.#ctRecord("error", `add-chain failed for backlog row ${row.id}: ${why}`);
       } catch (err) {
         this.#ctRecord("error", `backlog row ${row.id}: ${String(err)}`);
       }
+      const at = Math.floor(Date.now() / 1000);
       if (ok) {
         this.ctx.storage.sql.exec(
-          "UPDATE ct_backlog SET logged_at = ? WHERE id = ?",
-          Math.floor(Date.now() / 1000),
+          "UPDATE ct_backlog SET logged_at = ?, last_attempt_at = ? WHERE id = ?",
+          at,
+          at,
           row.id,
         );
       } else {
         this.ctx.storage.sql.exec(
-          "UPDATE ct_backlog SET attempts = attempts + 1 WHERE id = ?",
+          "UPDATE ct_backlog SET attempts = attempts + 1, last_attempt_at = ? WHERE id = ?",
+          at,
           row.id,
         );
       }
@@ -2022,8 +2163,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     );
   }
 
-  #readCtHealth(): CtHealth {
+  async #readCtHealth(): Promise<CtHealth> {
     this.#ensureCtSchema();
+    const pin = this.env.CT_LOG ? await this.#ctLogPin() : null;
     const sql = this.ctx.storage.sql;
     const max = SigningAuthority.CT_MAX_ATTEMPTS;
     const b = sql
@@ -2040,11 +2182,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray()[0] as { n: number };
     const h = sql
       .exec(
-        "SELECT unloggable_count, unloggable_last_at, last_error, last_error_at FROM ct_health WHERE id = 'ct'",
+        "SELECT unloggable_count, unloggable_last_at, unloggable_reason, embed_failed_count, embed_failed_last_at, last_error, last_error_at FROM ct_health WHERE id = 'ct'",
       )
       .toArray()[0] as {
       unloggable_count: number;
       unloggable_last_at: number;
+      unloggable_reason: string;
+      embed_failed_count: number;
+      embed_failed_last_at: number;
       last_error: string;
       last_error_at: number;
     };
@@ -2055,7 +2200,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       gaveUp: g.n,
       lastError: h.last_error,
       lastErrorAt: h.last_error_at,
-      unloggable: { count: h.unloggable_count, lastAt: h.unloggable_last_at },
+      unloggable: {
+        count: h.unloggable_count,
+        lastAt: h.unloggable_last_at,
+        reason: h.unloggable_reason,
+      },
+      embedFailed: { count: h.embed_failed_count, lastAt: h.embed_failed_last_at },
+      configError: pin && "error" in pin ? pin.error : null,
     };
   }
 
@@ -4166,7 +4317,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         health.total_fires >= SigningAuthority.DRIFT_RATIO_WARMUP_FIRES,
       circuitBreakerOpen:
         health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES,
-      ct: this.#readCtHealth(),
+      ct: await this.#readCtHealth(),
     };
   }
 }

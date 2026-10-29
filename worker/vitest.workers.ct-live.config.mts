@@ -61,6 +61,11 @@ export default defineConfig({
           ...(LOG_URL
             ? { CT_LOG_PATH: LOG_URL.pathname.replace(/\/$/, "") }
             : {}),
+          // The pin (final review I1): the authority embeds only SCTs from
+          // this log id whose signature verifies under this key.
+          // ct/scripts/acceptance.sh reads both from the log's metadata.json.
+          ...(process.env.CT_LOG_ID ? { CT_LOG_ID: process.env.CT_LOG_ID } : {}),
+          ...(process.env.CT_LOG_KEY ? { CT_LOG_KEY: process.env.CT_LOG_KEY } : {}),
         },
         ...(LOG_URL
           ? {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { submitChain, submitPreChain } from "../ct/log-client";
+import { postChain, postPreChain, submitChain, submitPreChain } from "../ct/log-client";
 
 const id = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
 const validSct = {
@@ -170,5 +170,26 @@ describe("submitChain", () => {
     const t0 = Date.now();
     expect(await submitChain(fake(() => new Promise(() => {})), ["AA=="], 300)).toBe(false);
     expect(Date.now() - t0).toBeLessThan(1300);
+  });
+});
+
+describe("postPreChain / postChain — the reason health records", () => {
+  it("ok carries the SCT", async () => {
+    expect(await postPreChain(fake(() => json(validSct)), ["AA=="])).toEqual({ ok: true, sct: validSct });
+  });
+
+  it("names the HTTP status, a timeout, an invalid SCT, and a network error", async () => {
+    expect(await postPreChain(fake(() => json(validSct, 503)), ["AA=="])).toEqual({ ok: false, reason: "HTTP 503" });
+    expect(await postChain(fake(() => json(validSct, 429)), ["AA=="])).toEqual({ ok: false, reason: "HTTP 429" });
+    expect(await postPreChain(fake(() => new Promise(() => {})), ["AA=="], 100)).toEqual({ ok: false, reason: "timeout" });
+    expect(await postPreChain(fake(() => json({ ...validSct, sct_version: 1 })), ["AA=="])).toEqual({ ok: false, reason: "invalid SCT" });
+    expect(await postPreChain(fake(() => Promise.resolve(new Response("nope"))), ["AA=="])).toEqual({ ok: false, reason: "invalid SCT" });
+    expect(await postPreChain(fake(() => Promise.reject(new Error("down"))), ["AA=="])).toEqual({ ok: false, reason: "network error" });
+  });
+
+  it("postChain posts to add-chain", async () => {
+    const seen: Seen[] = [];
+    await postChain(fake(() => json(validSct), seen), ["AA=="]);
+    expect(seen[0]!.url).toBe("https://ct-log/logs/notme/ct/v1/add-chain");
   });
 });

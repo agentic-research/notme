@@ -1,3 +1,4 @@
+import { createHash, createPublicKey } from "node:crypto";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 import { baseMiniflare, CT_BOUND_SUITES, x509Dir } from "./vitest.workers.config.mts";
@@ -30,8 +31,16 @@ import { baseMiniflare, CT_BOUND_SUITES, x509Dir } from "./vitest.workers.config
 // against its OWN certificate's bytes — which is what catches an SCT embedded
 // in the wrong certificate of the pair, not just a dropped pin.
 //
+// For add-chain (the drain) it signs an x509_entry over the whole final
+// certificate instead, as a real log does.
+//
+// The authority is pinned to this key (CT_LOG_ID / CT_LOG_KEY, below), so
+// `wrong-id` and `bad-sig` are SCTs it must refuse.
+//
 // Modes:
 //   ok            every call returns a validly signed SCT
+//   wrong-id      a validly signed SCT carrying another log's id
+//   bad-sig       this log's id, but a signature over different bytes
 //   500           every call returns 500
 //   hang          every call is accepted and never answered (30 s)
 //   ok-then-fail  the first-numbered call succeeds, every later one 500s
@@ -104,30 +113,37 @@ function rawToDer(raw) {
   const int = (b) => { let i = 0; while (i < b.length - 1 && b[i] === 0) i++; b = b.subarray(i); return enc(0x02, b[0] & 0x80 ? cat([new Uint8Array([0]), b]) : b); };
   return enc(0x30, cat([int(raw.subarray(0, 32)), int(raw.subarray(32))]));
 }
-async function signSct(chain) {
+const u24 = (n) => new Uint8Array([n >> 16, (n >> 8) & 0xff, n & 0xff]);
+async function signSct(chain, precert, tamper) {
   const k = await logKeys();
   const leaf = unb64(chain[0]);
-  const issuerKeyHash = new Uint8Array(await crypto.subtle.digest("SHA-256", spkiOf(unb64(chain[1]))));
-  const tbs = tbsWithoutPoison(leaf);
   const ext = unb64("AAAFAAAAAAA="); // leaf_index extension, as azul emits
   const timestamp = Date.now();
   const ts = new Uint8Array(8); let t = BigInt(timestamp);
   for (let i = 7; i >= 0; i--) { ts[i] = Number(t & 0xffn); t >>= 8n; }
+  let entry;
+  if (precert) {
+    const issuerKeyHash = new Uint8Array(await crypto.subtle.digest("SHA-256", spkiOf(unb64(chain[1]))));
+    const tbs = tbsWithoutPoison(leaf);
+    entry = [new Uint8Array([0, 1]), issuerKeyHash, u24(tbs.length), tbs]; // precert_entry
+  } else {
+    entry = [new Uint8Array([0, 0]), u24(leaf.length), leaf]; // x509_entry
+  }
   const signed = cat([
     new Uint8Array([0, 0]), // version v1, signature_type certificate_timestamp
     ts,
-    new Uint8Array([0, 1]), // entry_type precert_entry
-    issuerKeyHash,
-    new Uint8Array([tbs.length >> 16, (tbs.length >> 8) & 0xff, tbs.length & 0xff]),
-    tbs,
+    ...entry,
     new Uint8Array([ext.length >> 8, ext.length & 0xff]),
     ext,
   ]);
+  // bad-sig: a real signature by this log, over bytes the authority did not submit.
+  if (tamper === "bad-sig") signed[signed.length - 1] ^= 0xff;
   const raw = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, k.priv, signed));
   const der = rawToDer(raw);
   // DigitallySigned: sha256(4) ecdsa(3) uint16 length, then the signature.
   const ds = cat([new Uint8Array([4, 3, der.length >> 8, der.length & 0xff]), der]);
-  return { sct_version: 0, id: b64(k.id), timestamp, extensions: b64(ext), signature: b64(ds) };
+  const id = tamper === "wrong-id" ? new Uint8Array(32).fill(0x42) : k.id;
+  return { sct_version: 0, id: b64(id), timestamp, extensions: b64(ext), signature: b64(ds) };
 }
 function isEcLeaf(leafB64) {
   const d = unb64(leafB64);
@@ -168,10 +184,20 @@ export default {
       (mode === "fail-second" && i === 2) ||
       (mode === "fail-signing" && !isEcLeaf(body.chain[0]));
     if (fail) return new Response("log unavailable", { status: 500 });
-    return Response.json(await signSct(body.chain));
+    return Response.json(
+      await signSct(body.chain, url.pathname.endsWith("/add-pre-chain"), mode),
+    );
   },
 };
 `;
+
+/** The pin the authority under test trusts: exactly the stub's key. */
+const STUB_LOG_SPKI = createPublicKey({
+  key: { kty: STUB_LOG_JWK.kty, crv: STUB_LOG_JWK.crv, x: STUB_LOG_JWK.x, y: STUB_LOG_JWK.y },
+  format: "jwk",
+}).export({ type: "spki", format: "der" });
+export const STUB_LOG_KEY = STUB_LOG_SPKI.toString("base64");
+export const STUB_LOG_ID = createHash("sha256").update(STUB_LOG_SPKI).digest("base64");
 
 export default defineConfig({
   resolve: { alias: { "@peculiar/x509": x509Dir } },
@@ -180,6 +206,11 @@ export default defineConfig({
       main: "./worker.ts",
       miniflare: {
         ...baseMiniflare,
+        bindings: {
+          ...baseMiniflare.bindings,
+          CT_LOG_ID: STUB_LOG_ID,
+          CT_LOG_KEY: STUB_LOG_KEY,
+        },
         serviceBindings: { CT_LOG: "ct-log-stub" },
         workers: [
           {

@@ -99,6 +99,7 @@ type Auth = {
       gaveUp: number;
       lastError: string;
       unloggable: { count: number };
+      configError: string | null;
     };
   }>;
   ctx: {
@@ -299,6 +300,7 @@ describe.skipIf(!READY)(
       const h3 = await inAuthority((a) => a.getAlarmHealth());
       expect(h3.ct.backlog, "step 3: health shows an empty backlog").toBe(0);
       expect(h3.ct.gaveUp).toBe(0);
+      expect(h3.ct.configError, "step 3: the authority is pinned to this log").toBeNull();
       expect(
         h3.failureCount,
         "step 3: the drain did not trip the alarm breaker",
