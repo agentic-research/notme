@@ -3093,23 +3093,28 @@ export default {
             { status: r.reason === "invalid_proof" ? 401 : 400 },
           );
         }
-        const { ok: _ok, principalId, authMethod, renewUntil, ...tier } = r;
+        const { ok: _ok, principalId, authMethod, renewUntil, generation, ...tier } = r;
         return Response.json({
           ...tier,
           principal_id: principalId,
           auth_method: authMethod,
           renew_until: renewUntil,
+          generation,
         });
       }
 
       // POST /cert/issuing-ca/renew — a machine renews its tier with no
       // human, while the approval holds (notme-337d82). Body
       // { public_key, iat, proof }; proof = Ed25519 over
-      // "notme/tier-renew/v1\0" || SPKI || uint64be(iat). Unauthenticated BY
+      // "notme/tier-renew/v1\0" || SPKI || uint64be(iat). v2 adds
+      // `generation` and signs "notme/tier-renew/v2\0" || SPKI ||
+      // uint64be(iat) || uint64be(generation); success returns the
+      // generation to sign next, and a copied key renewing is a 403
+      // fork_detected (notme-747cc7). Unauthenticated BY
       // DESIGN: the proof of possession is the authentication, and the result
       // is a public certificate for a key only the renewer holds.
       if (pathname === "/cert/issuing-ca/renew" && request.method === "POST") {
-        let body: { public_key?: unknown; iat?: unknown; proof?: unknown } = {};
+        let body: { public_key?: unknown; iat?: unknown; proof?: unknown; generation?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
         } catch {
@@ -3120,6 +3125,9 @@ export default {
           publicKeyPem: typeof body.public_key === "string" ? body.public_key : "",
           iat: typeof body.iat === "number" ? body.iat : NaN,
           proof: typeof body.proof === "string" ? body.proof : "",
+          // v2 (notme-747cc7): a generation in the body selects the v2
+          // binding; without one the request is v1.
+          ...(typeof body.generation === "number" ? { generation: body.generation } : {}),
         });
         if (!r.ok) {
           const status =
@@ -3127,13 +3135,13 @@ export default {
             : r.reason === "invalid_key" ? 400
             : r.reason === "stale_proof" || r.reason === "invalid_proof" ? 401
             : 403;
-          // revoked / horizon_passed / epoch_changed / approval_withdrawn all
-          // mean "a human must approve again" — named, so the machine can say
-          // which.
+          // revoked / horizon_passed / epoch_changed / approval_withdrawn /
+          // fork_detected all mean "a human must approve again" — named, so
+          // the machine can say which.
           return Response.json({ error: r.reason }, { status });
         }
-        const { ok: _ok, renewUntil, ...tier } = r;
-        return Response.json({ ...tier, renew_until: renewUntil });
+        const { ok: _ok, renewUntil, generation, ...tier } = r;
+        return Response.json({ ...tier, renew_until: renewUntil, generation });
       }
 
       // GET /cert/issuing-ca/enrollments — the signed-in human's machines.
