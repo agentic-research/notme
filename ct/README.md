@@ -187,7 +187,7 @@ In `config.notme.json`:
 | field | value | why |
 |---|---|---|
 | `intended_use` | `production` | this is the real log, not a test shard |
-| `temporal_interval` | 2026-01-01Z to 2027-07-01Z (end exclusive) | the log accepts only certificates whose `notAfter` falls in this window; a new shard is needed after it |
+| `temporal_interval` | 2026-07-01Z to 2027-07-01Z (end exclusive) | the log accepts only certificates whose `notAfter` falls in this window. azul's `build.rs` requires a production shard to span 3 to 12 months, so this is the maximum; the next shard must be live before 2027-07-01 (runbook step 5) |
 | `require_server_auth_eku` | `false` | notme leaves are clientAuth or have no EKU. Needs the azul fork (below) |
 | `enable_ccadb_roots` | `false` | this log accepts notme's root and nothing from the WebPKI |
 | `reject_expired` | `false` | the backlog submits after the leaf has expired; `true` would refuse every drained row (see above) |
@@ -250,11 +250,11 @@ azul's `CtClient::get_raw` reads with `wrangler r2 object get --local`.
 (the test root), a standalone `wrangler.notmelocal.jsonc`, and signing /
 witness keys appended to `.dev.vars` (a file azul tracks). Commit none of it.
 
-**Why not `config.notme.json` verbatim:** its production shard `notme` has an
-18-month temporal interval, and azul's `build.rs` refuses a production shard
-outside 3 to 12 months (`notme invalid temporal interval`), so the full file
-does not build. That is a defect in the production shard to fix before
-provisioning (see "What is NOT done").
+**Why not `config.notme.json` verbatim:** the local log needs only the two
+test shards, and the production shard would need its own bindings and keys.
+(The production shard does build: `DEPLOY_ENV=notme` with the production
+root passes azul's `build.rs`. An earlier 18-month interval did not, and was
+fixed in `notme-a3a2bc`.)
 
 ### The roots file, and the two-pass bootstrap
 
@@ -328,6 +328,15 @@ Worker (`CT_LOG_PATH` only if the shard is not named `notme`), then use the
 normal canary path (`task worker:canary` / `worker:promote`). **Unbound means no
 logging, by design:** that is also the rollback.
 
+**Deploy check: measure production `add-pre-chain` latency** against the
+mint's 2000 ms timeout (`DEFAULT_TIMEOUT_MS`, `worker/src/ct/log-client.ts`).
+Locally it was about 950 ms (about 400 to 950 ms over every run of the
+acceptance, dominated by the sequencing interval). If production runs close to
+2000 ms, every mint will time out and be backlogged with no embedded SCT. On
+the canary, watch the log Worker's request durations and `ct.backlog` /
+`lastError` on `/admin/alarm-health`: a backlog that grows while the log is
+up means the timeout, not the log, is the problem.
+
 ### 4. Health and alerting
 
 `GET /admin/alarm-health` (authority-manage session) returns a `ct` object:
@@ -353,12 +362,30 @@ Alert on:
   certificate life and beyond): the log is slow or down, and rows left past
   their certificate's life are expected to be refused as expired (see above).
 
+### 5. Roll the shard before it closes
+
+A production shard spans 3 to 12 months (azul `build.rs`, from Chrome's log
+policy), so the log has to be rolled. `notme` accepts certificates whose
+`notAfter` is before **2027-07-01T00:00:00Z**. After that date every
+submission is refused and every mint is backlogged, and then `gaveUp`. Well
+before then:
+
+1. Add the next shard to `config.notme.json`, e.g. `notme2027h2` with
+   `temporal_interval` 2027-07-01Z to 2028-01-01Z and the same policy fields
+   (`require_server_auth_eku: false`, `enable_ccadb_roots: false`,
+   `reject_expired: false`).
+2. Provision it (step 1: `LOG_NAME=notme2027h2` gives its own R2 bucket, KV
+   namespace and keys), deploy, and record its key in the pin (step 2; the pin
+   is per log, so it gains a second entry).
+3. Point `CT_LOG_PATH` at `/logs/notme2027h2` before 2027-07-01, through the
+   canary. Keep the old shard serving reads; it stays the record for what it
+   logged.
+
 ## What is NOT done
 
 - Verifiers still do not require SCTs (signet `--insecure-ignore-sct`). Until
   they do, the log records issuance and enforces nothing.
 - Offline task certificates (`mintTaskCertPair`) are not logged; their tier is.
 - The log is not provisioned and nothing is pinned or bound.
-- The production shard in `config.notme.json` does not build: azul's `build.rs`
-  requires a production shard's temporal interval to be 3 to 12 months, and
-  `notme`'s is 18 (2026-01-01 to 2027-07-01). Shorten it before provisioning.
+- Shard rollover (step 5) is a manual runbook step: nothing alerts ahead of
+  `notme`'s 2027-07-01 close.

@@ -55,7 +55,7 @@
                 "url": "https://REPLACE-ME.example/logs/notme/"
             },
             "temporal_interval": {
-                "start_inclusive": "2026-01-01T00:00:00Z",
+                "start_inclusive": "2026-07-01T00:00:00Z",
                 "end_exclusive": "2027-07-01T00:00:00Z"
             },
             "enable_ccadb_roots": false,
