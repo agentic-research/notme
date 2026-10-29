@@ -151,9 +151,11 @@ the machine's tier key is the approval: whoever holds it can renew until you rev
 |---|---|---|
 | `task-cert revoke --task X` | X and everything under it, on that machine | next mint; issued certs live out ≤ 5 min |
 | `POST /cert/issuing-ca/enrollments/revoke` | one machine | next renewal (≤ 1 h) |
-| fork detection | one machine, automatic | at the copy's next renewal |
+| fork detection | one machine, automatic | whichever line renews second is refused, and the enrollment is shut off. if the copy renews first, the honest machine is the one refused — that refusal is the alarm |
 | revoke a grant | every machine that grant approved | next renewal |
 | `POST /admin/revoke-epoch` | everything this authority issued | ≤ 5 min for online verifiers |
+
+**deploy order.** deploy the worker before using the updated `task-cert` client: the new client relies on the worker's renewal generations and its one-hour resend window. a legacy machine (a `tier.json` with no generation) keeps renewing either way.
 
 ### try it
 

@@ -1,7 +1,7 @@
 <!--
 @doc-check
 @types: BridgeCertResult, CertScope
-@endpoints: POST /cert, POST /cert/gha, POST /cert/issuing-ca/renew, POST /cert/issuing-ca/device/approve, GET /.well-known/signet-authority.json, GET /.well-known/ca-bundle.pem
+@endpoints: POST /cert, POST /cert/gha, POST /cert/issuing-ca/renew, POST /cert/issuing-ca/device/approve, GET /cert/issuing-ca/enrollments, GET /.well-known/signet-authority.json, GET /.well-known/ca-bundle.pem
 -->
 <!doctype html>
 <html lang="en">
@@ -554,7 +554,8 @@
   "generation": 3,
   "proof": "&lt;sig&gt;"
 }</div>
-          <div class="ep-note"><code>generation</code> is the generation returned by the machine's last successful renewal (or its collect response). With it, <code>proof</code> is an Ed25519 signature over <code>"notme/tier-renew/v2\0" || SPKI || uint64be(iat) || uint64be(generation)</code>. Without it the request is the legacy v1 form, <code>"notme/tier-renew/v1\0" || SPKI || uint64be(iat)</code>, which only enrollments made before v2 may still use; new enrollments refuse v1.</div>
+          <div class="ep-note"><code>generation</code> is the generation returned by the machine's last successful renewal (or its collect response). With it, <code>proof</code> is an Ed25519 signature over <code>"notme/tier-renew/v2\0" || SPKI || uint64be(iat) || uint64be(generation)</code>. Without it the request is the legacy v1 form, <code>"notme/tier-renew/v1\0" || SPKI || uint64be(iat)</code>, which only enrollments made before v2 may still use; new enrollments refuse v1 with <code>binding_v2_required</code>.</div>
+          <div class="ep-note"><code>iat</code> is the machine's clock when it signed. At the enrollment's current generation (and for a legacy v1 request) a valid proof is accepted with <code>iat</code> from one hour (3600 s) in the past to 120 s in the future, so a request that never reached the authority can be resent unchanged. A request already accepted is a retry only within one hour of its <code>iat</code>; a newly signed request at an older generation is judged a fork only if its <code>iat</code> is within 120 s of the authority's clock, and is otherwise <code>stale_proof</code>.</div>
           <div class="ep-label">response</div>
           <div class="ep-response">{
   "...": "the renewed tier certificate material",
@@ -563,10 +564,33 @@
 }</div>
           <div class="ep-note"><code>generation</code> is the value to sign into the next renewal.</div>
           <div class="ep-label">errors</div>
-          <div class="ep-response">// 404 unknown_key   400 invalid_key
+          <div class="ep-response">// 404 unknown_key   400 invalid_key   400 binding_v2_required
 // 401 stale_proof   401 invalid_proof
 // 403 revoked | horizon_passed | epoch_changed | approval_withdrawn | fork_detected</div>
           <div class="ep-note"><code>fork_detected</code> (403): a copy of this machine renewed, so the enrollment (one shared key) is shut off; the human runs <code>enroll</code> again. An exact resend of a request that was already accepted (within a one-hour window) is treated as a retry, not a fork; a replay of an accepted request is <code>stale_proof</code> and revokes nothing.</div>
+          <div class="ep-note"><code>binding_v2_required</code> (400): a v1 request (no <code>generation</code>) for an enrollment that speaks v2. The approval has not ended: the client is older than the authority and must be updated.</div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/cert/issuing-ca/enrollments</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">The signed-in human's enrolled machines (session cookie). <code>POST /cert/issuing-ca/enrollments/revoke</code> <code>{ "key_fingerprint": "..." }</code> stops one renewing.</div>
+          <div class="ep-label">response</div>
+          <div class="ep-response">[{
+  "key_fingerprint": "9f86d081...",
+  "status": "active",
+  "renew_until": 1712275200,
+  "revoked_at": 1711670400,
+  "revoke_reason": "fork_detected",
+  "scopes": ["bridgeCert"],
+  "clone_policy": "singleton",
+  "generation": 4
+}]</div>
+          <div class="ep-note"><code>revoke_reason</code> is <code>null</code> while the machine is not revoked. <code>fork_detected</code> means a copy of the machine renewed and the authority shut the enrollment off; a revocation made by the human or an administrator may carry no reason.</div>
         </div>
       </div>
 
