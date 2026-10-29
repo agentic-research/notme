@@ -24,6 +24,7 @@ import {
   tierEnrolmentBinding,
   deviceCodeHash,
   tierRenewalBindingV2,
+  tierRenewalBinding,
   renewalRequestDigest,
 } from "./auth/tier-enrolment-binding";
 import { ED25519 } from "./platform";
@@ -309,5 +310,30 @@ describe("re-enrolling a key", () => {
     expect(await count()).toBe(2);
     await enrolled(m);
     expect(await count()).toBe(0);
+  });
+});
+
+/** A v1 renewal request: no generation, v1 binding. */
+async function renewV1(m: Machine, iat = nowS()) {
+  const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, m.kp.privateKey, tierRenewalBinding(m.spki, iat))));
+  return send({ public_key: m.pem, iat, proof });
+}
+
+describe("binding v1 is retired", () => {
+  it("a new enrollment refuses v1 renewal", async () => {
+    const { m } = await enrolled();
+    await expectErr(await renewV1(m), 401, "invalid_proof");
+    expect((await rowOf(m)).generation).toBe(0);
+  });
+
+  it("a legacy enrollment renews with v1 until its first v2 renewal", async () => {
+    const { m } = await enrolled();
+    const f = await fp(m.spki);
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", f);
+    });
+    expect((await renewV1(m)).status).toBe(200);
+    await expectOk(await renew(m, 0), 1);
+    await expectErr(await renewV1(m), 401, "invalid_proof");
   });
 });

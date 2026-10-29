@@ -22,7 +22,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { X509Certificate } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
 import { createSessionCookie } from "./auth/session";
-import { tierEnrolmentBinding, deviceCodeHash, tierRenewalBinding } from "./auth/tier-enrolment-binding";
+import { tierEnrolmentBinding, deviceCodeHash, tierRenewalBindingV2 } from "./auth/tier-enrolment-binding";
 import { ED25519 } from "./platform";
 import type { SigningAuthority } from "./signing-authority";
 
@@ -59,12 +59,21 @@ async function enrolled(renewDays?: number) {
   const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, m.kp.privateKey, tierEnrolmentBinding(m.spki, await deviceCodeHash(start.device_code)))));
   const tok = await post("/cert/issuing-ca/device/token", { device_code: start.device_code, proof });
   expect(tok.status, await tok.clone().text()).toBe(200);
-  return { m, h, tier: (await tok.json()) as { certificate: string; renew_until: number } };
+  const tier = (await tok.json()) as { certificate: string; renew_until: number; generation: number };
+  generations.set(m, tier.generation);
+  return { m, h, tier };
 }
 
+/** The generation each machine must sign next: from collect, then from each renewal. */
+const generations = new WeakMap<object, number>();
+
+/** A v2 renewal at the machine's current generation (0 if it never enrolled). */
 async function renew(m: { kp: CryptoKeyPair; spki: Uint8Array; pem: string }, iat = Math.floor(Date.now() / 1000), key = m.kp.privateKey) {
-  const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, key, tierRenewalBinding(m.spki, iat))));
-  return post("/cert/issuing-ca/renew", { public_key: m.pem, iat, proof });
+  const generation = generations.get(m) ?? 0;
+  const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, key, tierRenewalBindingV2(m.spki, iat, generation))));
+  const res = await post("/cert/issuing-ca/renew", { public_key: m.pem, iat, generation, proof });
+  if (res.status === 200) generations.set(m, ((await res.clone().json()) as { generation: number }).generation);
+  return res;
 }
 
 const fp = async (spki: Uint8Array) =>

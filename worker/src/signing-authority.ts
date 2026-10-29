@@ -2189,6 +2189,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       approved_epoch: number | null;
       public_key_pem: string;
       generation: number;
+      binding_version: number | null;
     };
     const readRow = () =>
       this.ctx.storage.sql
@@ -2224,8 +2225,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       }
       digest = await renewalRequestDigest(binding);
     } else {
-      // v1 (no generation): unchanged — it neither checks nor advances the
-      // generation. Refusing v1 for v2 enrollments is a later step.
+      // v1 (no generation) neither checks nor advances the generation, so a
+      // copied key could use it to renew around the fork check: refused once
+      // the enrollment speaks v2. NULL (a legacy row) still accepts v1 until
+      // its first v2 renewal sets binding_version = 2.
+      if (row.binding_version === 2) return { ok: false, reason: "invalid_proof" };
       if (!fresh) return { ok: false, reason: "stale_proof" };
       if (!(await verifyEd25519PopProof(tierRenewalBinding(spki, params.iat), key, params.proof))) {
         return { ok: false, reason: "invalid_proof" };
