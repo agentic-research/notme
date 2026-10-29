@@ -35,14 +35,14 @@
  * certs as you until it expires (≤24h). It is protected by file permissions
  * only.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { X509Certificate } from "@peculiar/x509";
 import { appendFileSync } from "node:fs";
 import {
   enrolProof, exportPrivateKeyPem, generateTierKey, groupFingerprint, importPrivateKeyPem,
-  isRevokedTask, mintTask, pollEnrolment, renewTier, type PendingRenewal, startEnrolment, taskOutDir, verifyChain,
+  isRevokedTask, mintTask, pollEnrolment, renewTierInDir, saveEnrolment, AuthorityRefusal, startEnrolment, taskOutDir, verifyChain,
 } from "./lib";
 
 
@@ -86,26 +86,20 @@ async function enroll() {
     expiresIn: start.expires_in,
   });
   const root = await (await fetch(`${authority}/.well-known/ca-bundle.pem`)).text();
-  writeFileSync(join(dir, "tier.key.pem"), await exportPrivateKeyPem(key.privateKey), { mode: 0o600 });
-  chmodSync(join(dir, "tier.key.pem"), 0o600);
-  writeFileSync(join(dir, "tier.pem"), tier.certificate);
-  writeFileSync(join(dir, "root.pem"), root);
-  writeFileSync(
-    join(dir, "tier.json"),
-    JSON.stringify(
-      {
-        authority,
-        identity: tier.identity,
-        scopes: tier.scopes,
-        expires_at: tier.expires_at,
-        epoch: tier.authority.epoch,
-        renew_until: tier.renew_until,
-        generation: tier.generation ?? 0,
-      },
-      null,
-      2,
-    ),
-  );
+  saveEnrolment(dir, {
+    keyPem: await exportPrivateKeyPem(key.privateKey),
+    tierPem: tier.certificate,
+    rootPem: root,
+    meta: {
+      authority,
+      identity: tier.identity,
+      scopes: tier.scopes,
+      expires_at: tier.expires_at,
+      epoch: tier.authority.epoch,
+      renew_until: tier.renew_until,
+      generation: tier.generation ?? 0,
+    },
+  });
   const check = await verifyRoot(root, tier.certificate);
   console.log(`\nEnrolled ${tier.identity}`);
   console.log(`  scopes ${tier.scopes.join(", ")}, expires ${new Date(tier.expires_at * 1000).toISOString()}`);
@@ -115,9 +109,10 @@ async function enroll() {
   }
 }
 
-function rmPending(p: string) {
-  try { unlinkSync(p); } catch { /* already gone */ }
-}
+const ENDED_REASONS = new Set([
+  "revoked", "horizon_passed", "epoch_changed", "approval_withdrawn",
+  "fork_detected", "invalid_proof", "unknown_key", "stale_proof",
+]);
 
 /**
  * Renew the tier with no human. The tier's public key comes from the tier
@@ -129,18 +124,14 @@ async function renewNow(quiet = false) {
   const tierCert = new X509Certificate(need("tier.pem"));
   const spki = new Uint8Array(tierCert.publicKey.rawData);
   const pem = `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...spki)).match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----\n`;
-  const pendingPath = join(dir, "renew-pending.json");
-  const pending: PendingRenewal | null = existsSync(pendingPath) ? JSON.parse(readFileSync(pendingPath, "utf8")) : null;
   try {
-    await renewTier(
+    await renewTierInDir(
       meta.authority ?? authority,
       { privateKey: await importPrivateKeyPem(need("tier.key.pem")), spki, pem },
+      dir,
       {
         // tier.json without a generation is a legacy enrolment: it renews with v1.
         generation: meta.generation,
-        pending,
-        savePending: (p) => writeFileSync(pendingPath, JSON.stringify(p), { mode: 0o600 }),
-        clearPending: () => rmPending(pendingPath),
         // The new tier reaches disk before the pending request is dropped.
         persist: (r) => {
           writeFileSync(join(dir, "tier.pem"), r.certificate);
@@ -157,9 +148,12 @@ async function renewNow(quiet = false) {
       },
     );
   } catch (e: any) {
-    // Lost state and a network failure are not the authority ending the approval.
-    if (e instanceof TypeError || String(e.message).startsWith("renewal state lost")) throw e;
-    throw new Error(`the approval for this machine has ended (${e.message}) — run \`task-cert enroll\` and approve again`);
+    if (String(e.message).startsWith("renewal state lost")) throw e;
+    if (e instanceof AuthorityRefusal && ENDED_REASONS.has(e.reason)) {
+      throw new Error(`the approval for this machine has ended (${e.reason}) — run \`task-cert enroll\` and approve again`);
+    }
+    if (e instanceof AuthorityRefusal) throw new Error(`the authority refused the renewal (${e.reason})`);
+    throw new Error(`could not renew, try again (${e.message})`);
   }
   const r = out!;
   if (!quiet) {

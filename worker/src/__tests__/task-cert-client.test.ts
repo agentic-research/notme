@@ -9,7 +9,10 @@
  * authority at all.
  */
 import { X509Certificate, X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { mintIssuingCaCert } from "../cert-authority";
 import { ED25519 } from "../platform";
 import { deviceCodeHash, tierEnrolmentBinding } from "../auth/tier-enrolment-binding";
@@ -185,10 +188,13 @@ describe("task output paths", () => {
 });
 
 // ── renewal with a generation (notme-747cc7) ────────────────────────────────
-import { renewTier, type PendingRenewal } from "../../../scripts/task-cert/lib";
+import {
+  renewTier, renewTierInDir, saveEnrolment, loadPending, AuthorityRefusal, CLIENT_RESEND_WINDOW_S, type PendingRenewal,
+} from "../../../scripts/task-cert/lib";
 import { tierRenewalBindingV2 } from "../auth/tier-enrolment-binding";
 
 describe("renewal with a generation", () => {
+  afterEach(() => vi.useRealTimers());
   const fromB64url = (s: string) =>
     Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4)), (c) => c.charCodeAt(0));
   const okBody = { certificate: "PEM", expires_at: 1, renew_until: 2, authority: { epoch: 3 }, generation: 4 };
@@ -251,7 +257,7 @@ describe("renewal with a generation", () => {
     const h = harness();
     let called = false;
     const fetchFn = (async () => { called = true; return reply(200, okBody); }) as unknown as typeof fetch;
-    const pending: PendingRenewal = { body: "{}", iat: Math.floor(Date.now() / 1000) - 3601, generation: 1 };
+    const pending: PendingRenewal = { body: "{}", iat: Math.floor(Date.now() / 1000) - (CLIENT_RESEND_WINDOW_S + 1), generation: 1 };
     await expect(renewTier("https://a", k, h.opts({ generation: 1, pending }), fetchFn)).rejects.toThrow("renewal state lost");
     expect(called).toBe(false);
     expect(h.events).toEqual([]);
@@ -262,7 +268,7 @@ describe("renewal with a generation", () => {
     const h = harness();
     let sent = "";
     const fetchFn = (async (_u: string, init: any) => { sent = init.body; return reply(200, okBody); }) as unknown as typeof fetch;
-    const pending: PendingRenewal = { body: '{"exact":"bytes"}', iat: Math.floor(Date.now() / 1000) - 3600, generation: 9 };
+    const pending: PendingRenewal = { body: '{"exact":"bytes"}', iat: Math.floor(Date.now() / 1000) - 60, generation: 9 };
     await renewTier("https://a", k, h.opts({ generation: 9, pending }), fetchFn);
     expect(sent).toBe(pending.body);
     expect(h.events).toEqual(["clear"]);
@@ -282,5 +288,125 @@ describe("renewal with a generation", () => {
     const k = await generateTierKey();
     const r = await renewTier("https://a", k, harness().opts({ generation: 3 }), (async () => reply(200, okBody)) as unknown as typeof fetch);
     expect(r.generation).toBe(4);
+  });
+
+  const NOW = 1_900_000_000;
+  const freeze = () => vi.useFakeTimers({ toFake: ["Date"], now: NOW * 1000 });
+  const pendingAt = (age: number): PendingRenewal => ({ body: '{"sealed":1}', iat: NOW - age, generation: 5 });
+  const withFetch = (res: () => Response | Promise<Response>, seen: string[] = []) =>
+    (async (_u: string, init: any) => { seen.push(init.body); return res(); }) as unknown as typeof fetch;
+  const textReply = (status: number) =>
+    ({ ok: false, status, json: async () => { throw new SyntaxError("not json"); } }) as unknown as Response;
+
+  it("the client stops resending at the window minus the skew (boundary)", async () => {
+    freeze();
+    const k = await generateTierKey();
+    expect(CLIENT_RESEND_WINDOW_S).toBe(3480);
+    const seen: string[] = [];
+    await renewTier("https://a", k, harness().opts({ pending: pendingAt(3480) }), withFetch(() => reply(200, okBody), seen));
+    expect(seen).toHaveLength(1);
+    await expect(renewTier("https://a", k, harness().opts({ pending: pendingAt(3481) }), withFetch(() => reply(200, okBody), seen))).rejects.toThrow("renewal state lost");
+    expect(seen).toHaveLength(1);
+  });
+
+  it("keeps pending on 429, 5xx, 3xx, 408 and on a non-JSON 4xx", async () => {
+    freeze();
+    for (const mk of [() => reply(429, { error: "rate_limited" }), () => reply(503, { error: "x" }), () => reply(302, {}), () => reply(408, { error: "t" }), () => textReply(403), () => textReply(404)]) {
+      const k = await generateTierKey();
+      const h = harness();
+      await expect(renewTier("https://a", k, h.opts({ pending: pendingAt(10) }), withFetch(mk))).rejects.toThrow();
+      expect(h.events).not.toContain("clear");
+      // and on a first attempt too
+      const h2 = harness();
+      await expect(renewTier("https://a", k, h2.opts({ generation: 1 }), withFetch(mk))).rejects.toThrow();
+      expect(h2.events).toEqual(["save"]);
+    }
+  });
+
+  it("a definitive refusal of a RESEND keeps pending and says the state is lost", async () => {
+    freeze();
+    const k = await generateTierKey();
+    const h = harness();
+    await expect(renewTier("https://a", k, h.opts({ pending: pendingAt(10) }), withFetch(() => reply(403, { error: "fork_detected" }))))
+      .rejects.toThrow(/renewal state lost \(fork_detected\).*task-cert enroll/);
+    expect(h.events).toEqual([]);
+  });
+
+  it("a definitive refusal on a FIRST attempt clears pending and throws the reason", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    const err = await renewTier("https://a", k, h.opts({ generation: 1 }), withFetch(() => reply(403, { error: "revoked" }))).catch((e) => e);
+    expect(err).toBeInstanceOf(AuthorityRefusal);
+    expect(err.reason).toBe("revoked");
+    expect(h.events).toEqual(["save", "clear"]);
+  });
+
+  it("an invalid 2xx keeps pending and never persists", async () => {
+    for (const bad of [{ ...okBody, certificate: undefined }, { ...okBody, generation: -1 }, { ...okBody, generation: 1.5 }, {}]) {
+      const k = await generateTierKey();
+      const h = harness();
+      let persisted = false;
+      await expect(renewTier("https://a", k, { ...h.opts({ generation: 1 }), persist: () => { persisted = true; } }, withFetch(() => reply(200, bad)))).rejects.toThrow("invalid");
+      expect(h.events).toEqual(["save"]);
+      expect(persisted).toBe(false);
+    }
+  });
+
+  it("persist throwing keeps pending", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    await expect(renewTier("https://a", k, { ...h.opts({ generation: 1 }), persist: () => { throw new Error("disk full"); } }, withFetch(() => reply(200, okBody)))).rejects.toThrow("disk full");
+    expect(h.events).toEqual(["save"]);
+  });
+
+  describe("on disk", () => {
+    const tmp = () => mkdtempSync(join(tmpdir(), "task-cert-test-"));
+
+    it("re-enrolling clears a stale pending file", () => {
+      const dir = tmp();
+      writeFileSync(join(dir, "renew-pending.json"), JSON.stringify(pendingAt(99999)));
+      saveEnrolment(dir, { keyPem: "K", tierPem: "T", rootPem: "R", meta: { generation: 0 } });
+      expect(existsSync(join(dir, "renew-pending.json"))).toBe(false);
+      expect(JSON.parse(readFileSync(join(dir, "tier.json"), "utf8")).generation).toBe(0);
+    });
+
+    it("two concurrent renewals produce one signed request", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      const seen: string[] = [];
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const slow = withFetch(async () => { await gate; return reply(200, okBody); }, seen);
+      const first = renewTierInDir("https://a", k, dir, { generation: 2 }, slow);
+      await vi.waitFor(() => expect(seen).toHaveLength(1));
+      await expect(renewTierInDir("https://a", k, dir, { generation: 2 }, slow)).rejects.toThrow("in progress");
+      expect(seen).toHaveLength(1);
+      release();
+      await first;
+      expect(existsSync(join(dir, "renew-pending.json"))).toBe(false);
+      expect(existsSync(join(dir, "renew.lock"))).toBe(false);
+    });
+
+    it("an existing pending file is resent by the next call, not replaced", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      const seen: string[] = [];
+      await expect(renewTierInDir("https://a", k, dir, { generation: 2 }, (async (_u: string, i: any) => { seen.push(i.body); throw new Error("down"); }) as unknown as typeof fetch)).rejects.toThrow("down");
+      await renewTierInDir("https://a", k, dir, { generation: 2 }, withFetch(() => reply(200, okBody), seen));
+      expect(seen).toHaveLength(2);
+      expect(seen[1]).toBe(seen[0]);
+    });
+
+    it("a corrupt pending file never signs", async () => {
+      const dir = tmp();
+      writeFileSync(join(dir, "renew-pending.json"), "{not json");
+      const k = await generateTierKey();
+      let called = false;
+      await expect(renewTierInDir("https://a", k, dir, { generation: 2 }, withFetch(() => { called = true; return reply(200, okBody); })))
+        .rejects.toThrow("renewal state lost (pending request unreadable)");
+      expect(called).toBe(false);
+      expect(() => loadPending(dir)).toThrow("unreadable");
+      expect(existsSync(join(dir, "renew.lock"))).toBe(false);
+    });
   });
 });

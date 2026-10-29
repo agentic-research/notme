@@ -16,12 +16,13 @@
  * would: scopes never exceed the tier's, lifetime never outlives it, an
  * expired tier is refused, and the tier key must match the tier cert.
  */
+import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { X509Certificate, BasicConstraintsExtension } from "@peculiar/x509";
 import { mintTaskCertPair } from "../../worker/src/cert-authority";
 import { ED25519 } from "../../worker/src/platform";
 import {
-  deviceCodeHash, RENEWAL_RETRY_WINDOW_S, tierEnrolmentBinding, tierRenewalBinding, tierRenewalBindingV2,
+  deviceCodeHash, RENEWAL_RETRY_WINDOW_S, RENEWAL_SKEW_S, tierEnrolmentBinding, tierRenewalBinding, tierRenewalBindingV2,
 } from "../../worker/src/auth/tier-enrolment-binding";
 
 const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b));
@@ -223,20 +224,42 @@ export type RenewalResult = {
   generation: number;
 };
 
+/** The authority definitively refused a FIRST attempt (its JSON `{ error }`, 4xx). */
+export class AuthorityRefusal extends Error {
+  constructor(public reason: string) {
+    super(reason);
+  }
+}
+
+const STATE_LOST_TAIL = "run `task-cert enroll` to approve this machine again";
+const stateLost = (why: string) => new Error(`renewal state lost (${why}) — ${STATE_LOST_TAIL}`);
+
 /**
- * Renew the tier with no human, while the approval holds. Throws with the
- * authority's reason (revoked, horizon_passed, epoch_changed,
- * approval_withdrawn, fork_detected) when a human must approve again.
+ * The client stops resending a little before the authority stops treating it
+ * as a retry (RENEWAL_RETRY_WINDOW_S), so a resend never lands on the edge of
+ * the window and is judged a fork.
+ */
+export const CLIENT_RESEND_WINDOW_S = RENEWAL_RETRY_WINDOW_S - RENEWAL_SKEW_S;
+
+// 4xx statuses that say "try again", not "no".
+const TRANSIENT_4XX = new Set([408, 425, 429]);
+
+/**
+ * Renew the tier with no human, while the approval holds.
  *
  * A response can be lost after the authority has acted on the request. The
  * authority serves the EXACT same request again as a retry, but treats a
  * newly signed request at the old generation as a fork. So:
  *   - the signed request is saved (savePending) BEFORE the POST;
- *   - while one exists and is inside the retry window it is resent verbatim,
+ *   - while one exists and is inside the client window it is resent verbatim,
  *     and nothing new is ever signed;
  *   - past the window it is not resent and not replaced: a human re-enrolls;
- *   - it is cleared (clearPending) on any definitive answer, 2xx or 4xx. A
- *     network failure or a 5xx is not definitive and leaves it in place.
+ *   - pending is cleared only on a definitive answer: a valid 2xx, or the
+ *     authority's own JSON refusal of a FIRST attempt. A refusal of a RESEND
+ *     keeps pending (clearing would let the next run re-sign at the old
+ *     generation, which is a fork) and says the state is lost.
+ *   - network errors, 5xx, 3xx, 408/425/429 and non-authority 4xx bodies
+ *     (edge or HTML error pages) are not definitive and keep pending.
  * `persist` runs on success BEFORE clearPending, so the new tier is on disk
  * before the only copy of the request that can recover it is dropped.
  */
@@ -253,12 +276,11 @@ export async function renewTier(
   fetchFn: typeof fetch = fetch,
 ): Promise<RenewalResult> {
   const now = Math.floor(Date.now() / 1000);
+  const resend = !!opts.pending;
   let body: string;
   if (opts.pending) {
-    if (now - opts.pending.iat > RENEWAL_RETRY_WINDOW_S) {
-      throw new Error(
-        "renewal state lost — a response never arrived within the retry window; run `task-cert enroll` to approve this machine again",
-      );
+    if (now - opts.pending.iat > CLIENT_RESEND_WINDOW_S) {
+      throw stateLost("a response never arrived within the retry window");
     }
     body = opts.pending.body;
   } else {
@@ -271,19 +293,137 @@ export async function renewTier(
     });
     opts.savePending({ body, iat: now, generation: gen ?? 0 });
   }
+  let sentGeneration = false;
+  try {
+    sentGeneration = "generation" in JSON.parse(body);
+  } catch { /* unparseable body: no v2 expectation */ }
+
   const res = await fetchFn(`${authority}/cert/issuing-ca/renew`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
   });
-  const out = (await res.json().catch(() => ({}))) as any;
-  if (res.ok) {
+  const out = (await res.json().catch(() => null)) as any;
+
+  if (res.status >= 200 && res.status < 300) {
+    const valid =
+      out && typeof out.certificate === "string" && out.certificate.length > 0 &&
+      (!sentGeneration || (Number.isInteger(out.generation) && out.generation >= 0));
+    if (!valid) throw new Error("renewal response invalid — kept the pending request to retry");
     opts.persist?.(out);
     opts.clearPending();
     return out;
   }
-  if (res.status < 500) opts.clearPending();
-  throw new Error(out.error ?? `HTTP ${res.status}`);
+  const definitive =
+    res.status >= 400 && res.status < 500 && !TRANSIENT_4XX.has(res.status) && typeof out?.error === "string";
+  if (!definitive) throw new Error(`renewal not answered by the authority (HTTP ${res.status}) — try again`);
+  if (resend) throw stateLost(out.error);
+  opts.clearPending();
+  throw new AuthorityRefusal(out.error);
+}
+
+// ── Renewal state on disk (notme-747cc7) ────────────────────────────────────
+
+const PENDING = "renew-pending.json";
+const LOCK = "renew.lock";
+const LOCK_STALE_MS = 120_000;
+
+/** Read the pending request. Unreadable means the state is lost; it must never lead to signing. */
+export function loadPending(dir: string): PendingRenewal | null {
+  const p = join(dir, PENDING);
+  if (!existsSync(p)) return null;
+  try {
+    const v = JSON.parse(readFileSync(p, "utf8"));
+    if (typeof v?.body !== "string" || !Number.isFinite(v.iat) || !Number.isFinite(v.generation)) throw new Error("shape");
+    return v;
+  } catch {
+    throw stateLost("pending request unreadable");
+  }
+}
+
+/** Remove the pending request, e.g. after a fresh enrolment makes it moot. */
+export function removePending(dir: string): void {
+  try { unlinkSync(join(dir, PENDING)); } catch { /* already gone */ }
+}
+
+/**
+ * Write the pending request atomically AND exclusively: a private temp file,
+ * then link() into place, which fails if the pending file already exists.
+ */
+function savePendingExclusive(dir: string, p: PendingRenewal): void {
+  const tmp = join(dir, `${PENDING}.${process.pid}.${Math.random().toString(36).slice(2)}`);
+  writeFileSync(tmp, JSON.stringify(p), { mode: 0o600 });
+  try {
+    linkSync(tmp, join(dir, PENDING));
+  } catch (e: any) {
+    if (e.code === "EEXIST") throw new Error("another renewal already saved a request — try again");
+    throw e;
+  } finally {
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+  }
+}
+
+/** One renewal at a time per directory: a lock file created with O_EXCL, held for the whole renew. */
+async function withRenewLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const path = join(dir, LOCK);
+  const take = () => {
+    const fd = openSync(path, "wx", 0o600);
+    writeSync(fd, String(Date.now()));
+    closeSync(fd);
+  };
+  try {
+    take();
+  } catch (e: any) {
+    if (e.code !== "EEXIST") throw e;
+    let at = 0;
+    try { at = Number(readFileSync(path, "utf8")); } catch { /* vanished: retry below */ }
+    if (at && Date.now() - at < LOCK_STALE_MS) throw new Error("another renewal is in progress — try again in a moment");
+    try { unlinkSync(path); } catch { /* raced */ }
+    try { take(); } catch { throw new Error("another renewal is in progress — try again in a moment"); }
+  }
+  try {
+    return await fn();
+  } finally {
+    try { unlinkSync(path); } catch { /* already gone */ }
+  }
+}
+
+/** renewTier backed by files in `dir`: locked, with the pending request persisted exclusively. */
+export function renewTierInDir(
+  authority: string,
+  key: { privateKey: CryptoKey; spki: Uint8Array; pem: string },
+  dir: string,
+  opts: { generation?: number; persist?: (r: RenewalResult) => void },
+  fetchFn: typeof fetch = fetch,
+): Promise<RenewalResult> {
+  return withRenewLock(dir, () =>
+    renewTier(
+      authority,
+      key,
+      {
+        generation: opts.generation,
+        pending: loadPending(dir),
+        savePending: (p) => savePendingExclusive(dir, p),
+        clearPending: () => removePending(dir),
+        persist: opts.persist,
+      },
+      fetchFn,
+    ),
+  );
+}
+
+/** Write a freshly enrolled tier. A new enrolment ends any pending renewal of the old one. */
+export function saveEnrolment(
+  dir: string,
+  e: { keyPem: string; tierPem: string; rootPem: string; meta: Record<string, unknown> },
+): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(dir, "tier.key.pem"), e.keyPem, { mode: 0o600 });
+  chmodSync(join(dir, "tier.key.pem"), 0o600);
+  writeFileSync(join(dir, "tier.pem"), e.tierPem);
+  writeFileSync(join(dir, "root.pem"), e.rootPem);
+  writeFileSync(join(dir, "tier.json"), JSON.stringify(e.meta, null, 2));
+  removePending(dir);
 }
 
 /**
