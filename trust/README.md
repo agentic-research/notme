@@ -280,8 +280,10 @@ a different log, not a refresh: replace the pin only by a reviewed manual edit.
 Once `provisioned`, the `trust-anchor` release job signs it as
 `notme-ct-log.json` with a `.sigstore.json` bundle, verified exactly like the
 root (the section above, with `notme-ct-log.json` in place of
-`notme-root.pem`). Unlike the root, the release job does not compare it to the
-live log before signing; run `task ct:verify` first.
+`notme-root.pem`). Before signing, the release job fetches the pin's
+`metadata_url` and refuses to sign unless the live `key` and `log_id` equal the
+pin and `log_id` is SHA-256 of `key` (the same checks as `task ct:verify`), and
+unless `ct/config.notme.json` has no `REPLACE-ME` placeholders left.
 
 ## Updating this anchor
 

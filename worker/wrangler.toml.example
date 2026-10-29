@@ -65,6 +65,17 @@ GHA_ALLOWED_OWNERS = "your-org"
 # /logs/notme; set it only if the shard is named differently in
 # ct/config.notme.json. Has no effect while CT_LOG is unbound.
 # CT_LOG_PATH = "/logs/notme"
+# The log notme trusts, REQUIRED once CT_LOG is bound: copy `log_id` and `key`
+# from trust/notme-ct-log.json (the reviewed pin, ct/README.md runbook step 2).
+# CT_LOG_ID is the base64 log id, CT_LOG_KEY the base64 SPKI DER of the log's
+# P-256 key; the id must be SHA-256 of the key. An SCT is embedded, and a
+# backlog row marked logged, only if it carries this id and its signature
+# verifies under this key — so a wrong CT_LOG_PATH, shard or service cannot
+# put a stranger's SCTs in notme's certificates. Missing or malformed while
+# bound: nothing is submitted, every mint goes out unlogged (never refused),
+# and /admin/alarm-health reports `ct.configError` and counts `ct.unloggable`.
+# CT_LOG_ID = "<base64 log_id from trust/notme-ct-log.json>"
+# CT_LOG_KEY = "<base64 key from trust/notme-ct-log.json>"
 
 # ATTESTED FIRST BOOT (notme-addef9) — the default way a fresh authority gets
 # its administrator, and the reason no secret has to travel through a log.
@@ -125,7 +136,7 @@ class_name = "RevocationAuthority"
 # commented out and notme behaves exactly as it did before the log existed:
 # nothing is submitted, no SCT is embedded, no backlog row is written.
 # Uncomment ONLY after the notme-ct Worker is deployed (ct/README.md, operator
-# runbook). With it bound, every bridge cert pair is logged; a log that is slow
+# runbook). With it bound, every bridge pair and tier is logged; a log that is slow
 # (2 s) or down does not block issuance, it queues the pair in ct_backlog and
 # the refresh alarm drains it. `service` is the deployed Worker's name: azul's
 # ct_worker is named "static-ct" and `-e notme` deploys it as "static-ct-notme"
@@ -134,8 +145,9 @@ class_name = "RevocationAuthority"
 # binding = "CT_LOG"
 # service = "static-ct-notme"
 #
-# CT_LOG_PATH (the log's base path behind CT_LOG, default /logs/notme) is a
-# variable: see the commented line under [vars] above.
+# CT_LOG_PATH (the log's base path behind CT_LOG, default /logs/notme) and
+# CT_LOG_ID / CT_LOG_KEY (the log's pinned id and key, REQUIRED with the
+# binding) are variables: see the commented lines under [vars] above.
 
 [[migrations]]
 tag = "v1"
