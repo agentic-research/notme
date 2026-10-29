@@ -19,6 +19,9 @@ declare global {
       // matching RevocationEnv in revocation.ts.
       REVOCATION: DurableObjectNamespace;
       CA_BUNDLE_CACHE: KVNamespace;
+      // Bound ONLY under vitest.workers.ct.config.mts (a stub transparency
+      // log); absent in the main pool config, hence optional.
+      CT_LOG?: Fetcher;
     }
   }
 }

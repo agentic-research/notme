@@ -508,6 +508,12 @@ export async function mintBridgeCertPair(
     issuerName?: string;
     /** Extra extensions (e.g. the task scope) — appended to both certs. */
     extraExtensions?: Extension[];
+    /**
+     * Extensions for ONE of the two certs, appended after extraExtensions.
+     * An embedded SCT list is per certificate — each cert is logged on its
+     * own and gets its own SCT — so it cannot ride on extraExtensions.
+     */
+    perCertExtensions?: { mtls?: Extension[]; signing?: Extension[] };
     /** What the subject IS (ADR-019 D2). Defaults to the human case. */
     principalKind?: PrincipalKind;
     /**
@@ -623,6 +629,7 @@ export async function mintBridgeCertPair(
       ...sharedExtensions,
       sanExtension,
       ...(opts.extraExtensions ?? []),
+      ...(opts.perCertExtensions?.mtls ?? []),
     ],
   });
 
@@ -642,6 +649,7 @@ export async function mintBridgeCertPair(
       ...sharedExtensions,
       sanExtension,
       ...(opts.extraExtensions ?? []),
+      ...(opts.perCertExtensions?.signing ?? []),
     ],
   });
 

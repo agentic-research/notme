@@ -55,6 +55,13 @@ async function mintPair(withPoison: boolean) {
 }
 
 describe("ct.precert", () => {
+  it("the main pool config binds NO transparency log", () => {
+    // Every suite under vitest.workers.config.mts relies on this: with
+    // CT_LOG absent, minting is exactly today's (notme-1b46a8). The CT-bound
+    // suites run under vitest.workers.ct.config.mts instead.
+    expect((env as { CT_LOG?: unknown }).CT_LOG).toBeUndefined();
+  });
+
   it("the poison and the SCT list are different, non-overlapping extensions", () => {
     // Guards a transposition that would be invisible in a hex dump: the two
     // OIDs differ only in their last arc.

@@ -18,6 +18,7 @@ import {
   mayBootstrapFromAttestation,
 } from "./auth/bootstrap-policy";
 import {
+  type Extension,
   X509CertificateGenerator,
   BasicConstraintsExtension,
   KeyUsagesExtension,
@@ -28,6 +29,17 @@ import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 // clients run the SAME implementation — see the RFC 7636 section there.
 import { sha256Base64url } from "@agentic-research/dpop";
 import { bundleCanonical, type CABundle } from "./revocation";
+import {
+  ctPoisonExtension,
+  sctListExtension,
+  serialiseSct,
+  type SctResponse,
+} from "./ct/sct";
+import {
+  DEFAULT_CT_LOG_PATH,
+  DEFAULT_TIMEOUT_MS,
+  submitPreChain,
+} from "./ct/log-client";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 import {
   deriveKek,
@@ -85,6 +97,15 @@ interface SigningAuthorityEnv {
    * falls back to DEFAULT_ALLOWED_AUDIENCES.
    */
   ALLOWED_AUDIENCES?: string;
+  /**
+   * Service binding to notme's Static CT log (notme-1b46a8). Absent, minting
+   * is exactly what it was before CT: no poison, no SCT, no backlog row, so
+   * production deploys safely before the log exists. Present, every online
+   * mint is logged or backlogged — never refused because of the log.
+   */
+  CT_LOG?: Fetcher;
+  /** The log's base path behind CT_LOG. Defaults to `/logs/notme`. */
+  CT_LOG_PATH?: string;
 }
 
 /**
@@ -336,6 +357,18 @@ const TIER_ENROLMENT_TTL_S = 600; // RFC 8628 device codes are minutes, not hour
 const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
 const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"; // RFC 8628 §6.1: no vowels
 
+/** A positive 128-bit serial, hex — the same shape cert-authority mints. */
+function randomSerialHex(): string {
+  const s = crypto.getRandomValues(new Uint8Array(16));
+  s[0]! &= 0x7f; // RFC 5280: serial must be a positive INTEGER
+  return hex(s);
+}
+
+/** PEM certificate → base64 DER, as a CT chain carries it. */
+function pemToB64(pem: string): string {
+  return pem.replace(/-----[A-Z ]+-----|\s/g, "");
+}
+
 function hex(b: Uint8Array): string {
   return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
 }
@@ -581,6 +614,20 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         redirect_uri   TEXT NOT NULL,
         code_challenge TEXT NOT NULL,
         expires_at     INTEGER NOT NULL
+      )
+    `);
+    // Certificates minted while the CT log was unreachable (notme-1b46a8).
+    // Each row is a FINAL chain — [leaf, issuer], base64 DER — that carries
+    // no SCT and still has to be recorded by the log via add-chain. Created
+    // unconditionally (an empty table is free); rows are written only when
+    // CT_LOG is bound and a submission failed.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS ct_backlog (
+        id         INTEGER PRIMARY KEY,
+        chain_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attempts   INTEGER NOT NULL DEFAULT 0,
+        logged_at  INTEGER
       )
     `);
     this.#initialized = true;
@@ -1699,23 +1746,120 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const { signingKey } = await this.#getOrCreateSigningKey();
     const state = await this.getAuthorityState();
     const { mintBridgeCertPair } = await import("./cert-authority");
-    const result = await mintBridgeCertPair(
-      params.subject,
-      params.identity,
-      params.mtlsPublicKeyPem,
-      params.signingPublicKeyPem,
-      signingKey,
-      {
-        scopes: params.scopes,
-        epoch: state.epoch,
-        authMethod: params.authMethod,
-        ttlMs: params.ttlMs,
+    // Bridge pairs are root-issued: the default issuer, no issuerName.
+    const ttlMs = params.ttlMs ?? 5 * 60 * 1000;
+    const notBefore = new Date();
+    const result = await this.#mintLogged({
+      pin: {
+        serialMtls: randomSerialHex(),
+        serialSigning: randomSerialHex(),
+        notBefore,
+        notAfter: new Date(notBefore.getTime() + ttlMs),
       },
-    );
+      mint: (pin, ct) =>
+        mintBridgeCertPair(
+          params.subject,
+          params.identity,
+          params.mtlsPublicKeyPem,
+          params.signingPublicKeyPem,
+          signingKey,
+          {
+            scopes: params.scopes,
+            epoch: state.epoch,
+            authMethod: params.authMethod,
+            ttlMs: params.ttlMs,
+            pin,
+            // Per cert: each certificate carries its OWN SCT. Order matches
+            // `pems` below — 0 is mTLS, 1 is signing.
+            perCertExtensions: { mtls: ct(0), signing: ct(1) },
+          },
+        ),
+      pems: (r) => [r.certificates.mtls, r.certificates.signing],
+    });
     return {
       ...result,
       authority: { epoch: state.epoch, key_id: state.keyId },
     };
+  }
+
+  /**
+   * Mint one or more certificates so each is recorded in the CT log
+   * (notme-1b46a8). Shared by every ONLINE mint point: a bridge pair passes
+   * two certificates, a tier passes one.
+   *
+   * `mint(pin, ct)` mints every certificate under `pin` and gives certificate
+   * i the extensions `ct(i)`; `pems` lists the result's certificates in that
+   * same order. All issued by the root.
+   *
+   * With CT_LOG bound:
+   *   1. mint precertificates (`ct(i)` = the poison) under the pin;
+   *   2. submit every [precert, root] chain concurrently, each bounded;
+   *   3. ALL returned SCTs → re-mint under the SAME pin with each
+   *      certificate's own SCT list, so the SCT signs the final cert's bytes;
+   *   4. any failure → mint with no CT extension and backlog every final
+   *      chain. A partially logged set is never issued, and the mint is never
+   *      refused because of the log.
+   *
+   * With CT_LOG absent: one mint, no pin, no extension, no row — byte for
+   * byte what minting did before CT.
+   *
+   * ECMAScript #private: the DO's public surface is pinned at 62 methods.
+   */
+  async #mintLogged<P, R>(p: {
+    pin: P;
+    mint: (pin: P | undefined, ct: (i: number) => Extension[]) => Promise<R>;
+    pems: (r: R) => string[];
+  }): Promise<R> {
+    const log = this.env.CT_LOG;
+    if (!log) return p.mint(undefined, () => []);
+
+    const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
+    let rootB64: string;
+    let scts: (SctResponse | null)[];
+    try {
+      rootB64 = pemToB64(await this.getCACertificatePem());
+      const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
+      scts = await Promise.all(
+        p.pems(pre).map((pem) =>
+          submitPreChain(log, [pemToB64(pem), rootB64], DEFAULT_TIMEOUT_MS, path),
+        ),
+      );
+    } catch (err) {
+      // The root read is the only thing above that can throw; a CA that
+      // cannot produce its root has bigger problems, but the mint still must
+      // not fail on the log's account. No root, no chain to backlog.
+      console.error({ event: "ct.submit_failed", error: String(err) });
+      return p.mint(p.pin, () => []);
+    }
+
+    if (scts.every((s): s is SctResponse => s !== null)) {
+      try {
+        return await p.mint(p.pin, (i) => [sctListExtension([serialiseSct(scts[i]!)])]);
+      } catch (err) {
+        console.error({ event: "ct.embed_failed", error: String(err) });
+      }
+    } else {
+      console.warn({
+        event: "ct.unlogged",
+        failed: scts.flatMap((s, i) => (s === null ? [i] : [])),
+        of: scts.length,
+      });
+    }
+
+    const fin = await p.mint(p.pin, () => []);
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      for (const pem of p.pems(fin)) {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO ct_backlog (chain_json, created_at) VALUES (?, ?)",
+          JSON.stringify([pemToB64(pem), rootB64]),
+          now,
+        );
+      }
+    } catch (err) {
+      console.error({ event: "ct.backlog_write_failed", error: String(err) });
+    }
+    return fin;
   }
 
   /**

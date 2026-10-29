@@ -81,6 +81,11 @@ tasks:
       # Hermetic — its config declares DO bindings inline (no wrangler.toml,
       # no remote VPC binding), so it needs no CF creds and runs in CI.
       - pnpm exec vitest run --config vitest.workers.config.mts
+      # The CT-bound suites (notme-1b46a8): a SEPARATE pool config that binds
+      # CT_LOG to a stub log. Separate so the config above provably carries no
+      # binding — its suites are the evidence that an unbound deployment mints
+      # exactly as before CT, which a per-test toggle could not show.
+      - pnpm exec vitest run --config vitest.workers.ct.config.mts
 
   proxy:check:
     desc: Build + test the Rust mTLS proxy crate
