@@ -274,6 +274,11 @@ export async function renewTier(
     savePending: (p: PendingRenewal) => void;
     clearPending: () => void;
     persist?: (r: RenewalResult) => void;
+    /**
+     * Re-reads the generation after the request is reserved. A peer that completed in between
+     * (overlapping holders after a sleep or clock jump) advanced it; signing at the old one is a fork.
+     */
+    currentGeneration?: () => Promise<number | undefined>;
     /** Abort the POST after this long; an aborted request is not definitive. */
     fetchTimeoutMs?: number;
   },
@@ -296,6 +301,10 @@ export async function renewTier(
       ...(gen === undefined ? {} : { generation: gen }),
     });
     opts.savePending({ body, iat: now, generation: gen ?? 0 });
+    if (opts.currentGeneration && (await opts.currentGeneration()) !== gen) {
+      opts.clearPending(); // our own reservation, never sent
+      throw new Error("another renewal completed meanwhile — try again");
+    }
   }
   let sentGeneration = false;
   try {
@@ -449,7 +458,7 @@ function lockHandle(path: string, token: string) {
 export async function renewTierInDir(
   dir: string,
   load: () => Promise<{ authority: string; key: { privateKey: CryptoKey; spki: Uint8Array; pem: string }; generation?: number }>,
-  opts: { persist?: (r: RenewalResult) => void; fetchTimeoutMs?: number; lock?: LockOpts },
+  opts: { persist?: (r: RenewalResult) => void; fetchTimeoutMs?: number; lock?: LockOpts; /** test hook */ beforeReserve?: () => void },
   fetchFn: typeof fetch = fetch,
 ): Promise<RenewalResult> {
   const lock = acquireRenewLock(dir, opts.lock);
@@ -461,8 +470,12 @@ export async function renewTierInDir(
       {
         generation,
         pending: loadPending(dir),
-        savePending: (p) => savePendingExclusive(dir, p),
+        savePending: (p) => {
+          opts.beforeReserve?.();
+          savePendingExclusive(dir, p);
+        },
         clearPending: () => removePending(dir),
+        currentGeneration: async () => (await load()).generation,
         persist: opts.persist,
         fetchTimeoutMs: opts.fetchTimeoutMs,
       },
@@ -479,12 +492,23 @@ export function saveEnrolment(
   e: { keyPem: string; tierPem: string; rootPem: string; meta: Record<string, unknown> },
 ): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // An in-flight renewal would overwrite this enrolment with its own result.
+  let lock: ReturnType<typeof acquireRenewLock>;
+  try {
+    lock = acquireRenewLock(dir);
+  } catch {
+    throw new Error("a renewal is in progress — try again");
+  }
+  try {
   writeFileSync(join(dir, "tier.key.pem"), e.keyPem, { mode: 0o600 });
   chmodSync(join(dir, "tier.key.pem"), 0o600);
   writeFileSync(join(dir, "tier.pem"), e.tierPem);
   writeFileSync(join(dir, "root.pem"), e.rootPem);
   writeFileSync(join(dir, "tier.json"), JSON.stringify(e.meta, null, 2));
   removePending(dir);
+  } finally {
+    lock.release();
+  }
 }
 
 /**

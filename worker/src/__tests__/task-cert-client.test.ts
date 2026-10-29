@@ -428,11 +428,11 @@ describe("renewal with a generation", () => {
       const p1 = renewTierInDir(dir, load, { persist }, withFetch(async () => { await gate; return reply(200, { ...okBody, generation: 3 }); }, seen));
       await vi.waitFor(() => expect(seen).toHaveLength(1));
       await expect(renewTierInDir(dir, load, { persist }, withFetch(() => reply(200, okBody), seen))).rejects.toThrow("in progress");
-      expect(loads).toEqual(["g2"]); // the second never even read state while the first held the lock
+      expect(loads).toEqual(["g2", "g2"]); // load + the post-reserve re-check; the second never read state while the first held the lock
       release();
       await p1;
       await renewTierInDir(dir, load, { persist }, withFetch(() => reply(200, okBody), seen));
-      expect(loads).toEqual(["g2", "g3"]);
+      expect(loads).toEqual(["g2", "g2", "g3", "g3"]);
       expect(JSON.parse(seen[1]!).generation).toBe(3);
     });
 
@@ -479,6 +479,40 @@ describe("renewal with a generation", () => {
       savePendingExclusive(dir, pendingAt(1));
       expect(() => savePendingExclusive(dir, { body: "second", iat: NOW, generation: 5 })).toThrow("already saved");
       expect(loadPending(dir)!.body).toBe('{"sealed":1}');
+    });
+
+    it("a peer that completed between load and reserve stops us before any POST", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      writeFileSync(join(dir, "tier.json"), JSON.stringify({ generation: 2 }));
+      const load = async () => ({
+        authority: "https://a", key: k,
+        generation: JSON.parse(readFileSync(join(dir, "tier.json"), "utf8")).generation as number,
+      });
+      let posts = 0;
+      await expect(
+        renewTierInDir(dir, load, {
+          // The peer persists g+1 and clears its pending request after we read g.
+          beforeReserve: () => writeFileSync(join(dir, "tier.json"), JSON.stringify({ generation: 3 })),
+        }, withFetch(() => { posts++; return reply(200, okBody); })),
+      ).rejects.toThrow("another renewal completed meanwhile");
+      expect(posts).toBe(0);
+      expect(JSON.parse(readFileSync(join(dir, "tier.json"), "utf8")).generation).toBe(3);
+      expect(existsSync(join(dir, "renew-pending.json"))).toBe(false);
+    });
+
+    it("enrolling while a renewal holds the lock refuses and changes nothing", () => {
+      const dir = tmp();
+      writeFileSync(join(dir, "tier.json"), '{"old":true}');
+      writeFileSync(join(dir, "renew-pending.json"), JSON.stringify(pendingAt(1)));
+      const held = acquireRenewLock(dir);
+      expect(() => saveEnrolment(dir, { keyPem: "K", tierPem: "T", rootPem: "R", meta: { new: true } })).toThrow("renewal is in progress");
+      expect(readFileSync(join(dir, "tier.json"), "utf8")).toBe('{"old":true}');
+      expect(existsSync(join(dir, "renew-pending.json"))).toBe(true);
+      held.release();
+      saveEnrolment(dir, { keyPem: "K", tierPem: "T", rootPem: "R", meta: { new: true } });
+      expect(existsSync(join(dir, "renew-pending.json"))).toBe(false);
+      expect(existsSync(join(dir, "renew.lock"))).toBe(false);
     });
   });
 });
