@@ -70,6 +70,12 @@ tasks:
       # checking. tsconfig.test.json loads the cloudflare:test types + the
       # ProvidedEnv augmentation so env bindings + DO instances are typed.
       - pnpm exec tsc -p tsconfig.test.json
+      # Type-check the task-cert client (scripts/task-cert/*.ts) and its plain
+      # tests. Neither tsconfig above covers them: tsconfig.json excludes
+      # __tests__ and does not include scripts/, and tsconfig.test.json is
+      # *.do.test.ts only. Scoped to the task-cert files; other plain tests
+      # carry pre-existing type errors and are not yet in scope.
+      - pnpm exec tsc -p tsconfig.scripts.json
       - pnpm exec vitest run
       # Real-Durable-Object tests (*.do.test.ts) via vitest-pool-workers.
       # Hermetic — its config declares DO bindings inline (no wrangler.toml,

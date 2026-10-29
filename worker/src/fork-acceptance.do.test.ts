@@ -4,11 +4,14 @@
  * (notme-747cc7). The REAL task-cert client (scripts/task-cert/lib.ts
  * renewTier) runs unmodified against the REAL worker; only `fetchFn` is a
  * shim that turns the client's request into worker.fetch. Pending state is
- * held in memory (the workers pool has no node:fs), via renewTier's callbacks.
+ * held in memory via renewTier's callbacks (chosen for determinism; the client
+ * itself defaults to files on disk).
  *
- * Falsifiable: against the plan-start commit (no generation) it fails; each of
- * the atomic generation guard, the client's pending-resend branch and the v1
- * lock makes at least one scenario here fail when removed.
+ * Falsifiable: against the plan-start commit (no generation) it fails; removing
+ * the client's pending-resend branch or the v1 lock makes at least one scenario
+ * here fail. It does NOT pin the atomic `generation = ?` guard: removing that
+ * guard leaves these scenarios green, because they run requests sequentially.
+ * That guard is pinned by tier-generation.do.test.ts's direct-injection test.
  */
 import worker from "../worker";
 import { env, runInDurableObject } from "cloudflare:test";
