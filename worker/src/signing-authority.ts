@@ -2081,6 +2081,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n"),
     ];
     if (change.n !== 1) return { ok: false, reason: "invalid_grant" };
+    // At most one ACTIVE enrollment per key (notme-747cc7). Re-enrolling a
+    // key retires its earlier enrollments, revoked or not — kept as
+    // 'superseded' for the record. Otherwise renewal (which looks up by key)
+    // could keep counting the old enrollment's generation and read the new
+    // one's generation 0 as a fork; and a revoked old enrollment would hide
+    // the new one, though re-enrolling is how a machine recovers from a fork.
+    // Same synchronous block as the activation: no request sees two.
+    this.ctx.storage.sql.exec(
+      "UPDATE tier_enrolments SET status = 'superseded' WHERE key_fingerprint = ? AND status = 'active' AND device_code_hash != ?",
+      row.key_fingerprint,
+      deviceCodeHash,
+    );
     // A re-enrolled key starts its generations over: digests recorded under
     // an earlier enrollment of the same key must not read as this one's.
     this.ctx.storage.sql.exec(

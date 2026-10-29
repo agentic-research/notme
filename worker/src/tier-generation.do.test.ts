@@ -55,11 +55,11 @@ async function human(scopes = ["bridgeCert", "certMint"]) {
 }
 
 /** Enroll a machine end to end; returns its key and the collected tier. */
-async function enrolled() {
-  const m = await machine();
+async function enrolled(m?: Machine, renewDays?: number) {
+  m ??= await machine();
   const start = (await (await post("/cert/issuing-ca/device", { public_key: m.pem })).json()) as { device_code: string; user_code: string };
   const h = await human();
-  const ap = await post("/cert/issuing-ca/device/approve", { user_code: start.user_code }, { cookie: h.cookie });
+  const ap = await post("/cert/issuing-ca/device/approve", { user_code: start.user_code, ...(renewDays ? { renew_days: renewDays } : {}) }, { cookie: h.cookie });
   expect(ap.status, await ap.clone().text()).toBe(200);
   const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, m.kp.privateKey, tierEnrolmentBinding(m.spki, await deviceCodeHash(start.device_code)))));
   const tok = await post("/cert/issuing-ca/device/token", { device_code: start.device_code, proof });
@@ -237,10 +237,77 @@ describe("what is not a fork", () => {
     expect(row.revoked_at).toBeNull();
   });
 
+  it("an invalid proof at the current generation leaves the counter alone", async () => {
+    const { m } = await enrolled();
+    await expectOk(await renew(m, 0), 1);
+    const thief = await machine();
+    await expectErr(await renew(m, 1, nowS(), thief.kp.privateKey), 401, "invalid_proof");
+    const row = await rowOf(m);
+    expect(row.generation).toBe(1);
+    expect(row.revoked_at).toBeNull();
+    await expectOk(await renew(m, 1), 2);
+  });
+
   it("a generation ahead of the authority is stale, never revoked", async () => {
     const { m } = await enrolled();
     await expectErr(await renew(m, 5), 401, "stale_proof");
     expect((await rowOf(m)).revoked_at).toBeNull();
     await expectOk(await renew(m, 0), 1);
+  });
+});
+
+describe("re-enrolling a key", () => {
+  /** Every row this key has ever had, oldest first. */
+  async function rowsOf(m: Machine) {
+    const f = await fp(m.spki);
+    return runInDurableObject(authority(), (a) =>
+      (a as SigningAuthority)["ctx"].storage.sql
+        .exec("SELECT status, generation, revoked_at, renew_until FROM tier_enrolments WHERE key_fingerprint = ? ORDER BY rowid", f)
+        .toArray() as Array<{ status: string; generation: number; revoked_at: number | null; renew_until: number }>,
+    );
+  }
+
+  it("re-enrolling the same key supersedes the old enrollment; renewal counts the new one", async () => {
+    // The old enrollment has the LONGER horizon, so a lookup that picked by
+    // horizon would keep renewing against it — and read the new enrollment's
+    // generation 0 as a fork of the old one's generation 2.
+    const { m } = await enrolled(undefined, 30);
+    await expectOk(await renew(m, 0), 1);
+    await expectOk(await renew(m, 1), 2);
+    const again = await enrolled(m, 1);
+    expect(again.tier.generation).toBe(0);
+    await expectOk(await renew(m, 0), 1);
+    const rows = await rowsOf(m);
+    expect(rows.map((r) => r.status)).toEqual(["superseded", "active"]);
+    expect(rows[0].revoked_at).toBeNull();
+    expect(rows[1].generation).toBe(1);
+  });
+
+  it("re-enrolling after a fork recovers", async () => {
+    // Re-enrollment is the documented recovery after a fork, so the revoked
+    // enrollment must not keep hiding the new one.
+    const { m } = await enrolled(undefined, 30);
+    const t = nowS();
+    await expectOk(await renew(m, 0, t), 1);
+    await expectErr(await renew(m, 0, t + 1), 403, "fork_detected");
+    await enrolled(m, 1);
+    await expectOk(await renew(m, 0), 1);
+    expect((await rowsOf(m)).map((r) => r.status)).toEqual(["superseded", "active"]);
+  });
+
+  it("collect clears a re-enrolled key's digest rows", async () => {
+    const { m } = await enrolled();
+    await expectOk(await renew(m, 0), 1);
+    await expectOk(await renew(m, 1), 2);
+    const f = await fp(m.spki);
+    const count = () =>
+      runInDurableObject(authority(), (a) =>
+        (a as SigningAuthority)["ctx"].storage.sql
+          .exec<{ n: number }>("SELECT COUNT(*) AS n FROM tier_renewal_digests WHERE key_fingerprint = ?", f)
+          .toArray()[0].n,
+      );
+    expect(await count()).toBe(2);
+    await enrolled(m);
+    expect(await count()).toBe(0);
   });
 });
