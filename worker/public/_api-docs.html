@@ -530,7 +530,7 @@
   "clone_policy": "singleton"
 }</div>
           <div class="ep-note"><code>renew_days</code> is 1, 7 or 30 (default 7): how long the machine may renew without a human.</div>
-          <div class="ep-note"><code>clone_policy</code> is <code>singleton</code> (the default), <code>replicas:2</code>, <code>replicas:4</code> or <code>replicas:8</code>. Anything other than <code>singleton</code> needs the live <code>authorityManage</code> grant and a <code>renew_days</code> of at most 7 (30 is refused with 400). The policy is shown in the enrollments list and in the machine's collect response.</div>
+          <div class="ep-note"><code>clone_policy</code> is <code>singleton</code> (the default), <code>replicas:2</code>, <code>replicas:4</code> or <code>replicas:8</code>. Anything other than <code>singleton</code> needs the live <code>authorityManage</code> grant and a <code>renew_days</code> of at most 7 (30 is refused with 400). The policy is shown in the enrollments list and in the machine's collect response. Phase 1 records the policy only. There is no branching yet, so every policy behaves as singleton, and a second copy renewing is <code>fork_detected</code>.</div>
           <div class="ep-label">response</div>
           <div class="ep-response">{
   "ok": true,
@@ -566,7 +566,7 @@
           <div class="ep-response">// 404 unknown_key   400 invalid_key
 // 401 stale_proof   401 invalid_proof
 // 403 revoked | horizon_passed | epoch_changed | approval_withdrawn | fork_detected</div>
-          <div class="ep-note"><code>fork_detected</code> (403): a copy of this machine renewed, so the enrollment is shut off for both; the human runs <code>enroll</code> again. An exact resend of a request that was already accepted (within a one-hour window) is treated as a retry, not a fork; a replay of an accepted request is <code>stale_proof</code> and revokes nothing.</div>
+          <div class="ep-note"><code>fork_detected</code> (403): a copy of this machine renewed, so the enrollment (one shared key) is shut off; the human runs <code>enroll</code> again. An exact resend of a request that was already accepted (within a one-hour window) is treated as a retry, not a fork; a replay of an accepted request is <code>stale_proof</code> and revokes nothing.</div>
         </div>
       </div>
 

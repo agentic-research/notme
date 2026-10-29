@@ -141,7 +141,7 @@ graph LR
 | `horizon_passed` | the 1/7/30 days ran out | `enroll` again |
 | `epoch_changed` | the authority's mass-revocation lever was pulled | `enroll` again |
 | `approval_withdrawn` | you no longer hold `certMint`, or the granted scopes | restore the grant, or `enroll` |
-| `fork_detected` | a copy of this machine renewed; both are shut off | `enroll` again |
+| `fork_detected` | a copy of this machine renewed; the enrollment is shut off | `enroll` again |
 
 the machine's tier key is the approval: whoever holds it can renew until you revoke the machine or the horizon passes. pick the shortest horizon that covers your pauses.
 
