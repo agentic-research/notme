@@ -32,8 +32,9 @@ export async function deviceCodeHash(deviceCode: string): Promise<Uint8Array> {
  *
  *   "notme/tier-renew/v1\0" || SPKI || uint64be(iat)
  *
- * iat must be within RENEWAL_SKEW_S of the authority's clock, so a proof is
- * only usable briefly. Replaying one is harmless anyway: renewal returns a
+ * iat may be up to RENEWAL_RETRY_WINDOW_S old and at most RENEWAL_SKEW_S
+ * ahead of the authority's clock, so a request that never arrived can be
+ * resent as is (notme-747cc7). Replaying one is harmless: renewal returns a
  * PUBLIC certificate for a key the replayer does not hold. What the proof
  * establishes is that the renewer still holds the tier key.
  */

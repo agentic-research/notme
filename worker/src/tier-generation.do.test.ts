@@ -130,6 +130,24 @@ describe("a copy renewing is a fork", () => {
     await expectErr(await renew(m, 1), 403, "fork_detected");
   });
 
+  it("the human's enrollment list says why a forked machine stopped", async () => {
+    const { m, h } = await enrolled();
+    const list = async () =>
+      (await (await call(`${ORIGIN}/cert/issuing-ca/enrollments`, { headers: { cookie: h.cookie } })).json()) as Array<{
+        revoked_at: number | null;
+        revoke_reason: string | null;
+      }>;
+    const before = await list();
+    expect(before).toHaveLength(1);
+    expect(before[0]).toHaveProperty("revoke_reason", null);
+    const t = nowS();
+    await expectOk(await renew(m, 0, t), 1);
+    await expectErr(await renew(m, 0, t + 1), 403, "fork_detected");
+    const [after] = await list();
+    expect(after.revoked_at).not.toBeNull();
+    expect(after.revoke_reason).toBe("fork_detected");
+  });
+
   it("a freshly signed request at current-1 is a fork, not a retry", async () => {
     const { m } = await enrolled();
     const t = nowS();
@@ -249,6 +267,32 @@ describe("what is not a fork", () => {
     await expectOk(await renew(m, 1), 2);
   });
 
+  it("a request that never arrived, resent 121 s and 3599 s later at the current generation, renews", async () => {
+    // The honest machine was offline (or met a 5xx or 429): its saved request
+    // is resent byte for byte with its original iat, past the 120 s skew.
+    const { m } = await enrolled();
+    await expectOk(await send(await renewalBody(m, 0, nowS() - 121)), 1);
+    await expectOk(await send(await renewalBody(m, 1, nowS() - 3599)), 2);
+    const row = await rowOf(m);
+    expect(row.generation).toBe(2);
+    expect(row.revoked_at).toBeNull();
+  });
+
+  it("a request older than the retry window at the current generation is stale, not revoked", async () => {
+    const { m } = await enrolled();
+    await expectErr(await send(await renewalBody(m, 0, nowS() - 3601)), 401, "stale_proof");
+    const row = await rowOf(m);
+    expect(row.generation).toBe(0);
+    expect(row.revoked_at).toBeNull();
+    await expectOk(await renew(m, 0), 1);
+  });
+
+  it("an iat beyond the skew ahead is stale at the current generation", async () => {
+    const { m } = await enrolled();
+    await expectErr(await send(await renewalBody(m, 0, nowS() + 121)), 401, "stale_proof");
+    expect((await rowOf(m)).generation).toBe(0);
+  });
+
   it("a generation ahead of the authority is stale, never revoked", async () => {
     const { m } = await enrolled();
     await expectErr(await renew(m, 5), 401, "stale_proof");
@@ -320,9 +364,10 @@ async function renewV1(m: Machine, iat = nowS()) {
 }
 
 describe("binding v1 is retired", () => {
-  it("a new enrollment refuses v1 renewal", async () => {
+  it("a new enrollment refuses v1 renewal, by its own name", async () => {
+    // binding_v2_required, not invalid_proof: the client says "update task-cert", not "approval ended".
     const { m } = await enrolled();
-    await expectErr(await renewV1(m), 401, "invalid_proof");
+    await expectErr(await renewV1(m), 400, "binding_v2_required");
     expect((await rowOf(m)).generation).toBe(0);
   });
 
@@ -334,7 +379,19 @@ describe("binding v1 is retired", () => {
     });
     expect((await renewV1(m)).status).toBe(200);
     await expectOk(await renew(m, 0), 1);
-    await expectErr(await renewV1(m), 401, "invalid_proof");
+    await expectErr(await renewV1(m), 400, "binding_v2_required");
+  });
+
+  it("a legacy enrollment accepts a v1 request up to the retry window old", async () => {
+    const { m } = await enrolled();
+    const f = await fp(m.spki);
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", f);
+    });
+    expect((await renewV1(m, nowS() - 121)).status).toBe(200);
+    expect((await renewV1(m, nowS() - 3599)).status).toBe(200);
+    await expectErr(await renewV1(m, nowS() - 3601), 401, "stale_proof");
+    expect((await rowOf(m)).revoked_at).toBeNull();
   });
 });
 

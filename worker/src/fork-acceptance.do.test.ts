@@ -109,6 +109,40 @@ describe("mint path phase 1, end to end with the real client", () => {
     expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
   });
 
+  it("a request that never arrived is resent minutes later and renews", async () => {
+    const c = await enroll();
+    // Offline on resume: the connection fails before any byte reaches the
+    // authority (no error code the client could prove that from, so it keeps
+    // the request). The client signed it 130 s before the resend below.
+    const signedAt = Date.now() - 130_000;
+    const now = vi.spyOn(Date, "now").mockReturnValue(signedAt);
+    // Never calls the worker.
+    const offline: Fetch = async () => {
+      throw new TypeError("fetch failed");
+    };
+    try {
+      await expect(runClient(c, offline)).rejects.toThrow();
+    } finally {
+      now.mockRestore();
+    }
+    expect(c.pending, "the request is kept for a resend").not.toBeNull();
+    expect(Math.floor(Date.now() / 1000) - c.pending!.iat).toBeGreaterThanOrEqual(121);
+
+    // Back online, past the 120 s skew: the same bytes renew at generation 0.
+    const sent: string[] = [];
+    const watching: Fetch = (url, init) => {
+      sent.push(String(init?.body));
+      return direct(url, init);
+    };
+    const pendingBody = c.pending!.body;
+    const r = await runClient(c, watching);
+    expect(sent).toEqual([pendingBody]);
+    expect(r.generation).toBe(1);
+    expect(c.pending).toBeNull();
+    expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
+    expect((await runClient(c)).generation).toBe(2);
+  });
+
   it("a copied machine is caught at renewal, and both lines are shut off", async () => {
     const original = await enroll();
     const copy = copyOf(original);
@@ -175,6 +209,6 @@ describe("mint path phase 1, end to end with the real client", () => {
     expect(v2.generation).toBe(1);
     // v1 is retired for this machine now.
     const refused = await refusal(runClient(copyOf({ ...c, generation: undefined }), direct, { v1: true }));
-    expect(refused?.reason).toBe("invalid_proof");
+    expect(refused?.reason).toBe("binding_v2_required");
   });
 });

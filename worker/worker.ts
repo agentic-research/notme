@@ -3159,12 +3159,13 @@ export default {
         if (!r.ok) {
           const status =
             r.reason === "unknown_key" ? 404
-            : r.reason === "invalid_key" ? 400
+            : r.reason === "invalid_key" || r.reason === "binding_v2_required" ? 400
             : r.reason === "stale_proof" || r.reason === "invalid_proof" ? 401
             : 403;
           // revoked / horizon_passed / epoch_changed / approval_withdrawn /
           // fork_detected all mean "a human must approve again" — named, so
-          // the machine can say which.
+          // the machine can say which. binding_v2_required (400) is not one:
+          // a v1 request to an enrollment that speaks v2 — update the client.
           return Response.json({ error: r.reason }, { status });
         }
         const { ok: _ok, renewUntil, generation, ...tier } = r;

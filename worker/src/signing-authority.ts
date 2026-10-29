@@ -2153,6 +2153,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   //     because nobody can tell which holder is the honest one;
   //   - an old request nobody accepted: stale, not revoked.
   // A generation ahead of the authority is malformed: stale, never revoked.
+  // At g == current a valid proof is accepted with iat up to the retry
+  // window old (and no more than the skew ahead): the honest resend of a
+  // request that never arrived.
   // Nothing is written before the proof verifies, so a stranger posting a
   // stale generation for someone's public key cannot shut it off.
 
@@ -2171,7 +2174,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           | "horizon_passed"
           | "epoch_changed"
           | "approval_withdrawn"
-          | "fork_detected";
+          | "fork_detected"
+          | "binding_v2_required";
       }
   > {
     this.#ensureTierEnrolmentSchema();
@@ -2220,6 +2224,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const { verifyEd25519PopProof } = await import("./auth/pop");
     const v2 = params.generation !== undefined;
     const fresh = Number.isSafeInteger(params.iat) && Math.abs(now - params.iat) <= RENEWAL_SKEW_S;
+    // At the CURRENT generation a valid proof may be up to the retry window
+    // old: a request that never reached the authority (offline on resume, a
+    // 5xx, a 429) is resent byte for byte, with its original iat. Accepting
+    // it is safe — a key holder can sign any iat, and a captured request
+    // nobody accepted only advances the counter; the honest resend of the
+    // same bytes then lands on the retry path.
+    const inRetryWindow =
+      Number.isSafeInteger(params.iat) &&
+      params.iat >= now - RENEWAL_RETRY_WINDOW_S &&
+      params.iat <= now + RENEWAL_SKEW_S;
     let digest = "";
     if (v2) {
       // v2: verify FIRST — a retry carries its original (older) iat, so
@@ -2237,8 +2251,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // copied key could use it to renew around the fork check: refused once
       // the enrollment speaks v2. NULL (a legacy row) still accepts v1 until
       // its first v2 renewal sets binding_version = 2.
-      if (row.binding_version === 2) return { ok: false, reason: "invalid_proof" };
-      if (!fresh) return { ok: false, reason: "stale_proof" };
+      // A distinct reason, so the machine says "update task-cert", not "approval ended".
+      if (row.binding_version === 2) return { ok: false, reason: "binding_v2_required" };
+      if (!inRetryWindow) return { ok: false, reason: "stale_proof" };
       if (!(await verifyEd25519PopProof(tierRenewalBinding(spki, params.iat), key, params.proof))) {
         return { ok: false, reason: "invalid_proof" };
       }
@@ -2267,6 +2282,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         iat: params.iat,
         digest,
         fresh,
+        inRetryWindow,
         now,
         retryWindowS: RENEWAL_RETRY_WINDOW_S,
       });
@@ -2301,6 +2317,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     iat: number;
     digest: string;
     fresh: boolean;
+    /** iat ∈ [now − retry window, now + skew]: what the CURRENT generation accepts. */
+    inRetryWindow: boolean;
     now: number;
     retryWindowS: number;
   }): { ok: true; generation: number } | { ok: false; reason: "stale_proof" | "fork_detected" | "revoked" } {
@@ -2308,7 +2326,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const g = p.generation;
     if (g > p.row.generation) return { ok: false, reason: "stale_proof" };
     if (g === p.row.generation) {
-      if (!p.fresh) return { ok: false, reason: "stale_proof" };
+      if (!p.inRetryWindow) return { ok: false, reason: "stale_proof" };
       // The row was read before this request's awaits, so another renewal
       // may have claimed g since: the generation guard is what makes exactly
       // one of two concurrent claims win.
@@ -2386,16 +2404,21 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   /** A principal's enrolled machines — what the human approved, and its state. */
   async listTierEnrolments(principalId: string): Promise<
-    Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; scopes: string[]; clone_policy: string; generation: number }>
+    Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; revoke_reason: string | null; scopes: string[]; clone_policy: string; generation: number }>
   > {
     this.#ensureTierEnrolmentSchema();
+    // revoke_reason (null unless revoked, e.g. fork_detected) so the human sees WHY a machine stopped.
     const rows = this.ctx.storage.sql
       .exec(
-        "SELECT key_fingerprint, status, renew_until, revoked_at, granted_scopes, clone_policy, generation FROM tier_enrolments WHERE principal_id = ? AND status = 'active'",
+        "SELECT key_fingerprint, status, renew_until, revoked_at, revoke_reason, granted_scopes, clone_policy, generation FROM tier_enrolments WHERE principal_id = ? AND status = 'active'",
         principalId,
       )
-      .toArray() as Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; granted_scopes: string; clone_policy: string; generation: number }>;
-    return rows.map(({ granted_scopes, ...r }) => ({ ...r, scopes: JSON.parse(granted_scopes) }));
+      .toArray() as Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; revoke_reason: string | null; granted_scopes: string; clone_policy: string; generation: number }>;
+    return rows.map(({ granted_scopes, ...r }) => ({
+      ...r,
+      revoke_reason: r.revoked_at === null ? null : (r.revoke_reason ?? null),
+      scopes: JSON.parse(granted_scopes),
+    }));
   }
 
   /**
