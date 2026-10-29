@@ -91,6 +91,50 @@ this section records why SPIRE still doesn't fit:
 Also borrowed: OAuth refresh-token rotation with reuse detection (§5.1), and
 Static CT for the receipt format (§5.4).
 
+## 3a. Where this sits: signet, sigid, sigpol, Interlace
+
+signet's ADR-011 names three concerns:
+
+| | Question | Role here |
+|---|---|---|
+| signet | "prove you hold this key" | verifiers: proof of possession, chain, revocation |
+| sigid | "who are you?" | minting: "mint a cert **if** policy allows", plus the verified context a verifier extracts |
+| sigpol | "what are you allowed to do?" | the criteria |
+
+The mint path is sigid-side minting and does not add a fourth concern. Three
+existing designs carry most of the weight:
+
+- **Criteria are distributed as sigpol data.** The definitions of the
+  criteria, their clone policies, and who may approve deploys travel as a
+  **Trust Policy Bundle** (signet ADR-011): signed, with an epoch and a
+  monotonic seqno for rollback protection, verified offline, and delivered
+  over the same path as the CA bundle.
+  - A certificate's `.1.10` *names* a criteria; the bundle *defines* it.
+  - So verifiers need no hardcoded definitions, and "ship three" means three
+    entries in notme's default bundle.
+  - The bundle checker exists in signet's `pkg/policy`; SCIM ingestion does
+    not, and is not needed here.
+- **Verifiers produce sigid-shaped context** (signet `sigid-requirements.md`):
+  - `Provenance.Chain` is the lineage: tier, then task, then subtask. "Chase
+    the origin" becomes a field.
+  - `Environment` carries the criteria's evidence: rootfs or
+    `confinementDigest`, and attestations.
+  - `Boundary` carries the scope limits.
+- **Interlace makes copies visible at the consumer, before any hardware**
+  (cloister `interlace-spec/0.1.0`). Its invariant is "silence is evidence":
+  every authenticated call is recorded per peer, with counters, and a peer
+  can request its own chain back by disclosure.
+  - The honest path already keeps a ledger of everything it minted
+    (`~/.notme/tasks/ledger.jsonl`).
+  - Comparing that ledger against a consumer's disclosed record exposes any
+    certificate in use that the path **never minted**: a copy, caught where
+    it was used.
+  - That is a population check, and it covers the gap left by deferring
+    receipts (§5.4): it detects rather than refuses.
+  - Known hazard: Interlace and notme overlap on `.1.5` and `.1.6` under the
+    shared placeholder arc. LLO tells them apart today; the PEN
+    (notme-229dc3) removes the overlap.
+
 ## 4. Concepts
 
 | Term | Meaning |
@@ -401,7 +445,9 @@ Acceptance:
 | `task-cert` CLI | `serve`; local log; checkpoint at renew | `enroll`, `mint`, `renew`, `revoke`, `verify`, `status` |
 | OID registry | `.1.10` allocated | `.1.1`–`.1.9`; `.1.7` stays LLO's |
 | revocation levers | fork detection is a fifth, automatic lever | the four in the README |
-| signet `verify` | must enforce `.1.10` and receipts to acknowledge | `.1.8` discriminator (signet-751af3 fix) |
+| signet `verify` | must enforce `.1.10` against the sigpol bundle's definition, and later receipts, to acknowledge | `.1.8` discriminator (signet-751af3 fix) |
+| signet `pkg/policy` (sigpol) | a criteria section in the Trust Policy Bundle | epoch, seqno, offline checking |
+| Interlace (cloister) | the path's ledger is compared against Interlace disclosure | leases, counters, "silence is evidence" |
 | LLO `cert_chain.rs` | reads `.1.10`; `llo-run/1` binds the run's digest | marker-based profile detection |
 | cloister | inherits the availability coupling (§9) | fails closed as today |
 | rosary-056d96 | dispatch identity becomes `agent-session/1` tasks | — |
@@ -443,7 +489,7 @@ enforced as configuration in each verifier, never hardcoded.
 | 2 | `.1.10` criteria + the three definitions + `task-cert verify` enforcement | a "deploy" certificate that's two hours old is refused |
 | 3 | `task-cert serve` over UDS (per-unit sockets / handles); HTTP/gRPC opt-in | workloads stop holding tiers |
 | 4 | `deploy/1` push approval (`deployApprove` grant, Web Push, request-bound WebAuthn) and the host-side mount lever | approve an agent's deploy from your phone; pull a task's workspace instantly |
-| 5 | LLO integration (`llo-run/1`), signet and LLO enforcement, log of logs into notme-ct | the §7 proof end to end |
+| 5 | LLO integration (`llo-run/1`); signet and LLO enforcement; criteria in a sigpol Trust Policy Bundle; ledger-vs-Interlace-disclosure population check (§3a); log of logs into notme-ct | the §7 proof end to end, with copies detected where they are used |
 | 6 | Secure Enclave / TPM custody of the path key (P-256 tier) **plus receipts**: local log, embedded SCTs, checkpoint anchoring (§5.4) | the key cannot leave the host, and certificates minted outside the path are refused at verify time |
 
 ## 11. Left to the builder
