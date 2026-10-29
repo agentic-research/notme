@@ -530,7 +530,7 @@
   "clone_policy": "singleton"
 }</div>
           <div class="ep-note"><code>renew_days</code> is 1, 7 or 30 (default 7): how long the machine may renew without a human.</div>
-          <div class="ep-note"><code>clone_policy</code> is <code>singleton</code> (the default), <code>replicas:2</code>, <code>replicas:4</code> or <code>replicas:8</code>. Anything other than <code>singleton</code> needs the live <code>authorityManage</code> grant and a <code>renew_days</code> of at most 7 (30 is refused with 400). The policy is shown in the enrollments list and in the machine's collect response. Phase 1 records the policy only. There is no branching yet, so every policy behaves as singleton: a newly signed renewal at a generation another copy already advanced past is <code>fork_detected</code>.</div>
+          <div class="ep-note"><code>clone_policy</code> is <code>singleton</code> (the default), <code>replicas:2</code>, <code>replicas:4</code> or <code>replicas:8</code>. Anything other than <code>singleton</code> needs the live <code>authorityManage</code> grant and a <code>renew_days</code> of at most 7 (30 is refused with 400). The policy is shown in the enrollments list and in the machine's collect response. Phase 1 records the policy only. There is no branching yet, so every policy behaves as singleton: a renewal that is fresh to the authority's clock (<code>iat</code> within 120 s), at a generation already spent, and different from the request recorded for that generation is <code>fork_detected</code> and shuts the enrollment off. One signed on a clock more than 120 s off gets <code>stale_proof</code> instead.</div>
           <div class="ep-label">response</div>
           <div class="ep-response">{
   "ok": true,

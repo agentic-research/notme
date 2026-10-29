@@ -151,7 +151,7 @@ the machine's tier key is the approval: whoever holds it can renew until you rev
 |---|---|---|
 | `task-cert revoke --task X` | X and everything under it, on that machine | next mint; issued certs live out ≤ 5 min |
 | `POST /cert/issuing-ca/enrollments/revoke` | one machine | next renewal (≤ 1 h) |
-| fork detection | one machine, automatic | a copy is detected when a *newly signed* renewal arrives at a generation the other line has already advanced past: whichever line sends it is refused, and the enrollment is shut off. if the copy renews first, the honest machine is the one refused — that refusal is the alarm. an honest machine that is instead resending an old request (one more than 120 s old) is not judged a fork: it reports "renewal state lost" and must re-enroll |
+| fork detection | one machine, automatic | the enrollment is shut off by a renewal that is *fresh* to the authority's clock (its `iat` within 120 s), at a generation already spent, and different from the request recorded for that generation. whichever line sends it is refused. if the copy renews first, the honest machine is the one refused — that refusal is the alarm. a request signed on a clock more than 120 s off, or an old request being resent, gets `stale_proof` instead: nothing is revoked, the machine is told to check its clock, and it keeps the request (it recovers if the clock is corrected within the hour; otherwise re-enroll) |
 | revoke a grant | every machine that grant approved | next renewal |
 | `POST /admin/revoke-epoch` | everything this authority issued | ≤ 5 min for online verifiers |
 

@@ -348,6 +348,51 @@ describe("renewal with a generation", () => {
       "the authority refused the timestamp — check this machine's clock; the request is kept and will be resent");
   });
 
+  it("an approval_withdrawn on a FIRST attempt keeps pending: restoring the grant makes the same bytes acceptable", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    const err = await renewTier("https://a", k, h.opts({ generation: 1 }), withFetch(() => reply(403, { error: "approval_withdrawn" }))).catch((e) => e);
+    expect(err).toBeInstanceOf(AuthorityRefusal);
+    expect(err.reason).toBe("approval_withdrawn");
+    expect(h.events).toEqual(["save"]);
+    expect(explainRenewalFailure(err).message).toBe(
+      "the approval for this machine was withdrawn — the request is kept and will be resent if the grant is restored; otherwise run `task-cert enroll` and approve again");
+  });
+
+  it("only refusals the authority could never reverse clear a first attempt", async () => {
+    const final = ["invalid_key", "invalid_proof", "binding_v2_required", "revoked", "fork_detected", "horizon_passed", "epoch_changed", "unknown_key", "bad_request"];
+    for (const reason of final) {
+      const h = harness();
+      await expect(renewTier("https://a", await generateTierKey(), h.opts({ generation: 1 }), withFetch(() => reply(400, { error: reason })))).rejects.toThrow();
+      expect(h.events, reason).toEqual(["save", "clear"]);
+    }
+    for (const reason of ["stale_proof", "approval_withdrawn"]) {
+      const h = harness();
+      await expect(renewTier("https://a", await generateTierKey(), h.opts({ generation: 1 }), withFetch(() => reply(403, { error: reason })))).rejects.toThrow();
+      expect(h.events, reason).toEqual(["save"]);
+    }
+  });
+
+  it("a RESEND refused for its timestamp keeps pending and says the clock can recover it", async () => {
+    freeze();
+    const k = await generateTierKey();
+    const h = harness();
+    const err = await renewTier("https://a", k, h.opts({ pending: pendingAt(10) }), withFetch(() => reply(401, { error: "stale_proof" }))).catch((e) => e);
+    expect(h.events).toEqual([]);
+    expect(err.message).not.toMatch(/state lost/);
+    expect(explainRenewalFailure(err).message).toBe(
+      "the authority refused the timestamp — check this machine's clock; the request is kept and will recover if the clock is corrected within the hour; otherwise run `task-cert enroll` to approve this machine again");
+  });
+
+  it("a RESEND refused as approval_withdrawn keeps pending and says a restored grant recovers it", async () => {
+    freeze();
+    const k = await generateTierKey();
+    const h = harness();
+    const err = await renewTier("https://a", k, h.opts({ pending: pendingAt(10) }), withFetch(() => reply(403, { error: "approval_withdrawn" }))).catch((e) => e);
+    expect(h.events).toEqual([]);
+    expect(explainRenewalFailure(err).message).toMatch(/withdrawn — the request is kept and will be resent if the grant is restored/);
+  });
+
   it("a definitive refusal on a FIRST attempt clears pending and throws the reason", async () => {
     const k = await generateTierKey();
     const h = harness();

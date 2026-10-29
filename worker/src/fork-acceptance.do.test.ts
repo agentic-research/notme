@@ -13,7 +13,9 @@
  * guard leaves these scenarios green, because they run requests sequentially.
  * That guard is pinned by tier-generation.do.test.ts's direct-injection test.
  * Clearing the pending request on a first-attempt stale_proof makes the
- * clock-ahead scenario fail (the honest re-sign is then fork_detected).
+ * clock-ahead scenario fail, and clearing it on a first-attempt
+ * approval_withdrawn makes the withdrawn-approval scenario fail (in each, the
+ * honest re-sign is then fork_detected).
  */
 import worker from "../worker";
 import { env, runInDurableObject } from "cloudflare:test";
@@ -37,7 +39,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 type Key = { privateKey: CryptoKey; spki: Uint8Array; pem: string };
 
 /** What a machine holds on disk: its key and the generation of its last tier. */
-type Client = { key: Key; generation: number | undefined; pending: PendingRenewal | null; human: { cookie: string } };
+type Client = { key: Key; generation: number | undefined; pending: PendingRenewal | null; human: { cookie: string; pid: string } };
 
 async function enroll(): Promise<Client> {
   const kp = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
@@ -54,7 +56,7 @@ async function enroll(): Promise<Client> {
   const tok = await post("/cert/issuing-ca/device/token", { device_code: start.device_code, proof });
   expect(tok.status, await tok.clone().text()).toBe(200);
   const tier = (await tok.json()) as { generation?: number };
-  return { key: { privateKey: kp.privateKey, spki, pem }, generation: tier.generation, pending: null, human: { cookie } };
+  return { key: { privateKey: kp.privateKey, spki, pem }, generation: tier.generation, pending: null, human: { cookie, pid } };
 }
 
 /** Copy the machine's disk: same key, same generation, its own pending slot. */
@@ -243,6 +245,48 @@ describe("mint path phase 1, end to end with the real client", () => {
 
       clock = T + 111_000;
       expect((await runClient(c)).generation).toBe(2);
+      expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("a withdrawn approval: the refused request is kept, and a replay after the grant returns cannot make the honest resend a fork", async () => {
+    const c = await enroll();
+    await authority().revokeCapability(c.human.pid, "certMint", "test");
+    let captured: { url: string; init: RequestInit } | undefined;
+    const capturing: Fetch = (url, init) => {
+      captured ??= { url, init: { ...init!, signal: undefined } };
+      return direct(url, init);
+    };
+    const refused = await refusal(runClient(c, capturing));
+    expect(refused?.reason).toBe("approval_withdrawn");
+    expect(c.pending, "a reversible refusal keeps the request").not.toBeNull();
+    expect(c.pending!.body).toBe(String(captured!.init.body));
+
+    // The grant comes back; an attacker who captured the body replays it first.
+    await runInDurableObject(authority(), async (a) => {
+      const { grantCapability } = await import("./auth/principals");
+      grantCapability((a as SigningAuthority)["ctx"].storage.sql, c.human.pid, "certMint", "test");
+    });
+    const replay = await direct(captured!.url, captured!.init);
+    expect(replay.status, await replay.clone().text()).toBe(200);
+
+    // Minutes later the honest machine runs again (a NEW request signed now
+    // would carry a different iat, so a different digest: a fork). It resends
+    // the same bytes instead: a retry, nothing revoked.
+    const later = Date.now() + 300_000;
+    const now = vi.spyOn(Date, "now").mockReturnValue(later);
+    try {
+      const sent: string[] = [];
+      const watching: Fetch = (url, init) => {
+        sent.push(String(init?.body));
+        return direct(url, init);
+      };
+      const r = await runClient(c, watching);
+      expect(sent).toEqual([String(captured!.init.body)]);
+      expect(r.generation).toBe(1);
+      expect(c.pending).toBeNull();
       expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
     } finally {
       now.mockRestore();

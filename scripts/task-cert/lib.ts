@@ -224,12 +224,32 @@ export type RenewalResult = {
   generation: number;
 };
 
-/** The authority definitively refused a FIRST attempt (its JSON `{ error }`, 4xx). Pending is cleared, except for stale_proof. */
+/**
+ * The authority refused the request (its JSON `{ error }`, 4xx): a FIRST
+ * attempt, or a resend refused for a REVERSIBLE reason (`resend` true).
+ * Pending is cleared only for a final reason (see REVERSIBLE_REASONS).
+ */
 export class AuthorityRefusal extends Error {
-  constructor(public reason: string) {
+  constructor(public reason: string, public resend = false) {
     super(reason);
   }
 }
+
+/**
+ * Refusals the authority could later reverse for the SAME bytes, so the
+ * request is kept. A first-attempt refusal may clear pending ONLY if the
+ * authority could never accept those bytes later; otherwise a captured copy
+ * replayed after the reversal advances the generation, and the honest
+ * machine's new request at the old one is a fork.
+ *   - stale_proof: the iat is judged against the authority's clock, which
+ *     moves (a clock running ahead becomes acceptable);
+ *   - approval_withdrawn: the authority checks the principal's LIVE scopes,
+ *     so restoring the grant makes the bytes acceptable again.
+ * Final, and cleared on a first attempt: invalid_key, invalid_proof,
+ * binding_v2_required, revoked, fork_detected, horizon_passed,
+ * epoch_changed, unknown_key, and a malformed-body 4xx.
+ */
+export const REVERSIBLE_REASONS: ReadonlySet<string> = new Set(["stale_proof", "approval_withdrawn"]);
 
 const STATE_LOST_TAIL = "run `task-cert enroll` to approve this machine again";
 const stateLost = (why: string) => new Error(`renewal state lost (${why}) — ${STATE_LOST_TAIL}`);
@@ -290,10 +310,11 @@ const isV1Body = (body: string): boolean => {
  *     and nothing new is ever signed;
  *   - past the window it is not resent and not replaced: a human re-enrolls;
  *   - pending is cleared only on a definitive answer: a valid 2xx, or the
- *     authority's own JSON refusal of a FIRST attempt — except stale_proof,
- *     which may be this machine's clock and is kept, so the next run resends
- *     the same bytes (a captured copy replayed meanwhile then makes that
- *     resend a retry, never a fork). A refusal of a RESEND
+ *     authority's own JSON refusal of a FIRST attempt for a FINAL reason.
+ *     A reversible refusal (REVERSIBLE_REASONS: stale_proof,
+ *     approval_withdrawn) is kept on any attempt, so a later run resends the
+ *     same bytes (a captured copy replayed meanwhile then makes that resend
+ *     a retry, never a fork). A final refusal of a RESEND
  *     keeps pending (clearing would let the next run re-sign at the old
  *     generation, which is a fork) and says the state is lost.
  *   - network errors, 5xx, 3xx, 408/425/429 and non-authority 4xx bodies
@@ -400,19 +421,19 @@ export async function renewTier(
     await opts.clearPending(body);
     return renewTier(authority, key, { ...opts, pending: null }, fetchFn);
   }
+  // A reversible refusal keeps the request, first attempt or resend: resent
+  // verbatim once the clock or the grant is right, it is accepted, or lands
+  // on the retry path if a captured copy was replayed meanwhile (past the
+  // window, the next run reports the state lost).
+  if (REVERSIBLE_REASONS.has(out.error)) throw new AuthorityRefusal(out.error, resend);
   if (resend) throw stateLost(out.error);
-  // stale_proof on a first attempt is most likely this machine's clock. Keep
-  // the request: if it was captured, a replay of it may still be accepted
-  // once the authority's clock covers its iat, and a NEW request signed at
-  // this generation would then be a fork. Resent verbatim, it lands on the
-  // retry path (or, past the window, reports the state lost).
-  if (out.error !== "stale_proof") await opts.clearPending(body);
+  await opts.clearPending(body);
   throw new AuthorityRefusal(out.error);
 }
 
 /** Refusals that mean a human must approve this machine again. */
 const ENDED_REASONS = new Set([
-  "revoked", "horizon_passed", "epoch_changed", "approval_withdrawn",
+  "revoked", "horizon_passed", "epoch_changed",
   "fork_detected", "invalid_proof", "unknown_key",
 ]);
 
@@ -426,7 +447,16 @@ export function explainRenewalFailure(e: unknown): Error {
     // Not an ended approval: the authority has retired v1 for this machine, and this client signed v1.
     if (e.reason === "binding_v2_required") return new Error(BINDING_V2_REQUIRED_MESSAGE);
     if (e.reason === "stale_proof") {
-      return new Error("the authority refused the timestamp — check this machine's clock; the request is kept and will be resent");
+      return new Error(
+        e.resend
+          ? "the authority refused the timestamp — check this machine's clock; the request is kept and will recover if the clock is corrected within the hour; otherwise run `task-cert enroll` to approve this machine again"
+          : "the authority refused the timestamp — check this machine's clock; the request is kept and will be resent",
+      );
+    }
+    if (e.reason === "approval_withdrawn") {
+      return new Error(
+        "the approval for this machine was withdrawn — the request is kept and will be resent if the grant is restored; otherwise run `task-cert enroll` and approve again",
+      );
     }
     if (ENDED_REASONS.has(e.reason)) {
       return new Error(`the approval for this machine has ended (${e.reason}) — run \`task-cert enroll\` and approve again`);
