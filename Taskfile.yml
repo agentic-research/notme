@@ -471,6 +471,12 @@ tasks:
     cmds:
       - pnpm exec tsx scripts/verify-ct-log.ts {{.CLI_ARGS}}
 
+  ct:acceptance:
+    desc: "End-to-end CT acceptance against a REAL local azul log: CT_LOG_URL + AZUL_DIR required, SKIPPED without CT_LOG_URL; not part of worker:check (notme-1b46a8)"
+    deps: [deps:install, dpop:build]
+    cmds:
+      - ct/scripts/acceptance.sh
+
   task-cert:
     desc: "Machine-side task certificates — enroll (passkey approval) | mint | verify | status (notme-486e8a)"
     # e.g. task task-cert -- enroll

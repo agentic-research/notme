@@ -77,11 +77,19 @@ export const baseMiniflare = {
  */
 export const CT_BOUND_SUITES = ["src/ct-mint.do.test.ts"];
 
+/**
+ * The end-to-end acceptance against a REAL log runs only under
+ * vitest.workers.ct-live.config.mts (CT_LOG proxied to CT_LOG_URL), and is
+ * excluded here and from the stub-log config: with CT_LOG_URL set but no
+ * CT_LOG bound it could only fail.
+ */
+export const CT_LIVE_SUITES = ["src/ct-acceptance.do.test.ts"];
+
 export default defineConfig({
   resolve: { alias: { "@peculiar/x509": x509Dir } },
   plugins: [cloudflareTest({ main: "./worker.ts", miniflare: baseMiniflare })],
   test: {
     include: ["src/**/*.do.test.ts"],
-    exclude: [...configDefaults.exclude, ...CT_BOUND_SUITES],
+    exclude: [...configDefaults.exclude, ...CT_BOUND_SUITES, ...CT_LIVE_SUITES],
   },
 });

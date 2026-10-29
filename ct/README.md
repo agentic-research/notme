@@ -53,6 +53,15 @@ giving up on a row after 24 attempts). Health is served at
 as before. The tests run under `worker/vitest.workers.ct.config.mts` with a
 stub log that signs real SCTs.
 
+**End to end against a real local azul log** (2026-10-29, `task
+ct:acceptance`; see "End-to-end acceptance" below): a pair minted through
+the real `/cert/gha` route carries embedded SCTs that azul's `sct_validator`
+verifies; with the log unreachable the mint still succeeds and both chains
+are backlogged; when the log returns, one alarm fire drains them, and azul's
+own `integration_tests` code finds both certificates as X509 entries in the
+log's signed tree with Merkle inclusion proven. This is a LOCAL log built from
+the fork branch, not a deployed one.
+
 **Not yet done**, and not claimed anywhere in this repo:
 
 - **The log is not provisioned.** No notme-ct Worker, R2 bucket, KV namespace
@@ -134,6 +143,10 @@ the Ed25519 arm would be the suspect.
 |---|---|
 | `config.notme.json` | the log shards, copied into azul's `crates/ct_worker/` as `config.<DEPLOY_ENV>.json`. `notmedev` / `notmestrict` are local test shards; `notme` is the production log |
 | `scripts/prove-chain-accepted.sh` | the lenient-vs-strict A/B against a running local log |
+| `scripts/local-log.sh` | prepares an azul worktree to serve the local shards with the test root |
+| `scripts/acceptance.sh` | the end-to-end acceptance driver (`task ct:acceptance`) |
+| `acceptance/*.rs` | the azul-side checks (sct_validator, inclusion), copied into the azul worktree only for a run |
+| `testdata/` | the FIXED test authority key and its root, for the local log only |
 | `../trust/notme-ct-log.json` | the log's public-key pin; `../scripts/verify-ct-log.ts` (`task ct:verify`) checks the deployed log against it |
 
 ## Where the roots file comes from
@@ -190,6 +203,76 @@ are not in that schema. `config.notme.json` validates against
 **Roots for the production log are the production root,
 `trust/notme-root.pem`**, copied verbatim to `roots.notme.pem` (the roots file
 is selected by `DEPLOY_ENV=notme`). Do not commit a second copy here.
+
+## End-to-end acceptance
+
+`worker/src/ct-acceptance.do.test.ts`, driven by `ct/scripts/acceptance.sh`
+(`task ct:acceptance`). It runs against a **real** azul `ct_worker` on your
+machine; nothing in it is a stub. It is not part of `task worker:check`: it
+needs a running log, and without `CT_LOG_URL` it SKIPS and says so.
+
+What it checks, all through `/cert/gha` with a genuinely signed GitHub OIDC
+token (stubbed JWKS, as the other `/cert/gha` suites do):
+
+| step | the authority's side (vitest) | the log's side (azul's own code) |
+|---|---|---|
+| 1. log up | both certs embed exactly one SCT, with this log's `log_id`; no backlog | `sct_validator::validate_embedded_scts` verifies each cert's SCT (count 1); a different real key verifies 0; the step-2 cert (no SCT list) is refused |
+| 2. log down | the mint still returns 200, with no SCT and no poison; both final chains are in `ct_backlog`; health `backlog` = 2 | — |
+| 3. log back | `runDurableObjectAlarm` drains both rows on one fire; health `backlog` 0, `gaveUp` 0, breaker untouched | the checkpoint's signature verifies; both step-2 certs are X509 entries in the data tiles; `assert_leaf_in_checkpoint` proves inclusion; a step-1 cert (precert-logged only) is NOT found as an X509 entry |
+
+"Log down" is a real refused TCP connection: the `CT_LOG` binding is a proxy
+(`worker/vitest.workers.ct-live.config.mts`) that the test points at port 1.
+Static CT has no `get-entries`; the read path is the tiles and the
+checkpoint, which a local `wrangler dev` keeps in its persisted R2 state, and
+azul's `CtClient::get_raw` reads with `wrangler r2 object get --local`.
+
+### Running it
+
+    # 1. a throwaway worktree of the azul fork branch (require_server_auth_eku)
+    git -C <azul> worktree add --detach /tmp/azul-ct ct-configurable-server-auth-eku
+    ct/scripts/local-log.sh /tmp/azul-ct
+    # 2. serve the log (first start compiles the Worker: minutes)
+    (cd /tmp/azul-ct/crates/ct_worker && \
+      npx wrangler -c wrangler.notmelocal.jsonc dev --persist-to .wrangler/state)
+    # 3. in another shell, from notme
+    CT_LOG_URL=http://localhost:8787/logs/notmedev AZUL_DIR=/tmp/azul-ct task ct:acceptance
+    # afterwards
+    git -C <azul> worktree remove --force /tmp/azul-ct
+
+| env | meaning |
+|---|---|
+| `CT_LOG_URL` | the shard base, `http://localhost:8787/logs/notmedev`. Unset → SKIPPED |
+| `AZUL_DIR` | the azul worktree serving that log; the two Rust files in `ct/acceptance/` are copied into it for the run and removed on exit |
+| `CT_ACCEPT_OUT` | optional: where the PEMs and the three logs go (default: a `mktemp -d`) |
+
+`local-log.sh` writes, in that worktree only: `config.notmelocal.json`
+(`config.notme.json` without the production shard), `roots.notmelocal.pem`
+(the test root), a standalone `wrangler.notmelocal.jsonc`, and signing /
+witness keys appended to `.dev.vars` (a file azul tracks). Commit none of it.
+
+**Why not `config.notme.json` verbatim:** its production shard `notme` has an
+18-month temporal interval, and azul's `build.rs` refuses a production shard
+outside 3 to 12 months (`notme invalid temporal interval`), so the full file
+does not build. That is a defect in the production shard to fix before
+provisioning (see "What is NOT done").
+
+### The roots file, and the two-pass bootstrap
+
+The log compiles its roots in at build time (`build.rs`), so it can only
+trust an authority whose root existed when it was built. The workers test
+pool gives every run fresh storage, so a test authority would mint a new CA
+every run and the log could never be bootstrapped to trust it. Hence the
+**fixed test authority key** (`ct/testdata/local-authority-key.json`,
+inlined in the test, NOT notme's CA): the test plants it before the authority
+creates a key, and `ct/testdata/roots.local-authority.pem` is that key's
+root. azul matches a chain to a root by issuer name and signature, so the
+per-run root certificate (new serial, same key) still chains.
+
+With that file committed there is ONE pass. Two passes are needed only if
+the fixed key changes: run once (the test prints the authority's root as
+`issuer` in its `CT_ACCEPT log` line, and step 1 fails because the log does
+not trust it), write that root to `ct/testdata/roots.local-authority.pem`,
+re-run `local-log.sh`, restart `wrangler dev` so it rebuilds, and run again.
 
 ## Operator runbook
 
@@ -276,3 +359,6 @@ Alert on:
   they do, the log records issuance and enforces nothing.
 - Offline task certificates (`mintTaskCertPair`) are not logged; their tier is.
 - The log is not provisioned and nothing is pinned or bound.
+- The production shard in `config.notme.json` does not build: azul's `build.rs`
+  requires a production shard's temporal interval to be 3 to 12 months, and
+  `notme`'s is 18 (2026-01-01 to 2027-07-01). Shorten it before provisioning.
