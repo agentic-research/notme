@@ -1,0 +1,67 @@
+{
+    "logging_level": "info",
+    "operator_name": "notme",
+    "logs": {
+        "notmedev": {
+            "friendly_name": "notme workload-identity issuance log (local dev)",
+            "intended_use": "test",
+            "status": "active",
+            "status_timestamp": "2026-10-29T00:00:00Z",
+            "submission_endpoint": {
+                "url": "http://localhost:8787/logs/notmedev/"
+            },
+            "monitoring_endpoint": {
+                "url": "http://localhost:8787/logs/notmedev/"
+            },
+            "temporal_interval": {
+                "start_inclusive": "2026-01-01T00:00:00Z",
+                "end_exclusive": "2027-01-01T00:00:00Z"
+            },
+            "enable_ccadb_roots": false,
+            "enable_dedup": false,
+            "require_server_auth_eku": false,
+            "location_hint": "enam",
+            "reject_expired": false
+        },
+        "notmestrict": {
+            "friendly_name": "notme strict twin - RFC 6962 serverAuth required (negative control)",
+            "intended_use": "test",
+            "status": "active",
+            "status_timestamp": "2026-10-29T00:00:00Z",
+            "submission_endpoint": {
+                "url": "http://localhost:8787/logs/notmestrict/"
+            },
+            "monitoring_endpoint": {
+                "url": "http://localhost:8787/logs/notmestrict/"
+            },
+            "temporal_interval": {
+                "start_inclusive": "2026-01-01T00:00:00Z",
+                "end_exclusive": "2027-01-01T00:00:00Z"
+            },
+            "enable_ccadb_roots": false,
+            "enable_dedup": false,
+            "location_hint": "enam",
+            "reject_expired": false
+        },
+        "notme": {
+            "friendly_name": "notme issuance log",
+            "intended_use": "production",
+            "status": "active",
+            "status_timestamp": "2026-10-29T00:00:00Z",
+            "submission_endpoint": {
+                "url": "https://REPLACE-ME.example/logs/notme/"
+            },
+            "monitoring_endpoint": {
+                "url": "https://REPLACE-ME.example/logs/notme/"
+            },
+            "temporal_interval": {
+                "start_inclusive": "2026-07-01T00:00:00Z",
+                "end_exclusive": "2027-07-01T00:00:00Z"
+            },
+            "enable_ccadb_roots": false,
+            "require_server_auth_eku": false,
+            "reject_expired": false,
+            "location_hint": "enam"
+        }
+    }
+}

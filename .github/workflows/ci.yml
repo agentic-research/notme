@@ -83,6 +83,9 @@ jobs:
 
       - run: task worker:check
       - run: task docs:check
+      # Exits 0 while trust/notme-ct-log.json is the not-provisioned placeholder;
+      # once a key is pinned, a log serving a different key fails CI (notme-1b46a8).
+      - run: task ct:verify
 
       # server.json is the ADR-0041 package-identity contract cloister reads
       # to derive `<identifier>:<version>`. Gated here, not only at release

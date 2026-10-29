@@ -90,8 +90,11 @@ describe("bootstrap trigger (notme-addef9)", () => {
 
   it('reports "armed" when the operator HAS set a bootstrap secret', async () => {
     // The test env binds BOOTSTRAP_CODE (see vitest.workers.config.mts), so
-    // this authority is armed. `armed` reports only that a secret EXISTS —
-    // never its value or length.
+    // this authority is armed. `armed` reports only that a mechanism EXISTS
+    // — never its value or length — and `methods` names WHICH, so the
+    // register/options 401 can offer only what actually works. That message
+    // used to send a fresh deployer to /cert/gha, which minted bridgeCert
+    // and created no administrator at all (notme-addef9).
     //
     // The "unconfigured" branch is covered by bootstrapSecret()'s validation:
     // absent, empty, whitespace-only and under-length all yield null, and the
@@ -100,7 +103,10 @@ describe("bootstrap trigger (notme-addef9)", () => {
     const state = await runInDurableObject(stub, (auth) =>
       (auth as SigningAuthority).getBootstrapState(),
     );
-    expect(state).toEqual({ status: "armed" });
+    expect(state).toEqual({
+      status: "armed",
+      methods: expect.arrayContaining(["secret"]),
+    });
   });
 
   it("refuses a WRONG code even when armed, including the empty string", async () => {

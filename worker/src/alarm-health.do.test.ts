@@ -56,7 +56,7 @@ async function tripBreaker(stub: ReturnType<typeof authority>, failures: number)
 }
 
 describe("bundle refresh alarm (notme-77a024)", () => {
-  it("reports health without having to be running", async () => {
+  it("signing.alarm.health-counter — reports health without having to be running", async () => {
     // The accessor an operator needs first. It must answer on a DO that has
     // never fired, rather than throwing on a missing table — an operator
     // diagnosing a dead alarm is the least convenient time to hit a crash.
@@ -90,7 +90,7 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     expect(Math.abs(Date.now() / 1000 - bundle.issuedAt)).toBeLessThan(300);
   });
 
-  it("re-arms itself, so one fire is not the last fire", async () => {
+  it("signing.alarm.idempotent-reschedule — re-arms itself, so one fire is not the last fire", async () => {
     // The failure mode behind a 130-day-old bundle is not "the alarm errored",
     // it is "the alarm stopped coming back". A fire that does not schedule the
     // next one looks perfectly healthy exactly once.
@@ -108,7 +108,7 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     expect(next, "alarm fired without scheduling its successor").not.toBeNull();
   });
 
-  it("stops re-arming once the breaker is open", async () => {
+  it("signing.alarm.circuit-breaker — stops re-arming once the breaker is open", async () => {
     // The breaker is deliberate: an alarm failing every 4 minutes forever is
     // its own incident. This pins that it actually stops.
     const stub = authority("alarm-breaker");

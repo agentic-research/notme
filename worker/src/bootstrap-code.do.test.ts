@@ -70,8 +70,8 @@ async function bootstrapStatus(stub: {
   return (await stub.getOrCreateBootstrapCode()).status as string;
 }
 
-describe("bootstrap code single-use invariant (real DO)", () => {
-  it("consumes exactly once — the same code never consumes twice", async () => {
+describe("passkey.admin.bootstrap-code — bootstrap code single-use invariant (real DO)", () => {
+  it("passkey.reset.single-use — consumes exactly once, so a leaked code cannot re-wipe", async () => {
     const stub = authority("bs-single-use");
     const code = await issuedCode(stub);
     expect(code).toBeTruthy();
@@ -285,11 +285,24 @@ describe("epoch key index — third-party historical verification (notme-a0cff4)
   //
   // This is the notme half of third-party attestability: publish the epoch →
   // key mapping so an auditor can verify history, not just the present.
-  it("serves every epoch's signing key, current and retired", async () => {
+  // KEYED BY KEY, NOT BY EPOCH (notme-77a024). This test used to index the
+  // response by `epoch` and expect one key per epoch. That held only while
+  // `rotate()` bumped the epoch in the same statement that replaced the key;
+  // now the epoch is the revocation generation and moves only on
+  // `revokeEpoch()`, so several keys can have signed under one epoch and one
+  // key can span several. Indexing by epoch would silently drop keys — which
+  // is the very repudiation risk this test exists to deny, so the index moved
+  // to `keyId` and the epoch became the span each key covers.
+  it("serves every key that ever signed, current and retired", async () => {
     const stub = authority("default");
-    // Establish a key, then rotate twice so there is real history to resolve.
+    // Establish a key, rotate twice, and move the epoch once — so there is
+    // both key history AND epoch history, and the two are interleaved rather
+    // than moving in lockstep.
     const first = await stub.getPublicKeyRawB64();
+    const firstBundle = await stub.generateBundle();
+    const startEpoch = firstBundle.epoch;
     const r1 = await stub.rotate();
+    await stub.revokeEpoch();
     const r2 = await stub.rotate();
 
     const res = await worker.fetch(
@@ -300,22 +313,38 @@ describe("epoch key index — third-party historical verification (notme-a0cff4)
     const body = (await res.json()) as {
       epochs: Array<{
         epoch: number;
+        untilEpoch: number | null;
         keyId: string;
         publicRawB64: string;
         retiredAt: number | null;
       }>;
     };
 
-    // Every epoch that ever existed is resolvable, including the two retired
-    // by the rotations above — the case cloister could previously miss.
-    const byEpoch = new Map(body.epochs.map((e) => [e.epoch, e]));
-    expect(byEpoch.size).toBeGreaterThanOrEqual(3);
-    expect(byEpoch.get(r2.epoch)?.retiredAt).toBeNull(); // current
-    expect(byEpoch.get(r1.epoch)?.retiredAt).toBeTypeOf("number"); // retired
+    // Every key that ever signed is resolvable, including the two retired by
+    // the rotations above — the case cloister could previously miss.
+    const byKeyId = new Map(body.epochs.map((e) => [e.keyId, e]));
+    expect(byKeyId.size).toBeGreaterThanOrEqual(3);
+    expect(byKeyId.get(r2.newKeyId)?.retiredAt).toBeNull(); // current
+    expect(byKeyId.get(r2.newKeyId)?.untilEpoch).toBeNull(); // still serving
+    expect(byKeyId.get(r1.newKeyId)?.retiredAt).toBeTypeOf("number"); // retired
+
+    // The middle key signed ACROSS the revocation, so its span is two epochs
+    // wide. One epoch number could not have recorded that.
+    expect(byKeyId.get(r1.newKeyId)?.epoch).toBe(startEpoch);
+    expect(byKeyId.get(r1.newKeyId)?.untilEpoch).toBe(startEpoch + 1);
+
     // The original key is still resolvable two rotations later — the exact
-    // repudiation risk notme-acd503 described.
-    const oldest = [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch)[0]!;
-    expect(oldest.publicRawB64).toBe(first);
+    // repudiation risk notme-acd503 described. Identified by keyId, because
+    // EPOCH NO LONGER ORDERS KEYS: this key and r1's both began at
+    // startEpoch, so "sort by epoch and take the first" picks between them
+    // arbitrarily. That tie is the decoupling showing through, and an earlier
+    // draft of this test failed on it — worth asserting rather than sorting
+    // around, since any consumer treating epoch as a key's identity hits the
+    // same ambiguity.
+    expect(byKeyId.get(firstBundle.keyId)?.publicRawB64).toBe(first);
+    expect(byKeyId.get(firstBundle.keyId)?.epoch).toBe(startEpoch);
+    expect(byKeyId.get(r1.newKeyId)?.epoch).toBe(startEpoch);
+    expect(firstBundle.keyId).not.toBe(r1.newKeyId);
   });
 
   it("is cacheable and needs no authentication — an auditor is not a principal", async () => {

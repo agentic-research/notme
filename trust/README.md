@@ -6,7 +6,7 @@ authenticated.
 
 | File | What it is |
 | --- | --- |
-| `notme-root.pem` | The **same certificate** that `https://auth.notme.bot/.well-known/ca-bundle.pem` serves. The file *framing* may differ by trailing whitespace, so compare the parsed certificate, never the file bytes — see [the warning below](#do-not-compare-file-bytes). |
+| `notme-root.pem` | The **same certificate** that `https://auth.notme.bot/.well-known/ca-bundle.pem` serves. The file *framing* may differ by trailing whitespace, so compare the parsed certificate, never the file bytes — see [the warning below](#do-not-compare-file-bytes). Refreshed 2026-10-29; see [staleness](#this-file-went-stale-twice). |
 | `notme-root.json` | Machine-readable pin: authority URL, subject, SPKI SHA-256, certificate SHA-256, validity window. |
 
 `worker/src/__tests__/trust-anchor.test.ts` re-derives both digests from
@@ -14,6 +14,48 @@ authenticated.
 `.github/workflows/ci.yml`), so the pin and the certificate beside it cannot
 drift apart. A pin that disagrees with its own certificate is worse than no pin,
 because it still looks authoritative.
+
+## This file went stale twice
+
+Self-consistency is necessary and it is not sufficient. Between 2026-08-28 and
+2026-09-25 the committed certificate was the **pre-heal root** — serial
+`d01f2a0a`, `pathlen:0`, issued 2026-03-31 — while production served a root
+re-issued under the **same key** with `pathlen:1` (`notme-1b1db4`). Both tests
+passed the whole time, because both compared the anchor only to itself.
+
+The public key never changed, so nobody pinning the SPKI was affected. Anyone
+pinning the **certificate** was pinning one production no longer serves, and
+`pathlen:0` forbids the intermediate tier ADR-019 D4 issues — so a verifier
+using the committed file would have rejected every tier-signed certificate.
+
+Caught while wiring the certificate transparency log, whose `roots.<env>.pem`
+is compiled in and whose chain validation enforces path length: shipping the
+stale anchor would have made the log refuse the certs it exists to record
+(`notme-1b46a8`).
+
+The test now also asserts the anchor's `pathLenConstraint` equals `CA_PATH_LEN`
+in `signing-authority.ts` — a fact that moves when production moves, checked
+without a network call. Re-verified by restoring the stale file: it fails.
+
+**It happened again** on 2026-10-28. The root was re-issued, again under the
+same key, so that its `notBefore` is the key's creation time (`notme-0c494f`).
+Before that, a re-issued root post-dated every signature made before it. The
+committed file kept serial `5dcb45c3` with `notBefore` 2026-08-28; production
+served serial `e7063d28` with `notBefore` 2026-03-29. The path-length test
+could not catch it: path length was unchanged.
+
+Two independent checks against itself had now failed the same way. So the fix
+compares to production instead:
+
+- `task trust:refresh` re-fetches the root, regenerates the PEM and every field
+  of `notme-root.json` from it (same digest path as the test), and **refuses,
+  writing nothing, if the SPKI changed**.
+- `task trust:refresh -- --check` only compares. `worker:verify` runs it after
+  every production deploy, so a re-issue that leaves `trust/` behind fails the
+  deploy gate the same day rather than four weeks later.
+
+**A changed SPKI is not a refresh.** It is a different authority and needs its
+own review. That is why the script stops there, not because of a bug.
 
 ## Why this exists
 
@@ -61,12 +103,12 @@ not the long-lived trust anchor.
 the two files.** They are expected to differ, and a mismatch there means
 nothing.
 
-Measured 2026-08-05:
+Measured 2026-10-29:
 
 | | bytes | SHA-256 of the *file* | SHA-256 of the *parsed certificate* (DER) |
 | --- | --- | --- | --- |
-| served by `auth.notme.bot` | 484 | `cee35250…87f2` | `c1ddec9d…ae86` |
-| `trust/notme-root.pem` | 485 | `7d253cfe…cb53` | `c1ddec9d…ae86` |
+| served by `auth.notme.bot` | 484 | `bc6f4e96…c48b` | `7fd698cb…afbd` |
+| `trust/notme-root.pem` | 485 | `b38beff7…3a02` | `7fd698cb…afbd` |
 
 One byte: the served response has no trailing newline, the committed file does.
 The certificate is identical — same key, same signature, same DER.
@@ -167,21 +209,81 @@ material committed here but never checked buys nothing.
   never asked for one, and no third party would observe it. Tracked as
   notme-907299 (*No issuance transparency: notme publishes its keys but records
   nothing about what it issued*).
-- **Revocation.** A compromised credential remains valid until it expires; the
-  only coarser lever is a CA epoch bump that invalidates everything at once.
-  Tracked as notme-77a024 (*Revocation has no unit between "wait for expiry" and
-  "revoke every credential ever issued"*).
-- **Cryptographic proof of this file's provenance.** The anchor is protected by
-  git history and code review, not by a signature. Signing this material with
-  the release pipeline's Sigstore identity is the second half of the anchor;
-  the pipeline already signs keylessly for images (`.github/workflows/
-  release.yml` requests `id-token: write` for cosign), so the capability exists
-  but is not applied to this directory.
+- **Revocation of an issued certificate.** Revocation acts on what can be
+  issued next: a grant (next request), a machine (next renewal), a task (next
+  mint on that machine), or everything (an epoch bump, ≤ 5 minutes for online
+  verifiers). A certificate already issued stays valid until it expires, which
+  is 5 minutes for leaves and 1 hour for a machine's tier. There is no CRL or
+  OCSP, by design.
 - **Any statement about the leaf.** Pinning the root says the issuer is who you
   expected. It says nothing about whether a particular subject *should* hold the
   certificate it presents — that remains your authorization policy's job.
 
 Background and the broader gap: notme-8e8836, and `docs/design/008-bridge-cert-csr-wimse.md`.
+
+## Verify the signed anchor
+
+From the first release cut after 2026-10-29, the release workflow signs
+`notme-root.pem` and `notme-root.json` with its own keyless Sigstore identity
+and attaches them, with their bundles, to the GitHub release. It **refuses to
+sign** unless the committed root is the one production serves. Releases before
+then carry no signed anchor; for those, git history is the only protection.
+
+```bash
+TAG=vX.Y.Z   # the release you trust
+BASE=https://github.com/agentic-research/notme/releases/download/$TAG
+curl -fLO $BASE/notme-root.pem && curl -fLO $BASE/notme-root.pem.sigstore.json
+
+cosign verify-blob notme-root.pem \
+  --bundle notme-root.pem.sigstore.json \
+  --certificate-identity "https://github.com/agentic-research/notme/.github/workflows/release.yml@refs/tags/$TAG" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Use cosign **3.1.3 or later**: older releases can report "Verified OK" for a
+substituted legacy-format bundle (GHSA-fx35-mq7g-6g98).
+
+The identity is **exact**: one workflow at one tag. A regexp here is how
+signet's release verification broke and how, unescaped, a pattern matches
+workflows it should not (see the container section of the top-level README).
+Then pin the key as above: the SPKI of the verified file must be the one you
+expect.
+
+What the signature adds: the root now carries a statement from the release
+workflow that a party controlling only `auth.notme.bot` cannot forge. What it
+does not add: the workflow signs what is in the repository, so anyone who can
+push a tag can sign a root. The review on the commit that changes `trust/` is
+still the control on *which* root is signed.
+
+## The CT log key pin
+
+`notme-ct-log.json` pins the public key of notme's issuance transparency log
+(`ct/README.md`), by the same logic as the root: `metadata.json` fetched from
+the log authenticates nothing by itself, so the key is also committed here and
+signed by the release workflow.
+
+Two states, and tooling recognises exactly these:
+
+- `{"status": "not-provisioned", ...}`: the log does not exist yet. This is
+  today's state. `task ct:verify` exits 0 and says so; the release does not
+  sign the file.
+- `{"status": "provisioned", "log_name", "metadata_url", "log_id", "key",
+  "key_spki_sha256", "observed_at"}`: `key` is the base64 SPKI DER, `log_id`
+  its SHA-256 (base64), `key_spki_sha256` the same digest in hex. Written only
+  by `task ct:verify -- --write --metadata <url>`, which refuses if a
+  different pin is already recorded.
+
+`task ct:verify` then exits 1 if the live log serves a different key or a
+`log_id` that is not the SHA-256 of its key. As with the root, a changed key is
+a different log, not a refresh: replace the pin only by a reviewed manual edit.
+
+Once `provisioned`, the `trust-anchor` release job signs it as
+`notme-ct-log.json` with a `.sigstore.json` bundle, verified exactly like the
+root (the section above, with `notme-ct-log.json` in place of
+`notme-root.pem`). Before signing, the release job fetches the pin's
+`metadata_url` and refuses to sign unless the live `key` and `log_id` equal the
+pin and `log_id` is SHA-256 of `key` (the same checks as `task ct:verify`), and
+unless `ct/config.notme.json` has no `REPLACE-ME` placeholders left.
 
 ## Updating this anchor
 

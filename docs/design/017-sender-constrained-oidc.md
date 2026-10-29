@@ -270,6 +270,32 @@ consumers" to "asserts identity to arbitrary RPs." What must be modelled:
    scopes DPoP to access tokens; see Standards reality above). RP enrollment
    (invariant iv) includes acknowledging this profile.
 
+   > **CORRECTION (2026-08-07, raised by cloister).** The gap is real and the
+   > reasoning for rejecting DPoP is correct — RFC 9449 does scope DPoP to
+   > access tokens. But the conclusion "therefore write our own profile" skips
+   > the option that exists: **RFC 9421, HTTP Message Signatures.**
+   >
+   > 9421 is Standards Track, has libraries, and covers exactly this shape —
+   > signing over `@method`, `@target-uri`, a nonce, with `created`/`expires`
+   > freshness, in `Signature` / `Signature-Input`. Every property specified by
+   > hand above is a 9421 parameter. And it is not DPoP, which was the
+   > constraint that pushed toward inventing in the first place.
+   >
+   > This is precisely the test [ADR-020](020-compose-do-not-invent.md) applies
+   > to every proposal: *which existing standard already does this, and why is
+   > it insufficient?* This section never asked. A bespoke profile means every
+   > relying party implements notme-specific verification — the cost moved from
+   > notme onto its consumers, which is what ADR-020 exists to prevent.
+   >
+   > Cloister's framing is worth preserving: 9421 is a poor fit at *their*
+   > ingress and a straightforward fit *here*, because what makes it awkward
+   > for a server being called is absent when a holder proves possession to a
+   > third-party RP.
+   >
+   > **Phase 1 should adopt RFC 9421 rather than author a profile**, unless a
+   > concrete incompatibility is found and written down. That finding, if it
+   > exists, is the artefact worth having — not the bespoke format.
+
 ## What flips in code (grounding, not scope-creep)
 
 - `worker/src/as-metadata.ts` (verified against the file, 2026-07-21):

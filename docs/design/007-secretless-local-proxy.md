@@ -23,6 +23,38 @@
 > `src/__tests__/key-encryption.test.ts`. It does NOT hold in `cf-managed` mode
 > without a secret, which relies solely on Cloudflare's encryption at rest.
 >
+> **NOTE (2026-09-25, `notme-41d0d3`): the secretless claim is currently
+> discharged by adding a secret, and that is worth saying out loud.**
+>
+> The Workers platform offers no keyless signing primitive. Checked rather
+> than assumed: an `mtls_certificate` binding yields a `Fetcher` whose only
+> operation is presenting a client certificate on outbound TLS — the Worker
+> truly never holds that key, and it cannot sign X.509 or JWS with it; and a
+> Secrets Store binding's `.get()` returns the value into Worker memory. So
+> whenever this authority signs, the private key is in the Worker's address
+> space, and no configuration avoids that.
+>
+> It follows that `NOTME_KEK_SECRET` defends exactly one surface: reading DO
+> storage WITHOUT code execution (a Cloudflare insider, a backup exfil, a
+> storage-layer bug). An attacker who can run Worker code reads the secret
+> from `env` and signs regardless. The cost on the other side is custody —
+> losing the secret bricks the authority, deliberately, because the
+> alternative is silently minting a new root.
+>
+> And it is not the cheapest forgery path. Per ADR-019 / `notme-8e8836`, the
+> CA is self-signed and the only thing binding "this CA" to "notme" is WebPKI
+> on the fetch to `auth.notme.bot`. Consumer trust already rests on hostname
+> control rather than on the key's secrecy.
+>
+> The property this ADR is reaching for is better served by making misuse
+> DETECTABLE than by making the key unreadable: an issuance transparency log
+> (`notme-907299`, `notme-1b46a8`) means a stolen key cannot mint unobserved,
+> and it is what would let the online key be ephemeral — this authority
+> already has an `ephemeral` storage mode, epoch rotation, retired-key
+> publication and five-minute leaf TTLs. What keeps the key persistent today
+> is that consumers pin the CA bundle; a log is the anchor that is not the
+> key.
+>
 > Also note the file references in "Problem" are stale: `cert-exchange.ts` no
 > longer exists.
 

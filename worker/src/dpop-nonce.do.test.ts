@@ -151,6 +151,43 @@ function decodeJwtPayload(jwt: string): Record<string, any> {
   return JSON.parse(atob(part));
 }
 
+describe("dpop.session.binding", () => {
+  // THREAT_MODEL §4 "session theft": a stolen session cookie must not be
+  // enough to use a token, because the token is bound to the client's key.
+  // The row named a test that existed nowhere (notme-8eed12); the cnf claim
+  // was only ever asserted as `toBeTruthy()` in passing, which a hardcoded
+  // constant would satisfy.
+  it("binds the minted token to the PROOF's key, not to the session", async () => {
+    const { computeJwkThumbprint } = await import("@agentic-research/dpop");
+    const alice = await newKeyPair();
+    const mallory = await newKeyPair();
+
+    const res = await postToken(await makeProof(alice), await realSessionCookie());
+    expect(res.status, await res.clone().text()).toBe(200);
+    const jkt = decodeJwtPayload(((await res.json()) as any).access_token).cnf.jkt;
+
+    const alicePub = await crypto.subtle.exportKey("jwk", alice.publicKey);
+    const malloryPub = await crypto.subtle.exportKey("jwk", mallory.publicKey);
+    expect(jkt).toBe(await computeJwkThumbprint(alicePub as any));
+    // The assertion that matters: holding the cookie does not get you a
+    // token bound to a key of your choosing.
+    expect(jkt).not.toBe(await computeJwkThumbprint(malloryPub as any));
+  });
+
+  it("the SAME session presenting a different key gets a differently-bound token", async () => {
+    // Two mints on one cookie. If cnf tracked the session rather than the
+    // proof, these would match and a stolen cookie would be sufficient.
+    const cookie = await realSessionCookie();
+    const first = await postToken(await makeProof(await newKeyPair()), cookie);
+    const second = await postToken(await makeProof(await newKeyPair()), cookie);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const jkt1 = decodeJwtPayload(((await first.json()) as any).access_token).cnf.jkt;
+    const jkt2 = decodeJwtPayload(((await second.json()) as any).access_token).cnf.jkt;
+    expect(jkt1).not.toBe(jkt2);
+  });
+});
+
 describe("/token nonce challenge — real route, real DO", () => {
   it("mints without a nonce when the flag is off", async () => {
     // The default posture. If this ever fails, enabling nothing has broken
@@ -265,7 +302,7 @@ describe("/token nonce challenge — real route, real DO", () => {
 });
 
 describe("/authorize redirect token — real route, real DO (notme-07204f)", () => {
-  it("is an UNBOUND bearer, and the threat model must not claim otherwise", async () => {
+  it("authorize.redirect-token.unbound — is an UNBOUND bearer, and the threat model must not claim otherwise", async () => {
     // THREAT_MODEL.md's `token in URL logs` row asserted this token was
     // "DPoP-bound (useless without ephemeral key)". It never was:
     // mintRedirectToken omits cnf.jkt on purpose, because the /authorize

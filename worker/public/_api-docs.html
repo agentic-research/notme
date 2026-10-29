@@ -1,7 +1,7 @@
 <!--
 @doc-check
 @types: BridgeCertResult, CertScope
-@endpoints: POST /cert, POST /cert/gha, GET /.well-known/signet-authority.json, GET /.well-known/ca-bundle.pem
+@endpoints: POST /cert, POST /cert/gha, POST /cert/issuing-ca/renew, POST /cert/issuing-ca/device/approve, GET /cert/issuing-ca/enrollments, GET /.well-known/signet-authority.json, GET /.well-known/ca-bundle.pem
 -->
 <!doctype html>
 <html lang="en">
@@ -359,12 +359,17 @@
   "scopes": ["bridgeCert"]
 }
 
-// or with OIDC:
+// or with OIDC — a GitHub Actions or notme token, aud "notme.bot",
+// whose identity is LINKED to a principal (redeem an invite with it first).
+// Exchanges for a cert pair only; the proofs bind SHA-256(token), and each
+// token's jti is single-use (shared with /cert/gha):
 {
   "proof": {
     "type": "oidc",
-    "token": "&lt;JWT from any issuer&gt;"
-  }
+    "token": "&lt;GHA OIDC JWT, aud=notme.bot&gt;"
+  },
+  "public_keys": { "mtls": "&lt;P-256 SPKI PEM&gt;", "signing": "&lt;Ed25519 SPKI PEM&gt;" },
+  "proofs": { "mtls": "&lt;sig&gt;", "signing": "&lt;sig&gt;" }
 }
 
 // or bootstrap (deployer only):
@@ -380,14 +385,16 @@
     "mtls":    "-----BEGIN CERTIFICATE-----\n...",
     "signing": "-----BEGIN CERTIFICATE-----\n..."
   },
-  "identity": "wimse://notme.bot/passkey/a1b2c3d4-...",
+  "identity": "wimse://notme.bot/principal/a1b2c3d4-...",
   "scopes": ["bridgeCert"],
   "expires_at": 1711670400,
-  "subject": "a1b2c3d4-...",
-  "binding": "9f86d081..."
+  "binding": "9f86d081...",
+  "authority": "https://auth.notme.bot",
+  "principal_id": "a1b2c3d4-...",
+  "auth_method": "passkey"
 }</div>
           <div class="ep-note"><strong>notme never sends a private key.</strong> The caller generates both keypairs locally with <code>extractable: false</code> and proves possession; only certificates come back. Earlier revisions of this page showed a <code>private_key</code> field &mdash; no endpoint has ever returned one.</div>
-          <div class="ep-note">Proof types: session (passkey cookie), oidc (any JWT), bootstrap (deployer code). Scopes are intersected with the principal's capability grants.</div>
+          <div class="ep-note">Proof types: session (passkey cookie, plus a nonce from POST /cert/nonce for a cert pair), oidc (a GitHub Actions or notme token whose identity is linked to a principal), bootstrap (deployer code). Scopes are intersected with the principal's capability grants.</div>
         </div>
       </div>
 
@@ -410,26 +417,67 @@
           <div class="ep-label">request</div>
           <div class="ep-example">
             curl -X POST https://auth.notme.bot/cert/gha \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN}" \
               -H "Content-Type: application/json" \
-              -d '{"oidc_token":"&lt;GHA OIDC JWT&gt;",
-                   "public_keys":{"mtls":"&lt;P-256 SPKI PEM&gt;","signing":"&lt;Ed25519 SPKI PEM&gt;"},
-                   "proofs":{"mtls":"&lt;base64url&gt;","signing":"&lt;base64url&gt;"}}'
+              -d '{"public_keys":{"mtls":"&lt;P-256 SPKI PEM&gt;","signing":"&lt;Ed25519 SPKI PEM&gt;"},
+                   "proofs":{"mtls":"&lt;base64&gt;","signing":"&lt;base64&gt;"}}'
+          </div>
+          <div class="ep-note">
+            The OIDC token goes in the <code>Authorization</code> header, not
+            in the body. Each proof is a signature by the corresponding
+            private key over the binding PRE-IMAGE
+            <code>mtls_spki &#8214; signing_spki &#8214; SHA-256(oidc_jwt)</code>
+            &mdash; the raw bytes, never their digest.
           </div>
           <div class="ep-label">response</div>
           <div class="ep-response">
             { "certificates": { "mtls": "-----BEGIN CERTIFICATE-----\n...",
             "signing": "-----BEGIN CERTIFICATE-----\n..." }, "identity":
-            "wimse://notme.bot/gha/agentic-research/signet", "scopes":
-            ["bridgeCert"], "expires_at": 1711670400, "subject":
-            "repo:agentic-research/signet:ref:refs/heads/main",
+            "wimse://notme.bot/principal/repo%3Aagentic-research%2Fsignet%3Aref%3Arefs%2Fheads%2Fmain",
+            "scopes": ["bridgeCert"], "expires_at": 1711670400,
             "claims": { "repository": "agentic-research/signet", "ref":
             "refs/heads/main", "sha": "abc123...", "actor": "github-actions",
             "workflow": "ci.yml", "run_id": "12345", "event_name": "push" } }
           </div>
           <div class="ep-note">
-            Allowed owners: <code>agentic-research</code> (configurable via
-            GHA_ALLOWED_OWNERS). Ephemeral P-256 keypair generated at edge —
-            private key returned once, never stored.
+            <strong>No private key crosses the wire here either.</strong> The
+            workflow generates both keypairs in its own runner and sends only
+            the public halves; the response is certificates.
+          </div>
+          <div class="ep-note">
+            <strong>Use <code>identity</code> from this response; do not
+            construct it.</strong> It is the exact string a verifier matches
+            &mdash; <code>cosign verify-blob --certificate-identity</code>
+            compares by equality &mdash; and it is byte-identical to the URI
+            SAN in both certificates. Capture it in CI and pass it through
+            rather than hardcoding a literal.
+            <br /><br />
+            If you must derive it offline, the rule is
+            <code>wimse://&lt;trust-domain&gt;/principal/&lt;urlencode(oidc
+            sub)&gt;</code>. The trust domain follows the deployment, so it
+            is not always <code>notme.bot</code>, and the OIDC
+            <code>sub</code> is percent-encoded &mdash; the slash in
+            <code>owner/repo</code> becomes <code>%2F</code>, which defeats
+            path-shaped regexes written against the older form.
+            <br /><br />
+            <strong>The <code>/gha/&lt;owner&gt;/&lt;repo&gt;</code> identity
+            shape is gone.</strong> It encoded the attestation mechanism where
+            other routes put an authentication ceremony, so one principal
+            arriving two ways minted two identities (ADR-019 D2). Anything
+            still pinning that form will fail to verify.
+          </div>
+          <div class="ep-note">
+            Owners are allowed by <code>GHA_ALLOWED_OWNERS</code>, which has
+            no default &mdash; an authority that has not declared whose
+            workflows it trusts trusts none. The token is spent on first use
+            (<code>jti</code> replay protection) and exchanges are rate
+            limited per repository.
+          </div>
+          <div class="ep-note">
+            The identity names the stable subject &mdash; the OIDC
+            <code>sub</code>, which is also the certificate CN &mdash; rather
+            than the attestation mechanism. Owner and repository remain
+            readable from <code>sub</code> and from the returned claims.
           </div>
         </div>
       </div>
@@ -437,29 +485,148 @@
       <div class="endpoint">
         <div class="ep-header">
           <span class="ep-method post">POST</span>
-          <span class="ep-path">/exchange-token</span>
+          <span class="ep-path">/cert/passkey</span>
         </div>
         <div class="ep-body">
           <div class="ep-desc">
-            Exchange an OIDC token for a bridge certificate. Used by
-            <code>signet auth login</code> (human auth flow). Proxied to signet
-            authority on Fly.
+            The passkey analogue of <code>/cert/gha</code>: an authenticated
+            browser session plus proof of possession, in exchange for a bridge
+            cert pair. Accepts any valid session &mdash; passkey, invite, or
+            OIDC &mdash; and derives the certificate's identity and auth method
+            from the session, so a certificate never claims an authenticator
+            the session did not use.
+          </div>
+          <div class="ep-note">
+            Fetch a nonce first with <code>POST /cert/nonce</code> (same-origin;
+            the session cookie is sent automatically) and sign
+            <code>"notme/cert-pair/v1\0" || mtls_spki || signing_spki ||
+            SHA-256(nonce)</code> with both keys. The nonce is single-use,
+            lasts 120&nbsp;s, and is bound to your session.
+          </div>
+          <div class="ep-note">
+            Session scopes are INTERSECTED with an allowlist rather than
+            passed through. A deployer session carries
+            <code>authorityManage</code> and <code>certMint</code>; a
+            certificate that silently inherited them would turn a cookie into
+            a minting credential with none of the properties that made the
+            cookie acceptable.
+          </div>
+        </div>
+      </div>
+
+      <h2>machine tiers</h2>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method post">POST</span>
+          <span class="ep-path">/cert/issuing-ca/device/approve</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">A signed-in human approves a pending machine enrollment (the tier a machine mints task certs from). Needs the live <code>certMint</code> grant and a session cookie.</div>
+          <div class="ep-label">request</div>
+          <div class="ep-example">{
+  "user_code": "ABCD-EFGH",
+  "renew_days": 7,
+  "clone_policy": "singleton"
+}</div>
+          <div class="ep-note"><code>renew_days</code> is 1, 7 or 30 (default 7): how long the machine may renew without a human.</div>
+          <div class="ep-note"><code>clone_policy</code> is <code>singleton</code> (the default), <code>replicas:2</code>, <code>replicas:4</code> or <code>replicas:8</code>. Anything other than <code>singleton</code> needs the live <code>authorityManage</code> grant and a <code>renew_days</code> of at most 7 (30 is refused with 400). The policy is shown in the enrollments list and in the machine's collect response. Phase 1 records the policy only. There is no branching yet, so every policy behaves as singleton: a renewal that is fresh to the authority's clock (<code>iat</code> within 120 s), at a generation already spent, and different from the request recorded for that generation is <code>fork_detected</code> and shuts the enrollment off. One signed on a clock more than 120 s off gets <code>stale_proof</code> instead.</div>
+          <div class="ep-label">response</div>
+          <div class="ep-response">{
+  "ok": true,
+  "scopes": ["bridgeCert"],
+  "clone_policy": "singleton"
+}</div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method post">POST</span>
+          <span class="ep-path">/cert/issuing-ca/renew</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">A machine renews its tier with no human while its approval holds. Unauthenticated by design: the proof of possession is the authentication.</div>
+          <div class="ep-label">request</div>
+          <div class="ep-example">{
+  "public_key": "&lt;Ed25519 SPKI PEM&gt;",
+  "iat": 1711670400,
+  "generation": 3,
+  "proof": "&lt;sig&gt;"
+}</div>
+          <div class="ep-note"><code>generation</code> is the generation returned by the machine's last successful renewal (or its collect response). With it, <code>proof</code> is an Ed25519 signature over <code>"notme/tier-renew/v2\0" || SPKI || uint64be(iat) || uint64be(generation)</code>. Without it the request is the legacy v1 form, <code>"notme/tier-renew/v1\0" || SPKI || uint64be(iat)</code>, which only enrollments made before v2 may still use; new enrollments refuse v1 with <code>binding_v2_required</code>.</div>
+          <div class="ep-note"><code>iat</code> is the machine's clock when it signed. At the enrollment's current generation (and for a legacy v1 request) a valid proof is accepted with <code>iat</code> from one hour (3600 s) in the past to 120 s in the future, so a request that never reached the authority can be resent unchanged. A request already accepted is a retry only within one hour of its <code>iat</code>; a newly signed request at an older generation is judged a fork only if its <code>iat</code> is within 120 s of the authority's clock, and is otherwise <code>stale_proof</code>.</div>
+          <div class="ep-label">response</div>
+          <div class="ep-response">{
+  "...": "the renewed tier certificate material",
+  "renew_until": 1712275200,
+  "generation": 4
+}</div>
+          <div class="ep-note"><code>generation</code> is the value to sign into the next renewal.</div>
+          <div class="ep-label">errors</div>
+          <div class="ep-response">// 404 unknown_key   400 invalid_key   400 binding_v2_required
+// 401 stale_proof   401 invalid_proof
+// 403 revoked | horizon_passed | epoch_changed | approval_withdrawn | fork_detected</div>
+          <div class="ep-note"><code>fork_detected</code> (403): a copy of this machine renewed, so the enrollment (one shared key) is shut off; the human runs <code>enroll</code> again. An exact resend of a request that was already accepted (within a one-hour window) is treated as a retry, not a fork; a replay of an accepted request is <code>stale_proof</code> and revokes nothing.</div>
+          <div class="ep-note"><code>binding_v2_required</code> (400): a v1 request (no <code>generation</code>) for an enrollment that speaks v2. The approval has not ended: the client is older than the authority and must be updated.</div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/cert/issuing-ca/enrollments</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">The signed-in human's enrolled machines (session cookie). <code>POST /cert/issuing-ca/enrollments/revoke</code> <code>{ "key_fingerprint": "..." }</code> stops one renewing.</div>
+          <div class="ep-label">response</div>
+          <div class="ep-response">[{
+  "key_fingerprint": "9f86d081...",
+  "status": "active",
+  "renew_until": 1712275200,
+  "revoked_at": 1711670400,
+  "revoke_reason": "fork_detected",
+  "scopes": ["bridgeCert"],
+  "clone_policy": "singleton",
+  "generation": 4
+}]</div>
+          <div class="ep-note"><code>revoke_reason</code> is <code>null</code> while the machine is not revoked. <code>fork_detected</code> means a copy of the machine renewed and the authority shut the enrollment off; a revocation made by the human or an administrator may carry no reason.</div>
+        </div>
+      </div>
+
+      <h2>tokens</h2>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method post">POST</span>
+          <span class="ep-path">/token</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            OAuth 2.0 token endpoint. Issues EdDSA-signed access tokens bound
+            to a DPoP proof (RFC 9449), verifiable against the published JWKS.
           </div>
           <div class="ep-label">authorization</div>
-          <p>OIDC token from OAuth callback flow.</p>
+          <p>
+            A session cookie, plus a <code>DPoP</code> proof header signed by
+            the client's own P-256 key. Tokens are sender-constrained: a
+            stolen token is useless without that key.
+          </p>
         </div>
       </div>
 
       <div class="endpoint">
         <div class="ep-header">
-          <span class="ep-method post">POST</span>
-          <span class="ep-path">/api/cert/register</span>
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/authorize</span>
         </div>
         <div class="ep-body">
           <div class="ep-desc">
-            Register an agent identity using a GitHub PAT. For
-            headless/automated environments where browser OAuth isn't possible.
-            Proxied to signet authority on Fly.
+            Human authorization grant. A browser flow that asks a present
+            human to approve a scoped delegation; the companion
+            <code>POST /authorize/code</code>,
+            <code>POST /authorize/redeem</code> and
+            <code>POST /authorize/token</code> complete it.
           </div>
         </div>
       </div>
@@ -480,15 +647,69 @@
           </div>
           <div class="ep-label">response</div>
           <div class="ep-response">
-            { "issuer": "https://auth.notme.bot", "exchange_token_endpoint":
-            "https://auth.notme.bot/exchange-token", "cert_gha_endpoint":
-            "https://auth.notme.bot/cert/gha", "registration_endpoint":
-            "https://auth.notme.bot/api/cert/register", "ca_bundle_endpoint":
+            { "issuer": "https://auth.notme.bot", "cert_endpoint":
+            "https://auth.notme.bot/cert", "cert_gha_endpoint":
+            "https://auth.notme.bot/cert/gha", "ca_bundle_endpoint":
             "https://auth.notme.bot/.well-known/ca-bundle.pem",
             "algorithms_supported": ["Ed25519"], "grant_types_supported": [
-            "oidc_token_exchange", "github_actions_oidc", "github_pat" ],
-            "cert_types_supported": ["bridge_certificate"], "documentation":
+            "urn:ietf:params:oauth:grant-type:token-exchange" ], "cert_types_supported":
+            ["bridge_certificate"], "token_endpoint":
+            "https://auth.notme.bot/token", "jwks_uri":
+            "https://auth.notme.bot/.well-known/jwks.json",
+            "dpop_signing_alg_values_supported": ["ES256"], "documentation":
             "https://notme.bot/architecture" }
+          </div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/.well-known/oauth-authorization-server</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            OAuth 2.0 Authorization Server Metadata (RFC 8414). Also served at
+            <code>/.well-known/openid-configuration</code> &mdash; same body,
+            and ONLY because many client libraries probe exclusively there.
+            notme is <strong>not</strong> an OpenID Provider: it issues no
+            <code>id_token</code>, honours no <code>scope=openid</code>, and
+            publishes an empty <code>response_types_supported</code>.
+          </div>
+          <div class="ep-note">
+            It does publish
+            <code>id_token_signing_alg_values_supported: ["EdDSA"]</code>.
+            That is a correctness requirement, not a capability claim: a
+            client whose discovery is silent on algorithms defaults to RS256
+            alone and rejects every token this issuer signs.
+          </div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/.well-known/jwks.json</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            The authority's token-signing public key, as a JWK set:
+            <code>{kty:"OKP", crv:"Ed25519", alg:"EdDSA"}</code>. "EdDSA" is
+            the JWA algorithm name (RFC 8037 §3.1); "Ed25519" is the curve.
+          </div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/.well-known/epochs.json</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            Revocation epochs. A certificate names the epoch it was issued
+            under; raising the epoch invalidates everything issued beneath it
+            without waiting for expiry.
           </div>
         </div>
       </div>
@@ -511,9 +732,16 @@
             CERTIFICATE-----
           </div>
           <div class="ep-note">
-            Cache-Control: 1 hour. CA:TRUE, KeyUsage: keyCertSign|cRLSign.
-            Key is generated in CF and never leaves — there is no PEM file
-            to exfiltrate.
+            Cache-Control: 1 hour. CA:TRUE, pathLenConstraint:1, KeyUsage:
+            keyCertSign|cRLSign. The key is generated inside Cloudflare and
+            never leaves it &mdash; there is no PEM file to exfiltrate.
+          </div>
+          <div class="ep-note">
+            <strong>The cRLSign bit is set and no CRL is published.</strong>
+            There is no CRL and no CRL distribution point; revocation works by
+            epoch (see <code>/.well-known/epochs.json</code>) and by short
+            certificate lifetimes. Do not build a verifier that waits for a
+            revocation list &mdash; none is coming.
           </div>
         </div>
       </div>
@@ -536,11 +764,30 @@
       <div class="endpoint">
         <div class="ep-header">
           <span class="ep-method get">GET</span>
-          <span class="ep-path">/healthz</span>
+          <span class="ep-path">/health</span>
         </div>
         <div class="ep-body">
           <div class="ep-desc">
-            Health check. Proxied to signet authority on Fly.
+            Liveness probe, also served at <code>/healthz</code>. Answered at
+            the edge &mdash; no auth, no Durable Object, no upstream. Replied
+            to before host canonicalization, so probes from a bare IP or from
+            inside a cluster get an answer rather than a redirect.
+          </div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="ep-header">
+          <span class="ep-method get">GET</span>
+          <span class="ep-path">/.well-known/version</span>
+        </div>
+        <div class="ep-body">
+          <div class="ep-desc">
+            Which BUILD is serving this request. Deploys are manual, so the
+            git tree does not settle what is running; this is the only
+            positive evidence that a fix shipped. Unauthenticated and
+            uncached &mdash; a cached answer would defeat the purpose on the
+            request after a deploy.
           </div>
         </div>
       </div>
@@ -551,29 +798,53 @@
         <em>attester</em>. You own your key. signet signs a short-lived
         certificate binding your public key to your verified identity.
       </p>
-      <p>Three grant types:</p>
+      <p>
+        One grant type is advertised, and it is the one the token endpoint
+        implements:
+      </p>
       <div style="margin-bottom: 24px">
         <div class="ep-field">
-          <span class="ep-field-name">oidc_token_exchange</span
+          <span class="ep-field-name">urn:ietf:params:oauth:grant-type:token-exchange</span
           ><span class="ep-field-desc"
-            >Human OAuth → browser flow via <code>signet auth login</code></span
-          >
-        </div>
-        <div class="ep-field">
-          <span class="ep-field-name">github_actions_oidc</span
-          ><span class="ep-field-desc"
-            >GHA CI → <code>POST /cert/gha</code> with OIDC JWT (zero
-            secrets)</span
-          >
-        </div>
-        <div class="ep-field">
-          <span class="ep-field-name">github_pat</span
-          ><span class="ep-field-desc"
-            >Headless agent → <code>POST /api/cert/register</code> with
-            PAT</span
+            >RFC 8693. CI workflow → <code>POST /token</code>, form-encoded, with
+            <code>subject_token</code> = a GitHub Actions OIDC JWT
+            (<code>aud=notme.bot</code>), <code>subject_token_type</code> =
+            <code>…:token-type:id_token</code>, an <code>audience</code>, and a
+            DPoP proof (RFC 9449). Returns a DPoP-bound access token for the
+            workflow's identity carrying <code>bridgeCert</code>. The subject
+            token's <code>jti</code> is single-use across <code>/token</code>,
+            <code>/cert/gha</code> and <code>/cert</code>.</span
           >
         </div>
       </div>
+      <p>
+        Not grants, and not listed as grants: <code>POST /cert/gha</code>
+        exchanges a GitHub OIDC JWT for a <em>certificate</em> (advertised as
+        <code>cert_gha_endpoint</code>), and DPoP is a token-binding scheme
+        (advertised as <code>dpop_signing_alg_values_supported</code>). This
+        list used to read <code>github_actions_oidc, dpop</code> — neither a
+        grant type, and the token endpoint accepted neither. The browser
+        session flow (no <code>grant_type</code>) is first-party and not
+        advertised, for the same reason <code>authorization_endpoint</code> is
+        withheld.
+      </p>
+      <p>
+        Everything else that gets you in is an <em>authentication method</em>,
+        not a grant, and the two are deliberately not conflated: passkey,
+        invite, and <code>oidc:github</code> establish a session; a grant
+        issues a token. An earlier revision of this page advertised
+        <code>oidc_token_exchange</code> and <code>github_pat</code> as grant
+        types. Neither was ever implemented. The discovery document derives its
+        list from a single constant — which keeps the documents consistent with
+        each other, not with the code; a test now posts each advertised grant
+        to <code>/token</code>, which is what keeps it true.
+      </p>
+      <p>
+        <strong>No endpoint returns a private key.</strong> The caller
+        generates its keypairs locally, ideally non-extractable, and proves
+        possession of them; only certificates come back. That is the property
+        the whole design exists to provide, and it holds on every route above.
+      </p>
       <p>
         All certificates are Ed25519-signed X.509 with custom OID extensions for
         subject identity and issuance time, matching the

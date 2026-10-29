@@ -29,6 +29,19 @@ const BASIC_CONSTRAINTS_LEAF = new BasicConstraintsExtension(
   true,
 );
 
+// Issuing-CA tier (ADR-008 §BasicConstraints "orchestrator bridge", named the
+// Issuing CA per signet-9dfb44): CA=true so the holder can sign task certs,
+// pathLenConstraint=0 so nothing it issues can issue in turn. The pathlen is
+// the rank function ADR-019 D4 requires — depth terminates because RFC 5280
+// §6.1.4(l)–(m) decrements it, not because scopes narrow (they may stay
+// equal). Critical per RFC 5280 §4.2.1.9.
+const BASIC_CONSTRAINTS_ISSUING = new BasicConstraintsExtension(true, 0, true);
+
+// keyCertSign ONLY, per ADR-008's tier table. Not digitalSignature: this key
+// signs CERTIFICATES, and a tier that can also sign arbitrary payloads
+// collapses the task/machine distinction the chain exists to draw.
+const ISSUING_KEY_USAGE = new KeyUsagesExtension(KeyUsageFlags.keyCertSign, true);
+
 // mTLS cert: digitalSignature (TLS handshake signing) + keyAgreement
 // (ECDHE in TLS 1.2+); ExtendedKeyUsage clientAuth so validators that
 // enforce EKU on TLS clients accept it.
@@ -66,11 +79,181 @@ const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigne
 // cert" rather than erroring — which is how a derived-identity check
 // degrades back into a trust-the-caller one (notme-6ad276).
 export const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
-const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
+// Exported, like OID_SUBJECT, because a cross-repo contract now depends on
+// this extension being PRESENT (see the profile-discriminator note below) and
+// the test that pins it must read exactly what minting wrote.
+export const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
 export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
 export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
 const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
-const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
+export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
+// `.1.7` IS NOT OURS. ley-line-open claimed it for `confinementDigest` — a
+// 32-byte BLAKE3-256 of the canonical ConfinementManifest — in LLO v0.7.6
+// (ley-line-open-c79ea8), and cloister's WASM verifier parses notme-minted
+// certs at this arc (`ep` from .1.4, `pf` from .1.6, `sc` from .1.3). This
+// file briefly allocated .1.7 for the task scope, which would have made a
+// notme task cert present a DER SEQUENCE where that verifier expects a
+// digest — mis-attributing "which confinement identity authorized the call".
+// Caught before any task cert was issued; nothing carries the old number.
+//
+// THE ARC IS SHARED AND THE MEANINGS DISAGREE. notme, signet and
+// ley-line-open all allocate under the IANA example/private-experiment arc
+// 1.3.6.1.4.1.99999 with no registry between them. ADR-005 designates THIS
+// FILE as the registry, so all three allocations belong in the table below.
+// Measured 2026-09-09 against LLO's rs/ll-open/sign/src/cert_chain.rs and
+// 2026-10-27 against signet's pkg/sigid/identity.go + cmd/signet/verify.go:
+//
+//   OID    notme                        signet                ley-line-open
+//   .1.1   subject                      subject        AGREE  —
+//   .1.2   issuance time                issuance time  AGREE  —
+//   .1.3   scopes (SEQ OF UTF8String)   capabilities    *** COLLIDES  —
+//   .1.4   epoch (INTEGER)              —                     epoch   AGREE
+//   .1.5   authMethod (UTF8String)      agent name      *** COLLIDES  interlace-peer  *** COLLIDES
+//   .1.6   peer binding (32 RAW bytes)  scope           *** COLLIDES  interlace-scope *** COLLIDES
+//   .1.7   — (task scope moved off it)  —                     confinementDigest  DO NOT REUSE
+//   .1.8   principal kind               (recognised only)     —
+//   .1.9   task scope                   —                     —
+//
+// SIGNET'S .1.5/.1.6 COLLISION WAS LIVE, unlike LLO's. LLO's sat behind an
+// earlier RFC 5280 rejection (see below); nothing shielded signet's.
+// `cmd/signet/verify.go` reads the extensions BEFORE verifying the chain, and
+// Go's x509 handles our critical BasicConstraints natively, so every notme
+// certificate presented to `signet verify` was reported with
+// `Agent = "gha-oidc"` (or "passkey", or whatever authMethod wrote) and a
+// `Scope` of 32 raw peer-binding bytes rendered as a string. Measured in
+// signet's cmd/signet/verify_notme_profile_test.go, which observed exactly
+// that before the fix. Both facts were INVENTED — worse than reporting
+// nothing, because a caller branching on `result.Agent` is told a workload
+// identity is a named agent.
+//
+// FIXED ON THE READ SIDE, in signet, by the same profile-discriminator shape
+// LLO adopted: a certificate carrying .1.8 is a notme certificate and its
+// .1.5/.1.6 are never reported. NOT by renumbering, because notme cannot
+// vacate .1.6 — cloister's WASM verifier already reads the peer binding
+// there, so moving the number breaks a shipped consumer to tidy an
+// allocation.
+//
+// WHICH PUTS A STRICTER CONTRACT ON .1.8 THAN LLO PUTS ON ITS FIVE MARKERS.
+// LLO checks `.any()` of five, so losing one is survivable. signet can only
+// use .1.8: it writes .1.1 and .1.2 itself, so those cannot tell the two
+// apart. .1.8 alone decides it, with no redundancy — pinned on all four mint
+// paths by llo-profile-contract.do.test.ts (signet-790ca1).
+//
+// .1.3 COLLIDES TOO and is NOT yet fixed: signet reserves it for
+// `OIDSignetCapabilities` (pkg/attest/x509/bridge.go) while notme writes a
+// SEQUENCE OF UTF8String of scopes. Inert today only because
+// cmd/signet/verify.go does not read .1.3 — so this one is latent, which is
+// what the LLO entry was mistaken for twice. Tracked, not fixed here.
+//
+// CORRECTED 2026-10-27 (notme-6070fa, relayed from LLO PR #489 and verified
+// against LLO's own source on both sides of the fix).
+//
+// An earlier version of this comment said .1.5 "parses silently and LLO
+// reads our authMethod as a peer fingerprint — no error, wrong value, in an
+// identity-correlation field". THAT MISREAD NEVER HAPPENED, and the reason
+// matters: LLO's known-critical-extension set contained no
+// ID_CE_BASIC_CONSTRAINTS, and notme marks BasicConstraints critical, so
+// every real notme certificate was REJECTED as carrying an unknown critical
+// extension (RFC 5280 §4.2) before any .1.x extension was read at all. The
+// collision was real as an allocation conflict and inert in practice,
+// sitting behind an earlier rejection. Describing it as a live silent
+// misread overstated it — in the direction that makes a hazard sound
+// confirmed rather than latent, which is its own kind of wrong.
+//
+// Nor will it happen now. LLO #489 decides a certificate's PROFILE from its
+// SIGNED extensions, so the choice cannot be stripped without breaking the
+// signature:
+//
+//     Signet profile  iff it carries at least one of .1.1, .1.2, …
+//     Interlace profile  otherwise
+//     Under the Signet profile, .1.5 and .1.6 are NEVER reported.
+//
+// THAT MAKES THE MARKER EXTENSIONS A CROSS-REPO CONTRACT, and the single
+// most surprising consequence in this file: they look like decorative audit
+// metadata — a subject the SAN already carries, a timestamp notBefore
+// already carries — but they are what tells a third-party verifier it holds
+// a notme certificate rather than a cloister one.
+//
+// The discriminator is a SET, and any ONE member selects it. An earlier
+// version of this comment said dropping .1.1/.1.2 from a mint path
+// reclassifies that path as Interlace. IT DOES NOT. Measured against LLO's
+// `oid_signet::MARKERS` + `classify_profile` (branch
+// fix/9ac66d-interlace-oid-profiles, NOT yet released): the set is .1.1,
+// .1.2, .1.3, .1.8, .1.9 and the check is `.any()`. Every notme mint path
+// emits .1.1, .1.2 AND .1.8, so the contract is satisfied three times over
+// and losing any single extension is survivable. The real hazard is a sweep
+// that strips ALL markers from a path — harder to do by accident, and the
+// thing actually worth watching for.
+//
+// So this is the second overstatement in this comment's history, in the same
+// direction as the first: a latent allocation conflict described as a
+// confirmed live misread.
+//
+// llo-profile-contract.do.test.ts pins .1.1/.1.2 on all four mint paths
+// (mutation-verified). That pin stands on its own footing — they are notme's
+// own identity contract, read by signet and cross-checked against the URI
+// SAN (notme-729801) — not on LLO's classifier. Pinning LLO's marker SET
+// waits for LLO's release, since the set can still move before then
+// (notme-6070fa).
+//
+// An even earlier version of this table said ".1.1–.1.6 notme + signet, .1.7
+// LLO". That was also wrong, and also in the direction that makes a
+// collision look resolved. The real fix remains a per-project PEN
+// (notme-229dc3), which is free and takes days.
+export const OID_PRINCIPAL_KIND = `${OID_PEN}.1.8`; // UTF8String: human|agent|workload|organization
+export const OID_TASK_SCOPE = `${OID_PEN}.1.9`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
+
+/**
+ * What the certificate's subject IS — a different axis from HOW it was
+ * authenticated or attested (ADR-019 D2). An earlier identity shape put the
+ * ceremony in the URI, which conflated the two and made the identity vary
+ * with the door the principal came through.
+ */
+export type PrincipalKind = "human" | "agent" | "workload" | "organization";
+
+/**
+ * The WIMSE identity: `wimse://<trust-domain>/principal/<stable-id>`.
+ *
+ * THE ONE BUILDER, because this string was previously assembled inline at
+ * four call sites with two different shapes — `/<authMethod>/<id>` for
+ * sessions and `/gha/<owner>/<repo>` for CI — which is how one principal
+ * ended up with several identities (notme-77438b).
+ *
+ * The URI carries the SUBJECT and nothing else. Kind, authentication and
+ * attestation are signed extensions, so a verifier reads a claim rather than
+ * splitting a string whose segment meanings differ by route. `gen/go/verify`
+ * already documents the URI as display-and-routing only — this makes that
+ * documented contract true rather than merely asserted.
+ *
+ * The id is percent-encoded per segment: a GHA subject is
+ * `repo:owner/name:ref:refs/heads/main`, whose slashes would otherwise
+ * invent path segments and break the D5 prefix-confinement rule that
+ * compares segments raw.
+ */
+export function principalIdentity(
+  trustDomain: string,
+  principalId: string,
+): string {
+  if (!principalId) {
+    throw new Error("principal id required — refusing to mint a headless identity");
+  }
+  return `wimse://${trustDomain}/principal/${encodeURIComponent(principalId)}`;
+}
+
+/** Read `principal_kind` back, or null when the cert predates the claim. */
+export function certPrincipalKind(cert: {
+  getExtension(oid: string): { value: ArrayBuffer } | null;
+}): PrincipalKind | null {
+  const ext = cert.getExtension(OID_PRINCIPAL_KIND);
+  if (!ext) return null;
+  const der = new Uint8Array(ext.value);
+  if (der.length < 2 || der[0] !== 0x0c) return null;
+  const value = new TextDecoder().decode(der.subarray(2, 2 + der[1]!));
+  return value === "human" || value === "agent" || value === "workload" ||
+    value === "organization"
+    ? value
+    : null;
+}
 
 // ASN.1 definite-length encoding: short form (a single byte) up to 0x7f, long
 // form (0x81 nn, 0x82 nn nn, …) above it.
@@ -241,6 +424,7 @@ export async function mintGHABridgeCert(
       CLIENT_AUTH_EKU,
       new Extension(OID_SUBJECT, false, derUtf8String(subject)),
       new Extension(OID_ISSUANCE_TIME, false, derUtf8String(now.toISOString())),
+      new Extension(OID_PRINCIPAL_KIND, false, derUtf8String("workload")),
     ],
   });
 
@@ -266,17 +450,43 @@ function derScopeSequence(scopes: string[]): Uint8Array {
 }
 
 // Encode a 4-byte big-endian integer as ASN.1 INTEGER
-function derInteger(n: number): Uint8Array {
-  const buf = new Uint8Array([
-    0x02,
-    0x04,
-    (n >> 24) & 0xff,
-    (n >> 16) & 0xff,
-    (n >> 8) & 0xff,
-    n & 0xff,
-  ]);
-  return buf;
+/**
+ * DER INTEGER, MINIMALLY encoded — the shortest form that represents `n`.
+ *
+ * This emitted a fixed-width `02 04 xx xx xx xx`, so epoch 1 was
+ * `02 04 00 00 00 01`. That is valid BER and invalid DER: X.690 §8.3.2
+ * forbids a leading zero octet unless the next octet's high bit is set.
+ * Go's encoding/asn1 enforces it and returns "integer not minimally
+ * encoded", and `gen/go/verify` swallowed that error — so every notme
+ * certificate reported epoch 0 to every Go consumer since the extension
+ * was added, silently disabling the revocation lever for them.
+ *
+ * Found by RUNNING the Go verifier against a freshly minted certificate
+ * while discharging a claim-ledger row that said its consumers were
+ * unaffected. No test caught it because every reader in this repo was ours,
+ * and ours accepted what ours produced.
+ *
+ * Exported for `der-integer.test.ts`, which round-trips it through a
+ * deliberately foreign strict reader rather than through `certEpoch`.
+ */
+export function derIntegerBytes(n: number): Uint8Array {
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`epoch must be a non-negative integer, got ${n}`);
+  }
+  // Big-endian, no leading zeros.
+  const body: number[] = [];
+  let v = n;
+  do {
+    body.unshift(v & 0xff);
+    v = Math.floor(v / 256);
+  } while (v > 0);
+  // A leading high bit would read as a negative number; one zero octet
+  // disambiguates it, and that octet is then part of the minimal form.
+  if (body[0]! & 0x80) body.unshift(0x00);
+  return new Uint8Array([0x02, body.length, ...body]);
 }
+
+const derInteger = derIntegerBytes;
 
 export async function mintBridgeCertPair(
   subject: string,
@@ -289,11 +499,54 @@ export async function mintBridgeCertPair(
     epoch: number;
     authMethod: string;
     ttlMs?: number;
+    /**
+     * The signer's SUBJECT name, when the signer is not the root. RFC 5280
+     * §6.1.3 chains by NAME as well as by key: a cert claiming
+     * CN=signet-authority while signed by a tier is rejected by every stock
+     * validator, and by verifyCertChain. mintTaskCertPair passes the tier's.
+     */
+    issuerName?: string;
+    /** Extra extensions (e.g. the task scope) — appended to both certs. */
+    extraExtensions?: Extension[];
+    /**
+     * Extensions for ONE of the two certs, appended after extraExtensions.
+     * An embedded SCT list is per certificate — each cert is logged on its
+     * own and gets its own SCT — so it cannot ride on extraExtensions.
+     */
+    perCertExtensions?: { mtls?: Extension[]; signing?: Extension[] };
+    /** What the subject IS (ADR-019 D2). Defaults to the human case. */
+    principalKind?: PrincipalKind;
+    /**
+     * Pin the fields that must be IDENTICAL between a precertificate and the
+     * certificate that replaces it (RFC 6962 §3.2).
+     *
+     * The log signs an SCT over the precertificate's TBSCertificate with the
+     * poison removed, and a verifier reconstructs that from the FINAL
+     * certificate by removing the SCT list. The two reconstructions have to be
+     * byte-identical, so every other field — serial numbers above all — must
+     * carry across. Two ordinary calls to this function generate fresh random
+     * serials and a fresh `now`, so the SCT would be signed over bytes the
+     * final certificate never contains, and it would verify nowhere
+     * (notme-1b46a8).
+     *
+     * Absent, both are random and the clock is read once, which is correct for
+     * every mint that is not being logged.
+     */
+    pin?: {
+      serialMtls: string;
+      serialSigning: string;
+      notBefore: Date;
+      notAfter: Date;
+    };
   },
 ): Promise<BridgeCertPairResult> {
   const ttlMs = opts.ttlMs ?? 5 * 60 * 1000;
-  const now = new Date();
-  const expires = new Date(now.getTime() + ttlMs);
+  // The pin carries the precertificate's clock across to the final
+  // certificate; without it the two differ in notBefore/notAfter and the
+  // SCT signs bytes the final certificate does not contain.
+  const now = opts.pin?.notBefore ?? new Date();
+  const expires = opts.pin?.notAfter ?? new Date(now.getTime() + ttlMs);
+  const issuerName = opts.issuerName ?? "CN=signet-authority,O=notme";
 
   // Import both public keys
   const mtlsPubKey = await importPublicKey(mtlsPublicKeyPem);
@@ -326,6 +579,11 @@ export async function mintBridgeCertPair(
     new Extension(OID_EPOCH, false, derInteger(opts.epoch)),
     new Extension(OID_AUTH_METHOD, false, derUtf8String(opts.authMethod)),
     new Extension(OID_PEER_BINDING, false, new Uint8Array(bindingHash)),
+    new Extension(
+      OID_PRINCIPAL_KIND,
+      false,
+      derUtf8String(opts.principalKind ?? "human"),
+    ),
   ];
 
   // SAN URI extension (WIMSE identity)
@@ -343,23 +601,21 @@ export async function mintBridgeCertPair(
   const sanDer = derTlv(0x30, sanUri); // SEQUENCE { [6] URI }
   const sanExtension = new Extension("2.5.29.17", true, sanDer); // SubjectAltName OID, critical
 
-  const serial1 = crypto.getRandomValues(new Uint8Array(16));
-  // Ensure positive (RFC 5280: serial must be positive integer)
-  serial1[0] &= 0x7f;
-  const serialHex1 = Array.from(serial1)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-
-  const serial2 = crypto.getRandomValues(new Uint8Array(16));
-  serial2[0] &= 0x7f;
-  const serialHex2 = Array.from(serial2)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  const randomSerial = (): string => {
+    const s = crypto.getRandomValues(new Uint8Array(16));
+    // Ensure positive (RFC 5280: serial must be positive integer)
+    s[0]! &= 0x7f;
+    return Array.from(s)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  };
+  const serialHex1 = opts.pin?.serialMtls ?? randomSerial();
+  const serialHex2 = opts.pin?.serialSigning ?? randomSerial();
 
   // Mint P-256 mTLS cert
   const mtlsCert = await X509CertificateGenerator.create({
     subject: `CN=${subject},O=notme`,
-    issuer: `CN=signet-authority,O=notme`,
+    issuer: issuerName,
     notBefore: now,
     notAfter: expires,
     signingAlgorithm: ED25519,
@@ -372,13 +628,15 @@ export async function mintBridgeCertPair(
       CLIENT_AUTH_EKU,
       ...sharedExtensions,
       sanExtension,
+      ...(opts.extraExtensions ?? []),
+      ...(opts.perCertExtensions?.mtls ?? []),
     ],
   });
 
   // Mint Ed25519 signing cert
   const signingCert = await X509CertificateGenerator.create({
     subject: `CN=${subject},O=notme`,
-    issuer: `CN=signet-authority,O=notme`,
+    issuer: issuerName,
     notBefore: now,
     notAfter: expires,
     signingAlgorithm: ED25519,
@@ -390,6 +648,8 @@ export async function mintBridgeCertPair(
       SIGNING_KEY_USAGE,
       ...sharedExtensions,
       sanExtension,
+      ...(opts.extraExtensions ?? []),
+      ...(opts.perCertExtensions?.signing ?? []),
     ],
   });
 
@@ -404,4 +664,368 @@ export async function mintBridgeCertPair(
     subject,
     binding: bindingHex,
   };
+}
+
+/** What `mintIssuingCaCert` returns — one certificate, one tier. */
+export interface IssuingCaCertResult {
+  certificate: string;
+  identity: string;
+  scopes: string[];
+  expires_at: number;
+  subject: string;
+}
+
+/**
+ * Mint the MIDDLE tier: an Issuing CA certificate (`CA=true, pathlen=0`).
+ *
+ * This is hop 1 of ADR-019's chain — the bridge delegates the human to the
+ * MACHINE, and the machine may then sign task certs itself, offline, without
+ * asking this authority per task. pathlen=0 is what makes every task cert
+ * terminal: an X.509 validator enforces the depth cap for us instead of
+ * trusting notme to refuse (delegation-depth.do.test.ts pins both halves).
+ *
+ * Ed25519 only. The chain is Ed25519 end-to-end — root signs this tier, this
+ * tier signs task certs — and accepting a P-256 subject key here would fork
+ * the chain's algorithm story for no caller that exists.
+ *
+ * Scopes carried here BOUND what task certs below may claim: a verifier
+ * applying the chain rule (`scopes ⊆ parent.scopes`, auth/scope-chain.ts)
+ * reads this cert as the parent. The route narrows them from the requesting
+ * session before they reach this function.
+ */
+export async function mintIssuingCaCert(
+  subject: string,
+  identity: string,
+  publicKeyPem: string,
+  signingKey: CryptoKey,
+  opts: {
+    scopes: string[];
+    epoch: number;
+    authMethod: string;
+    ttlMs?: number;
+    /** Signer's subject name when not the root — see mintBridgeCertPair. */
+    issuerName?: string;
+    /** Defaults to "agent": a tier is a machine, however a human armed it. */
+    principalKind?: PrincipalKind;
+    /** Extra extensions — e.g. the CT poison or the embedded SCT list. */
+    extraExtensions?: Extension[];
+    /**
+     * Pin the fields a precertificate and its final certificate must share
+     * (RFC 6962 §3.2): serial and validity window. See mintBridgeCertPair's
+     * pin for why. Absent, the serial is random and the clock is read once.
+     */
+    pin?: { serial: string; notBefore: Date; notAfter: Date };
+  },
+): Promise<IssuingCaCertResult> {
+  // Longer-lived than the 5-minute leaves by design (ADR-019 D4: "a
+  // longer-lived machine tier"): the tier must outlive the tasks it signs
+  // for, or every task cert chains to an expired parent at first use.
+  const ttlMs = opts.ttlMs ?? 60 * 60 * 1000;
+  const now = opts.pin?.notBefore ?? new Date();
+  const expires = opts.pin?.notAfter ?? new Date(now.getTime() + ttlMs);
+
+  const publicKey = await importPublicKey(publicKeyPem);
+  if (publicKey.algorithm.name !== "Ed25519") {
+    throw new Error(
+      `issuing tier requires an Ed25519 key, got ${publicKey.algorithm.name}`,
+    );
+  }
+
+  const sanUri = derTlv(0x86, new TextEncoder().encode(identity));
+  const sanDer = derTlv(0x30, sanUri);
+  const serial = crypto.getRandomValues(new Uint8Array(16));
+  serial[0] &= 0x7f;
+
+  const cert = await X509CertificateGenerator.create({
+    subject: `CN=${subject},O=notme`,
+    issuer: opts.issuerName ?? "CN=signet-authority,O=notme",
+    notBefore: now,
+    notAfter: expires,
+    signingAlgorithm: ED25519,
+    publicKey,
+    signingKey,
+    serialNumber:
+      opts.pin?.serial ??
+      Array.from(serial)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+    extensions: [
+      BASIC_CONSTRAINTS_ISSUING,
+      ISSUING_KEY_USAGE,
+      new Extension(OID_SUBJECT, false, derUtf8String(subject)),
+      new Extension(OID_ISSUANCE_TIME, false, derUtf8String(now.toISOString())),
+      new Extension(OID_SCOPES, false, derScopeSequence(opts.scopes)),
+      new Extension(OID_EPOCH, false, derInteger(opts.epoch)),
+      new Extension(OID_AUTH_METHOD, false, derUtf8String(opts.authMethod)),
+      new Extension(
+        OID_PRINCIPAL_KIND,
+        false,
+        derUtf8String(opts.principalKind ?? "agent"),
+      ),
+      new Extension("2.5.29.17", true, sanDer),
+      ...(opts.extraExtensions ?? []),
+    ],
+  });
+
+  return {
+    certificate: cert.toString("pem"),
+    identity,
+    scopes: opts.scopes,
+    expires_at: Math.floor(expires.getTime() / 1000),
+    subject,
+  };
+}
+
+// ── Hop 2: the machine mints task credentials (ADR-019 D3/D4/D5) ────────────
+
+const GOAL_HASH_RE = /^[0-9a-f]{64}$/;
+
+function derOctetString(bytes: Uint8Array): Uint8Array {
+  return derTlv(0x04, bytes);
+}
+
+/**
+ * Encode the task scope: SEQUENCE { UTF8String task, OCTET STRING goalHash }.
+ * This is what makes the credential TASK-scoped rather than merely
+ * time-bound (ADR-019 D3): `expires_at` stops it outliving the work;
+ * `goal_hash` says which work.
+ */
+function derTaskScope(task: string, goalHash: string): Uint8Array {
+  const hash = new Uint8Array(goalHash.match(/../g)!.map((h) => parseInt(h, 16)));
+  const body = new Uint8Array([...derUtf8String(task), ...derOctetString(hash)]);
+  return derTlv(0x30, body);
+}
+
+/** Read the task scope back — null when absent, never a partial. */
+export function certTaskScope(cert: {
+  getExtension(oid: string): { value: ArrayBuffer } | null;
+}): { task: string; goalHash: string } | null {
+  const ext = cert.getExtension(OID_TASK_SCOPE);
+  if (!ext) return null;
+  const der = new Uint8Array(ext.value);
+  // SEQUENCE
+  if (der[0] !== 0x30) return null;
+  let at = 2;
+  if (der[1]! & 0x80) at = 2 + (der[1]! & 0x7f);
+  // UTF8String
+  if (der[at] !== 0x0c) return null;
+  let len = der[at + 1]!;
+  let hdr = 2;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + der[at + 2 + i]!;
+    hdr = 2 + n;
+  }
+  const task = new TextDecoder().decode(der.subarray(at + hdr, at + hdr + len));
+  at = at + hdr + len;
+  // OCTET STRING, exactly 32 bytes
+  if (der[at] !== 0x04 || der[at + 1] !== 32 || der.length < at + 34) return null;
+  const goalHash = Array.from(der.subarray(at + 2, at + 34))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return { task, goalHash };
+}
+
+/**
+ * Mint a TASK credential pair, signed by an Issuing CA tier — offline, no
+ * round trip to the authority. This is hop 2 of the chain, and the reason
+ * the tier exists at all (ADR-019 D4: "a machine that mints locally").
+ *
+ * What the producer enforces, so a verifier is not the only line:
+ *
+ *   NAMESPACE  identity = tier.identity + "/" + task — D5 confinement by
+ *              construction; a task id that is empty, contains a separator,
+ *              or is a dot-segment is refused before it can escape
+ *   AUTHORITY  scopes ⊆ tier scopes, via narrowScopes' checked postcondition
+ *   DEPTH      the pair is CA=false (BASIC_CONSTRAINTS_LEAF): tasks are
+ *              terminal, and the tier's pathlen=0 makes stock validators
+ *              agree
+ *   LIFETIME   never past the tier's own notAfter — a task cert chaining to
+ *              an expired parent fails at first use
+ *   POSSESSION the private key must match the tier certificate's public key;
+ *              the producer refuses to sign with a key that is not the tier's
+ *
+ * Epoch is the caller's to supply because the machine is offline: it stamps
+ * the epoch it enrolled under, and a rotation since then is caught by the
+ * verifier (every tier checks the epoch), which is the intended blast
+ * radius.
+ */
+export async function mintTaskCertPair(
+  tierCertPem: string,
+  tierPrivateKey: CryptoKey,
+  mtlsPublicKeyPem: string,
+  signingPublicKeyPem: string,
+  opts: {
+    task: string;
+    goalHash: string;
+    scopes: string[];
+    epoch: number;
+    ttlMs?: number;
+    /**
+     * A parent TASK certificate (PEM) to derive from — a subtask
+     * (notme-9f84e6). Omitted, this is a top-level task or a re-mint of one.
+     *
+     * Re-mints and subtasks are one operation: issuing a credential derived
+     * from an existing task credential. Both are minted by the TIER HOLDER,
+     * never by the agent — a task key signs nothing a verifier accepts — and
+     * both may only narrow: the child's scopes ⊆ the parent's, its notAfter
+     * ≤ the parent's, and its task path and identity extend the parent's, so
+     * revoking by prefix reaches everything derived from a task.
+     */
+    parent?: string;
+  },
+): Promise<BridgeCertPairResult> {
+  const { X509Certificate, SubjectAlternativeNameExtension } = await import("@peculiar/x509");
+  const { narrowScopes, escalatedScopes } = await import("./auth/scope-chain");
+  const tier = new X509Certificate(tierCertPem);
+
+  // Possession: the private key must be the tier's. Sign a probe and verify
+  // against the cert's public key — WebCrypto has no "same key" oracle.
+  const probe = new TextEncoder().encode("notme task-credential possession probe");
+  const sig = await crypto.subtle.sign(ED25519, tierPrivateKey, probe);
+  const tierPublic = await tier.publicKey.export();
+  if (!(await crypto.subtle.verify(ED25519, tierPublic, sig, probe))) {
+    throw new Error("private key does not match the tier certificate");
+  }
+
+  // Task id: one segment, non-empty, no separator, no dot-segments. Encoded
+  // per segment so an odd character cannot become structure.
+  if (opts.task.length === 0 || opts.task.includes("/") || opts.task === "." || opts.task === "..") {
+    throw new Error(`task id must be one non-empty path segment, got ${JSON.stringify(opts.task)}`);
+  }
+  if (!GOAL_HASH_RE.test(opts.goalHash)) {
+    throw new Error("goal hash must be a SHA-256 hex digest (64 lowercase hex chars)");
+  }
+
+  const san = tier.getExtension(SubjectAlternativeNameExtension);
+  const tierIdentity = san?.names.items.find((n) => n.type === "url")?.value;
+  if (!tierIdentity) throw new Error("tier certificate carries no identity URI");
+
+  const tierScopes = readScopes(tier);
+  if (tierScopes === null) throw new Error("tier certificate carries no scopes");
+
+  // The bound every narrowing check is made against: the tier, or — for a
+  // subtask — the parent task, which is itself already within the tier.
+  let taskPath = opts.task;
+  let identity = `${tierIdentity}/${encodeURIComponent(opts.task)}`;
+  let boundScopes = tierScopes;
+  let boundNotAfter = tier.notAfter.getTime();
+  let boundName = "the tier";
+  if (opts.parent !== undefined) {
+    let parent: InstanceType<typeof X509Certificate>;
+    try {
+      parent = new X509Certificate(opts.parent);
+    } catch {
+      throw new Error("parent is not a certificate");
+    }
+    // Issued by THIS tier: name and signature both, so a parent from another
+    // tier (another machine, another human) cannot be extended here.
+    if (
+      parent.issuer !== tier.subject ||
+      !(await parent.verify({ publicKey: tierPublic, signatureOnly: true }))
+    ) {
+      throw new Error("parent task was not issued by this tier");
+    }
+    const parentScope = certTaskScope(parent);
+    if (!parentScope) throw new Error("parent is not a task certificate (no task scope)");
+    if (parent.notAfter.getTime() <= Date.now()) {
+      throw new Error(`parent task expired at ${parent.notAfter.toISOString()} — re-mint it first`);
+    }
+    const parentIdentity = parent
+      .getExtension(SubjectAlternativeNameExtension)
+      ?.names.items.find((n) => n.type === "url")?.value;
+    const parentScopes = readScopes(parent);
+    if (!parentIdentity || parentScopes === null) {
+      throw new Error("parent task carries no identity or scopes");
+    }
+    taskPath = `${parentScope.task}/${opts.task}`;
+    identity = `${parentIdentity}/${encodeURIComponent(opts.task)}`;
+    boundScopes = parentScopes;
+    boundNotAfter = parent.notAfter.getTime();
+    boundName = "the parent task";
+  }
+
+  const requested = [...new Set(opts.scopes)];
+  const scopes = narrowScopes(boundScopes, requested);
+  if (scopes.length !== requested.length) {
+    throw new Error(
+      `scope escalation: ${escalatedScopes(boundScopes, requested).join(", ")} not held by ${boundName}`,
+    );
+  }
+
+  // Lifetime: never past the tier's own expiry — nor, for a subtask, the
+  // parent's.
+  const requestedTtl = opts.ttlMs ?? 5 * 60 * 1000;
+  const untilTierExpiry = tier.notAfter.getTime() - Date.now();
+  // REFUSE AN EXPIRED TIER rather than minting against it.
+  //
+  // This is the pause/resume path. A microVM suspended for longer than the
+  // tier's lifetime resumes holding a tier past its own notAfter, and the
+  // clamp used to be `Math.max(0, Math.min(...))` — so a negative remaining
+  // lifetime floored to zero and the mint SUCCEEDED, returning a certificate
+  // whose notBefore equals its notAfter. Valid for zero seconds,
+  // indistinguishable from a working credential at the call site, and failing
+  // later at whoever first used it with an expiry error naming the TASK
+  // rather than the expired tier that caused it.
+  //
+  // The caller's recovery for an expired tier is to re-enrol the machine, and
+  // nothing in a zero-second certificate says so. Minting a corpse is worse
+  // than refusing. (`Math.max(0, …)` is gone with the throw: it existed only
+  // to paper over this case.)
+  if (untilTierExpiry <= 0) {
+    throw new Error(
+      `tier certificate expired at ${tier.notAfter.toISOString()} — re-enrol the machine before minting task credentials`,
+    );
+  }
+  const ttlMs = Math.min(requestedTtl, untilTierExpiry, boundNotAfter - Date.now());
+
+  const authMethodExt = tier.getExtension(OID_AUTH_METHOD);
+  const authMethod = authMethodExt
+    ? new TextDecoder().decode(new Uint8Array(authMethodExt.value).subarray(2))
+    : "task";
+
+  return mintBridgeCertPair(
+    taskPath,
+    identity,
+    mtlsPublicKeyPem,
+    signingPublicKeyPem,
+    tierPrivateKey,
+    {
+      scopes,
+      epoch: opts.epoch,
+      authMethod,
+      ttlMs,
+      issuerName: tier.subject,
+      // A task is exercised by the same agent the tier names; the task scope
+      // bounds WHAT it may do, it does not make the task a separate kind.
+      principalKind: "agent",
+      extraExtensions: [new Extension(OID_TASK_SCOPE, false, derTaskScope(taskPath, opts.goalHash))],
+    },
+  );
+}
+
+/** Scopes at OID_SCOPES — a local reader so this module has no import cycle with verify-chain. */
+function readScopes(cert: { getExtension(oid: string): { value: ArrayBuffer } | null }): string[] | null {
+  const ext = cert.getExtension(OID_SCOPES);
+  if (!ext) return null;
+  const der = new Uint8Array(ext.value);
+  if (der[0] !== 0x30) return null;
+  let at = 2;
+  if (der[1]! & 0x80) at = 2 + (der[1]! & 0x7f);
+  const out: string[] = [];
+  while (at < der.length) {
+    if (der[at] !== 0x0c) return null;
+    let len = der[at + 1]!;
+    let hdr = 2;
+    if (len & 0x80) {
+      const n = len & 0x7f;
+      len = 0;
+      for (let i = 0; i < n; i++) len = len * 256 + der[at + 2 + i]!;
+      hdr = 2 + n;
+    }
+    out.push(new TextDecoder().decode(der.subarray(at + hdr, at + hdr + len)));
+    at += hdr + len;
+  }
+  return out;
 }

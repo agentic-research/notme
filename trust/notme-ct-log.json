@@ -1,0 +1,4 @@
+{
+    "status": "not-provisioned",
+    "note": "The notme-ct log has not been provisioned. `task ct:verify -- --write` records its key here (ct/README.md, operator runbook). Until then nothing is pinned and nothing is signed."
+}

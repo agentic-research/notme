@@ -58,13 +58,70 @@ sequenceDiagram
     W-->>B: certificate pair
 ```
 
+**Registration is invite-only** after the first user (ADR-021). Scopes come
+from the invite, never from the request. The eventual gate is signet's trust
+policy bundle (`sigpol`); the invite is the interim mechanism, and the
+decision — that registration is a policy question about a subject notme does
+not own the registry for — is the same either way.
+
 **Scopes narrow at the cert boundary.** A session holding `authorityManage`
 mints a cert carrying only `bridgeCert` — a long-lived exportable credential
 must not carry authority that was granted to a browser session.
 
-**Known defect:** the identity reads `wimse://notme.bot/<authMethod>/<id>`, so
-the same principal gets a *different* identity depending on how they signed in
-(`notme-77438b`). ADR-019 exists to fix this.
+**The identity names the principal, not the door.**
+`wimse://<domain>/principal/<stable-id>` — the same for a given principal
+however they signed in. It used to read `wimse://<domain>/<authMethod>/<id>`,
+so one human had a different "identity" per ceremony while the stable
+principal sat unadvertised in the cert subject (`notme-77438b`, the SPIFFE
+inversion; fixed 2026-08-29 per ADR-019 D2).
+
+The ceremony still travels, in `OID_AUTH_METHOD` — a verifier reads a claim
+instead of splitting a URI whose segments meant different things per route.
+`principal_kind` (`OID_PRINCIPAL_KIND`, `human|agent|workload|organization`)
+is its own axis, because *what a subject is* and *how it was attested* are
+different questions.
+
+---
+
+## 2b. Delegation — human → machine → task
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as human session (certMint)
+    participant W as auth.notme.bot
+    participant M as machine (holds tier key)
+    participant T as task
+    participant V as any verifier
+
+    H->>W: POST /cert/issuing-ca + Ed25519 PoP
+    W-->>H: Issuing CA cert — CA=true, pathlen=0
+    H->>M: tier cert + key (the machine IS the holder)
+    M->>M: mintTaskCertPair — OFFLINE, no round trip
+    M-->>T: task pair, identity = tier/<task>, scopes ⊆ tier
+    T->>V: cert + chain [tier]
+    V->>V: verifyCertChain — signatures, names,<br/>pathlen, scopes ⊆ parent, prefix confinement
+```
+
+**The tier signs offline** — that is the point of issuing a CA tier rather
+than a leaf. Every task cert carries its task scope (`task` + `goal_hash`,
+`OID_TASK_SCOPE`) so it is bounded to *work*, not just to time, and
+`taskCorrelationKey` recovers `<principal>/<bridge>/<task>` from the
+certificates alone.
+
+**Gotcha:** the task cert must name the **tier** as its issuer, not the root.
+Names chain as well as keys (RFC 5280 §6.1.3); the walker checks both, and
+the first chain-test fixtures were lying about it without anyone noticing.
+
+**Gotcha, worse:** the root the authority SERVES must carry the budget the
+code MINTS. Production served `pathlen:0` for five months after the code moved
+to `pathlen=1`, because the DO's cache check asked only whether
+BasicConstraints *existed* — so every Issuing CA tier minted in production was
+unverifiable by any stock validator, while every test passed against a fresh
+test root (`notme-1b1db4`). The DO now re-issues under the same key when the
+served budget disagrees (no rotation, nothing in flight breaks), and
+`worker:verify` reads the LIVE root's pathlen. Check yours:
+`openssl x509 -in <(curl -s https://auth.notme.bot/.well-known/ca-bundle.pem) -noout -text | grep pathlen`.
 
 ---
 
@@ -72,17 +129,77 @@ the same principal gets a *different* identity depending on how they signed in
 
 ```mermaid
 graph TD
-    A["fresh authority"] --> B{"has an authenticator?"}
+    A["fresh authority"] --> B{"an administrator exists?<br/>(a live authorityManage grant)"}
     B -->|yes| C["closed — sign in, or ask for an invite"]
-    B -->|no| D{"BOOTSTRAP_CODE set?"}
-    D -->|no| E["unconfigured<br/>wrangler secret put BOOTSTRAP_CODE"]
-    D -->|yes| F["armed — present the code to register"]
-    F --> G["first user gets<br/>bridgeCert + authorityManage + certMint"]
+    B -->|no| D{"which mechanism is armed?"}
+    D -->|BOOTSTRAP_GHA_SUBJECT| F["register a passkey → CLAIM code<br/>(holds nothing yet)"]
+    F --> G["gh workflow run claim-authority.yml -f code=…<br/>(the named workflow's OIDC token approves it)"]
+    G --> H["that passkey's principal holds the admin set;<br/>sign in again"]
+    D -->|BOOTSTRAP_CODE only| I["secret — present the code to register"]
+    D -->|neither| E["unconfigured — arm one and retry"]
 ```
+
+**The default path is attestation, not a secret — and a human finishes it.**
+Set `BOOTSTRAP_GHA_SUBJECT` to one GitHub workflow identity (the full OIDC
+`sub`, e.g. `repo:owner/name:ref:refs/heads/main`). Then:
+
+1. open `/login` and register a passkey. With no administrator, it is
+   registered as a **claim** holding nothing, and the page shows a code;
+2. `gh workflow run claim-authority.yml -f code=XXXX-XXXX` from that repo;
+3. sign in again with the same passkey — you are the administrator.
+
+The human holds the credential (it never leaves their authenticator), GitHub
+attests the deployer (the workflow's token must carry exactly that `sub`), and
+nothing secret is set, typed or logged. `BOOTSTRAP_GHA_SUBJECT` is a **var,
+not a secret**: an identity has nothing to leak. The code is not a secret
+either — approving it requires the workflow's identity — but check the code you
+pass is the one your own login page shows, because approving someone else's
+makes *them* the administrator.
+
+**What this replaced, and why it was a dead end (`notme-486e8a`).** The
+attested bootstrap used to run as a side effect of `/cert/gha` and make the
+*workflow* the administrator, with a note that the human would then "attach a
+passkey by taking an invite from it". But `/invites` accepts only a browser
+session and a workflow never has one, so the authority ended up governed by an
+identity no human could act as — and, since a credential now existed, closed
+to every human registration. The only way in was the `BOOTSTRAP_CODE` secret
+this mechanism was meant to replace. `/cert/gha` now has no administrative
+side effect.
+
+**Gated on "no administrator", not "no credential".** Anyone may open a claim
+while no administrator exists; only the code the named workflow approves
+counts, and approval voids every other pending claim. Under a "first
+credential" gate, a stranger who registered first and was never approved
+would lock the deployer out permanently.
+
+**The ref segment is trigger-dependent, and a mismatch refuses the claim.**
+A branch run produces `…:ref:refs/heads/main`; a tag run produces
+`…:ref:refs/tags/v1.2.3`. Verified against a real value — the cert production
+minted for `agentic-research/signet` on 2026-08-07 carries
+`CN=repo:agentic-research/signet:ref:refs/tags/v0.3.0`. Arm the form the claim
+workflow actually produces when you dispatch it.
+
+**Why exact-subject and not the owner allowlist.** `GHA_ALLOWED_OWNERS`
+answers *may this workflow get a credential*; anyone with push access to any
+repo under that owner clears it. *May it make someone the administrator* is a
+different question, so the deployer names one workflow.
+
+**Proven with a real token, not a fixture.**
+`.github/workflows/bootstrap-e2e.yml` runs the Worker locally inside an
+Actions job — the one place a genuine GitHub-signed OIDC token exists — and
+drives the whole claim with a software WebAuthn authenticator: claim
+registration holding nothing → the real workflow token approves it → sign in →
+that session issues an invite → registration is invite-only and a second
+approval is refused. It cannot be pointed at staging, whose
+`GHA_ALLOWED_OWNERS` must differ from production's (`notme-1532eb`); the local
+CA is born in the job and dies with it.
 
 Asking about bootstrap state is a **read** — it mints nothing. Previously the
 first unauthenticated request caused an admin code to be minted and logged, so
 any stranger chose the moment a credential appeared (`notme-addef9`).
+
+`BOOTSTRAP_CODE` remains the explicit operator break-glass — including
+recovery when the last administrator credential is lost.
 
 ---
 
@@ -106,30 +223,56 @@ permanently ungovernable (`notme-4838ae`).
 
 ---
 
-## 5. Third-party verification — the claim that matters
+## 5. Provenance — prove who produced an artifact
 
 ```bash
-./scripts/verify-as-third-party.sh
+./scripts/demo-provenance.sh          # --pause to step through it live
 ```
+
+Four commands as an outsider: download a public artifact from another repo's
+release, read the identity off its certificate, check the authority's key
+against an anchor you pinned in advance, and verify the private key signed it.
+No credential, no issuer software.
+
+The credential in that chain **expired five minutes after it was issued** —
+which is why `openssl verify` needs `-no_check_time`. Say that out loud before
+anyone asks: the signature outlives the credential, and that is what makes
+short-lived identity usable for provenance at all.
+
+## 5b. Authority checks — continuity, freshness, possession
+
+```bash
+./scripts/check-authority.sh --spki <sha256> [--leaf agent-cert.pem]
+```
+
+The anchor is **required input**, never a default — a pin shipped inside the
+repository being evaluated is not an anchor, it is a self-reference.
 
 `curl`, `openssl`, `shasum`. No issuer software, because verification requiring
 the issuer's code would be circular.
 
 ```mermaid
 graph LR
-    P["pin SPKI hash<br/>OUT OF BAND"] --> F["fetch /.well-known/ca-bundle.pem"]
-    F --> C{"hash matches?"}
-    C -->|yes| V["authority holds the key<br/>you already trusted"]
+    P["anchor supplied by CALLER<br/>--spki &lt;sha256&gt;"] --> F["fetch /.well-known/ca-bundle.pem"]
+    F --> C{"served key<br/>matches anchor?"}
     C -->|no| X["stop"]
-    V --> B["check bundle freshness<br/>< 5 min"]
-    B --> L["chain a leaf:<br/>openssl verify -CAfile"]
+    C -->|yes| V["CONTINUITY<br/>(not possession — a public<br/>cert is public)"]
+    V --> B["bundle freshness &lt; 5 min"]
+    B --> L{"--leaf given?"}
+    L -->|yes| PO["POSSESSION<br/>openssl verify -CAfile<br/>the private key signed it"]
+    L -->|no| SK["skipped — say so,<br/>do not imply it"]
 ```
 
 Pin on **SPKI**, not just the certificate — the *key* is the identity. A
 re-issued cert over the same key is the same authority; a new key is not.
 
-**Boundary, stated:** the bundle *signature* is Ed25519 over canonical CBOR, so
-verifying it needs a CBOR encoder and therefore software.
+**Boundaries, stated.** Matching the served key against your anchor proves
+CONTINUITY, not possession — a public certificate is public and anyone can
+re-serve it. Only `--leaf` proves possession, by verifying a credential the
+private key actually signed. The bundle *signature* is not checked at all:
+Ed25519 over canonical CBOR needs a CBOR encoder, therefore software, therefore
+a dependency on the issuer's ecosystem. This does **not** discharge Goal Zero
+criterion (D).
 
 ---
 
@@ -139,11 +282,16 @@ verifying it needs a CBOR encoder and therefore software.
 |---|---|---|
 | **Epoch rotation** | every cert issued under the old epoch | **works** — `verifyX509` compares `OID_EPOCH` |
 | TTL expiry | one credential, ≤5 min | works |
-| `checkRevocation` (bundle/seqno/kid) | per-credential | **unwired** — no call sites (`notme-77a024`) |
-| Capability grants | per-principal | **not re-checked** — baked into a 24h session cookie |
+| **Grant revocation** | one scope, one principal | **works** — `POST /principals/:id/revoke`; every authority gate reads the grant store LIVE, so it takes effect on the next request, not at cookie expiry |
+| `checkRevocation` (bundle/seqno/kid) | external verifiers | SDK path; by design not called in-worker (in-worker checks read the live epoch) |
 
-Rotation is the emergency lever. Until yesterday `OID_EPOCH` was written into
-every cert and read nowhere, so rotating bumped a number nothing compared.
+Rotation is the emergency lever; **the grant is the everyday one** (ADR-019
+D3, criterion C). A passkey user is a principal with grants — `is_admin` no
+longer decides anything after first enrollment — and revoking a grant strips
+it from every live session immediately. Self-revocation of `authorityManage`
+is refused (409): the last admin revoking themselves is `notme-4838ae` again.
+Until 2026-08 `OID_EPOCH` was written into every cert and read nowhere, so
+rotating bumped a number nothing compared.
 
 **Never rotate production during a demo** — it invalidates every cert in
 flight. Staging has its own CA and DOs for exactly this.

@@ -191,9 +191,25 @@ rather than trusting the session alone.
 
 The bridge cert subject identifies the holder. The correct content:
 
+> **CORRECTION (2026-08-30).** The allocation below **never shipped** and must
+> not be used to pick a number. The code uses `.1.4` for the epoch and `.1.5`
+> for the auth method, not `.1.7` and `.1.8`. Worse, `.1.7` was independently
+> claimed by ley-line-open for `confinementDigest` (LLO v0.7.6,
+> `ley-line-open-c79ea8`), which cloister's verifier parses out of
+> notme-minted certificates — so this table's `.1.7` has a third meaning
+> again. A task-scope extension was briefly allocated there before the
+> collision was found; nothing was issued carrying it.
+>
+> **`worker/src/cert-authority.ts` is the registry.** It carries the live
+> allocation and a note on which numbers belong to which repo. Three
+> projects — notme, signet and ley-line-open — allocate under the same
+> squatted `1.3.6.1.4.1.99999` arc with no registry between them, which is
+> the underlying problem and why `notme-229dc3` (obtain a real IANA PEN)
+> is not cosmetic.
+
 ```
 Subject CN: <principal_id>
-Extensions:
+Extensions:                                      # HISTORICAL — never shipped
   1.3.6.1.4.1.99999.1.1: OIDCSubject (if authenticated via OIDC)
   1.3.6.1.4.1.99999.1.7: Epoch
   1.3.6.1.4.1.99999.1.8: AuthMethod ("passkey" | "oidc:<issuer>")

@@ -1,0 +1,72 @@
+name: Claim authority
+
+# Approve the first administrator of a fresh notme authority (notme-486e8a).
+#
+# 1. Open https://<authority>/login and register a passkey. On an authority
+#    with no administrator it is registered as a CLAIM holding nothing, and
+#    the page shows a code like BCDF-GHJK.
+# 2. gh workflow run claim-authority.yml -f code=BCDF-GHJK
+# 3. Sign in again with the same passkey — you are the administrator.
+#
+# Why this shape: the human holds the credential (the passkey never leaves
+# their device), GitHub attests the deployer (this workflow's OIDC identity
+# must equal BOOTSTRAP_GHA_SUBJECT on the authority), and nothing secret is
+# set, typed or logged. The code is not a secret — approving it requires this
+# workflow's identity — and the OIDC token is never printed.
+#
+# BOOTSTRAP_GHA_SUBJECT is a [vars] entry, e.g.
+#   repo:agentic-research/notme:ref:refs/heads/main
+# so run this from that branch. Check the code on the login page matches the
+# one you pass: approving someone else's code would make THEM the admin.
+#
+# Deliberately no third-party actions: the token comes from GitHub's own OIDC
+# endpoint and the request is curl, so there is nothing to pin and no
+# supply-chain surface on the step that creates an administrator.
+
+on:
+  workflow_dispatch:
+    inputs:
+      code:
+        description: "Claim code shown on the login page (XXXX-XXXX)"
+        required: true
+        type: string
+      authority_url:
+        description: "Authority to claim"
+        required: false
+        type: string
+        default: "https://auth.notme.bot"
+      audience:
+        description: "OIDC audience the authority expects (GHA_CERT_AUDIENCE)"
+        required: false
+        type: string
+        default: "notme.bot"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Approve the claim
+        env:
+          CODE: ${{ inputs.code }}
+          AUTHORITY: ${{ inputs.authority_url }}
+          AUDIENCE: ${{ inputs.audience }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$CODE" | grep -Eq '^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$'; then
+            echo "::error::'$CODE' is not a claim code (XXXX-XXXX)"; exit 1
+          fi
+          token=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r .value)
+          echo "::add-mask::$token"
+          status=$(curl -sS -o /tmp/claim.json -w '%{http_code}' -X POST "$AUTHORITY/bootstrap/claim" \
+            -H "Authorization: Bearer $token" -H 'content-type: application/json' \
+            -d "{\"code\":\"$CODE\"}")
+          cat /tmp/claim.json; echo
+          if [ "$status" != "200" ]; then
+            echo "::error::claim refused ($status)"; exit 1
+          fi
+          echo "Claimed. Sign in at $AUTHORITY/login with the passkey that showed $CODE." >> "$GITHUB_STEP_SUMMARY"

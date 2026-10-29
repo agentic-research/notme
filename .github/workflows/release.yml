@@ -172,3 +172,95 @@ jobs:
             VERSION="${TAG#v}" \
             REGISTRY="ghcr.io/${{ github.repository_owner }}" \
             SIGN=true
+
+  # Sign the committed trust anchor with this workflow's keyless identity
+  # (notme-8e8836). Without it, trust/ is protected by git history alone,
+  # and fetching /.well-known/ca-bundle.pem trusts whoever controls the
+  # hostname. With it, a consumer can check the root against a Sigstore
+  # signature bound to THIS workflow at THIS tag, which a party who only
+  # controls the hostname cannot produce. Separate from `image` so a
+  # trust-anchor problem cannot block, or be masked by, an image publish.
+  trust-anchor:
+    name: Sign trust anchor → release assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release if absent; upload assets
+      id-token: write # cosign keyless
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Refuse to sign a stale anchor. A valid signature over a certificate
+      # production no longer serves is worse than none: it lends the stale
+      # file authority. trust/ went stale twice (trust/README.md). Compare
+      # the parsed DER, never file bytes (their framing differs by a newline).
+      - name: Confirm trust/ is what production serves
+        run: |
+          curl -fsS "https://auth.notme.bot/.well-known/ca-bundle.pem?r=$GITHUB_RUN_ID" -o live.pem
+          if ! cmp -s <(openssl x509 -in live.pem -outform DER) \
+                      <(openssl x509 -in trust/notme-root.pem -outform DER); then
+            echo "::error::trust/notme-root.pem is not the served root. Run 'task trust:refresh', commit, and re-tag."
+            exit 1
+          fi
+
+      # The CT log key pin is signed only once it records a key. While it is
+      # the not-provisioned placeholder there is nothing to attest, and a
+      # signature over "nothing is pinned" would read as endorsement of a log
+      # that does not exist. A pin that is neither state fails the release.
+      - name: Is the CT log key pinned?
+        id: ctpin
+        run: |
+          status=$(jq -r '.status' trust/notme-ct-log.json)
+          case "$status" in
+            provisioned) echo "signed=true" >> "$GITHUB_OUTPUT" ;;
+            not-provisioned) echo "signed=false" >> "$GITHUB_OUTPUT"
+                             echo "::notice::trust/notme-ct-log.json is the not-provisioned placeholder; not signing it." ;;
+            *) echo "::error::trust/notme-ct-log.json has unrecognised status '$status'"; exit 1 ;;
+          esac
+
+      # Mirror of the root check above: never sign a log key the log does not
+      # serve. Only when the pin records a key; the placeholder has nothing to
+      # compare. Same checks as scripts/verify-ct-log.ts: key and log_id equal
+      # the pin, and log_id is SHA-256(key).
+      - name: Confirm the pinned CT log key is what the log serves
+        if: steps.ctpin.outputs.signed == 'true'
+        run: |
+          url=$(jq -r '.metadata_url' trust/notme-ct-log.json)
+          curl -fsS "$url?r=$GITHUB_RUN_ID" -o ct-live.json
+          live_key=$(jq -r '.key' ct-live.json); live_id=$(jq -r '.log_id' ct-live.json)
+          pin_key=$(jq -r '.key' trust/notme-ct-log.json); pin_id=$(jq -r '.log_id' trust/notme-ct-log.json)
+          calc_id=$(printf '%s' "$live_key" | base64 -d | openssl dgst -sha256 -binary | base64 -w0)
+          if [ "$live_key" != "$pin_key" ] || [ "$live_id" != "$pin_id" ] || [ "$calc_id" != "$live_id" ]; then
+            echo "::error::trust/notme-ct-log.json is not what $url serves (or its log_id is not SHA-256(key)). Run 'task ct:verify', fix the pin by review, and re-tag."
+            exit 1
+          fi
+          if grep -q REPLACE-ME ct/config.notme.json; then
+            echo "::error::ct/config.notme.json still has REPLACE-ME placeholders."
+            exit 1
+          fi
+
+      - name: Sign
+        run: |
+          files="notme-root.pem notme-root.json"
+          if [ "${{ steps.ctpin.outputs.signed }}" = "true" ]; then files="$files notme-ct-log.json"; fi
+          for f in $files; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "trust/$f"
+          done
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --title "$TAG" \
+                 --notes "Container images and the signed trust anchor. Verify the anchor: trust/README.md."
+          gh release upload "$TAG" --clobber \
+            trust/notme-root.pem notme-root.pem.sigstore.json \
+            trust/notme-root.json notme-root.json.sigstore.json
+          if [ "${{ steps.ctpin.outputs.signed }}" = "true" ]; then
+            gh release upload "$TAG" --clobber \
+              trust/notme-ct-log.json notme-ct-log.json.sigstore.json
+          fi

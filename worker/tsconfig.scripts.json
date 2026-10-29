@@ -1,0 +1,22 @@
+{
+  // Type-checks the task-cert client (scripts/task-cert/*.ts) and its plain
+  // (non-pool) tests. tsconfig.json excludes __tests__ and does not include
+  // scripts/, and tsconfig.test.json covers only *.do.test.ts, so the client
+  // was never type-checked. Run via `task worker:check`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "node"],
+    "paths": { "@peculiar/x509": ["./node_modules/@peculiar/x509"] },
+    "noEmit": true
+  },
+  "include": [
+    "../scripts/task-cert/**/*.ts",
+    "src/__tests__/task-cert-client.test.ts",
+    "src/__tests__/tier-renewal-binding.test.ts",
+    "src/__tests__/capnp-codegen.test.ts",
+    "src/__tests__/ct-log-client.test.ts",
+    "src/__tests__/verify-ct-log.test.ts",
+    "../scripts/verify-ct-log.ts"
+  ],
+  "exclude": ["node_modules"]
+}

@@ -4,7 +4,7 @@
 -->
 # ADR-019: Typed principals and bounded delegation
 
-**Status:** proposed
+**Status:** accepted (2026-08-27)
 **Beads:** `notme-600df1` (this decision), `notme-77438b` (ceremony-varying identity), `notme-2c4209` (registration policy), `notme-77a024` (revocation unit), `notme-acc822` (chain constraints), `notme-9f84e6` (correlation key)
 **Answers:** cloister ADR-0066 Q1 and Q2
 **Serves:** `notme-bed754` criterion (B); unblocks (C) and (D)
@@ -129,8 +129,14 @@ absent, actor is a machine) exists but is rarer than it looks, and stating it
 as the default is how accountability gets lost.
 
 **The model covers all three; the code covers one and a half.**
-`/cert/passkey` is case 2 and works, modulo the ceremony-varying identity
-(`notme-77438b`). `/cert/gha` is case 3 and carries **no represented principal
+`/cert/passkey` is case 2 and, as written here, "works, modulo the
+ceremony-varying identity (`notme-77438b`)". **It did not work** (corrected
+2026-10-28, `notme-486e8a`): its proof bound SHA-256 of the HttpOnly session
+cookie, which no client can read, so nothing could call it — and the same was
+true of `/cert/issuing-ca`, this ADR's D4 tier. Both now work: the passkey
+route binds a session nonce from `POST /cert/nonce`, and the tier is enrolled
+by device authorization (`POST /cert/issuing-ca/device`, approved with a
+passkey at `/enroll`). `/cert/gha` is case 3 and carries **no represented principal
 at all**: `worker.ts:746` builds the identity from `repository_owner` and the
 repo name, and mints with `subject: claims.sub` and `scopes: ["bridgeCert"]` —
 so the cert says *what ran*, never *whose authority it ran under*. That is
@@ -258,6 +264,26 @@ That repeats the very defect it was fixing: **GHA is how the workload was
 attested, not what the workload is.** Kind and assurance mechanism are
 different axes and must not share a slot.
 
+**BUILT 2026-08-29** (`notme-77438b`, Goal Zero criterion B's code half).
+`principalIdentity()` in `cert-authority.ts` is the single builder; the four
+inline call sites that assembled this string in two different shapes are
+gone. `OID_PRINCIPAL_KIND` (`.1.8`) carries the kind. The GHA path's identity
+is now the OIDC `sub` — which is already the cert CN — so URI and subject
+name the same principal, which is the inversion this fixes.
+
+**One deviation, stated rather than slipped in.** This section lists
+`authentication` and `attestation` as separate claims; the implementation
+keeps the existing single `OID_AUTH_METHOD` and discriminates by
+`principal_kind` — for `kind=human` the value is an authentication
+(`passkey`, `invite`), for `kind=workload` an attestation (`gha-oidc`). The
+reason to split is real but not yet load-bearing: it becomes so when one
+credential needs BOTH, which is the delegation chain's case (a tier is an
+agent, armed by a human's passkey — `auth_method=passkey`,
+`principal_kind=agent`, three hops from the ceremony). That reads coherently
+today; the day it does not, split the field rather than overloading it. A
+second wire change now, for a distinction nothing yet reads, would cost every
+consumer twice.
+
 ### D3 — The grant is a first-class object with a defined payload
 
 The prior draft required only a granting subject and a grant time. That is not
@@ -308,9 +334,13 @@ The same rule governs scopes and validity windows: intersection, never union.
 ### D4 — Depth is bounded by a rank function, not by scope narrowing
 
 ADR-008 already specifies three tiers and `notme-20f88b` widened the root to
-`pathlen=1` for exactly this. The middle tier was never built:
-`cert-authority.ts` stamps `CA=false` on every cert notme mints, so **the
-authority issues two levels while its root advertises room for three.**
+`pathlen=1` for exactly this. When this section was written the middle tier
+did not exist — `cert-authority.ts` stamped `CA=false` on every cert, so the
+authority issued two levels while its root advertised room for three. **Built
+2026-08-27** (after adoption and the `signet-9dfb44` naming decision):
+`mintIssuingCaCert` produces the Issuing CA (`CA=true, pathlen=0,
+keyCertSign`), reachable at `POST /cert/issuing-ca`, gated on `certMint` —
+that scope's first enforcement site.
 
 An earlier draft argued that monotone scope narrowing made depth bound itself.
 **That was wrong:**
@@ -348,8 +378,8 @@ the anchor.
 | Bound | Mechanism | Enforcement | Built? |
 |---|---|---|---|
 | **Authority** — what a credential may *do* | `scopes ⊆ parent` (`auth/scope-chain.ts`) | **cooperative** — relying parties MUST; nothing compels them | yes |
-| **Depth** — how far it may *pass that on* | `pathLenConstraint` + `remaining_delegation_depth` | **intrinsic** for pathlen | root only; middle tier missing |
-| **Namespace** — which identities it may *name* | see below — **not** URI `nameConstraints` | **cooperative** unless hosts are split | no |
+| **Depth** — how far it may *pass that on* | `pathLenConstraint` + `remaining_delegation_depth` | **intrinsic** for pathlen | yes — root `pathlen=1`, Issuing CA tier `pathlen=0` (2026-08-27) |
+| **Namespace** — which identities it may *name* | URI-SAN segment-prefix confinement (decided below) | **cooperative** — notme's chain verifier + SDK; labeled honestly, like scopes | **built 2026-08-27** — `auth/verify-chain.ts`, mutation-tested |
 
 **The namespace bound cannot be done the way ADR-008 §299 says.** That section
 proposes `permittedSubtrees: URI:wimse://notme.bot/agent/*`. RFC 5280 §4.2.1.10
@@ -372,16 +402,44 @@ Constraining kinds therefore requires one of:
    which is safe, but means it is enforced by notme's own verifier, not by
    everyone's.
 
-This is an open question, not a decision. ADR-008 §299 should be corrected
-regardless of which is chosen.
+**DECIDED 2026-08-27: none of the three as primary — the confinement rule
+instead.** A child certificate's identity URI must **segment-prefix-extend**
+its parent's: a tier whose SAN is `wimse://notme.bot/principal/alice` may only
+issue identities under `wimse://notme.bot/principal/alice/…`. This is RFC 3820's
+proxy-certificate confinement rule (child subject = parent subject + one
+appended component) transplanted onto WIMSE URIs — the one existing X.509
+delegation standard that solves exactly this, per ADR-020's required question.
+
+Why it beats the three options above: it bounds both threats at once (same
+subtree ⇒ same principal *and* same kind, so Alice's machine can neither name
+Bob nor name a human); it reuses the segment-prefix machinery already shipped
+in `auth/correlation-key.ts` (percent-encoded segments, prefix-closed — never
+string-prefix); and it makes the identity URI and the correlation key the
+same shape, so "what happened under X" and "what X may name" are one closure.
+
+What it costs, stated honestly: enforcement is **cooperative** — notme's
+chain verifier and the SDK enforce it; stock validators see ordinary URI SANs
+and verify signatures and pathlen only. That is the same enforcement class as
+the authority bound (scopes), and strictly better than option 3, which makes
+chains unverifiable by stock tools and so breaks third-party verifiability.
+The **upgrade path stays open**: once the PEN lands (`notme-229dc3`), the same
+subtree relation can be expressed as an `otherName` under our arc constrained
+via `permittedSubtrees` — intrinsic for validators that implement it — after
+measuring how stock openssl actually treats an unrecognized `otherName` form
+in constraints, which must be an experiment, not an assumption.
+
+ADR-008 §299 stands corrected regardless (it already carries the CORRECTION
+block).
 
 ## What follows, already built
 
 - `auth/scope-chain.ts` — the authority bound, applied at
   `certScopesForSession`, with six previously-orphaned attenuation tests now
   bound to it.
-- `delegation-depth.do.test.ts` — the depth gap pinned as `it.fails`, going red
-  the moment the middle tier lands.
+- `delegation-depth.do.test.ts` — began as `it.fails` pinning the depth gap;
+  the polarity flipped when the tier landed (2026-08-27) and they now stand as
+  normal tests: a mint path produces `CA=true/pathlen=0`, and the root's
+  budget equals the tiers it can issue.
 - `auth/correlation-key.ts` — `<principal>/<bridge>/<task>`, keyed on the
   stable principal and the pair binding (not a serial: a bridge is two certs
   with two independent serials, so no serial names it).
@@ -391,12 +449,38 @@ regardless of which is chosen.
 
 ## What it requires that is not built
 
-1. **The grant as a stored, referenceable object** with the D3 payload. Today
-   there are three `*_by` columns and no grant identity.
-2. **The middle tier** — a mint path producing `CA=true, pathlen=0`.
-3. **A namespace mechanism**, per D5's open question.
-4. **A task-credential producer**, which gives the correlation key its third
-   segment and the receipt field a value. Note the subject of a task credential
+1. **The grant as a stored, referenceable object** with the D3 payload.
+   PARTLY BUILT. `capability_grants` has a stable, referenceable `id` as of
+   2026-10-26: the table is append-only history with a partial unique index
+   admitting one LIVE grant per `(principal, scope)`, and `grantCapability`
+   is idempotent rather than replacing — so a re-grant appends beside the
+   revoked row instead of overwriting it, and an id, once taken, still names
+   the same grant. Before that, `INSERT OR REPLACE` against an all-rows
+   `UNIQUE(principal_id, scope)` erased the `revoked_at`/`revoked_by` of the
+   row it replaced and minted a fresh id each call, so the audit view lost
+   the one event it exists to show and nothing could reference a grant at
+   all. (Latent, not live: no route reached it — `grantCapability` has no RPC
+   method, and its two callers either refuse an existing principal or return
+   existing grants rather than re-granting.)
+
+   STILL MISSING is the D3 payload itself: `represented_principal`,
+   `parent_grant_id`, `audience`/`resources`, `purpose`/`goal_hash`,
+   `delegable`, `remaining_delegation_depth`. A grant is still a
+   `(principal, scope)` row with provenance, not a delegation object, and no
+   credential names its grant. **That work is gated, not merely unscheduled**
+   — open question 6 below asks what this adds over an in-toto layout, and
+   ADR-020 forbids inventing a format where composition would do. Building
+   the payload before answering it would be the invention ADR-020 exists to
+   prevent.
+2. ~~**The middle tier** — a mint path producing `CA=true, pathlen=0`.~~ Built 2026-08-27: `mintIssuingCaCert` + `POST /cert/issuing-ca`.
+3. ~~**A namespace mechanism**, per D5's open question.~~ Decided 2026-08-27:
+   segment-prefix confinement on the URI SAN (see D5); built as part of the
+   chain verifier.
+4. ~~**A task-credential producer**~~ Built 2026-08-28: `mintTaskCertPair`
+   in `cert-authority.ts` — the machine mints offline under its tier, the
+   task scope (`task` + `goal_hash`) rides in the cert at `OID_TASK_SCOPE`,
+   and `taskCorrelationKey` derives `<principal>/<bridge>/<task>` from the
+   certificates alone. Note the subject of a task credential
    should be the **agent or agent instance**, with `task_id`/`goal_hash` as
    bounded context — a task is execution context, not an entity capable of
    holding a key, unless it genuinely generates and controls its own.
@@ -427,9 +511,104 @@ What notme has today is **epoch-based bundle revocation** (`revocation.ts`):
 coarse (a whole issuance class), pull-based, and gated on `BUNDLE_MAX_AGE_MS`.
 There is no CRL, no OCSP, and no per-credential status. So the honest current
 answer is **TTL-only for anything finer than an epoch**, and the ADR says so
-rather than implying the hierarchy above already works. Choosing among signed
-revocation epochs, a CRL distribution point, OCSP, or trust-bundle refresh is
-`notme-77a024`'s remaining work.
+rather than implying the hierarchy above already works.
+
+#### D7 — The epoch is a lever, and pulling it costs no evidence
+
+**Decided 2026-10-26, closing `notme-77a024`.** Signed revocation epochs, of
+the three options this ADR listed. Not a CRL or OCSP: both require notme to
+answer at verification time, which `ADR-020` forbids making mandatory and
+which the offline-verification goal rules out anyway.
+
+The defect was not the choice of mechanism but that the chosen one **could
+not be operated**. `rotate()` advanced the epoch in the same statement that
+replaced the signing key, so the two axes were one:
+
+| | before | now |
+|---|---|---|
+| mass revocation | required destroying the signing key | `revokeEpoch()`, key untouched |
+| key rotation | silently mass-revoked | `rotate()`, epoch untouched |
+
+Both directions were harmful. Revoking cost the signing key — the one
+irreversible action available — and past the key archive's retention that
+makes every receipt naming an earlier epoch unverifiable, which is the
+audit-defeat Interlace `RECEIPTS.md` §2.3 names as a MUST-not. **A lever that
+destroys your own evidence does not get pulled**, so in practice notme had no
+mass revocation at all. And in the other direction a routine key rotation
+voided every outstanding credential, because `checkRevocation` tests the
+epoch (step 5) before the key id (step 6) — so the previous-key grace window
+built for `notme-54f84b` guarded a branch no token could reach.
+
+> **The epoch is the revocation generation and moves only on
+> `revokeEpoch()`. The key id says which key signed and moves only on
+> `rotate()`. Neither implies the other.**
+
+**AND THE LEVER NEEDED A HANDLE.** Decoupling the axes made the mechanism
+sound and left it unreachable: `revokeEpoch()` shipped as a Durable Object
+RPC method with no route and no caller outside the test suite, so the
+sentence above — "could not be operated" — stayed true for a different
+reason. That is the same defect this bead had already fixed one function
+earlier, for `resetAlarmHealth()`, whose absent route let production serve a
+rejected bundle for 130 days (`notme-4896d8`). Found 2026-10-27 while
+answering whether the release waits on ley-line-open; `grep -rn revokeEpoch`
+returned its own definition, nine test call sites, and nothing else.
+
+`POST /admin/revoke-epoch` now exposes it, `authorityManage`-gated with the
+auth check ahead of the method check, and it returns `BUNDLE_MAX_AGE_MS`
+alongside the new generation so an operator pulling it is told when it takes
+effect rather than assuming "now". Gating and effect are pinned by
+`admin-revoke-epoch-route.do.test.ts` — including that a second pull advances
+the generation again, because an idempotent revoke could not answer a second
+incident, and that a revoked grant shuts the door on the next request.
+
+**PROPAGATION BOUND: `BUNDLE_MAX_AGE_MS` — five minutes.** A verifier that
+can reach the bundle enforces the new generation within one refresh;
+`isBundleStale()` refuses a bundle older than that, so the bound is enforced
+rather than hoped for. `revokeEpoch()` publishes synchronously instead of
+waiting for `alarm()`, because an alarm is the one component here with a
+measured history of never firing (`notme-4896d8`: `totalFires: 0` across 130
+days). A verifier that cannot reach the bundle has TTL and nothing else —
+unchanged, and still the honest answer.
+
+**WHAT THE LEVER IS NOT.** Class-level, never targeted: it cannot revoke one
+task, one tier, or one principal.
+
+**AND THE FIRST VERSION OF THIS SECTION OVERSTATED WHAT COVERS THAT**, in the
+one direction that makes a hole look filled. It claimed the targeted job was
+already handled by "the chain, where revoking a tier fails every task
+credential beneath it by issuer under ordinary path validation, needing no
+index at all". The path-validation mechanics are correct; **the lever does not
+exist.** Measured 2026-10-27: no CRL, no OCSP, no per-certificate status
+anywhere in the worker, and `CABundle` carries `epoch`, `seqno`, `keys`,
+`keyId`, `prevKeyId`, `issuedAt`, `signature` — no revoked-serial list.
+Nothing can mark one tier revoked, so nothing beneath one falls. The claim
+also contradicted the paragraph two above it, which had said the honest thing
+all along.
+
+The levers that EXIST are this one and the **grant** (`liveScopes` at the
+authorization gate — which governs what a session may do, not the validity of
+a certificate already in someone's hands). **Killing one task, or one machine,
+is an open hole**, tracked at `notme-9f84e6`, and the shape this ADR commits
+to for it is a renewal predicate, not a revocation list — see "Enforcement is
+a short lease, never 'valid until done'" above. Reaching for the epoch to do a
+targeted job remains the error; the point is that the targeted lever has to be
+BUILT, not that it is already there.
+
+**CONSEQUENCE THE SCHEMA PAID FOR.** `retired_keys` was keyed
+`epoch INTEGER PRIMARY KEY`, which is sound only while the two axes move
+together. Decoupled, a second rotation inside one epoch collides on that key —
+and the archive write is `INSERT OR IGNORE`, so the collision is **silent** and
+the second key's bytes are lost. That is the same audit-defeat failure in a new
+costume, reintroduced by the fix if the schema were left alone. The archive is
+therefore keyed on the key and records the inclusive **span** of epochs it
+served, and `getEpochPublicKey` returns the **set** of keys that served an
+epoch — resolution at audit time is by `actor_fp`, which the receipt carries,
+with the epoch as a filter. One number was never an index for two axes.
+
+**ALSO FIXED, found by the test that drove this.** The epoch comparison was
+one-sided (`token.epoch < bundle.epoch`), so a credential naming a *future*
+generation passed step 5 and then matched the current key id at step 6. It is
+equality now: an epoch is not a timestamp and has no skew to tolerate.
 
 #### "Offline verification" and "not revoked" cannot both be fully true
 
@@ -570,6 +749,25 @@ missing" but **what APAS adds that a layout does not** — plausibly the
 delegation chain, the represented principal, and an actor that was itself
 delegated to mid-execution, none of which in-toto's functionary model covers.
 Extending that model is a stronger position than a parallel format.
+
+**PARTLY ANSWERED UPSTREAM, 2026-10-26 — and in the direction above.** APAS
+0.4 (signet `signet-ded9d4`, on branch, UNMERGED) makes an **in-toto Statement
+the mandatory baseline carrier**, with DSSE required at L2 and above, and
+assigns notme the predicate/schema namespace (`https://notme.bot/provenance/…`,
+its Appendix B). So "compose onto in-toto" is already the decided shape for the
+statement layer; what remains open is only the narrower question of whether the
+delegation chain, the represented principal and the mid-execution re-delegation
+fit a layout's functionary model or need a predicate of their own. Being
+assigned the predicate namespace means notme answers that as a predicate
+schema, which is composition, not a parallel format.
+
+Two consequences for the grant payload: it should be specified as a predicate
+under that namespace rather than as notme-internal columns first, and the
+sequencing waits on 0.4 merging — building against an unmerged document would
+pin notme to a draft. Tracked at `notme-230b40` (notme serves 0.3's
+`dispatch/v1` and owes 0.4's `activity/v1`; the rename from *dispatch* to
+*Activity* is itself the task-not-time distinction, since an Activity spans
+process replacement and resumption while a dispatch does not).
 
 **Federation** is a separate, horizontal axis and is out of scope here. notme
 already emits trust-domain-qualified identities; the accept side is missing.

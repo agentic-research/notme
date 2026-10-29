@@ -9,6 +9,8 @@
 // NOTE: sql.exec() below is SQLite's query method on the Durable Object,
 // NOT child_process.exec(). This is safe — all parameters are bound, not interpolated.
 
+import { verifyScopeChain } from "./scope-chain";
+
 export interface Principal {
   principalId: string;
   displayName?: string;
@@ -49,6 +51,20 @@ export function ensurePrincipalSchema(sql: any): void {
       status       TEXT NOT NULL DEFAULT 'active'
     )
   `);
+  // APPEND-ONLY HISTORY, ONE LIVE GRANT PER SCOPE (ADR-019 D3).
+  //
+  // This table used to declare `UNIQUE(principal_id, scope)` across ALL rows,
+  // and `grantCapability` wrote `INSERT OR REPLACE`. Re-granting a scope then
+  // destroyed two things: the `revoked_at`/`revoked_by` of the row it
+  // replaced — so a deliberate revocation vanished from the record that
+  // `listGrants` advertises as "the audit view" — and the grant's `id`, since
+  // each call generates a fresh one. An identifier that moves cannot be
+  // REFERENCED, which is what blocked a credential naming the grant that
+  // authorized it.
+  //
+  // The invariant worth keeping is "at most one LIVE grant per scope", not
+  // "one row ever". A partial unique index says exactly that and lets
+  // revoked rows accumulate as history.
   sql.exec(`
     CREATE TABLE IF NOT EXISTS capability_grants (
       id           TEXT PRIMARY KEY,
@@ -58,9 +74,54 @@ export function ensurePrincipalSchema(sql: any): void {
       granted_at   TEXT NOT NULL DEFAULT (datetime('now')),
       expires_at   TEXT,
       revoked_at   TEXT,
-      UNIQUE(principal_id, scope)
+      revoked_by   TEXT
     )
   `);
+  // Migration: rebuild a table carrying the old all-rows UNIQUE.
+  //
+  // A table-level constraint cannot be dropped in SQLite, so the shape has to
+  // be detected and the table rewritten. sqlite_master holds the original
+  // CREATE text, which is the only honest place to ask. Existing rows carry
+  // at most one grant per (principal, scope) by construction, so the copy
+  // cannot violate the new partial index.
+  const grantsDdl = (
+    sql
+      .exec(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'capability_grants'",
+      )
+      .toArray() as Array<{ sql: string | null }>
+  )[0]?.sql;
+  if (grantsDdl && grantsDdl.includes("UNIQUE(principal_id, scope)")) {
+    sql.exec(`
+      CREATE TABLE capability_grants_v2 (
+        id           TEXT PRIMARY KEY,
+        principal_id TEXT NOT NULL,
+        scope        TEXT NOT NULL,
+        granted_by   TEXT,
+        granted_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at   TEXT,
+        revoked_at   TEXT,
+        revoked_by   TEXT
+      )
+    `);
+    sql.exec(
+      "INSERT INTO capability_grants_v2 (id, principal_id, scope, granted_by, granted_at, expires_at, revoked_at, revoked_by) " +
+        "SELECT id, principal_id, scope, granted_by, granted_at, expires_at, revoked_at, revoked_by FROM capability_grants",
+    );
+    sql.exec("DROP TABLE capability_grants");
+    sql.exec("ALTER TABLE capability_grants_v2 RENAME TO capability_grants");
+  }
+  sql.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS capability_grants_one_live " +
+      "ON capability_grants (principal_id, scope) WHERE revoked_at IS NULL",
+  );
+  // Existing authorities predate revoked_by. SQLite has no ADD COLUMN IF NOT
+  // EXISTS; the duplicate-column error is the "already migrated" signal.
+  try {
+    sql.exec("ALTER TABLE capability_grants ADD COLUMN revoked_by TEXT");
+  } catch {
+    /* column exists */
+  }
   sql.exec(`
     CREATE TABLE IF NOT EXISTS federated_identities (
       id            TEXT PRIMARY KEY,
@@ -129,15 +190,90 @@ export function principalCount(sql: any): number {
 
 // ── Capabilities ──
 
+/**
+ * Grant a scope, or leave an existing live grant exactly as it is.
+ *
+ * IDEMPOTENT, NOT REPLACING. Granting a scope the principal already holds
+ * live is a no-op: same row, same `id`, same `granted_by`, same
+ * `granted_at`. That is what makes the id referenceable — a credential or
+ * receipt naming a grant still names the same grant afterwards.
+ *
+ * The previous `INSERT OR REPLACE` did the opposite, and its worst case was
+ * not the moved id but the erased revocation: re-granting a revoked scope
+ * overwrote the row that recorded the revocation, so the audit view lost the
+ * one event it existed to show. A re-grant after a revocation now INSERTS a
+ * new grant beside the revoked one — two rows, one history, one live.
+ */
 export function grantCapability(
   sql: any, principalId: string, scope: string, grantedBy?: string, expiresAt?: string,
 ): void {
   ensurePrincipalSchema(sql);
-  const id = crypto.randomUUID();
+  const live = sql.exec(
+    "SELECT COUNT(*) AS c FROM capability_grants WHERE principal_id = ? AND scope = ? AND revoked_at IS NULL",
+    principalId, scope,
+  ).toArray() as Array<{ c: number }>;
+  if ((live[0]?.c ?? 0) > 0) return;
   sql.exec(
-    "INSERT OR REPLACE INTO capability_grants (id, principal_id, scope, granted_by, expires_at) VALUES (?, ?, ?, ?, ?)",
-    id, principalId, scope, grantedBy ?? null, expiresAt ?? null,
+    "INSERT INTO capability_grants (id, principal_id, scope, granted_by, expires_at) VALUES (?, ?, ?, ?, ?)",
+    crypto.randomUUID(), principalId, scope, grantedBy ?? null, expiresAt ?? null,
   );
+}
+
+/**
+ * Revoke one grant. The grant is the revocation UNIT (notme-77a024, ADR-019
+ * D3): finer than rotation, which voids every credential ever issued, and a
+ * decision rather than expiry, which is automatic. Returns whether a LIVE
+ * grant was revoked — idempotent, and honest about no-ops so an operator
+ * revoking the wrong scope is told, not reassured.
+ */
+export function revokeCapability(
+  sql: any, principalId: string, scope: string, revokedBy?: string,
+): { revoked: boolean } {
+  ensurePrincipalSchema(sql);
+  const before = sql.exec(
+    "SELECT COUNT(*) AS c FROM capability_grants WHERE principal_id = ? AND scope = ? AND revoked_at IS NULL",
+    principalId, scope,
+  ).toArray() as Array<{ c: number }>;
+  if ((before[0]?.c ?? 0) === 0) return { revoked: false };
+  sql.exec(
+    "UPDATE capability_grants SET revoked_at = datetime('now'), revoked_by = ? WHERE principal_id = ? AND scope = ? AND revoked_at IS NULL",
+    revokedBy ?? null, principalId, scope,
+  );
+  return { revoked: true };
+}
+
+export interface Grant {
+  id: string;
+  principalId: string;
+  scope: string;
+  grantedBy: string | null;
+  grantedAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  revokedBy: string | null;
+}
+
+/** Every grant ever made to a principal, revoked ones included — the audit view. */
+export function listGrants(sql: any, principalId: string): Grant[] {
+  ensurePrincipalSchema(sql);
+  const rows = sql.exec(
+    // ORDER BY granted_at, then rowid: `datetime('now')` has one-second
+    // resolution, so a revoke-and-re-grant inside the same second ties and
+    // leaves the audit view's order up to the query planner. rowid breaks
+    // the tie by insertion order, which is the order the events happened in.
+    "SELECT id, principal_id, scope, granted_by, granted_at, expires_at, revoked_at, revoked_by FROM capability_grants WHERE principal_id = ? ORDER BY granted_at, rowid",
+    principalId,
+  ).toArray() as Array<Record<string, string | null>>;
+  return rows.map((r) => ({
+    id: r.id!,
+    principalId: r.principal_id!,
+    scope: r.scope!,
+    grantedBy: r.granted_by ?? null,
+    grantedAt: r.granted_at!,
+    expiresAt: r.expires_at ?? null,
+    revokedAt: r.revoked_at ?? null,
+    revokedBy: r.revoked_by ?? null,
+  }));
 }
 
 export function getCapabilities(sql: any, principalId: string): string[] {
@@ -150,7 +286,15 @@ export function getCapabilities(sql: any, principalId: string): string[] {
 }
 
 export function canGrant(grantorScopes: string[], scope: string): boolean {
-  return grantorScopes.includes("authorityManage") && grantorScopes.includes(scope);
+  // Two separate requirements: authorityManage says the grantor may grant AT
+  // ALL; the chain rule says a grant may only carry what the grantor holds.
+  // The second is ADR-008's subset rule, so it goes through the same function
+  // every other narrowing site uses rather than a private includes() —
+  // one predicate, one place to get it wrong (notme-acc822).
+  return (
+    grantorScopes.includes("authorityManage") &&
+    verifyScopeChain(grantorScopes, [scope])
+  );
 }
 
 // ── Federated Identities ──

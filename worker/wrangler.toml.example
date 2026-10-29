@@ -61,6 +61,53 @@ SIGNET_AUTHORITY_URL = "https://auth.notme.bot"
 # Comma-separated list of GitHub org/user names allowed to exchange GHA OIDC tokens
 # for bridge certs at auth.notme.bot/cert/gha.
 GHA_ALLOWED_OWNERS = "your-org"
+# Base path of the log behind the CT_LOG service binding (below). Default is
+# /logs/notme; set it only if the shard is named differently in
+# ct/config.notme.json. Has no effect while CT_LOG is unbound.
+# CT_LOG_PATH = "/logs/notme"
+# The log notme trusts, REQUIRED once CT_LOG is bound: copy `log_id` and `key`
+# from trust/notme-ct-log.json (the reviewed pin, ct/README.md runbook step 2).
+# CT_LOG_ID is the base64 log id, CT_LOG_KEY the base64 SPKI DER of the log's
+# P-256 key; the id must be SHA-256 of the key. An SCT is embedded, and a
+# backlog row marked logged, only if it carries this id and its signature
+# verifies under this key — so a wrong CT_LOG_PATH, shard or service cannot
+# put a stranger's SCTs in notme's certificates. Missing or malformed while
+# bound: nothing is submitted, every mint goes out unlogged (never refused),
+# and /admin/alarm-health reports `ct.configError` and counts `ct.unloggable`.
+# CT_LOG_ID = "<base64 log_id from trust/notme-ct-log.json>"
+# CT_LOG_KEY = "<base64 key from trust/notme-ct-log.json>"
+
+# ATTESTED FIRST BOOT (notme-addef9) — the default way a fresh authority gets
+# its administrator, and the reason no secret has to travel through a log.
+#
+# Set this to the FULL OIDC `sub` of exactly one workflow, e.g.
+#   repo:your-org/your-repo:ref:refs/heads/main     (a branch push)
+#   repo:your-org/your-repo:ref:refs/tags/v1.2.3    (a tag / release run)
+#
+# THE REF SEGMENT DEPENDS ON THE TRIGGER, and getting it wrong fails SILENTLY
+# — bootstrap simply never fires, with no error naming why. Verified against a
+# real value: the certificate production notme minted on 2026-08-07 for
+# agentic-research/signet carries CN=repo:agentic-research/signet:ref:refs/
+# tags/v0.3.0, because that workflow ran on a tag. Arm the form your
+# bootstrap workflow will actually produce; if unsure, run it once and read
+# the `sub` from the cert CN or the run'"'"'s OIDC claims.
+# The first run of that workflow bootstraps the authority through /cert/gha:
+# it creates the admin principal and LINKS the attested GitHub identity to it,
+# so the administrator can actually authenticate rather than being an admin
+# row nobody can sign in as.
+#
+# A VAR, NOT A SECRET, deliberately: it is an identity, so there is nothing to
+# leak and nothing to scrape out of a log. Security comes from GitHub's
+# signature over the OIDC token.
+#
+# NARROWER THAN GHA_ALLOWED_OWNERS ON PURPOSE. That list answers "may this
+# workflow get a credential" — anyone with push access to any repo under the
+# owner clears it. "May it become the administrator" is a different question,
+# so it is answered by naming one workflow.
+#
+# Leave UNSET to disable attested bootstrap entirely; unset means off, never
+# "allow anyone the owner allowlist already admitted".
+# BOOTSTRAP_GHA_SUBJECT = "repo:your-org/your-repo:ref:refs/heads/main"
 
 # Workers VPC — direct tunnel to signet on Fly (identity server).
 # Create via: wrangler vpc create <name>
@@ -84,6 +131,23 @@ class_name = "SigningAuthority"
 [[durable_objects.bindings]]
 name = "REVOCATION"
 class_name = "RevocationAuthority"
+
+# Issuance transparency log (notme-1b46a8). OPTIONAL. Leave this block
+# commented out and notme behaves exactly as it did before the log existed:
+# nothing is submitted, no SCT is embedded, no backlog row is written.
+# Uncomment ONLY after the notme-ct Worker is deployed (ct/README.md, operator
+# runbook). With it bound, every bridge pair and tier is logged; a log that is slow
+# (2 s) or down does not block issuance, it queues the pair in ct_backlog and
+# the refresh alarm drains it. `service` is the deployed Worker's name: azul's
+# ct_worker is named "static-ct" and `-e notme` deploys it as "static-ct-notme"
+# — confirm with `npx wrangler -e=notme deployments list` in azul's crate.
+# [[services]]
+# binding = "CT_LOG"
+# service = "static-ct-notme"
+#
+# CT_LOG_PATH (the log's base path behind CT_LOG, default /logs/notme) and
+# CT_LOG_ID / CT_LOG_KEY (the log's pinned id and key, REQUIRED with the
+# binding) are variables: see the commented lines under [vars] above.
 
 [[migrations]]
 tag = "v1"

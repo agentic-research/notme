@@ -11,6 +11,8 @@
 **Relates to:** notme `/oauth/token` (client_credentials) already shipped via cloister.capnp identity-bridge tenant; cloister ADR-0007 (Interlace substrate, the orthogonal internal trust layer); cloister ADR-0018 (notme co-location)
 **Companion reading:** [Cloudflare "OAuth for All" (2026-06)](https://blog.cloudflare.com/oauth-for-all/)
 
+> **Client registration: replacement PROPOSED in [ADR-022](./022-client-registration.md) (status: proposed, 2026-10-26).** ADR-022 proposes replacing the apps registry below (`client_id` / `client_secret` rows, `apps-registry.ts`, open question 2) with Client ID Metadata Documents, with DCR accepted and stored as notme-hosted CIMD and no client secrets. Until ADR-022 is accepted, this ADR's registry design stands as written; nothing in this banner is implemented. Consent, introspection and revocation remain this ADR's scope either way.
+
 ## Context
 
 Cloudflare's "OAuth for All" announcement opened OAuth delegation to any Worker — every developer on CF can now ship an OAuth-server surface. That raises a substrate-trust question for ART: should notme expose a Cloudflare-compatible OAuth dance so third-party apps that already speak OAuth (and may be deployed on CF) can use notme as their identity provider, the way they'd OAuth into Google / GitHub / Atlassian today?

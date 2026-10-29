@@ -1,0 +1,473 @@
+/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/**
+ * tier-generation.do.test.ts — a copied machine key renewing is a fork
+ * (notme-747cc7, mint path phase 1).
+ *
+ * THE CASE. Renewal by proof of possession (notme-337d82) means anyone who
+ * copies a machine's tier key can renew it too, forever, unnoticed. Renewal
+ * binding v2 commits to a GENERATION counter the authority keeps per
+ * enrollment: each accepted renewal at generation g moves the counter to g+1.
+ * Two holders of one key cannot both keep up — the second to renew at g
+ * presents a stale generation, and that is a fork: the enrollment is shut off.
+ *
+ * WHAT MUST NOT BE A FORK. An honest machine that lost a renewal response
+ * resends the EXACT same request (same iat, same generation, same digest);
+ * that is a retry and mints again. A replay of an accepted request, or an old
+ * request past the retry window, is stale — refused, never revoked. A proof
+ * that does not verify changes nothing at all.
+ */
+import worker from "../worker";
+import { env, runInDurableObject } from "cloudflare:test";
+import { describe, expect, it } from "vitest";
+import { createSessionCookie } from "./auth/session";
+import {
+  tierEnrolmentBinding,
+  deviceCodeHash,
+  tierRenewalBindingV2,
+  tierRenewalBinding,
+  renewalRequestDigest,
+} from "./auth/tier-enrolment-binding";
+import { ED25519 } from "./platform";
+import type { SigningAuthority } from "./signing-authority";
+
+const ORIGIN = "http://localhost:8788";
+const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
+const call = (url: string, init: RequestInit = {}) =>
+  (worker.fetch as (r: Request, e: unknown) => Promise<Response>)(new Request(url, init), { ...env, ...LOCAL_ENV });
+const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+  call(`${ORIGIN}${path}`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+const authority = () => env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+const b64u = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+type Machine = { kp: CryptoKeyPair; spki: Uint8Array; pem: string };
+
+async function machine(): Promise<Machine> {
+  const kp = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
+  const spki = new Uint8Array((await crypto.subtle.exportKey("spki", kp.publicKey)) as ArrayBuffer);
+  const pem = `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...spki)).match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
+  return { kp, spki, pem };
+}
+
+async function human(scopes = ["bridgeCert", "certMint"]) {
+  const pid = `gen-${crypto.randomUUID()}`;
+  await authority().createPrincipalWithCapabilities(pid, scopes);
+  const cookie = await createSessionCookie({ principalId: pid, scopes, authMethod: "passkey" }, await authority().getSessionSecret());
+  return { pid, cookie };
+}
+
+/** Enroll a machine end to end; returns its key and the collected tier. */
+async function enrolled(m?: Machine, renewDays?: number) {
+  m ??= await machine();
+  const start = (await (await post("/cert/issuing-ca/device", { public_key: m.pem })).json()) as { device_code: string; user_code: string };
+  const h = await human();
+  const ap = await post("/cert/issuing-ca/device/approve", { user_code: start.user_code, ...(renewDays ? { renew_days: renewDays } : {}) }, { cookie: h.cookie });
+  expect(ap.status, await ap.clone().text()).toBe(200);
+  const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, m.kp.privateKey, tierEnrolmentBinding(m.spki, await deviceCodeHash(start.device_code)))));
+  const tok = await post("/cert/issuing-ca/device/token", { device_code: start.device_code, proof });
+  expect(tok.status, await tok.clone().text()).toBe(200);
+  return { m, h, tier: (await tok.json()) as { certificate: string; renew_until: number; generation?: number } };
+}
+
+const nowS = () => Math.floor(Date.now() / 1000);
+
+/** A v2 renewal request body, signed but not sent. */
+async function renewalBody(m: Machine, generation: number, iat = nowS(), key = m.kp.privateKey) {
+  const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, key, tierRenewalBindingV2(m.spki, iat, generation))));
+  return { public_key: m.pem, iat, generation, proof };
+}
+
+const send = (body: unknown) => post("/cert/issuing-ca/renew", body);
+
+async function renew(m: Machine, generation: number, iat = nowS(), key = m.kp.privateKey) {
+  return send(await renewalBody(m, generation, iat, key));
+}
+
+const fp = async (spki: Uint8Array) =>
+  Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", spki))).map((b) => b.toString(16).padStart(2, "0")).join("");
+
+/** The enrollment row as the authority holds it. */
+async function rowOf(m: Machine) {
+  const f = await fp(m.spki);
+  return runInDurableObject(authority(), (a) =>
+    (a as SigningAuthority)["ctx"].storage.sql
+      .exec("SELECT generation, revoked_at, revoke_reason FROM tier_enrolments WHERE key_fingerprint = ? AND status = 'active'", f)
+      .toArray()[0] as { generation: number; revoked_at: number | null; revoke_reason: string | null },
+  );
+}
+
+async function expectOk(res: Response, generation: number) {
+  expect(res.status, await res.clone().text()).toBe(200);
+  expect(await res.json()).toMatchObject({ generation });
+}
+
+async function expectErr(res: Response, status: number, error: string) {
+  expect(res.status, await res.clone().text()).toBe(status);
+  expect(await res.json()).toMatchObject({ error });
+}
+
+describe("generations advance on each renewal", () => {
+  it("a fresh enrollment collects at generation 0 and renews 0 → 1 → 2", async () => {
+    const { m, tier } = await enrolled();
+    expect(tier.generation).toBe(0);
+    await expectOk(await renew(m, 0), 1);
+    await expectOk(await renew(m, 1), 2);
+    expect((await rowOf(m)).generation).toBe(2);
+  });
+});
+
+describe("a copy renewing is a fork", () => {
+  it("a copy that renews second is a fork, and the enrollment is shut off", async () => {
+    const { m } = await enrolled();
+    const t = nowS();
+    await expectOk(await renew(m, 0, t), 1);
+    // The copy holds the same key and the same generation, but signs its own
+    // request: a different iat, so a different digest.
+    await expectErr(await renew(m, 0, t + 1), 403, "fork_detected");
+    const row = await rowOf(m);
+    expect(row.revoked_at).not.toBeNull();
+    expect(row.revoke_reason).toBe("fork_detected");
+    // The original is shut off too: nobody can tell which holder is honest.
+    await expectErr(await renew(m, 1), 403, "fork_detected");
+  });
+
+  it("the human's enrollment list says why a forked machine stopped", async () => {
+    const { m, h } = await enrolled();
+    const list = async () =>
+      (await (await call(`${ORIGIN}/cert/issuing-ca/enrollments`, { headers: { cookie: h.cookie } })).json()) as Array<{
+        revoked_at: number | null;
+        revoke_reason: string | null;
+      }>;
+    const before = await list();
+    expect(before).toHaveLength(1);
+    expect(before[0]).toHaveProperty("revoke_reason", null);
+    const t = nowS();
+    await expectOk(await renew(m, 0, t), 1);
+    await expectErr(await renew(m, 0, t + 1), 403, "fork_detected");
+    const [after] = await list();
+    expect(after.revoked_at).not.toBeNull();
+    expect(after.revoke_reason).toBe("fork_detected");
+  });
+
+  it("a freshly signed request at current-1 is a fork, not a retry", async () => {
+    const { m } = await enrolled();
+    const t = nowS();
+    await expectOk(await renew(m, 0, t), 1);
+    await expectErr(await renew(m, 0, t + 1), 403, "fork_detected");
+  });
+
+  it("two concurrent renewals at the same generation: one wins, one forks", async () => {
+    const { m } = await enrolled();
+    const t = nowS();
+    const [a, b] = await Promise.all([renew(m, 0, t), renew(m, 0, t + 1)]);
+    expect([a.status, b.status].sort()).toEqual([200, 403]);
+    expect((await rowOf(m)).generation).toBe(1);
+  });
+
+  it("the claim is guarded: a renewal that read the counter before a rival claimed it forks", async () => {
+    // Review Focus 3, deterministically. Two requests at g may both read the
+    // counter at g before either claims it (renewTier awaits in between).
+    // Open that window on purpose: the rival claims g while this request is
+    // past its read and before its claim. Only the `generation = ?` guard on
+    // the claim stops both from winning.
+    const { m } = await enrolled();
+    const f = await fp(m.spki);
+    const t = nowS();
+    const ours = await renewalBody(m, 0, t);
+    const rivalDigest = await renewalRequestDigest(tierRenewalBindingV2(m.spki, t + 1, 0));
+    const r = await runInDurableObject(authority(), async (a) => {
+      const sa = a as SigningAuthority & { getPrincipalScopes: SigningAuthority["getPrincipalScopes"] };
+      const sql = sa["ctx"].storage.sql;
+      const orig = sa.getPrincipalScopes.bind(sa);
+      sa.getPrincipalScopes = async (pid: string) => {
+        sql.exec("UPDATE tier_enrolments SET generation = 1 WHERE key_fingerprint = ? AND status = 'active'", f);
+        sql.exec("INSERT INTO tier_renewal_digests (key_fingerprint, generation, digest, iat) VALUES (?, 0, ?, ?)", f, rivalDigest, t + 1);
+        return orig(pid);
+      };
+      try {
+        return await sa.renewTier({ publicKeyPem: m.pem, iat: ours.iat, proof: ours.proof, generation: 0 });
+      } finally {
+        delete (sa as { getPrincipalScopes?: unknown }).getPrincipalScopes;
+      }
+    });
+    expect(r).toMatchObject({ ok: false, reason: "fork_detected" });
+    const row = await rowOf(m);
+    expect(row.generation).toBe(1);
+    expect(row.revoke_reason).toBe("fork_detected");
+  });
+});
+
+describe("what is not a fork", () => {
+  it("a lost response: resending the exact request is a retry, not a fork", async () => {
+    const { m } = await enrolled();
+    const body = await renewalBody(m, 0);
+    expect((await send(body)).status).toBe(200); // response "lost"
+    await expectOk(await send(body), 1);
+    expect((await rowOf(m)).generation).toBe(1);
+    await expectOk(await renew(m, 1), 2);
+  });
+
+  it("an exact resend after the retry window is stale, not a fork", async () => {
+    const { m } = await enrolled();
+    const f = await fp(m.spki);
+    const iat = nowS() - 3601;
+    const body = await renewalBody(m, 0, iat);
+    const digest = await renewalRequestDigest(tierRenewalBindingV2(m.spki, iat, 0));
+    // As if generation 0 was accepted an hour and a second ago.
+    await runInDurableObject(authority(), (a) => {
+      const sql = (a as SigningAuthority)["ctx"].storage.sql;
+      sql.exec("INSERT INTO tier_renewal_digests (key_fingerprint, generation, digest, iat) VALUES (?, 0, ?, ?)", f, digest, iat);
+      sql.exec("UPDATE tier_enrolments SET generation = 1 WHERE key_fingerprint = ?", f);
+    });
+    await expectErr(await send(body), 401, "stale_proof");
+    expect((await rowOf(m)).revoked_at).toBeNull();
+  });
+
+  it("an old request nobody accepted, at a spent generation, is stale, not a fork", async () => {
+    // A copy's request that sat unsent past the skew: it cannot be told from
+    // a delayed replay, so it is refused and nothing is revoked.
+    const { m } = await enrolled();
+    await expectOk(await renew(m, 0), 1);
+    await expectErr(await renew(m, 0, nowS() - 600), 401, "stale_proof");
+    expect((await rowOf(m)).revoked_at).toBeNull();
+    await expectOk(await renew(m, 1), 2);
+  });
+
+  it("a replayed request with a stale generation does not revoke", async () => {
+    // Review Focus 1: a replay of an ACCEPTED request is not a fork, however
+    // fresh its timestamp still is — only a request nobody accepted can be.
+    const { m } = await enrolled();
+    const gen0 = await renewalBody(m, 0);
+    await expectOk(await send(gen0), 1);
+    await expectOk(await renew(m, 1), 2);
+    await expectErr(await send(gen0), 401, "stale_proof");
+    expect((await rowOf(m)).revoked_at).toBeNull();
+    await expectOk(await renew(m, 2), 3);
+  });
+
+  it("an invalid proof at a stale generation changes nothing", async () => {
+    // Review Focus 2: anyone can POST a stale generation for a public key.
+    // Without the key's signature it must not shut the enrollment off.
+    const { m } = await enrolled();
+    await expectOk(await renew(m, 0), 1);
+    const thief = await machine();
+    await expectErr(await renew(m, 0, nowS() + 1, thief.kp.privateKey), 401, "invalid_proof");
+    const row = await rowOf(m);
+    expect(row.generation).toBe(1);
+    expect(row.revoked_at).toBeNull();
+  });
+
+  it("an invalid proof at the current generation leaves the counter alone", async () => {
+    const { m } = await enrolled();
+    await expectOk(await renew(m, 0), 1);
+    const thief = await machine();
+    await expectErr(await renew(m, 1, nowS(), thief.kp.privateKey), 401, "invalid_proof");
+    const row = await rowOf(m);
+    expect(row.generation).toBe(1);
+    expect(row.revoked_at).toBeNull();
+    await expectOk(await renew(m, 1), 2);
+  });
+
+  it("a request that never arrived, resent 121 s and 3599 s later at the current generation, renews", async () => {
+    // The honest machine was offline (or met a 5xx or 429): its saved request
+    // is resent byte for byte with its original iat, past the 120 s skew.
+    const { m } = await enrolled();
+    await expectOk(await send(await renewalBody(m, 0, nowS() - 121)), 1);
+    await expectOk(await send(await renewalBody(m, 1, nowS() - 3599)), 2);
+    const row = await rowOf(m);
+    expect(row.generation).toBe(2);
+    expect(row.revoked_at).toBeNull();
+  });
+
+  it("a request older than the retry window at the current generation is stale, not revoked", async () => {
+    const { m } = await enrolled();
+    await expectErr(await send(await renewalBody(m, 0, nowS() - 3601)), 401, "stale_proof");
+    const row = await rowOf(m);
+    expect(row.generation).toBe(0);
+    expect(row.revoked_at).toBeNull();
+    await expectOk(await renew(m, 0), 1);
+  });
+
+  it("an iat beyond the skew ahead is stale at the current generation", async () => {
+    const { m } = await enrolled();
+    await expectErr(await send(await renewalBody(m, 0, nowS() + 121)), 401, "stale_proof");
+    expect((await rowOf(m)).generation).toBe(0);
+  });
+
+  it("a generation ahead of the authority is stale, never revoked", async () => {
+    const { m } = await enrolled();
+    await expectErr(await renew(m, 5), 401, "stale_proof");
+    expect((await rowOf(m)).revoked_at).toBeNull();
+    await expectOk(await renew(m, 0), 1);
+  });
+});
+
+describe("re-enrolling a key", () => {
+  /** Every row this key has ever had, oldest first. */
+  async function rowsOf(m: Machine) {
+    const f = await fp(m.spki);
+    return runInDurableObject(authority(), (a) =>
+      (a as SigningAuthority)["ctx"].storage.sql
+        .exec("SELECT status, generation, revoked_at, renew_until FROM tier_enrolments WHERE key_fingerprint = ? ORDER BY rowid", f)
+        .toArray() as Array<{ status: string; generation: number; revoked_at: number | null; renew_until: number }>,
+    );
+  }
+
+  it("re-enrolling the same key supersedes the old enrollment; renewal counts the new one", async () => {
+    // The old enrollment has the LONGER horizon, so a lookup that picked by
+    // horizon would keep renewing against it — and read the new enrollment's
+    // generation 0 as a fork of the old one's generation 2.
+    const { m } = await enrolled(undefined, 30);
+    await expectOk(await renew(m, 0), 1);
+    await expectOk(await renew(m, 1), 2);
+    const again = await enrolled(m, 1);
+    expect(again.tier.generation).toBe(0);
+    await expectOk(await renew(m, 0), 1);
+    const rows = await rowsOf(m);
+    expect(rows.map((r) => r.status)).toEqual(["superseded", "active"]);
+    expect(rows[0].revoked_at).toBeNull();
+    expect(rows[1].generation).toBe(1);
+  });
+
+  it("re-enrolling after a fork recovers", async () => {
+    // Re-enrollment is the documented recovery after a fork, so the revoked
+    // enrollment must not keep hiding the new one.
+    const { m } = await enrolled(undefined, 30);
+    const t = nowS();
+    await expectOk(await renew(m, 0, t), 1);
+    await expectErr(await renew(m, 0, t + 1), 403, "fork_detected");
+    await enrolled(m, 1);
+    await expectOk(await renew(m, 0), 1);
+    expect((await rowsOf(m)).map((r) => r.status)).toEqual(["superseded", "active"]);
+  });
+
+  it("collect clears a re-enrolled key's digest rows", async () => {
+    const { m } = await enrolled();
+    await expectOk(await renew(m, 0), 1);
+    await expectOk(await renew(m, 1), 2);
+    const f = await fp(m.spki);
+    const count = () =>
+      runInDurableObject(authority(), (a) =>
+        (a as SigningAuthority)["ctx"].storage.sql
+          .exec<{ n: number }>("SELECT COUNT(*) AS n FROM tier_renewal_digests WHERE key_fingerprint = ?", f)
+          .toArray()[0].n,
+      );
+    expect(await count()).toBe(2);
+    await enrolled(m);
+    expect(await count()).toBe(0);
+  });
+});
+
+/** A v1 renewal request: no generation, v1 binding. */
+async function renewV1(m: Machine, iat = nowS()) {
+  const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, m.kp.privateKey, tierRenewalBinding(m.spki, iat))));
+  return send({ public_key: m.pem, iat, proof });
+}
+
+describe("binding v1 is retired", () => {
+  it("a new enrollment refuses v1 renewal, by its own name", async () => {
+    // binding_v2_required, not invalid_proof: the client says "update task-cert", not "approval ended".
+    const { m } = await enrolled();
+    await expectErr(await renewV1(m), 400, "binding_v2_required");
+    expect((await rowOf(m)).generation).toBe(0);
+  });
+
+  it("a legacy enrollment renews with v1 until its first v2 renewal", async () => {
+    const { m } = await enrolled();
+    const f = await fp(m.spki);
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", f);
+    });
+    expect((await renewV1(m)).status).toBe(200);
+    await expectOk(await renew(m, 0), 1);
+    await expectErr(await renewV1(m), 400, "binding_v2_required");
+  });
+
+  it("a legacy enrollment accepts a v1 request up to the retry window old", async () => {
+    const { m } = await enrolled();
+    const f = await fp(m.spki);
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", f);
+    });
+    expect((await renewV1(m, nowS() - 121)).status).toBe(200);
+    expect((await renewV1(m, nowS() - 3599)).status).toBe(200);
+    await expectErr(await renewV1(m, nowS() - 3601), 401, "stale_proof");
+    expect((await rowOf(m)).revoked_at).toBeNull();
+  });
+});
+
+describe("clone policy", () => {
+  const startOne = async () => {
+    const m = await machine();
+    const start = (await (await post("/cert/issuing-ca/device", { public_key: m.pem })).json()) as { device_code: string; user_code: string };
+    return { m, start };
+  };
+  const approveWith = (h: { cookie: string }, user_code: string, extra: Record<string, unknown>) =>
+    post("/cert/issuing-ca/device/approve", { user_code, ...extra }, { cookie: h.cookie });
+  const listOf = async (h: { cookie: string }) =>
+    (await (await call(`${ORIGIN}/cert/issuing-ca/enrollments`, { headers: { cookie: h.cookie } })).json()) as Array<{ clone_policy: string; generation: number }>;
+  const collect = async (m: Machine, device_code: string) => {
+    const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, m.kp.privateKey, tierEnrolmentBinding(m.spki, await deviceCodeHash(device_code)))));
+    return post("/cert/issuing-ca/device/token", { device_code, proof });
+  };
+
+  it("a plain approval is singleton", async () => {
+    const { m, start } = await startOne();
+    const h = await human();
+    const ap = await approveWith(h, start.user_code, {});
+    expect(ap.status).toBe(200);
+    expect(((await ap.json()) as { clone_policy: string }).clone_policy).toBe("singleton");
+    const tok = await collect(m, start.device_code);
+    expect(((await tok.json()) as { clone_policy: string }).clone_policy).toBe("singleton");
+    const rows = await listOf(h);
+    expect(rows[0].clone_policy).toBe("singleton");
+    expect(rows[0].generation).toBe(0);
+  });
+
+  it("replicas requires authorityManage", async () => {
+    const a = await startOne();
+    const weak = await human(["bridgeCert", "certMint"]);
+    expect((await approveWith(weak, a.start.user_code, { clone_policy: "replicas:4", renew_days: 7 })).status).toBe(403);
+    const b = await startOne();
+    const strong = await human(["bridgeCert", "certMint", "authorityManage"]);
+    const ap = await approveWith(strong, b.start.user_code, { clone_policy: "replicas:4", renew_days: 7 });
+    expect(ap.status, await ap.clone().text()).toBe(200);
+    expect(((await ap.json()) as { clone_policy: string }).clone_policy).toBe("replicas:4");
+    await collect(b.m, b.start.device_code);
+    expect((await listOf(strong))[0].clone_policy).toBe("replicas:4");
+  });
+
+  it("replicas needs LIVE authorityManage, not the cookie's", async () => {
+    const a = await startOne();
+    const h = await human(["bridgeCert", "certMint"]);
+    // cookie claims authorityManage the principal does not hold
+    const cookie = await createSessionCookie(
+      { principalId: h.pid, scopes: ["bridgeCert", "certMint", "authorityManage"], authMethod: "passkey" },
+      await authority().getSessionSecret(),
+    );
+    expect((await approveWith({ cookie }, a.start.user_code, { clone_policy: "replicas:2", renew_days: 7 })).status).toBe(403);
+  });
+
+  it("replicas allows at most a 7-day horizon", async () => {
+    const strong = await human(["bridgeCert", "certMint", "authorityManage"]);
+    const a = await startOne();
+    expect((await approveWith(strong, a.start.user_code, { clone_policy: "replicas:2", renew_days: 30 })).status).toBe(400);
+    expect((await approveWith(strong, a.start.user_code, { clone_policy: "replicas:2", renew_days: 7 })).status).toBe(200);
+  });
+
+  it("anything else is refused", async () => {
+    const strong = await human(["bridgeCert", "certMint", "authorityManage"]);
+    const a = await startOne();
+    for (const bad of ["replicas:3", "many", ""]) {
+      expect((await approveWith(strong, a.start.user_code, { clone_policy: bad })).status, bad).toBe(400);
+    }
+  });
+
+  it("the enroll page offers the policy, singleton selected", async () => {
+    const a = await startOne();
+    const h = await human();
+    const res = await call(`${ORIGIN}/enroll?code=${a.start.user_code}`, { headers: { cookie: h.cookie } });
+    const html = await res.text();
+    expect(html).toContain('id="clone"');
+    expect(html).toContain('<option value="singleton" selected');
+  });
+});

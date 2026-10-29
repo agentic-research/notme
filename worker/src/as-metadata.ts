@@ -14,22 +14,30 @@
 import { ALL_SCOPES } from "@notme/contract";
 
 /**
- * Grant types advertised by the discovery documents.
+ * Grant types advertised by the discovery documents — the grant_type values
+ * the TOKEN ENDPOINT accepts, which is what RFC 8414 §2 means by the field.
  *
  * Single source of truth on purpose: these were previously hand-listed in
  * each document and had already drifted from reality — "github_pat" and
- * "oidc_token_exchange" were advertised publicly but implemented NOWHERE
- * (the authMethod values the code actually emits are gha-oidc, invite,
- * oidc:github, passkey, test). Two hand-maintained copies of a public
- * capability claim is how a discovery document starts lying.
+ * "oidc_token_exchange" were advertised publicly but implemented NOWHERE.
  *
- * Only verified token-issuance paths belong here:
- *   github_actions_oidc — /cert/gha, validateGHAToken
- *   dpop                — mintDPoPToken
- * Session-establishment methods (passkey/invite/oidc:github) are auth
- * methods, not grants, and are deliberately not conflated with these.
+ * And then it drifted again (notme-486e8a). This listed
+ * ["github_actions_oidc", "dpop"]. Neither is a grant type: GitHub Actions
+ * OIDC was exchanged at /cert/gha (a CERTIFICATE endpoint), and DPoP is a
+ * token-binding scheme, already advertised by dpop_signing_alg_values_supported.
+ * /token ignored grant_type and accepted only a session cookie, so a client
+ * following RFC 8414 would send one of these to the token endpoint and be
+ * refused. "If it advertises it should work."
+ *
+ * Now /token implements RFC 8693 token exchange with a GitHub Actions OIDC
+ * subject token, and this is that grant's registered URN. The first-party
+ * session flow (no grant_type) is deliberately NOT listed — for the same
+ * first-party policy reason authorization_endpoint is withheld below.
+ * A test pins that every value here is accepted by /token.
  */
-export const AUTHORITY_GRANT_TYPES = ["github_actions_oidc", "dpop"] as const;
+export const AUTHORITY_GRANT_TYPES = [
+  "urn:ietf:params:oauth:grant-type:token-exchange",
+] as const;
 
 /** The DPoP *proof* algorithm (client-generated P-256). RFC 9449. */
 export const DPOP_PROOF_ALGS = ["ES256"] as const;

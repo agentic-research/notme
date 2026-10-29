@@ -171,10 +171,21 @@
 
   <div id="bootstrapDiv" class="hidden" style="margin-top:12px">
     <input class="bootstrap-input" id="bootstrapInput" type="text"
-      placeholder="bootstrap code from wrangler tail" />
+      placeholder="the BOOTSTRAP_CODE this deployment was configured with" />
     <button class="term-provider" style="width:100%;margin-top:4px" onclick="bootstrapRegister()">
       bootstrap + register
     </button>
+  </div>
+
+  <div id="claimDiv" class="hidden" style="margin-top:12px">
+    <p>This authority has no administrator yet. Your passkey is registered as a
+    <strong>claim</strong> and holds nothing until it is approved.</p>
+    <p style="margin-top:8px">Claim code: <code id="claimCode" style="font-size:1.25em"></code></p>
+    <p style="margin-top:8px">Approve it from the repository named by
+    <code>BOOTSTRAP_GHA_SUBJECT</code>:</p>
+    <pre id="claimCommand" style="white-space:pre-wrap;margin-top:4px"></pre>
+    <p style="margin-top:8px">Then sign in again with this passkey. Only run the
+    command with the code shown here.</p>
   </div>
 
   <div class="term-footer">
@@ -283,7 +294,13 @@ async function registerPasskey() {
       var err = (await optRes.json()).error || 'failed';
       if (err.indexOf('bootstrap') !== -1) {
         document.getElementById('bootstrapDiv').classList.remove('hidden');
-        setStatus('enter bootstrap code from wrangler tail', 'info');
+        // Never "read it from the logs". notme-addef9 removed the
+        // mechanism that minted a code into Worker logs on an
+        // unauthenticated request; this placeholder outlived it, so the UI
+        // was still sending operators to look for a secret nothing writes.
+        // The server's own 401 says which mechanisms are armed — show that,
+        // rather than a guess this page makes on its behalf.
+        setStatus(err, 'info');
         return;
       }
       throw new Error(err);
@@ -333,6 +350,17 @@ async function registerPasskey() {
     });
 
     if (!verifyRes.ok) throw new Error((await verifyRes.json()).error || 'registration failed');
+    var verified = await verifyRes.json();
+    // A claim on an authority with no administrator (notme-486e8a): the
+    // passkey holds nothing until the named workflow approves the code, so
+    // there is nowhere useful to redirect yet. Values go in via textContent.
+    if (verified.claim) {
+      document.getElementById('claimCode').textContent = verified.claim.code;
+      document.getElementById('claimCommand').textContent = verified.claim.command;
+      document.getElementById('claimDiv').classList.remove('hidden');
+      setStatus('registered as a claim — approve it to become administrator', 'info');
+      return;
+    }
     setStatus('registered — redirecting...', 'ok');
     setTimeout(function() { window.location.href = returnTo; }, 800);
   } catch(e) {

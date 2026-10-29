@@ -90,6 +90,7 @@ export const BridgeCertResultSchema: z.ZodType<BridgeCertResult> = z.object({
 export interface BridgeCertPair {
   mtlsCert: string; // PEM — P-256 cert for mTLS transport auth
   signingCert: string; // PEM — Ed25519 cert for git commits + APAS attestations
+  identity: string; // WIMSE identity URI (wimse://notme.bot/principal/{stable-id})
   scopes: string[]; // Granted capabilities (string-based, not enum — extensible)
   expiresAt: number; // Unix timestamp (seconds)
   subject: string; // Principal UUID or OIDC sub
@@ -101,6 +102,7 @@ export interface BridgeCertPair {
 export const BridgeCertPairSchema: z.ZodType<BridgeCertPair> = z.object({
   mtlsCert: z.string(),
   signingCert: z.string(),
+  identity: z.string(),
   scopes: z.array(z.string()),
   expiresAt: z.number().int(),
   subject: z.string(),
@@ -121,6 +123,7 @@ export const AuthorityStateSchema: z.ZodType<AuthorityState> = z.object({
 
 export interface GHAClaims {
   iss: string;
+  sub: string; // "repo:{owner}/{repo}:ref:refs/heads/{branch}"
   aud: string; // Requested audience (e.g. "notme.bot")
   exp: number;
   iat: number;
@@ -139,6 +142,7 @@ export interface GHAClaims {
 
 export const GHAClaimsSchema: z.ZodType<GHAClaims> = z.object({
   iss: z.string(),
+  sub: z.string(),
   aud: z.string(),
   exp: z.number().int(),
   iat: z.number().int(),
@@ -213,11 +217,13 @@ export const CertRequestSchema: z.ZodType<CertRequest> = z.object({
 export interface BeadRef {
   repo: string;
   beadId: string;
+  contentHash: string; // sha256:{hex}
 }
 
 export const BeadRefSchema: z.ZodType<BeadRef> = z.object({
   repo: z.string(),
   beadId: z.string(),
+  contentHash: z.string(),
 }) as any;
 
 export interface AgentIdentity {

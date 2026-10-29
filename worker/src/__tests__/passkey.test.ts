@@ -288,7 +288,7 @@ describe("passkey.challenge.session-binding", () => {
     };
   }
 
-  it("rejects assertions whose challenge was never issued", async () => {
+  it("passkey.challenge.unknown-rejected — rejects assertions whose challenge was never issued", async () => {
     const sql = createMockSql();
     // No challenges stored. Submitted challenge has no DB match.
     const result = await verifyAuthentication(

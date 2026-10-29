@@ -1,9 +1,13 @@
 # Goal Zero — status and orientation
 
-**Epic:** `notme-bed754` · **Branch:** `goalzero` (87 commits ahead of `main`, PR #70)
-**Production:** version `91b54069` at 100%, `task worker:verify` 13/13
-**Tests:** 526 unit (38 files) + 120 real-DO (15 files) + 2 deliberate `it.fails`
-**Last updated:** 2026-08-06
+**Epic:** `notme-bed754` · **Branch:** `goalzero` — merged to `main` 2026-08-07
+(PR #72) as one release; the branch continues for the next cycle
+**Production:** version `79e5ba12` at 100%, converged on `473f9268`,
+`task worker:verify` 14/14
+**Tests:** run `task worker:check` for current counts; the two deliberate
+`it.fails` that were the D4 completion signal fired 2026-08-27 and are now
+ordinary passing tests
+**Last updated:** 2026-08-27
 
 Read this before picking up Goal Zero work. It exists because several
 conclusions in this repo were *reached, then corrected*, and a fresh reader who
@@ -18,11 +22,11 @@ unknown security-critical failures**. Five criteria:
 
 | | Criterion | State |
 |---|---|---|
-| **A** | Every P0/P1 closed, linked, or deliberately deferred; runtime contracts exercised; artifacts have provenance; no schema/build drift; cross-repo smoke recorded | partial — see §5 |
-| **B** | The authority states what it names; identity no longer varies with auth ceremony; registration policy follows from that | **ADR written (`proposed`), code half open** |
-| **C** | A revocation unit exists between "wait out the TTL" and "revoke everything" | open, blocked on B |
+| **A** | Every P0/P1 closed, linked, or deliberately deferred; runtime contracts exercised; artifacts have provenance; no schema/build drift; cross-repo smoke recorded | partial — scope settled 2026-08-27: the 7 disputed beads are deferred with recorded reasons, leaving the release-surface P0/P1 set; see §5 |
+| **B** | The authority states what it names; identity no longer varies with auth ceremony; registration policy follows from that | **met 2026-08-29** for the first two clauses — ADR-019 accepted, and `wimse://<domain>/principal/<stable-id>` shipped with `principal_kind` as its own claim (`notme-77438b`). Registration policy decided 2026-08-30 (ADR-021): gated, `sigpol` eventually, invite today — so criterion (B) is met in full |
+| **C** | A revocation unit exists between "wait out the TTL" and "revoke everything" | **met 2026-08-28** — the grant is the unit: `POST /principals/:id/revoke`, live re-read at every authority gate, passkey users enrolled as principals with grants |
 | **D** | A third party can verify without trusting notme at the moment of the check | open, half done |
-| **E** | First boot needs no secret from the logs and cannot be triggered by a stranger | open |
+| **E** | First boot needs no secret from the logs and cannot be triggered by a stranger | **REOPENED and re-met 2026-10-28 (`notme-486e8a`, pending deploy)** — the 2026-08-30 version made the attested WORKFLOW the administrator; workflows hold no session and `/invites` needs one, so no human could ever get in without the `BOOTSTRAP_CODE` secret. Now a human registers a passkey as a claim (holding nothing) and the named workflow approves its code via `claim-authority.yml`; `bootstrap-e2e.yml` drives it end to end with a real token and real WebAuthn. Original entry, superseded: **met 2026-08-30** — attested first boot: `BOOTSTRAP_GHA_SUBJECT` names one GitHub workflow identity, its OIDC token bootstraps the authority and is LINKED to the admin principal. No secret, nothing in a log, and the trigger is the deployer's own workflow. `BOOTSTRAP_CODE` remains the explicit-operator-action fallback (`notme-addef9`). **Proven end to end 2026-09-01**, run 33535377660: `.github/workflows/bootstrap-e2e.yml` bootstraps a locally-run Worker with a REAL GitHub-signed OIDC token verified against the LIVE JWKS, asserting the transition — ungovernable → governed by an administrator that can authenticate → a second run minting no second administrator. The DO tests cover the code path with forged-but-signed tokens against a stubbed JWKS; this covers the integration |
 
 Plus a **documentation-honesty clause** applying to all of them: where a
 property is deliberately not provided, docs must say so rather than implying
@@ -34,8 +38,8 @@ the stronger property. This clause has already done real work — see §3.
 
 `feature → goalzero` is the happy path: merge freely, no ceremony.
 `goalzero → PR → main` is **one** release, and scrutiny happens once, at that
-gate. PR #70 is the accumulating release PR. Do not open per-feature PRs to
-`main`.
+gate. The first release merged 2026-08-07 (PR #72); `goalzero` continues
+accumulating the next one. Do not open per-feature PRs to `main`.
 
 Consequence worth knowing: anything requiring a change on `main` — notably the
 self-pin in `.github/workflows/gha-identity.yml:137`, which pins
@@ -137,8 +141,8 @@ repository under test.
 | Bead | State |
 |---|---|
 | `notme-a011d2`, `notme-718ac0` | **Done on notme's side; blocked on signet.** One rc.3 run closes both. Left open deliberately: "we deployed the fix" ≠ "the path works end to end", and notme cannot mint a GitHub OIDC token for its own endpoint |
-| `notme-9f2f79` | ADR-018's canary gate cannot verify the version it claims to — failed twice, silently *toward* the status quo. Needs a call on whether targeting works on a Free-plan zone; if not, delete the phase rather than keep an unperformable ceremony |
-| `notme-acc822` | Scope half landed. Namespace half is now known-absent (§3.2). Depth half needs the middle tier |
+| `notme-9f2f79` | **Closed 2026-08-27.** Cause confirmed in Cloudflare docs: overrides apply only to versions in the current deployment, silent fallback otherwise. Canary phase deleted from ADR-018; the pipeline is promote → converge → verify |
+| `notme-acc822` | Scope half enforced at every narrowing site (`narrowScopes`, 2026-08-27). Depth half built: Issuing CA tier, `POST /cert/issuing-ca`. Namespace half remains open (§3.2 / ADR-019 D5) |
 | `notme-28959a` | undici in `action/dist` — parked at owner's direction while signet coordinates |
 
 ### Cross-repo, awaiting others
@@ -154,6 +158,22 @@ repository under test.
 ---
 
 ## 6. Scope question the owner must settle for criterion (A)
+
+> **SETTLED 2026-10-28 by the owner: (A) means the release-blocker set.**
+> Roadmap P1s were deferred to P2, each with its reason recorded on the bead:
+> the CAS-release epic and its four children, workerd-as-rope and its ADR
+> supersession, the network-gateway decade, the cloister re-survey, the
+> `/identity/lease` reshape, the workerd mTLS binding, and human-signed
+> acceptance. Two consolidation beads (`notme-3dac49`, `notme-3e22e0`) were
+> closed as superseded: the public repo became canonical and notme.bot was
+> archived as a deploy target (`notme-4e02fb`). The release-blocker set that
+> remains: criterion D (`notme-8e8836`, `notme-907299`, `notme-1b46a8`), CA key
+> at rest (`notme-41d0d3`), the placeholder OID arc (`notme-229dc3`), dpop
+> provenance (`notme-77ead7`), schema drift (`notme-b96b4c`), receipt epoch
+> repudiation (`notme-acd503`), the external-review triage (`notme-3e5b7d`),
+> alarm-loop hardening (`notme-5c2511`), LLO adoption (`notme-bc4cd2`), and the
+> P0 `notme-729801` (one local `verify-release` run). The text below is the
+> question as it was posed.
 
 (A) requires every P0/P1 "closed, linked, or deliberately deferred." There are
 **~72 open beads**, most P1/P2, many unrelated to release integrity — the
@@ -185,13 +205,29 @@ fixtures built by the encoder under test.
 
 Two conventions follow from these and appear in the suite:
 
-- **`it.fails` marks a gap, not a bug.** `delegation-depth.do.test.ts` asserts
-  the middle tier is *still missing*, so it goes red the moment someone builds
-  it — that is the signal to delete the `.fails`.
+- **`it.fails` marks a gap, not a bug.** `delegation-depth.do.test.ts` used
+  this to assert the middle tier was *still missing*; the tier landed
+  2026-08-27, the polarity flipped on cue, and the `.fails` markers came off —
+  the convention worked exactly as designed.
 - **Some fixtures are deliberately foreign.** `pop-preimage.test.ts` and the
   hand-encoder in `receipt-commitment.test.ts` build inputs *without* the code
   under test, because a fixture built by the encoder it validates is a fixed
   point rather than a conformance check.
+- **A security control's tests are mutation-verified before commit.** For
+  every bound in `verify-chain.ts` and every `liveScopes` gate, the control
+  was disabled and the suite re-run: each mutation must kill *exactly* its own
+  tests and nothing else. A test that stays green when its control is removed
+  is the pattern in §7 wearing a green badge. The results are recorded in the
+  commit message, not just claimed.
+- **Route wiring is tested through the route, with a real authenticator.**
+  `passkey-lifecycle.do.test.ts` drives register → login → revoke → re-login
+  through `/auth/passkey/*` with a software WebAuthn authenticator that
+  builds genuine attestation objects and signs real assertions
+  (`__tests__/helpers/software-authenticator.ts`). The reason: a DO-layer
+  test of `ensurePasskeyPrincipal` proved the helper worked and would have
+  stayed green with the route never calling it — which is exactly the
+  "property of a path production never takes" defect, caught in this
+  session's own code on the day it was written.
 
 ---
 

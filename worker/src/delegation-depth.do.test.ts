@@ -15,28 +15,33 @@
  *   Agent session       CA=false  (leaf)      digitalSignature <- the TASK
  *
  * The root was widened to pathlen=1 for exactly this (notme-20f88b, closed,
- * "blocks orchestrator→agent delegation"). The middle tier was never built:
- * cert-authority.ts stamps BASIC_CONSTRAINTS_LEAF (CA=false) on every cert
- * notme mints, so the authority issues two levels while its root advertises
- * room for three.
+ * "blocks orchestrator→agent delegation"). The middle tier landed 2026-08-27
+ * as `mintIssuingCaCert` — the Issuing CA per the signet-9dfb44 naming
+ * decision — resolving the fork these tests were written to pin: BUILD the
+ * tier, so a mint path produces CA=true/pathlen=0 and the root's budget of 1
+ * is exactly spent.
  *
- * WHY THAT ASYMMETRY IS THE THING TO TEST, rather than "does hop 2 exist":
- * a pathlen budget is a statement to VERIFIERS about what chains they should
- * accept. The root currently tells every verifier "an intermediate below me is
- * legitimate" while nothing legitimate ever occupies that slot — so the only
- * cert that could ever fill it is one nobody meant to issue. Whichever way the
- * fork is resolved, the budget and the tiers have to agree:
- *
- *   BUILD the tier   -> a mint path produces CA=true/pathlen=0, budget 1 is spent
- *   DROP the tier    -> the root narrows to pathlen=0 and hop 2 lives elsewhere
- *
- * Both exits satisfy these tests. Neither presupposes the design decision,
- * which is why they can be written before it is made.
+ * WHY BUDGET-EQUALS-TIERS IS THE THING TO TEST, rather than "does hop 2
+ * exist": a pathlen budget is a statement to VERIFIERS about what chains they
+ * should accept. Before the tier existed, the root told every verifier "an
+ * intermediate below me is legitimate" while nothing legitimate ever occupied
+ * that slot — so the only cert that could fill it was one nobody meant to
+ * issue. These began as `it.fails` pinning that unbuilt state; the polarity
+ * flipped on 2026-08-27 and the `.fails` markers came off, per the protocol
+ * they were written with.
  */
 import { env, runInDurableObject } from "cloudflare:test";
-import { BasicConstraintsExtension, X509Certificate } from "@peculiar/x509";
+import {
+  BasicConstraintsExtension,
+  X509Certificate,
+  X509CertificateGenerator,
+} from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
-import { mintBridgeCertPair, mintGHABridgeCert } from "./cert-authority";
+import {
+  mintBridgeCertPair,
+  mintGHABridgeCert,
+  mintIssuingCaCert,
+} from "./cert-authority";
 import { ED25519 } from "./platform";
 import type { SigningAuthority } from "./signing-authority";
 
@@ -44,6 +49,11 @@ async function spkiToPem(key: CryptoKey): Promise<string> {
   const spki = (await crypto.subtle.exportKey("spki", key)) as ArrayBuffer;
   const b64 = btoa(String.fromCharCode(...new Uint8Array(spki)));
   return `-----BEGIN PUBLIC KEY-----\n${b64.match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
+}
+
+function pemToSpki(pem: string): Uint8Array {
+  const b64 = pem.replace(/-----(BEGIN|END) PUBLIC KEY-----|\s/g, "");
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
 
 /**
@@ -82,10 +92,23 @@ async function mintEverything(): Promise<X509Certificate[]> {
     ca.privateKey,
   );
 
+  const machine = (await crypto.subtle.generateKey(ED25519, true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const issuing = await mintIssuingCaCert(
+    "machine-under-test",
+    "wimse://notme.bot/passkey/machine-under-test",
+    await spkiToPem(machine.publicKey),
+    ca.privateKey,
+    { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+  );
+
   return [
     new X509Certificate(pair.certificates.mtls),
     new X509Certificate(pair.certificates.signing),
     new X509Certificate(gha.certificate),
+    new X509Certificate(issuing.certificate),
   ];
 }
 
@@ -96,16 +119,10 @@ function intermediateTiers(certs: X509Certificate[]): number {
 }
 
 describe("delegation depth (notme-600df1 / ADR-008 §BasicConstraints)", () => {
-  // `it.fails` rather than `it.todo`: these assert the gap is STILL OPEN, so
-  // they execute on every run and go red the moment hop 2 lands — which is
-  // the signal to delete the `.fails` and let them stand as normal tests. A
-  // todo would sit inert and tell nobody. The unusual polarity is the point:
-  // the unbuilt state is the one being pinned, not the built one.
-  it.fails("issues a machine tier that may delegate to tasks", async () => {
+  it("issues a machine tier that may delegate to tasks", async () => {
     // Hop 2 of the desired outcome. ADR-008 calls this the orchestrator
-    // bridge: CA=true so it can sign task certs, pathlen=0 so a task cannot
-    // sign anything in turn. Today every mint path stamps CA=false, so the
-    // machine cannot delegate and the chain stops one hop short.
+    // bridge, the naming decision calls it the Issuing CA: CA=true so it can
+    // sign task certs, pathlen=0 so a task cannot sign anything in turn.
     const certs = await mintEverything();
     expect(
       intermediateTiers(certs),
@@ -129,7 +146,7 @@ describe("delegation depth (notme-600df1 / ADR-008 §BasicConstraints)", () => {
     }
   });
 
-  it.fails("advertises a pathlen budget equal to the tiers it can issue", async () => {
+  it("advertises a pathlen budget equal to the tiers it can issue", async () => {
     // The asymmetry itself. A budget larger than the tiers that exist tells
     // verifiers to accept an intermediate that notme never legitimately mints.
     const stub = env.SIGNING_AUTHORITY.get(
@@ -146,5 +163,368 @@ describe("delegation depth (notme-600df1 / ADR-008 §BasicConstraints)", () => {
       budget,
       "the root reserves room for intermediates the authority cannot issue",
     ).toBe(intermediateTiers(await mintEverything()));
+  });
+});
+
+describe("chain verification is deliberately unbuilt (ADR-019 D5 gate)", () => {
+  // The tier can be MINTED; nothing yet ACCEPTS what it signs. verifyX509 is
+  // single-hop — leaf against the root key, no path building — so a task
+  // cert signed by a machine tier is rejected everywhere in notme today,
+  // even on a fully legitimate chain. That is deliberate: a chain-walking
+  // verifier must ship WITH the namespace bound — decided 2026-08-27 as
+  // URI-SAN segment-prefix confinement (ADR-019 D5) — and the chain scope
+  // rule, or a tier holder could name identities it has no business naming. This test pins the boundary — the day someone builds
+  // path validation, it fails, and this comment is what they must answer.
+  it("REJECTS a task cert signed by the machine tier, even on a legitimate chain", async () => {
+    const ca = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const machine = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const task = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const taskEd = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+
+    const rootCert = await X509CertificateGenerator.createSelfSigned({
+      name: "CN=signet-authority,O=notme",
+      notBefore: new Date(),
+      notAfter: new Date(Date.now() + 3600_000),
+      signingAlgorithm: ED25519,
+      keys: ca,
+      serialNumber: "01",
+    });
+    await mintIssuingCaCert(
+      "machine-under-test",
+      "wimse://notme.bot/passkey/machine-under-test",
+      await spkiToPem(machine.publicKey),
+      ca.privateKey,
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey" },
+    );
+    // Hop 2: the MACHINE signs a task cert — legitimate use of the tier.
+    const taskPair = await mintBridgeCertPair(
+      "task-under-test",
+      "wimse://notme.bot/passkey/task-under-test",
+      await spkiToPem(task.publicKey),
+      await spkiToPem(taskEd.publicKey),
+      machine.privateKey,
+      { scopes: ["bridgeCert"], epoch: 1, authMethod: "passkey", issuerName: "CN=machine-under-test,O=notme" },
+    );
+
+    const { verifyX509 } = await import("./auth/verify-proof");
+    await expect(
+      verifyX509(taskPair.certificates.mtls, rootCert.toString("pem"), 1),
+    ).rejects.toThrow(/not signed by trusted CA/);
+  });
+});
+
+
+describe("the SERVED root's budget matches the code's (notme-1b1db4)", () => {
+  // Production served CA:TRUE, pathlen:0 for five months after the code
+  // moved to pathlen=1 (9c75d93). getCACertificatePem's cache check asked
+  // only whether BasicConstraints EXISTED — the v1→v2 regenerate guard —
+  // so a v2 cert with the wrong budget was cached forever, and the D4 budget
+  // test above passed against a fresh test root that production never had.
+  // This test plants exactly production's condition and asserts the DO
+  // heals it: same key, re-issued cert, no rotation.
+  it("re-issues a cached root whose pathlen disagrees with the code — same key, no rotation", async () => {
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("stale-root-pathlen"),
+    );
+    const before = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const state = await a.getAuthorityState();
+      // Plant a pathlen:0 self-signed cert under the CURRENT key, as March
+      // 2026 production did.
+      //
+      // The key is read out of the DO's own storage rather than from a
+      // method: #getOrCreateSigningKey is ECMAScript-private and off the RPC
+      // surface (notme-eedc9c), which is the point — no caller, in-isolate or
+      // otherwise, is handed the authority's private key. A test that needs
+      // to forge production's exact condition reaches for the stored material
+      // the same way the DO does, and this file already reaches into
+      // ctx.storage.sql below to plant the stale row.
+      //
+      // Plaintext JWK because the pool env sets no KEK, so key storage
+      // resolves to cf-managed — the same mode production runs (notme-41d0d3
+      // tracks the at-rest exposure that follows from it).
+      await a.getCACertificatePem(); // force key + schema init
+      const keyRow = a["ctx"].storage.sql
+        .exec("SELECT private_jwk FROM keys WHERE id = 'authority'")
+        .toArray()[0] as { private_jwk: string };
+      const signingKey = await crypto.subtle.importKey(
+        "jwk",
+        JSON.parse(keyRow.private_jwk),
+        ED25519,
+        false,
+        ["sign"],
+      );
+      const verifyKey = await crypto.subtle.importKey(
+        "spki",
+        pemToSpki(await a.getPublicKeyPem()),
+        ED25519,
+        true,
+        ["verify"],
+      );
+      const stale = await X509CertificateGenerator.createSelfSigned({
+        name: "CN=signet-authority,O=notme",
+        notBefore: new Date(Date.now() - 86_400_000),
+        notAfter: new Date(Date.now() + 86_400_000 * 3650),
+        signingAlgorithm: ED25519,
+        keys: { privateKey: signingKey, publicKey: verifyKey },
+        serialNumber: "0a",
+        extensions: [new BasicConstraintsExtension(true, 0, true)],
+      });
+      a["ctx"].storage.sql.exec("DELETE FROM ca_cert WHERE id = 'cert'");
+      a["ctx"].storage.sql.exec(
+        "INSERT INTO ca_cert (id, pem, key_id) VALUES ('cert', ?, ?)",
+        stale.toString("pem"),
+        state.keyId,
+      );
+      return { epoch: state.epoch, keyId: state.keyId, spki: await a.getPublicKeyPem() };
+    });
+
+    const pem = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).getCACertificatePem(),
+    );
+    const served = new X509Certificate(pem);
+    expect(served.getExtension(BasicConstraintsExtension)?.pathLength).toBe(1);
+
+    // Healing must not rotate: same epoch, same key.
+    const after = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const s = await a.getAuthorityState();
+      // getPublicKeyPem() is the public half and is a legitimate RPC method;
+      // it is what the "same key" comparison actually needs.
+      return { epoch: s.epoch, keyId: s.keyId, spki: await a.getPublicKeyPem() };
+    });
+    expect(after).toEqual(before);
+    // getPublicKeyPem() ends with a trailing newline; spkiToPem does not.
+    // Compare the base64 body, which is the thing that must be identical.
+    const body = (pem: string) => pem.replace(/-----[A-Z ]+-----|\s/g, "");
+    expect(body(await spkiToPem(await served.publicKey.export()))).toBe(
+      body(before.spki),
+    );
+  });
+});
+
+// ── The root's validity belongs to the KEY, not to the moment of issue ──────
+// (notme-0c494f)
+//
+// MEASURED IN PRODUCTION by the signet session that filed this: the live
+// /.well-known/ca-bundle.pem had notBefore 2026-08-28T20:17:40Z; the copy
+// published with signet v0.3.0 had notBefore 2026-03-31T01:44:33Z. Identical
+// SPKI — the same key, re-issued. v0.3.0's leaf was valid 2026-08-07, BEFORE
+// the live root's notBefore, so `cosign verify-blob` against the live anchor
+// failed with "leaf certificate verification failed" and passed against the
+// old copy.
+//
+// The re-issue was the notme-1b1db4 heal above, which minted the replacement
+// with `notBefore: now` under a comment calling it "safe and non-destructive …
+// leaves verify by key, so nothing in flight is invalidated". That holds for a
+// verifier that checks a signature against a key. RFC 5280 path validation
+// does not stop there: every element of the chain must be valid AT THE
+// VERIFICATION TIME, and cosign verifies at the signing time. So every
+// artifact signed before the heal became unverifiable against the anchor
+// notme publishes — a heal that broke more than it fixed, invisibly.
+//
+// The rule now: notBefore = when the KEY began signing (keys.created_at).
+// Nothing the key signed can predate that, so no re-issue can strand it.
+describe("the root's notBefore is the key's start, not the re-issue time (notme-0c494f)", () => {
+  const KEY_START_SQL = "2026-03-31 01:44:33"; // production's key, per the bead
+  const KEY_START = new Date("2026-03-31T01:44:33Z");
+
+  /** Backdate this DO's key and return the stored signing key + CA name. */
+  async function backdateKey(a: SigningAuthority) {
+    await a.getCACertificatePem(); // force key + schema init
+    a["ctx"].storage.sql.exec(
+      "UPDATE keys SET created_at = ? WHERE id = 'authority'",
+      KEY_START_SQL,
+    );
+    const keyRow = a["ctx"].storage.sql
+      .exec("SELECT private_jwk FROM keys WHERE id = 'authority'")
+      .toArray()[0] as { private_jwk: string };
+    const signingKey = await crypto.subtle.importKey(
+      "jwk",
+      JSON.parse(keyRow.private_jwk),
+      ED25519,
+      false,
+      ["sign"],
+    );
+    const verifyKey = await crypto.subtle.importKey(
+      "spki",
+      pemToSpki(await a.getPublicKeyPem()),
+      ED25519,
+      true,
+      ["verify"],
+    );
+    return { signingKey, verifyKey };
+  }
+
+  /** Plant a root under the CURRENT key with the given notBefore/pathlen. */
+  async function plantRoot(
+    a: SigningAuthority,
+    keys: { signingKey: CryptoKey; verifyKey: CryptoKey },
+    notBefore: Date,
+    pathlen: number,
+  ) {
+    const state = await a.getAuthorityState();
+    const root = await X509CertificateGenerator.createSelfSigned({
+      name: "CN=signet-authority,O=notme",
+      notBefore,
+      notAfter: new Date(notBefore.getTime() + 86_400_000 * 3650),
+      signingAlgorithm: ED25519,
+      keys: { privateKey: keys.signingKey, publicKey: keys.verifyKey },
+      serialNumber: "0b",
+      extensions: [new BasicConstraintsExtension(true, pathlen, true)],
+    });
+    a["ctx"].storage.sql.exec("DELETE FROM ca_cert WHERE id = 'cert'");
+    a["ctx"].storage.sql.exec(
+      "INSERT INTO ca_cert (id, pem, key_id) VALUES ('cert', ?, ?)",
+      root.toString("pem"),
+      state.keyId,
+    );
+  }
+
+  it("a root re-issued under the same key carries the KEY's notBefore", async () => {
+    // The 1b1db4 trigger (pathlen mismatch) — the exact heal that caused this.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-pathlen-heal"),
+    );
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const keys = await backdateKey(a);
+      await plantRoot(a, keys, KEY_START, 0);
+    });
+    const pem = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).getCACertificatePem(),
+    );
+    const root = new X509Certificate(pem);
+    expect(root.getExtension(BasicConstraintsExtension)?.pathLength).toBe(1);
+    expect(root.notBefore.toISOString()).toBe(KEY_START.toISOString());
+  });
+
+  it("re-issues a cached root whose notBefore is LATER than the key's start — production's state", async () => {
+    // Correct pathlen, wrong notBefore: what production serves today. The
+    // pathlen check alone passes this root, so without a notBefore check the
+    // DO would serve it forever and never self-heal.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-late-cached"),
+    );
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const keys = await backdateKey(a);
+      await plantRoot(a, keys, new Date("2026-08-28T20:17:40Z"), 1);
+    });
+    const pem = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).getCACertificatePem(),
+    );
+    expect(new X509Certificate(pem).notBefore.toISOString()).toBe(
+      KEY_START.toISOString(),
+    );
+  });
+
+  it("serves a correct cached root unchanged — the heal is not a re-issue on every fetch", async () => {
+    // A cache that never hits would mint a new root (new serial) per request,
+    // so every verifier holding a previous copy would hold a different cert.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-stable"),
+    );
+    const first = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      await backdateKey(a);
+      // Drop the root cached before the backdate so the next fetch issues
+      // one against the backdated key start.
+      a["ctx"].storage.sql.exec("DELETE FROM ca_cert WHERE id = 'cert'");
+      return a.getCACertificatePem();
+    });
+    const second = await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).getCACertificatePem(),
+    );
+    expect(second).toBe(first);
+    expect(new X509Certificate(first).notBefore.toISOString()).toBe(
+      KEY_START.toISOString(),
+    );
+  });
+
+  it("a fresh key's root starts at that key's creation", async () => {
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-fresh"),
+    );
+    const { pem, createdAt } = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const pem = await a.getCACertificatePem();
+      const row = a["ctx"].storage.sql
+        .exec("SELECT created_at FROM keys WHERE id = 'authority'")
+        .toArray()[0] as { created_at: string };
+      return { pem, createdAt: row.created_at };
+    });
+    expect(new X509Certificate(pem).notBefore.toISOString()).toBe(
+      new Date(createdAt.replace(" ", "T") + "Z").toISOString(),
+    );
+  });
+
+  it("a cert signed BEFORE the re-issue still chains — the bead's close condition", async () => {
+    // The property that actually broke. Signed in the past (as signet v0.3.0
+    // was, 2026-08-07), then the root is healed. RFC 5280: the root must be
+    // valid at the time the leaf is checked. Check it the way cosign does —
+    // at the leaf's own signing time.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("root-nb-old-leaf"),
+    );
+    const leafPem = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      const keys = await backdateKey(a);
+      const subjectKeys = (await crypto.subtle.generateKey(ED25519, true, [
+        "sign",
+        "verify",
+      ])) as CryptoKeyPair;
+      const signedAt = new Date("2026-08-07T15:51:00Z");
+      const leaf = await X509CertificateGenerator.create({
+        subject: "CN=signet-release,O=notme",
+        issuer: "CN=signet-authority,O=notme",
+        notBefore: signedAt,
+        notAfter: new Date(signedAt.getTime() + 5 * 60 * 1000),
+        signingAlgorithm: ED25519,
+        publicKey: subjectKeys.publicKey,
+        signingKey: keys.signingKey,
+        serialNumber: "0c",
+      });
+      // Production's state at the time of the failure: a healed root issued
+      // three weeks AFTER this leaf.
+      await plantRoot(a, keys, new Date("2026-08-28T20:17:40Z"), 1);
+      return leaf.toString("pem");
+    });
+
+    const { rootPem, keyPem } = await runInDurableObject(stub, async (auth) => {
+      const a = auth as SigningAuthority;
+      return { rootPem: await a.getCACertificatePem(), keyPem: await a.getPublicKeyPem() };
+    });
+    const root = new X509Certificate(rootPem);
+    const leaf = new X509Certificate(leafPem);
+    // One minute into the leaf's window — when the signature was actually
+    // made. Not leaf.notBefore itself: @peculiar/x509 checks validity with a
+    // STRICT notBefore < t, so the boundary instant reads as invalid.
+    const at = new Date(leaf.notBefore.getTime() + 60_000);
+    const rootKey = await crypto.subtle.importKey(
+      "spki",
+      pemToSpki(keyPem),
+      ED25519,
+      true,
+      ["verify"],
+    );
+
+    // Signature: the leaf is the key's.
+    expect(await leaf.verify({ publicKey: rootKey, date: at })).toBe(true);
+    // And the anchor itself is valid at that moment — the check cosign failed.
+    expect(await root.verify({ date: at })).toBe(true);
   });
 });

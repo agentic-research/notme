@@ -6,7 +6,10 @@
   // `task worker:check` (tsc -p tsconfig.test.json).
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types", "node"],
+    // fork-acceptance.do.test.ts imports scripts/task-cert/lib.ts (repo root), which needs node types and
+    // resolves @peculiar/x509 from the repo root, where it is not hoisted.
+    "paths": { "@peculiar/x509": ["./node_modules/@peculiar/x509"] },
     "noEmit": true
   },
   "include": ["src/**/*.do.test.ts", "src/pool-test-env.d.ts"],

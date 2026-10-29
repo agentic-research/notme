@@ -94,7 +94,7 @@ async function verifyClassified(
   });
 }
 
-describe("registration challenge freshness (notme-addef9 / audit N5)", () => {
+describe("passkey.challenge.expiry — registration challenge freshness (notme-addef9 / audit N5)", () => {
   it("rejects a registration challenge older than the 5-minute window", async () => {
     const stub = await seedChallenge("chal-stale", "user-stale", 10);
     expect(await verifyClassified(stub, "user-stale")).toBe("no-challenge");

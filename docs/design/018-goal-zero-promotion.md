@@ -2,9 +2,9 @@
 @doc-check
 @endpoints: POST /token, GET /health, GET /internal/ca-bundle
 -->
-# ADR-018: Goal Zero release promotion — staging → canary → production
+# ADR-018: Goal Zero release promotion — staging → promote → converge → verify
 
-**Status:** accepted (staging environment + canary tasks shipped in this PR)
+**Status:** accepted; canary phase deleted 2026-08-27 (`notme-9f2f79`) — see the CORRECTION in Phase 2
 **Beads:** notme-cf288e (this plan), notme-bed754 (Goal Zero epic)
 **Audits it serves:** notme-c0a37e (runtime/deployment proof), notme-c0a4f6 (release/package verification), notme-c0a4aa (cross-repo convergence)
 
@@ -91,52 +91,82 @@ verify staging).
 staging carries no traffic, so rollback is redeploy. Staging state is
 disposable by design (its CA is not trusted by anything).
 
-### Phase 2 — Beta / canary (production traffic, bounded)
+### Phase 2 — Promote, converge, verify (production)
+
+> **CORRECTION (2026-08-27, `notme-9f2f79`).** This phase previously specified
+> a bounded-exposure canary: a 10/90 gradual deployment, a 30-minute-to-24-hour
+> soak, and pre-promotion smoke tests routed to the new version with the
+> `Cloudflare-Workers-Version-Overrides` header. It is deleted, for a measured
+> reason and a documented one.
+>
+> **Measured:** the gate failed twice, independently, and both failures
+> reported the OLD version's behaviour while appearing to measure the new one.
+> A 10/90 split confirmed active served 85/85 samples from the old version
+> (~0.01% by chance, caching ruled out). The override header, adopted as the
+> replacement, then routed a pre-promotion probe to the old version wearing
+> the new version's label — which read as "the fix doesn't work" for a fix
+> that did (production `91b54069`, 2026-08-06).
+>
+> **Documented:** per Cloudflare's version-overrides documentation, an
+> override *"will only be applied if the specified version is in the current
+> deployment"*, and when not applied the request *silently falls back to the
+> deployment's percentage routing*. An uploaded-but-not-yet-deployed version
+> is not in the current deployment, so the exact pre-promotion smoke test this
+> phase prescribed was outside the tool's contract — and the tool's documented
+> failure mode is indistinguishable from "no change". The 85/85 gradual-split
+> sample remains unexplained and is not blamed on plan gating or anything
+> else; it is simply recorded.
+>
+> A gate that cannot prove *which version answered* manufactures confidence
+> in whatever is already running. That is worse than no gate, so the phase is
+> removed rather than repaired. Nothing may be reintroduced here without first
+> demonstrating, by measurement against `/.well-known/version`, that traffic
+> splitting on this Worker routes as configured.
 
 **Entry:** Phase 1 green at the SHA being released.
-**Commands:**
+**Command:** `task ship-prod` — preflight → install → check → docs → deploy →
+**await-convergence** → verify, with the promotion steps runnable individually:
 
 ```
-task ship                      # uploads the version — prints the version id
-task worker:versions           # confirm NEW (just uploaded) and OLD (current)
-task worker:canary NEW=<id> OLD=<id> PCT=10
+task worker:deploy-preview               # upload; stamps BUILD_SHA; prints id
+task worker:promote NEW=<id>             # 100% — atomic, no partial exposure
+task worker:await-convergence            # EXPECT=<sha>: N CONSECUTIVE samples
+task worker:verify                       # behavioural checks, only after that
 ```
 
-The same three tasks take `ENV=staging`, so the canary path is **rehearsed
-on staging with the identical commands** that promote production — not a
-staging rehearsal of a different mechanism.
+**The ordering is the design.** Identity first, behaviour second: the
+convergence gate polls `/.well-known/version` (stamped with `BUILD_SHA` at
+upload) until consecutive samples report the released SHA, distinguishing
+"still converging" from "a different build is answering". Promotion is not
+immediate — measured 2026-08-06, live traffic alternates between old and new
+for roughly a minute after the API reports 100%, and `worker:verify` retries
+for ~10 seconds, shorter than that window. Every behavioural check before
+convergence is a check of an unknown version.
 
-**Soak:** minimum 30 minutes at 10% for routine changes; 24 hours for
-identity-critical changes (auth/, signing-authority, cert-exchange, DPoP).
-During soak: `task worker:verify` (may hit either version — both must hold
-the contract) and `wrangler tail --env production`/CF invocation logs for
-error-rate deltas.
+**What replaces bounded exposure.** Nothing pretends to. Production exposure
+is bounded instead by: staging exercised with the *identical commands*
+(`ENV=staging`), atomic promotion of a version already verified there, and a
+rollback that is the same mechanism as promotion. Identity-critical changes
+(auth/, signing-authority, cert-exchange, DPoP) take their soak on staging,
+where a broken version costs nothing.
 
-**Exit criteria:** verify green during soak; no new error signatures in
-invocation logs; no revocation/DO alarm anomalies.
+**Rollback:** `task worker:promote NEW=<old-id>`, then
+`worker:await-convergence` against the OLD sha, then `worker:verify` — the
+convergence caveat applies on the way back too, which is exactly when nobody
+wants to wait for it.
 
-**Rollback triggers (any one):**
-- `worker:verify` failure attributable to the new version
-- new 5xx signature or error-rate increase in invocation logs
-- any cryptographic-surface anomaly (JWKS/ca-bundle/token mint divergence)
+**Hard constraint (unchanged):** a version carrying a new `[[migrations]]`
+entry promotes atomically anyway — Durable Object migrations do not split —
+and deleted-class migrations do not roll back, so the rollback plan for a
+migration-carrying release is reviewed *before* deploy.
 
-**Rollback command:** `task worker:promote NEW=<old-id>` — the same
-mechanism as promotion, no special path, no rebuild.
+### Phase 3 — Artifact publish
 
-**Hard constraint:** a version carrying a new `[[migrations]]` entry
-**cannot** be split-deployed — Durable Object migrations promote atomically,
-and deleted-class migrations do not roll back. Releases that add migrations
-skip canary (documented in the release PR) and use `task worker:deploy` +
-immediate `worker:verify`, with the rollback plan reviewed *before* deploy.
-
-### Phase 3 — Production promotion + artifact publish
-
-**Entry:** Phase 2 exit criteria met.
-**Commands:**
+**Entry:** Phase 2 complete — the version is promoted, converged, and
+verified.
+**Command:**
 
 ```
-task worker:promote NEW=<id>   # 100% traffic to the soaked version id
-task worker:verify             # production smoke, post-promotion
 git tag v<X.Y.Z> && git push --tags   # artifact plane
 ```
 
@@ -148,9 +178,9 @@ declare" structurally impossible. If the DPoP SDK changed:
 `git tag dpop-v<X.Y.Z>` → trusted publishing + provenance verification
 (`publish-dpop.yml`).
 
-**Exit criteria:** verify green at 100%; release workflow green on both
-image legs; provenance/signature verification steps green (they are part of
-the workflows, not manual).
+**Exit criteria:** release workflow green on both image legs;
+provenance/signature verification steps green (they are part of the
+workflows, not manual).
 
 **Rollback:**
 - Service: `task worker:promote NEW=<old-id>` (or `task worker:rollback`).
@@ -166,7 +196,7 @@ Recorded on the release bead (and linked from the PR) at each cut:
 
 1. Git SHA + tag; PR URL; CI run URL (Phase 0).
 2. `ship-staging` transcript tail + staging verify output (Phase 1).
-3. Version id uploaded; canary split + soak window + promote command
+3. Version id uploaded; promote command + convergence proof (consecutive `/.well-known/version` samples at the released SHA)
    transcript (Phase 2–3).
 4. Release workflow run URL; `cosign verify` / `verify-attestation` output
    (in-job); npm provenance attestation URL when dpop shipped.

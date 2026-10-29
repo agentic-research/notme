@@ -65,13 +65,28 @@ Issue **proof-of-possession bridge certificates** via a nonce-based exchange. Th
 
 Adopt WIMSE identity URIs as the canonical format. The same URI appears in X.509 SAN, WIT `sub` claims, git signatures, and APAS attestations:
 
+> **CORRECTION (2026-08-29, `notme-77438b` / ADR-019 D2).** The `{context}`
+> segment below is **retired**. It held the auth ceremony for session-minted
+> certs and the attestation mechanism for CI certs, so one principal's
+> identity changed with the door they came through, and the subject's
+> position in the path differed by route. The format is now:
+>
+> ```
+> wimse://{trust-domain}/principal/{stable-id}
+> ```
+>
+> Kind (`principal_kind`, OID `.1.8`) and mechanism (`authMethod`, OID `.1.5`)
+> are signed extensions. The examples and `{context}` discussion below are
+> kept as the historical record of what shipped first; read them as history.
+
 ```
 wimse://notme.bot/gha/agentic-research/notme        (GHA workflow)
 wimse://notme.bot/user/james                         (passkey-authenticated human)
 wimse://notme.bot/agent/dev-agent/dispatch/abc123    (dispatched agent)
 ```
 
-Format: `wimse://{trust-domain}/{context}/{identity}`
+Format: `wimse://{trust-domain}/{context}/{identity}` — **superseded, see the
+correction above.**
 
 The trust domain is a FQDN. The path is scoped within the trust domain. This follows `draft-ietf-wimse-arch-02` Section 3.1 and is compatible with SPIFFE ID conventions.
 
@@ -154,16 +169,16 @@ sequenceDiagram
     participant G as GitHub OIDC
 
     Note over C: Generate P-256 + Ed25519 keypairs<br/>(extractable: false)
-    Note over C: binding_payload = SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
-    Note over C: Sign binding_payload with both private keys
+    Note over C: binding_input = mtls_spki || signing_spki || SHA-256(oidc_jwt)
+    Note over C: Sign binding_input ITSELF with both keys — never its digest
 
     C->>G: (pre-step) Request OIDC JWT
     G-->>C: OIDC JWT (one-time JTI)
 
     C->>A: POST /cert/gha<br/>Authorization: Bearer {oidc_jwt}<br/>Body: {public_keys, proofs}
     Note over A: 1. Verify OIDC JWT signature + JTI (replay check)
-    Note over A: 2. Verify ES256 proof over binding_payload
-    Note over A: 3. Verify EdDSA proof over binding_payload
+    Note over A: 2. Verify ES256 proof over binding_input
+    Note over A: 3. Verify EdDSA proof over binding_input
     Note over A: 4. Issue P-256 cert + Ed25519 cert<br/>   signed by CA (extractable:false)
     A-->>C: {certificates: {mtls, signing}, identity, scopes, expires_at}
 
@@ -181,18 +196,19 @@ Content-Type: application/json
     "signing": "<Ed25519 SPKI PEM>"
   },
   "proofs": {
-    "mtls": "<ES256 signature over binding_payload>",
-    "signing": "<EdDSA signature over binding_payload>"
+    "mtls": "<ES256 signature over binding_input>",
+    "signing": "<EdDSA signature over binding_input>"
   }
 }
 ```
 
-Where `binding_payload = SHA-256(mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt))`.
+Where `binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)`.
 
-> **CORRECTION (2026-08-06, `notme-bd68f2`).** The outer `SHA-256(…)` is wrong,
-> in both this definition and the sequence diagram above. **Signers must sign
-> the concatenation itself — the pre-image — never its digest.** The normative
-> encoding is:
+> **CORRECTION (2026-08-06, amended 2026-09-18, `notme-bd68f2`).** This
+> definition and the sequence diagram above both used to specify
+> `binding_payload = SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))`.
+> The outer `SHA-256(…)` is wrong. **Signers must sign the concatenation
+> itself — the pre-image — never its digest.** The normative encoding is:
 >
 > ```
 > binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)
@@ -216,6 +232,27 @@ Where `binding_payload = SHA-256(mtls_spki_der || signing_spki_der || SHA-256(oi
 > moves past `0d2312f` and nothing reports `"digest"` — so the encoding
 > described above is not merely wrong, it is being withdrawn. Build against the
 > pre-image.
+
+> **SESSION ROUTES BIND A NONCE (2026-10-28, `notme-486e8a`).** The above is
+> the `/cert/gha` binding. The session routes — `/cert/passkey` and `/cert`'s
+> session branch — bind a server-issued nonce, fetched first with
+> `POST /cert/nonce` (same-origin; the session cookie is sent automatically):
+>
+> ```
+> binding_input = "notme/cert-pair/v1\0" || mtls_spki_der || signing_spki_der || SHA-256(nonce)
+> ```
+>
+> with `nonce` echoed in the request body. Normative source:
+> `worker/src/auth/cert-pair-binding.ts`. The nonce is single-use, expires in
+> 120 s, is bound to the session's principal, and is spent only after the
+> proofs verify.
+>
+> What it replaced, and why: `/cert/passkey` bound `SHA-256(notme_session)`,
+> but that cookie is HttpOnly and every session is issued only as
+> `Set-Cookie`, so no browser could compute the binding and the route was
+> uncallable. `/cert`'s session branch bound `mtls_spki || signing_spki` with
+> no session term at all, so a captured keys+proofs pair could be replayed
+> under another session to bind the victim's keys to the attacker's identity.
 
 Each proof is a signature over the same binding payload, proving:
 - The caller holds the P-256 private key
