@@ -12,7 +12,8 @@
   "include": [
     "../scripts/task-cert/**/*.ts",
     "src/__tests__/task-cert-client.test.ts",
-    "src/__tests__/tier-renewal-binding.test.ts"
+    "src/__tests__/tier-renewal-binding.test.ts",
+    "src/__tests__/capnp-codegen.test.ts"
   ],
   "exclude": ["node_modules"]
 }
