@@ -224,7 +224,7 @@ export type RenewalResult = {
   generation: number;
 };
 
-/** The authority definitively refused a FIRST attempt (its JSON `{ error }`, 4xx). */
+/** The authority definitively refused a FIRST attempt (its JSON `{ error }`, 4xx). Pending is cleared, except for stale_proof. */
 export class AuthorityRefusal extends Error {
   constructor(public reason: string) {
     super(reason);
@@ -247,17 +247,26 @@ export const RENEW_FETCH_TIMEOUT_MS = 30_000;
 const TRANSIENT_4XX = new Set([408, 425, 429]);
 
 /**
- * Errors raised while CONNECTING: the name did not resolve or nothing
- * accepted the connection, so no byte of the request left this host. A
- * timeout, an abort or a reset (ECONNRESET) is not one of these: the request
- * may have been delivered.
+ * Errors that can only be raised while CONNECTING: the name did not resolve
+ * or nothing accepted the connection, so no byte of the request left this
+ * host. A timeout, an abort or a reset (ECONNRESET) is not one of these: the
+ * request may have been delivered.
  */
-export const CONNECT_PHASE_CODES: ReadonlySet<string> = new Set([
-  "ENOTFOUND", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "EAI_AGAIN",
-]);
+export const CONNECT_PHASE_CODES: ReadonlySet<string> = new Set(["ENOTFOUND", "ECONNREFUSED", "EAI_AGAIN"]);
+/**
+ * Errors that mean "never sent" only when the connect (or the lookup) raised
+ * them: EHOSTUNREACH and ENETUNREACH can also come from an already-connected
+ * socket (a laptop sleeping after delivery), when the request may have been
+ * accepted. Without a connect-phase syscall they keep pending.
+ */
+export const ROUTE_CODES: ReadonlySet<string> = new Set(["EHOSTUNREACH", "ENETUNREACH"]);
+const CONNECT_SYSCALLS: ReadonlySet<string> = new Set(["connect", "getaddrinfo"]);
 const isConnectPhaseError = (e: unknown): boolean => {
-  const code = (e as { cause?: { code?: unknown } } | null)?.cause?.code;
-  return typeof code === "string" && CONNECT_PHASE_CODES.has(code);
+  const cause = (e as { cause?: { code?: unknown; syscall?: unknown } } | null)?.cause;
+  const code = cause?.code;
+  if (typeof code !== "string") return false;
+  if (CONNECT_PHASE_CODES.has(code)) return true;
+  return ROUTE_CODES.has(code) && typeof cause?.syscall === "string" && CONNECT_SYSCALLS.has(cause.syscall);
 };
 
 /** A v1 (legacy) request body: no generation, so resending or re-signing it carries no fork risk. */
@@ -281,12 +290,16 @@ const isV1Body = (body: string): boolean => {
  *     and nothing new is ever signed;
  *   - past the window it is not resent and not replaced: a human re-enrolls;
  *   - pending is cleared only on a definitive answer: a valid 2xx, or the
- *     authority's own JSON refusal of a FIRST attempt. A refusal of a RESEND
+ *     authority's own JSON refusal of a FIRST attempt — except stale_proof,
+ *     which may be this machine's clock and is kept, so the next run resends
+ *     the same bytes (a captured copy replayed meanwhile then makes that
+ *     resend a retry, never a fork). A refusal of a RESEND
  *     keeps pending (clearing would let the next run re-sign at the old
  *     generation, which is a fork) and says the state is lost.
  *   - network errors, 5xx, 3xx, 408/425/429 and non-authority 4xx bodies
  *     (edge or HTML error pages) are not definitive and keep pending —
- *     except a connect-phase error (CONNECT_PHASE_CODES) on a FIRST attempt:
+ *     except a connect-phase error (CONNECT_PHASE_CODES, or ROUTE_CODES
+ *     raised by connect/getaddrinfo) on a FIRST attempt:
  *     those bytes never left the host, so the request just reserved is ours
  *     to clear. (A resend's earlier delivery is unknown, so it is kept.)
  *   - a pending request at a generation below the stored one was accepted
@@ -388,7 +401,12 @@ export async function renewTier(
     return renewTier(authority, key, { ...opts, pending: null }, fetchFn);
   }
   if (resend) throw stateLost(out.error);
-  await opts.clearPending(body);
+  // stale_proof on a first attempt is most likely this machine's clock. Keep
+  // the request: if it was captured, a replay of it may still be accepted
+  // once the authority's clock covers its iat, and a NEW request signed at
+  // this generation would then be a fork. Resent verbatim, it lands on the
+  // retry path (or, past the window, reports the state lost).
+  if (out.error !== "stale_proof") await opts.clearPending(body);
   throw new AuthorityRefusal(out.error);
 }
 
@@ -407,7 +425,9 @@ export function explainRenewalFailure(e: unknown): Error {
   if (e instanceof AuthorityRefusal) {
     // Not an ended approval: the authority has retired v1 for this machine, and this client signed v1.
     if (e.reason === "binding_v2_required") return new Error(BINDING_V2_REQUIRED_MESSAGE);
-    if (e.reason === "stale_proof") return new Error("the authority refused the timestamp — check this machine's clock");
+    if (e.reason === "stale_proof") {
+      return new Error("the authority refused the timestamp — check this machine's clock; the request is kept and will be resent");
+    }
     if (ENDED_REASONS.has(e.reason)) {
       return new Error(`the approval for this machine has ended (${e.reason}) — run \`task-cert enroll\` and approve again`);
     }

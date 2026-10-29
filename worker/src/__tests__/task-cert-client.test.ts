@@ -334,6 +334,20 @@ describe("renewal with a generation", () => {
     expect(h.events).toEqual([]);
   });
 
+  it("a stale_proof on a FIRST attempt keeps pending: it may be this clock, and a captured copy could still be accepted", async () => {
+    // Clearing here would let the next run sign a NEW request at this
+    // generation; if a captured copy of this one was accepted meanwhile, that
+    // new request is a fork. Kept, the next run resends these exact bytes.
+    const k = await generateTierKey();
+    const h = harness();
+    const err = await renewTier("https://a", k, h.opts({ generation: 1 }), withFetch(() => reply(401, { error: "stale_proof" }))).catch((e) => e);
+    expect(err).toBeInstanceOf(AuthorityRefusal);
+    expect(err.reason).toBe("stale_proof");
+    expect(h.events).toEqual(["save"]);
+    expect(explainRenewalFailure(err).message).toBe(
+      "the authority refused the timestamp — check this machine's clock; the request is kept and will be resent");
+  });
+
   it("a definitive refusal on a FIRST attempt clears pending and throws the reason", async () => {
     const k = await generateTierKey();
     const h = harness();
@@ -383,18 +397,54 @@ describe("renewal with a generation", () => {
     return e;
   };
 
+  const failWithSyscall = (code: string, syscall?: string) => {
+    const e = failWith(code);
+    if (syscall !== undefined) (e as any).cause.syscall = syscall;
+    return e;
+  };
+
+  /** A first attempt that fails with `err`: the events and what was cleared. */
+  const firstAttemptFailing = async (err: () => unknown) => {
+    const k = await generateTierKey();
+    const h = harness();
+    const cleared: string[] = [];
+    let saved = "";
+    const opts = { ...h.opts({ generation: 1 }), savePending: (p: PendingRenewal) => { saved = p.body; h.events.push("save"); },
+      clearPending: (b: string) => { cleared.push(b); h.events.push("clear"); } };
+    await expect(renewTier("https://a", k, opts, (async () => { throw err(); }) as unknown as typeof fetch)).rejects.toThrow("fetch failed");
+    return { events: h.events, cleared, saved };
+  };
+
   it("a connect-phase error on a first attempt clears our own pending: the bytes never left", async () => {
-    expect([...CONNECT_PHASE_CODES].sort()).toEqual(["EAI_AGAIN", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND"]);
+    expect([...CONNECT_PHASE_CODES].sort()).toEqual(["EAI_AGAIN", "ECONNREFUSED", "ENOTFOUND"]);
     for (const code of CONNECT_PHASE_CODES) {
-      const k = await generateTierKey();
-      const h = harness();
-      const cleared: string[] = [];
-      let saved = "";
-      const opts = { ...h.opts({ generation: 1 }), savePending: (p: PendingRenewal) => { saved = p.body; h.events.push("save"); },
-        clearPending: (b: string) => { cleared.push(b); h.events.push("clear"); } };
-      await expect(renewTier("https://a", k, opts, (async () => { throw failWith(code); }) as unknown as typeof fetch)).rejects.toThrow("fetch failed");
-      expect(h.events, code).toEqual(["save", "clear"]);
+      const { events, cleared, saved } = await firstAttemptFailing(() => failWith(code));
+      expect(events, code).toEqual(["save", "clear"]);
       expect(cleared, code).toEqual([saved]); // our own body, owner-checked
+    }
+  });
+
+  it("EHOSTUNREACH / ENETUNREACH clear only when raised by connect or getaddrinfo", async () => {
+    for (const code of ["EHOSTUNREACH", "ENETUNREACH"]) {
+      for (const syscall of ["connect", "getaddrinfo"]) {
+        const { events, cleared, saved } = await firstAttemptFailing(() => failWithSyscall(code, syscall));
+        expect(events, `${code}/${syscall}`).toEqual(["save", "clear"]);
+        expect(cleared, `${code}/${syscall}`).toEqual([saved]);
+      }
+      // On an already-connected socket (or with no syscall to prove otherwise)
+      // the request may have been delivered and accepted: clearing it would let
+      // the next run re-sign at the old generation, which is a fork.
+      for (const syscall of [undefined, "read", "write"]) {
+        const { events } = await firstAttemptFailing(() => failWithSyscall(code, syscall));
+        expect(events, `${code}/${syscall}`).toEqual(["save"]);
+      }
+    }
+  });
+
+  it("ECONNRESET keeps pending, whatever the syscall", async () => {
+    for (const syscall of [undefined, "connect", "read"]) {
+      const { events } = await firstAttemptFailing(() => failWithSyscall("ECONNRESET", syscall));
+      expect(events, String(syscall)).toEqual(["save"]);
     }
   });
 

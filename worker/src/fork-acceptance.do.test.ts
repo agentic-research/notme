@@ -12,6 +12,8 @@
  * here fail. It does NOT pin the atomic `generation = ?` guard: removing that
  * guard leaves these scenarios green, because they run requests sequentially.
  * That guard is pinned by tier-generation.do.test.ts's direct-injection test.
+ * Clearing the pending request on a first-attempt stale_proof makes the
+ * clock-ahead scenario fail (the honest re-sign is then fork_detected).
  */
 import worker from "../worker";
 import { env, runInDurableObject } from "cloudflare:test";
@@ -194,6 +196,57 @@ describe("mint path phase 1, end to end with the real client", () => {
     expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
 
     expect((await runClient(c)).generation).toBe(3);
+  });
+
+  it("a clock running ahead: the refused request is kept, and a replay of it cannot make the honest resend a fork", async () => {
+    const c = await enroll();
+    // One clock for the whole isolate; the shim moves it between the
+    // machine's view and the authority's, so no test sleeps.
+    const T = Date.now();
+    let clock = T;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      // The machine's clock runs 200 s ahead; the authority's is at T.
+      let captured: { url: string; init: RequestInit } | undefined;
+      const skewed: Fetch = (url, init) => {
+        captured ??= { url, init: { ...init!, signal: undefined } };
+        clock = T;
+        return direct(url, init);
+      };
+      clock = T + 200_000;
+      const refused = await refusal(runClient(c, skewed));
+      expect(refused?.reason).toBe("stale_proof");
+      expect(c.pending, "a timestamp refusal keeps the request: it is resent, never re-signed").not.toBeNull();
+      expect(captured).toBeDefined();
+      expect(c.pending!.body).toBe(String(captured!.init.body));
+
+      // An attacker who captured the body replays it once the authority's
+      // clock covers its iat (within 120 s of it): it is accepted, g 0 → 1.
+      clock = T + 100_000;
+      const replay = await direct(captured!.url, captured!.init);
+      expect(replay.status, await replay.clone().text()).toBe(200);
+      expect(((await replay.json()) as { generation: number }).generation).toBe(1);
+
+      // The human fixes the clock and runs again: the SAME bytes are resent,
+      // land on the retry path, and nothing is revoked.
+      clock = T + 110_000;
+      const sent: string[] = [];
+      const watching: Fetch = (url, init) => {
+        sent.push(String(init?.body));
+        return direct(url, init);
+      };
+      const r = await runClient(c, watching);
+      expect(sent).toEqual([String(captured!.init.body)]);
+      expect(r.generation).toBe(1);
+      expect(c.pending).toBeNull();
+      expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
+
+      clock = T + 111_000;
+      expect((await runClient(c)).generation).toBe(2);
+      expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("a legacy machine keeps working until its first v2 renewal", async () => {
