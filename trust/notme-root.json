@@ -5,11 +5,11 @@
     "subject": "CN=signet-authority, O=notme",
     "issuer": "CN=signet-authority, O=notme",
     "self_signed": true,
-    "serial_number": "5dcb45c3b6a6ed62133d71f7dc8413f3",
+    "serial_number": "e7063d28469715351cf3b58d6453ca70",
     "key_algorithm": "Ed25519",
     "spki_sha256": "a2e571d8834225781873fa621ead03393d57dc05ff8379c64755d709018d36a4",
-    "cert_sha256": "088a9b38ffa6f7a0981a272d9f25b1b620e772b2a8cb374fb2d60452ee24da38",
-    "not_before": "2026-08-28T20:17:40Z",
-    "not_after": "2036-08-28T08:17:40Z",
-    "observed_at": "2026-09-25T00:00:00Z"
+    "cert_sha256": "7fd698cb18810646a30446c7d97de725ed711182f367ca15e50f8e203728afbd",
+    "not_before": "2026-03-29T05:39:57Z",
+    "not_after": "2036-03-28T17:39:57Z",
+    "observed_at": "2026-10-29T00:25:10Z"
 }

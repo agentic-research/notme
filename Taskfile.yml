@@ -198,6 +198,19 @@ tasks:
           echo "✗ root-pathlen: served root has pathlen '${ROOT_PATHLEN:-none}', code mints 1 — Issuing CA tiers cannot verify"
           FAIL=1
         fi
+        # The committed trust anchor must still be what production serves.
+        # It went stale twice (2026-08-28 pathlen heal, 2026-10-28 notBefore
+        # re-issue) while trust-anchor.test.ts passed, because that test
+        # compares trust/ only to itself (notme-8e8836). Production only:
+        # trust/ pins the production authority.
+        if [ "$AUTH_BASE" = "https://auth.notme.bot" ]; then
+          if pnpm exec tsx scripts/refresh-trust-anchor.ts --check; then
+            echo "✓ trust-anchor (trust/ matches the served root)"
+          else
+            echo "✗ trust-anchor: trust/ disagrees with the served root (see above)"
+            FAIL=1
+          fi
+        fi
         check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
         # The deployed build must be able to NAME ITSELF. Asserting
         # "stamped":true rather than merely a 200: an endpoint that always
@@ -435,6 +448,11 @@ tasks:
       - echo "  task worker:promote NEW=<old-id>       # rollback = promote the old id"
       - echo ""
       - 'echo "Direct path (skips canary): task worker:deploy && task worker:verify"'
+
+  trust:refresh:
+    desc: "Refresh trust/ from the live root; refuses if the KEY changed. `-- --check` only compares (notme-8e8836)"
+    cmds:
+      - pnpm exec tsx scripts/refresh-trust-anchor.ts {{.CLI_ARGS}}
 
   task-cert:
     desc: "Machine-side task certificates — enroll (passkey approval) | mint | verify | status (notme-486e8a)"
