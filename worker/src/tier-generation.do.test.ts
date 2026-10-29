@@ -337,3 +337,80 @@ describe("binding v1 is retired", () => {
     await expectErr(await renewV1(m), 401, "invalid_proof");
   });
 });
+
+describe("clone policy", () => {
+  const startOne = async () => {
+    const m = await machine();
+    const start = (await (await post("/cert/issuing-ca/device", { public_key: m.pem })).json()) as { device_code: string; user_code: string };
+    return { m, start };
+  };
+  const approveWith = (h: { cookie: string }, user_code: string, extra: Record<string, unknown>) =>
+    post("/cert/issuing-ca/device/approve", { user_code, ...extra }, { cookie: h.cookie });
+  const listOf = async (h: { cookie: string }) =>
+    (await (await call(`${ORIGIN}/cert/issuing-ca/enrollments`, { headers: { cookie: h.cookie } })).json()) as Array<{ clone_policy: string; generation: number }>;
+  const collect = async (m: Machine, device_code: string) => {
+    const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, m.kp.privateKey, tierEnrolmentBinding(m.spki, await deviceCodeHash(device_code)))));
+    return post("/cert/issuing-ca/device/token", { device_code, proof });
+  };
+
+  it("a plain approval is singleton", async () => {
+    const { m, start } = await startOne();
+    const h = await human();
+    const ap = await approveWith(h, start.user_code, {});
+    expect(ap.status).toBe(200);
+    expect(((await ap.json()) as { clone_policy: string }).clone_policy).toBe("singleton");
+    const tok = await collect(m, start.device_code);
+    expect(((await tok.json()) as { clone_policy: string }).clone_policy).toBe("singleton");
+    const rows = await listOf(h);
+    expect(rows[0].clone_policy).toBe("singleton");
+    expect(rows[0].generation).toBe(0);
+  });
+
+  it("replicas requires authorityManage", async () => {
+    const a = await startOne();
+    const weak = await human(["bridgeCert", "certMint"]);
+    expect((await approveWith(weak, a.start.user_code, { clone_policy: "replicas:4", renew_days: 7 })).status).toBe(403);
+    const b = await startOne();
+    const strong = await human(["bridgeCert", "certMint", "authorityManage"]);
+    const ap = await approveWith(strong, b.start.user_code, { clone_policy: "replicas:4", renew_days: 7 });
+    expect(ap.status, await ap.clone().text()).toBe(200);
+    expect(((await ap.json()) as { clone_policy: string }).clone_policy).toBe("replicas:4");
+    await collect(b.m, b.start.device_code);
+    expect((await listOf(strong))[0].clone_policy).toBe("replicas:4");
+  });
+
+  it("replicas needs LIVE authorityManage, not the cookie's", async () => {
+    const a = await startOne();
+    const h = await human(["bridgeCert", "certMint"]);
+    // cookie claims authorityManage the principal does not hold
+    const cookie = await createSessionCookie(
+      { principalId: h.pid, scopes: ["bridgeCert", "certMint", "authorityManage"], authMethod: "passkey" },
+      await authority().getSessionSecret(),
+    );
+    expect((await approveWith({ cookie }, a.start.user_code, { clone_policy: "replicas:2", renew_days: 7 })).status).toBe(403);
+  });
+
+  it("replicas allows at most a 7-day horizon", async () => {
+    const strong = await human(["bridgeCert", "certMint", "authorityManage"]);
+    const a = await startOne();
+    expect((await approveWith(strong, a.start.user_code, { clone_policy: "replicas:2", renew_days: 30 })).status).toBe(400);
+    expect((await approveWith(strong, a.start.user_code, { clone_policy: "replicas:2", renew_days: 7 })).status).toBe(200);
+  });
+
+  it("anything else is refused", async () => {
+    const strong = await human(["bridgeCert", "certMint", "authorityManage"]);
+    const a = await startOne();
+    for (const bad of ["replicas:3", "many", ""]) {
+      expect((await approveWith(strong, a.start.user_code, { clone_policy: bad })).status, bad).toBe(400);
+    }
+  });
+
+  it("the enroll page offers the policy, singleton selected", async () => {
+    const a = await startOne();
+    const h = await human();
+    const res = await call(`${ORIGIN}/enroll?code=${a.start.user_code}`, { headers: { cookie: h.cookie } });
+    const html = await res.text();
+    expect(html).toContain('id="clone"');
+    expect(html).toContain('<option value="singleton" selected');
+  });
+});

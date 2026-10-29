@@ -1860,6 +1860,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       "generation INTEGER NOT NULL DEFAULT 0",
       "revoke_reason TEXT",
       "binding_version INTEGER",
+      // The approver's clone policy (notme-747cc7): recorded and shown only;
+      // phase 1 has no branch endpoint, so every line acts as a singleton.
+      "clone_policy TEXT NOT NULL DEFAULT 'singleton'",
     ]) {
       try {
         this.ctx.storage.sql.exec(`ALTER TABLE tier_enrolments ADD COLUMN ${col}`);
@@ -1983,6 +1986,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     scopes: string[];
     /** How long the machine may renew without a human (notme-337d82). */
     renewDays: number;
+    /** The ROUTE validates and authorizes; this records it. */
+    clonePolicy: "singleton" | "replicas:2" | "replicas:4" | "replicas:8";
   }): Promise<{ ok: true } | { ok: false; reason: "not_found" | "expired" | "not_pending" }> {
     this.#ensureTierEnrolmentSchema();
     const now = Math.floor(Date.now() / 1000);
@@ -1995,7 +2000,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec(
       `UPDATE tier_enrolments
           SET status = 'approved', principal_id = ?, identity = ?, auth_method = ?, granted_scopes = ?,
-              renew_until = ?, approved_epoch = ?
+              renew_until = ?, approved_epoch = ?, clone_policy = ?
         WHERE user_code = ? AND status = 'pending'`,
       params.principalId,
       params.identity,
@@ -2003,6 +2008,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       JSON.stringify(params.scopes),
       now + params.renewDays * 86400,
       (await this.getAuthorityState()).epoch,
+      params.clonePolicy,
       params.userCode,
     );
     return { ok: true };
@@ -2016,7 +2022,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * the real holder's approval. A good one consumes it before minting.
    */
   async collectTierEnrolment(params: { deviceCode: string; proof: string }): Promise<
-    | ({ ok: true; principalId: string; authMethod: string; renewUntil: number; generation: number } &
+    | ({ ok: true; principalId: string; authMethod: string; renewUntil: number; generation: number; clone_policy: string } &
         import("./cert-authority").IssuingCaCertResult & {
           authority: { epoch: number; key_id: string };
         })
@@ -2047,6 +2053,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           expires_at: number;
           renew_until: number | null;
           key_fingerprint: string;
+          clone_policy: string;
         }
       | undefined;
     if (!row) return { ok: false, reason: "invalid_grant" };
@@ -2113,6 +2120,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       authMethod: row.auth_method,
       renewUntil: row.renew_until ?? 0,
       generation: 0,
+      clone_policy: row.clone_policy,
       ...result,
     };
   }
@@ -2378,15 +2386,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   /** A principal's enrolled machines — what the human approved, and its state. */
   async listTierEnrolments(principalId: string): Promise<
-    Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; scopes: string[] }>
+    Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; scopes: string[]; clone_policy: string; generation: number }>
   > {
     this.#ensureTierEnrolmentSchema();
     const rows = this.ctx.storage.sql
       .exec(
-        "SELECT key_fingerprint, status, renew_until, revoked_at, granted_scopes FROM tier_enrolments WHERE principal_id = ? AND status = 'active'",
+        "SELECT key_fingerprint, status, renew_until, revoked_at, granted_scopes, clone_policy, generation FROM tier_enrolments WHERE principal_id = ? AND status = 'active'",
         principalId,
       )
-      .toArray() as Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; granted_scopes: string }>;
+      .toArray() as Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; granted_scopes: string; clone_policy: string; generation: number }>;
     return rows.map(({ granted_scopes, ...r }) => ({ ...r, scopes: JSON.parse(granted_scopes) }));
   }
 

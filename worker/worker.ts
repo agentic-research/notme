@@ -1222,6 +1222,16 @@ function enrolPageHtml(
       </select></label>
   </p>
   <p class="muted">So a machine that pauses and resumes is not blocked on you. You can revoke it at any time; renewal stops at once.</p>
+  <p>
+    <label>Clone policy
+      <select id="clone">
+        <option value="singleton" selected>singleton — one copy of this key</option>
+        <option value="replicas:2">replicas:2 (break glass)</option>
+        <option value="replicas:4">replicas:4 (break glass)</option>
+        <option value="replicas:8">replicas:8 (break glass)</option>
+      </select></label>
+  </p>
+  <p class="muted">Replicas need authorityManage and a renewal horizon of at most 7 days. For now every line still acts as a singleton.</p>
   <button id="approve">approve</button>` : `<p>This enrollment is already ${esc(status)}.</p>`}
   <p id="out" class="muted"></p>
   <script>
@@ -1233,7 +1243,8 @@ function enrolPageHtml(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_code: document.body.dataset.code,
-          renew_days: Number(document.getElementById('renew').value)
+          renew_days: Number(document.getElementById('renew').value),
+          clone_policy: document.getElementById('clone').value
         })
       });
       var data = await res.json().catch(function () { return {}; });
@@ -3031,7 +3042,7 @@ export default {
         if (typeof session.authMethod !== "string" || !session.authMethod) {
           return jsonErr("session carries no authMethod", 401);
         }
-        let body: { user_code?: unknown; renew_days?: unknown } = {};
+        let body: { user_code?: unknown; renew_days?: unknown; clone_policy?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
         } catch {
@@ -3045,6 +3056,21 @@ export default {
         const renewDays = body.renew_days === undefined ? 7 : body.renew_days;
         if (renewDays !== 1 && renewDays !== 7 && renewDays !== 30) {
           return jsonErr("renew_days must be 1, 7 or 30", 400);
+        }
+        // Clone policy (notme-747cc7): singleton unless the approver, holding
+        // LIVE authorityManage, says otherwise. Phase 1 only records it.
+        const clonePolicy = body.clone_policy === undefined ? "singleton" : body.clone_policy;
+        if (
+          clonePolicy !== "singleton" &&
+          clonePolicy !== "replicas:2" &&
+          clonePolicy !== "replicas:4" &&
+          clonePolicy !== "replicas:8"
+        ) {
+          return jsonErr("clone_policy must be singleton, replicas:2, replicas:4 or replicas:8", 400);
+        }
+        if (clonePolicy !== "singleton") {
+          if (!live.includes("authorityManage")) return jsonErr("replicas requires authorityManage", 403);
+          if (renewDays === 30) return jsonErr("replicas allows a renewal horizon of at most 7 days", 400);
         }
         const pending = await authority.getTierEnrolment(userCode);
         if (!pending) return jsonErr("no such enrolment", 404);
@@ -3063,6 +3089,7 @@ export default {
           authMethod: session.authMethod,
           scopes,
           renewDays,
+          clonePolicy,
         });
         if (!r.ok) {
           return jsonErr(
@@ -3070,7 +3097,7 @@ export default {
             r.reason === "not_found" ? 404 : 409,
           );
         }
-        return Response.json({ ok: true, scopes });
+        return Response.json({ ok: true, scopes, clone_policy: clonePolicy });
       }
 
       // POST /cert/issuing-ca/device/token — the machine collects. Error
