@@ -42,7 +42,7 @@ import { X509Certificate } from "@peculiar/x509";
 import { appendFileSync } from "node:fs";
 import {
   enrollInDir, importPrivateKeyPem,
-  isRevokedTask, mintTask, renewTierInDir, AuthorityRefusal, taskOutDir, verifyChain,
+  explainRenewalFailure, isRevokedTask, mintTask, renewTierInDir, taskOutDir, verifyChain,
 } from "./lib";
 
 
@@ -87,11 +87,6 @@ async function enroll() {
   }
 }
 
-const ENDED_REASONS = new Set([
-  "revoked", "horizon_passed", "epoch_changed", "approval_withdrawn",
-  "fork_detected", "invalid_proof", "unknown_key",
-]);
-
 /**
  * Renew the tier with no human. The tier's public key comes from the tier
  * certificate itself, so nothing beyond what enroll saved is needed.
@@ -131,16 +126,8 @@ async function renewNow(quiet = false) {
         },
       },
     );
-  } catch (e: any) {
-    if (String(e.message).startsWith("renewal state lost")) throw e;
-    if (e instanceof AuthorityRefusal && e.reason === "stale_proof") {
-      throw new Error("the authority refused the timestamp — check this machine's clock");
-    }
-    if (e instanceof AuthorityRefusal && ENDED_REASONS.has(e.reason)) {
-      throw new Error(`the approval for this machine has ended (${e.reason}) — run \`task-cert enroll\` and approve again`);
-    }
-    if (e instanceof AuthorityRefusal) throw new Error(`the authority refused the renewal (${e.reason})`);
-    throw new Error(`could not renew, try again (${e.message})`);
+  } catch (e) {
+    throw explainRenewalFailure(e);
   }
   const r = out!;
   if (!quiet) {

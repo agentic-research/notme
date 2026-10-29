@@ -247,6 +247,30 @@ export const RENEW_FETCH_TIMEOUT_MS = 30_000;
 const TRANSIENT_4XX = new Set([408, 425, 429]);
 
 /**
+ * Errors raised while CONNECTING: the name did not resolve or nothing
+ * accepted the connection, so no byte of the request left this host. A
+ * timeout, an abort or a reset (ECONNRESET) is not one of these: the request
+ * may have been delivered.
+ */
+export const CONNECT_PHASE_CODES: ReadonlySet<string> = new Set([
+  "ENOTFOUND", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "EAI_AGAIN",
+]);
+const isConnectPhaseError = (e: unknown): boolean => {
+  const code = (e as { cause?: { code?: unknown } } | null)?.cause?.code;
+  return typeof code === "string" && CONNECT_PHASE_CODES.has(code);
+};
+
+/** A v1 (legacy) request body: no generation, so resending or re-signing it carries no fork risk. */
+const isV1Body = (body: string): boolean => {
+  try {
+    const v = JSON.parse(body);
+    return typeof v === "object" && v !== null && !("generation" in v);
+  } catch {
+    return false; // unparseable: not provably v1, so treated as v2
+  }
+};
+
+/**
  * Renew the tier with no human, while the approval holds.
  *
  * A response can be lost after the authority has acted on the request. The
@@ -261,7 +285,16 @@ const TRANSIENT_4XX = new Set([408, 425, 429]);
  *     keeps pending (clearing would let the next run re-sign at the old
  *     generation, which is a fork) and says the state is lost.
  *   - network errors, 5xx, 3xx, 408/425/429 and non-authority 4xx bodies
- *     (edge or HTML error pages) are not definitive and keep pending.
+ *     (edge or HTML error pages) are not definitive and keep pending —
+ *     except a connect-phase error (CONNECT_PHASE_CODES) on a FIRST attempt:
+ *     those bytes never left the host, so the request just reserved is ours
+ *     to clear. (A resend's earlier delivery is unknown, so it is kept.)
+ *   - a pending request at a generation below the stored one was accepted
+ *     and its result persisted (a crash between persist and clear): it is
+ *     discarded and a new request is signed.
+ *   - a v1 (legacy) request has no generation and so no fork risk: past the
+ *     window, or refused on a resend, it is dropped and re-signed, never
+ *     "state lost".
  * `persist` runs on success BEFORE clearPending, so the new tier is on disk
  * before the only copy of the request that can recover it is dropped.
  */
@@ -286,13 +319,23 @@ export async function renewTier(
   fetchFn: typeof fetch = fetch,
 ): Promise<RenewalResult> {
   const now = Math.floor(Date.now() / 1000);
-  const resend = !!opts.pending;
+  let pending = opts.pending ?? null;
+  if (pending && opts.generation !== undefined && pending.generation < opts.generation) {
+    // Accepted and persisted already; only the clear was lost.
+    await opts.clearPending(pending.body);
+    pending = null;
+  }
+  if (pending && isV1Body(pending.body) && now - pending.iat > CLIENT_RESEND_WINDOW_S) {
+    await opts.clearPending(pending.body); // v1: re-signing is safe
+    pending = null;
+  }
+  const resend = !!pending;
   let body: string;
-  if (opts.pending) {
-    if (now - opts.pending.iat > CLIENT_RESEND_WINDOW_S) {
+  if (pending) {
+    if (now - pending.iat > CLIENT_RESEND_WINDOW_S) {
       throw stateLost("a response never arrived within the retry window");
     }
-    body = opts.pending.body;
+    body = pending.body;
   } else {
     const gen = opts.generation;
     body = JSON.stringify({
@@ -312,12 +355,19 @@ export async function renewTier(
     sentGeneration = "generation" in JSON.parse(body);
   } catch { /* unparseable body: no v2 expectation */ }
 
-  const res = await fetchFn(`${authority}/cert/issuing-ca/renew`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body,
-    signal: AbortSignal.timeout(opts.fetchTimeoutMs ?? RENEW_FETCH_TIMEOUT_MS),
-  });
+  let res: Response;
+  try {
+    res = await fetchFn(`${authority}/cert/issuing-ca/renew`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      signal: AbortSignal.timeout(opts.fetchTimeoutMs ?? RENEW_FETCH_TIMEOUT_MS),
+    });
+  } catch (e) {
+    // Never sent: the reservation is ours and provably undelivered.
+    if (!resend && isConnectPhaseError(e)) await opts.clearPending(body);
+    throw e;
+  }
   const out = (await res.json().catch(() => null)) as any;
 
   if (res.status >= 200 && res.status < 300) {
@@ -332,9 +382,38 @@ export async function renewTier(
   const definitive =
     res.status >= 400 && res.status < 500 && !TRANSIENT_4XX.has(res.status) && typeof out?.error === "string";
   if (!definitive) throw new Error(`renewal not answered by the authority (HTTP ${res.status}) — try again`);
+  if (resend && isV1Body(body)) {
+    // v1 carries no fork risk: drop the refused request and sign a new one.
+    await opts.clearPending(body);
+    return renewTier(authority, key, { ...opts, pending: null }, fetchFn);
+  }
   if (resend) throw stateLost(out.error);
   await opts.clearPending(body);
   throw new AuthorityRefusal(out.error);
+}
+
+/** Refusals that mean a human must approve this machine again. */
+const ENDED_REASONS = new Set([
+  "revoked", "horizon_passed", "epoch_changed", "approval_withdrawn",
+  "fork_detected", "invalid_proof", "unknown_key",
+]);
+
+export const BINDING_V2_REQUIRED_MESSAGE = "this task-cert is older than the authority; update it";
+
+/** What `task-cert renew` (and mint's resume) tells a human when renewal fails. */
+export function explainRenewalFailure(e: unknown): Error {
+  const message = String((e as Error | null)?.message ?? e);
+  if (message.startsWith("renewal state lost")) return e as Error;
+  if (e instanceof AuthorityRefusal) {
+    // Not an ended approval: the authority has retired v1 for this machine, and this client signed v1.
+    if (e.reason === "binding_v2_required") return new Error(BINDING_V2_REQUIRED_MESSAGE);
+    if (e.reason === "stale_proof") return new Error("the authority refused the timestamp — check this machine's clock");
+    if (ENDED_REASONS.has(e.reason)) {
+      return new Error(`the approval for this machine has ended (${e.reason}) — run \`task-cert enroll\` and approve again`);
+    }
+    return new Error(`the authority refused the renewal (${e.reason})`);
+  }
+  return new Error(`could not renew, try again (${message})`);
 }
 
 // ── Renewal state on disk (notme-747cc7) ────────────────────────────────────
@@ -606,7 +685,10 @@ export async function enrollInDir(
       expires_at: tier.expires_at,
       epoch: tier.authority.epoch,
       renew_until: tier.renew_until,
-      generation: tier.generation ?? 0,
+      // An authority that returns no generation predates generations: store
+      // none, so this machine renews as legacy v1 (never assume 0).
+      ...(Number.isSafeInteger(tier.generation) && tier.generation >= 0 ? { generation: tier.generation } : {}),
+      ...(typeof tier.clone_policy === "string" ? { clone_policy: tier.clone_policy } : {}),
     },
   });
   return { tier, root };
