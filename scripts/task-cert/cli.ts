@@ -35,14 +35,14 @@
  * certs as you until it expires (≤24h). It is protected by file permissions
  * only.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { X509Certificate } from "@peculiar/x509";
 import { appendFileSync } from "node:fs";
 import {
   enrolProof, exportPrivateKeyPem, generateTierKey, groupFingerprint, importPrivateKeyPem,
-  isRevokedTask, mintTask, pollEnrolment, renewTier, startEnrolment, taskOutDir, verifyChain,
+  isRevokedTask, mintTask, pollEnrolment, renewTier, type PendingRenewal, startEnrolment, taskOutDir, verifyChain,
 } from "./lib";
 
 
@@ -100,6 +100,7 @@ async function enroll() {
         expires_at: tier.expires_at,
         epoch: tier.authority.epoch,
         renew_until: tier.renew_until,
+        generation: tier.generation ?? 0,
       },
       null,
       2,
@@ -114,30 +115,53 @@ async function enroll() {
   }
 }
 
+function rmPending(p: string) {
+  try { unlinkSync(p); } catch { /* already gone */ }
+}
+
 /**
  * Renew the tier with no human. The tier's public key comes from the tier
  * certificate itself, so nothing beyond what enroll saved is needed.
  */
 async function renewNow(quiet = false) {
+  let out: { expires_at: number; renew_until: number } | undefined;
   const meta = JSON.parse(need("tier.json"));
   const tierCert = new X509Certificate(need("tier.pem"));
   const spki = new Uint8Array(tierCert.publicKey.rawData);
   const pem = `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...spki)).match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----\n`;
-  let r;
+  const pendingPath = join(dir, "renew-pending.json");
+  const pending: PendingRenewal | null = existsSync(pendingPath) ? JSON.parse(readFileSync(pendingPath, "utf8")) : null;
   try {
-    r = await renewTier(meta.authority ?? authority, {
-      privateKey: await importPrivateKeyPem(need("tier.key.pem")),
-      spki,
-      pem,
-    });
+    await renewTier(
+      meta.authority ?? authority,
+      { privateKey: await importPrivateKeyPem(need("tier.key.pem")), spki, pem },
+      {
+        // tier.json without a generation is a legacy enrolment: it renews with v1.
+        generation: meta.generation,
+        pending,
+        savePending: (p) => writeFileSync(pendingPath, JSON.stringify(p), { mode: 0o600 }),
+        clearPending: () => rmPending(pendingPath),
+        // The new tier reaches disk before the pending request is dropped.
+        persist: (r) => {
+          writeFileSync(join(dir, "tier.pem"), r.certificate);
+          writeFileSync(
+            join(dir, "tier.json"),
+            JSON.stringify(
+              { ...meta, expires_at: r.expires_at, epoch: r.authority.epoch, renew_until: r.renew_until, generation: r.generation },
+              null,
+              2,
+            ),
+          );
+          out = r;
+        },
+      },
+    );
   } catch (e: any) {
+    // Lost state and a network failure are not the authority ending the approval.
+    if (e instanceof TypeError || String(e.message).startsWith("renewal state lost")) throw e;
     throw new Error(`the approval for this machine has ended (${e.message}) — run \`task-cert enroll\` and approve again`);
   }
-  writeFileSync(join(dir, "tier.pem"), r.certificate);
-  writeFileSync(
-    join(dir, "tier.json"),
-    JSON.stringify({ ...meta, expires_at: r.expires_at, epoch: r.authority.epoch, renew_until: r.renew_until }, null, 2),
-  );
+  const r = out!;
   if (!quiet) {
     console.log(`Renewed — no human needed. Tier valid until ${new Date(r.expires_at * 1000).toISOString()},`);
     console.log(`  renewable without you until ${new Date(r.renew_until * 1000).toISOString()}.`);
@@ -249,6 +273,8 @@ async function status() {
   const renewLeft = (meta.renew_until ?? 0) * 1000 - now;
   console.log(meta.identity);
   console.log(`  tier: ${left > 0 ? `valid for ${Math.round(left / 60000)} min` : "expired"}`);
+  console.log(`  generation ${meta.generation ?? "none (legacy enrolment)"}`);
+  if (meta.clone_policy !== undefined) console.log(`  clone policy: ${typeof meta.clone_policy === "string" ? meta.clone_policy : JSON.stringify(meta.clone_policy)}`);
   console.log(
     `  renewal: ${renewLeft > 0 ? `without a human for ${Math.round(renewLeft / 3_600_000)} h more` : "ended — run enroll and approve again"}`,
   );

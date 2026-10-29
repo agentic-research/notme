@@ -20,7 +20,9 @@ import { join } from "node:path";
 import { X509Certificate, BasicConstraintsExtension } from "@peculiar/x509";
 import { mintTaskCertPair } from "../../worker/src/cert-authority";
 import { ED25519 } from "../../worker/src/platform";
-import { deviceCodeHash, tierEnrolmentBinding, tierRenewalBinding } from "../../worker/src/auth/tier-enrolment-binding";
+import {
+  deviceCodeHash, RENEWAL_RETRY_WINDOW_S, tierEnrolmentBinding, tierRenewalBinding, tierRenewalBindingV2,
+} from "../../worker/src/auth/tier-enrolment-binding";
 
 const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b));
 const b64url = (b: Uint8Array) => b64(b).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -196,30 +198,92 @@ export async function verifyChain(
 
 // ── Renewal, subtasks, ledger, local revocation (notme-337d82, notme-9f84e6) ─
 
-/** The renewal proof — over the authority's shared binding, byte for byte. */
-export async function renewProof(privateKey: CryptoKey, spki: Uint8Array, iat: number): Promise<string> {
-  return b64url(new Uint8Array(await crypto.subtle.sign(ED25519, privateKey, tierRenewalBinding(spki, iat))));
+/**
+ * The renewal proof — over the authority's shared binding, byte for byte. With
+ * a generation it is the v2 binding; without one (a legacy tier.json) it is v1.
+ */
+export async function renewProof(
+  privateKey: CryptoKey,
+  spki: Uint8Array,
+  iat: number,
+  generation?: number,
+): Promise<string> {
+  const input = generation === undefined ? tierRenewalBinding(spki, iat) : tierRenewalBindingV2(spki, iat, generation);
+  return b64url(new Uint8Array(await crypto.subtle.sign(ED25519, privateKey, input)));
 }
+
+/** A signed renewal request, persisted BEFORE it is sent so it can be resent byte for byte. */
+export type PendingRenewal = { body: string; iat: number; generation: number };
+
+export type RenewalResult = {
+  certificate: string;
+  expires_at: number;
+  renew_until: number;
+  authority: { epoch: number };
+  generation: number;
+};
 
 /**
  * Renew the tier with no human, while the approval holds. Throws with the
  * authority's reason (revoked, horizon_passed, epoch_changed,
- * approval_withdrawn) when a human must approve again.
+ * approval_withdrawn, fork_detected) when a human must approve again.
+ *
+ * A response can be lost after the authority has acted on the request. The
+ * authority serves the EXACT same request again as a retry, but treats a
+ * newly signed request at the old generation as a fork. So:
+ *   - the signed request is saved (savePending) BEFORE the POST;
+ *   - while one exists and is inside the retry window it is resent verbatim,
+ *     and nothing new is ever signed;
+ *   - past the window it is not resent and not replaced: a human re-enrolls;
+ *   - it is cleared (clearPending) on any definitive answer, 2xx or 4xx. A
+ *     network failure or a 5xx is not definitive and leaves it in place.
+ * `persist` runs on success BEFORE clearPending, so the new tier is on disk
+ * before the only copy of the request that can recover it is dropped.
  */
 export async function renewTier(
   authority: string,
   key: { privateKey: CryptoKey; spki: Uint8Array; pem: string },
+  opts: {
+    generation?: number;
+    pending?: PendingRenewal | null;
+    savePending: (p: PendingRenewal) => void;
+    clearPending: () => void;
+    persist?: (r: RenewalResult) => void;
+  },
   fetchFn: typeof fetch = fetch,
-): Promise<{ certificate: string; expires_at: number; renew_until: number; authority: { epoch: number } }> {
-  const iat = Math.floor(Date.now() / 1000);
+): Promise<RenewalResult> {
+  const now = Math.floor(Date.now() / 1000);
+  let body: string;
+  if (opts.pending) {
+    if (now - opts.pending.iat > RENEWAL_RETRY_WINDOW_S) {
+      throw new Error(
+        "renewal state lost — a response never arrived within the retry window; run `task-cert enroll` to approve this machine again",
+      );
+    }
+    body = opts.pending.body;
+  } else {
+    const gen = opts.generation;
+    body = JSON.stringify({
+      public_key: key.pem,
+      iat: now,
+      proof: await renewProof(key.privateKey, key.spki, now, gen),
+      ...(gen === undefined ? {} : { generation: gen }),
+    });
+    opts.savePending({ body, iat: now, generation: gen ?? 0 });
+  }
   const res = await fetchFn(`${authority}/cert/issuing-ca/renew`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ public_key: key.pem, iat, proof: await renewProof(key.privateKey, key.spki, iat) }),
+    body,
   });
-  const body = (await res.json().catch(() => ({}))) as any;
-  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
-  return body;
+  const out = (await res.json().catch(() => ({}))) as any;
+  if (res.ok) {
+    opts.persist?.(out);
+    opts.clearPending();
+    return out;
+  }
+  if (res.status < 500) opts.clearPending();
+  throw new Error(out.error ?? `HTTP ${res.status}`);
 }
 
 /**

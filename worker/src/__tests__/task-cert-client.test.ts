@@ -183,3 +183,104 @@ describe("task output paths", () => {
     expect(taskOutDir("/home/u/.notme/tasks", "build/compile")).toBe("/home/u/.notme/tasks/build/compile");
   });
 });
+
+// ── renewal with a generation (notme-747cc7) ────────────────────────────────
+import { renewTier, type PendingRenewal } from "../../../scripts/task-cert/lib";
+import { tierRenewalBindingV2 } from "../auth/tier-enrolment-binding";
+
+describe("renewal with a generation", () => {
+  const fromB64url = (s: string) =>
+    Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4)), (c) => c.charCodeAt(0));
+  const okBody = { certificate: "PEM", expires_at: 1, renew_until: 2, authority: { epoch: 3 }, generation: 4 };
+  const reply = (status: number, body: unknown) =>
+    ({ ok: status >= 200 && status < 300, status, json: async () => body }) as unknown as Response;
+
+  function harness() {
+    const events: string[] = [];
+    let saved: PendingRenewal | null = null;
+    return {
+      events,
+      get saved() { return saved; },
+      opts: (extra: { generation?: number; pending?: PendingRenewal | null } = {}) => ({
+        ...extra,
+        savePending: (p: PendingRenewal) => { saved = p; events.push("save"); },
+        clearPending: () => { saved = null; events.push("clear"); },
+      }),
+    };
+  }
+
+  it("signs v2 over the stored generation", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    let sent: any;
+    const fetchFn = (async (_u: string, init: any) => { sent = JSON.parse(init.body); return reply(200, okBody); }) as unknown as typeof fetch;
+    await renewTier("https://a", k, h.opts({ generation: 3 }), fetchFn);
+    expect(sent.generation).toBe(3);
+    expect(await crypto.subtle.verify(ED25519, k.publicKey, fromB64url(sent.proof), tierRenewalBindingV2(k.spki, sent.iat, 3))).toBe(true);
+  });
+
+  it("saves the request before sending, clears it after a definitive answer", async () => {
+    for (const status of [200, 403]) {
+      const k = await generateTierKey();
+      const h = harness();
+      const fetchFn = (async () => { h.events.push("fetch"); return reply(status, status === 200 ? okBody : { error: "fork_detected" }); }) as unknown as typeof fetch;
+      const p = renewTier("https://a", k, h.opts({ generation: 0 }), fetchFn);
+      if (status === 403) await expect(p).rejects.toThrow("fork_detected"); else await p;
+      expect(h.events).toEqual(["save", "fetch", "clear"]);
+      expect(h.saved).toBeNull();
+    }
+  });
+
+  it("a network failure leaves the pending request; the next call resends the same bytes", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    const bodies: string[] = [];
+    const boom = (async (_u: string, init: any) => { bodies.push(init.body); throw new Error("network down"); }) as unknown as typeof fetch;
+    await expect(renewTier("https://a", k, h.opts({ generation: 2 }), boom)).rejects.toThrow("network down");
+    expect(h.saved).not.toBeNull();
+    expect(h.events).toEqual(["save"]);
+    const ok = (async (_u: string, init: any) => { bodies.push(init.body); return reply(200, okBody); }) as unknown as typeof fetch;
+    await renewTier("https://a", k, h.opts({ generation: 2, pending: h.saved }), ok);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toBe(bodies[0]);
+    expect(h.saved).toBeNull();
+  });
+
+  it("a pending request older than the retry window stops instead of signing", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    let called = false;
+    const fetchFn = (async () => { called = true; return reply(200, okBody); }) as unknown as typeof fetch;
+    const pending: PendingRenewal = { body: "{}", iat: Math.floor(Date.now() / 1000) - 3601, generation: 1 };
+    await expect(renewTier("https://a", k, h.opts({ generation: 1, pending }), fetchFn)).rejects.toThrow("renewal state lost");
+    expect(called).toBe(false);
+    expect(h.events).toEqual([]);
+  });
+
+  it("a pending request is resent verbatim and never re-signed, even when a generation is known", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    let sent = "";
+    const fetchFn = (async (_u: string, init: any) => { sent = init.body; return reply(200, okBody); }) as unknown as typeof fetch;
+    const pending: PendingRenewal = { body: '{"exact":"bytes"}', iat: Math.floor(Date.now() / 1000) - 3600, generation: 9 };
+    await renewTier("https://a", k, h.opts({ generation: 9, pending }), fetchFn);
+    expect(sent).toBe(pending.body);
+    expect(h.events).toEqual(["clear"]);
+  });
+
+  it("legacy tier.json without a generation renews with v1", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    let sent: any;
+    const fetchFn = (async (_u: string, init: any) => { sent = JSON.parse(init.body); return reply(200, okBody); }) as unknown as typeof fetch;
+    await renewTier("https://a", k, h.opts(), fetchFn);
+    expect("generation" in sent).toBe(false);
+    expect(await crypto.subtle.verify(ED25519, k.publicKey, fromB64url(sent.proof), tierRenewalBinding(k.spki, sent.iat))).toBe(true);
+  });
+
+  it("returns the response generation to persist", async () => {
+    const k = await generateTierKey();
+    const r = await renewTier("https://a", k, harness().opts({ generation: 3 }), (async () => reply(200, okBody)) as unknown as typeof fetch);
+    expect(r.generation).toBe(4);
+  });
+});
