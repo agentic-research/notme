@@ -2228,8 +2228,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // old: a request that never reached the authority (offline on resume, a
     // 5xx, a 429) is resent byte for byte, with its original iat. Accepting
     // it is safe — a key holder can sign any iat, and a captured request
-    // nobody accepted only advances the counter; the honest resend of the
-    // same bytes then lands on the retry path.
+    // nobody accepted only advances the counter, PROVIDED the honest client
+    // still holds that request: its resend of the same bytes then lands on
+    // the retry path. The client guarantees this by keeping its pending
+    // request on every refusal whose outcome a replay could change —
+    // including a first-attempt stale_proof (a clock running ahead); were it
+    // to clear and re-sign at this generation, that new request is a fork.
     const inRetryWindow =
       Number.isSafeInteger(params.iat) &&
       params.iat >= now - RENEWAL_RETRY_WINDOW_S &&
