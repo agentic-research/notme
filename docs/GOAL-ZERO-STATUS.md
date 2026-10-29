@@ -159,6 +159,22 @@ repository under test.
 
 ## 6. Scope question the owner must settle for criterion (A)
 
+> **SETTLED 2026-10-28 by the owner: (A) means the release-blocker set.**
+> Roadmap P1s were deferred to P2, each with its reason recorded on the bead:
+> the CAS-release epic and its four children, workerd-as-rope and its ADR
+> supersession, the network-gateway decade, the cloister re-survey, the
+> `/identity/lease` reshape, the workerd mTLS binding, and human-signed
+> acceptance. Two consolidation beads (`notme-3dac49`, `notme-3e22e0`) were
+> closed as superseded: the public repo became canonical and notme.bot was
+> archived as a deploy target (`notme-4e02fb`). The release-blocker set that
+> remains: criterion D (`notme-8e8836`, `notme-907299`, `notme-1b46a8`), CA key
+> at rest (`notme-41d0d3`), the placeholder OID arc (`notme-229dc3`), dpop
+> provenance (`notme-77ead7`), schema drift (`notme-b96b4c`), receipt epoch
+> repudiation (`notme-acd503`), the external-review triage (`notme-3e5b7d`),
+> alarm-loop hardening (`notme-5c2511`), LLO adoption (`notme-bc4cd2`), and the
+> P0 `notme-729801` (one local `verify-release` run). The text below is the
+> question as it was posed.
+
 (A) requires every P0/P1 "closed, linked, or deliberately deferred." There are
 **~72 open beads**, most P1/P2, many unrelated to release integrity — the
 ley-line substrate work, the CAS-release epic, workerd-as-rope research. Read
