@@ -41,8 +41,8 @@ import { join } from "node:path";
 import { X509Certificate } from "@peculiar/x509";
 import { appendFileSync } from "node:fs";
 import {
-  enrolProof, exportPrivateKeyPem, generateTierKey, groupFingerprint, importPrivateKeyPem,
-  isRevokedTask, mintTask, pollEnrolment, renewTierInDir, saveEnrolment, AuthorityRefusal, startEnrolment, taskOutDir, verifyChain,
+  enrollInDir, importPrivateKeyPem,
+  isRevokedTask, mintTask, renewTierInDir, AuthorityRefusal, taskOutDir, verifyChain,
 } from "./lib";
 
 
@@ -73,32 +73,10 @@ function need(f: string) {
 }
 
 async function enroll() {
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const key = await generateTierKey();
-  const start = await startEnrolment(authority, key.pem, a.scopes ? a.scopes.split(",") : undefined);
-  console.log(`\nApprove this machine with your passkey:\n\n  ${start.verification_uri}\n`);
-  console.log(`  code:        ${start.user_code}`);
-  console.log(`  fingerprint: ${groupFingerprint(start.key_fingerprint)}`);
-  console.log(`\nApprove only if the page shows the same fingerprint. Waiting (${start.expires_in}s)...`);
-  const proof = await enrolProof(key.privateKey, key.spki, start.device_code);
-  const tier = await pollEnrolment(authority, start.device_code, proof, {
-    interval: start.interval,
-    expiresIn: start.expires_in,
-  });
-  const root = await (await fetch(`${authority}/.well-known/ca-bundle.pem`)).text();
-  saveEnrolment(dir, {
-    keyPem: await exportPrivateKeyPem(key.privateKey),
-    tierPem: tier.certificate,
-    rootPem: root,
-    meta: {
-      authority,
-      identity: tier.identity,
-      scopes: tier.scopes,
-      expires_at: tier.expires_at,
-      epoch: tier.authority.epoch,
-      renew_until: tier.renew_until,
-      generation: tier.generation ?? 0,
-    },
+  // Checks the renew lock BEFORE starting, so a held lock never strands a just-approved key.
+  const { tier, root } = await enrollInDir(dir, authority, {
+    scopes: a.scopes ? a.scopes.split(",") : undefined,
+    log: (line) => console.log(line),
   });
   const check = await verifyRoot(root, tier.certificate);
   console.log(`\nEnrolled ${tier.identity}`);

@@ -272,7 +272,8 @@ export async function renewTier(
     generation?: number;
     pending?: PendingRenewal | null;
     savePending: (p: PendingRenewal) => void;
-    clearPending: () => void;
+    /** Clear the pending request, but only if it is still THIS request (`body`). */
+    clearPending: (body: string) => void;
     persist?: (r: RenewalResult) => void;
     /**
      * Re-reads the generation after the request is reserved. A peer that completed in between
@@ -302,7 +303,7 @@ export async function renewTier(
     });
     opts.savePending({ body, iat: now, generation: gen ?? 0 });
     if (opts.currentGeneration && (await opts.currentGeneration()) !== gen) {
-      opts.clearPending(); // our own reservation, never sent
+      opts.clearPending(body); // our own reservation, never sent
       throw new Error("another renewal completed meanwhile — try again");
     }
   }
@@ -325,14 +326,14 @@ export async function renewTier(
       (!sentGeneration || (Number.isInteger(out.generation) && out.generation >= 0));
     if (!valid) throw new Error("renewal response invalid — kept the pending request to retry");
     opts.persist?.(out);
-    opts.clearPending();
+    opts.clearPending(body);
     return out;
   }
   const definitive =
     res.status >= 400 && res.status < 500 && !TRANSIENT_4XX.has(res.status) && typeof out?.error === "string";
   if (!definitive) throw new Error(`renewal not answered by the authority (HTTP ${res.status}) — try again`);
   if (resend) throw stateLost(out.error);
-  opts.clearPending();
+  opts.clearPending(body);
   throw new AuthorityRefusal(out.error);
 }
 
@@ -359,6 +360,46 @@ export function loadPending(dir: string): PendingRenewal | null {
 /** Remove the pending request, e.g. after a fresh enrolment makes it moot. */
 export function removePending(dir: string): void {
   try { unlinkSync(join(dir, PENDING)); } catch { /* already gone */ }
+}
+
+/**
+ * Remove the pending request only if it is THIS holder's request (its body,
+ * byte for byte). A holder that was suspended past the lock's staleness may
+ * wake to find a LATER holder's unknown-outcome request in place; deleting
+ * that would let the next run sign anew at its generation, which is a fork.
+ * So: rename the file to a name only we know (exactly one renamer wins),
+ * compare, and unlink only on a match; otherwise link it back.
+ */
+export function clearOwnPending(
+  dir: string,
+  body: string,
+  o: { token?: string; /** test hook: runs before a peer's file is linked back */ beforeLinkBack?: () => void } = {},
+): void {
+  const path = join(dir, PENDING);
+  const moved = `${path}.clear-${o.token ?? crypto.randomUUID()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    renameSync(path, moved);
+  } catch (e: any) {
+    if (e.code === "ENOENT") return; // nothing pending
+    throw e;
+  }
+  let mine = false;
+  try {
+    mine = JSON.parse(readFileSync(moved, "utf8"))?.body === body;
+  } catch { /* unreadable: not provably ours, so keep it */ }
+  if (mine) {
+    unlinkSync(moved);
+    return;
+  }
+  o.beforeLinkBack?.();
+  try {
+    linkSync(moved, path);
+  } catch (e: any) {
+    // Two pending requests at once cannot arise legitimately; keep both for a human.
+    if (e.code === "EEXIST") throw new Error(`renewal state conflict — run \`task-cert status\` (kept ${moved})`);
+    throw e;
+  }
+  unlinkSync(moved);
 }
 
 /**
@@ -474,7 +515,7 @@ export async function renewTierInDir(
           opts.beforeReserve?.();
           savePendingExclusive(dir, p);
         },
-        clearPending: () => removePending(dir),
+        clearPending: (body) => clearOwnPending(dir, body, { token: lock.token }),
         currentGeneration: async () => (await load()).generation,
         persist: opts.persist,
         fetchTimeoutMs: opts.fetchTimeoutMs,
@@ -486,6 +527,70 @@ export async function renewTierInDir(
   }
 }
 
+const RENEWAL_BUSY = "a renewal is in progress — try again";
+
+function acquireForEnrol(dir: string): ReturnType<typeof acquireRenewLock> {
+  try {
+    return acquireRenewLock(dir);
+  } catch (e: any) {
+    if (String(e?.message).includes("in progress")) throw new Error(RENEWAL_BUSY);
+    throw e;
+  }
+}
+
+/**
+ * Fail fast BEFORE an enrolment starts if a renewal holds the lock, so a
+ * passkey approval is never collected into a key that then cannot be saved.
+ * (saveEnrolment still takes the lock itself: a renewal may start meanwhile.)
+ */
+export function assertNoRenewalInProgress(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  acquireForEnrol(dir).release();
+}
+
+/**
+ * The whole enrolment, from key generation to saved tier. `log` receives the
+ * lines a human needs to approve (URL, code, fingerprint).
+ */
+export async function enrollInDir(
+  dir: string,
+  authority: string,
+  opts: { scopes?: string[]; log?: (line: string) => void; fetchFn?: typeof fetch; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<{ tier: any; root: string }> {
+  const log = opts.log ?? (() => {});
+  const fetchFn = opts.fetchFn ?? fetch;
+  assertNoRenewalInProgress(dir);
+  const key = await generateTierKey();
+  const start = await startEnrolment(authority, key.pem, opts.scopes, fetchFn);
+  log(`\nApprove this machine with your passkey:\n\n  ${start.verification_uri}\n`);
+  log(`  code:        ${start.user_code}`);
+  log(`  fingerprint: ${groupFingerprint(start.key_fingerprint)}`);
+  log(`\nApprove only if the page shows the same fingerprint. Waiting (${start.expires_in}s)...`);
+  const proof = await enrolProof(key.privateKey, key.spki, start.device_code);
+  const tier = await pollEnrolment(authority, start.device_code, proof, {
+    interval: start.interval,
+    expiresIn: start.expires_in,
+    fetchFn,
+    sleep: opts.sleep,
+  });
+  const root = await (await fetchFn(`${authority}/.well-known/ca-bundle.pem`)).text();
+  saveEnrolment(dir, {
+    keyPem: await exportPrivateKeyPem(key.privateKey),
+    tierPem: tier.certificate,
+    rootPem: root,
+    meta: {
+      authority,
+      identity: tier.identity,
+      scopes: tier.scopes,
+      expires_at: tier.expires_at,
+      epoch: tier.authority.epoch,
+      renew_until: tier.renew_until,
+      generation: tier.generation ?? 0,
+    },
+  });
+  return { tier, root };
+}
+
 /** Write a freshly enrolled tier. A new enrolment ends any pending renewal of the old one. */
 export function saveEnrolment(
   dir: string,
@@ -493,19 +598,14 @@ export function saveEnrolment(
 ): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   // An in-flight renewal would overwrite this enrolment with its own result.
-  let lock: ReturnType<typeof acquireRenewLock>;
+  const lock = acquireForEnrol(dir);
   try {
-    lock = acquireRenewLock(dir);
-  } catch {
-    throw new Error("a renewal is in progress — try again");
-  }
-  try {
-  writeFileSync(join(dir, "tier.key.pem"), e.keyPem, { mode: 0o600 });
-  chmodSync(join(dir, "tier.key.pem"), 0o600);
-  writeFileSync(join(dir, "tier.pem"), e.tierPem);
-  writeFileSync(join(dir, "root.pem"), e.rootPem);
-  writeFileSync(join(dir, "tier.json"), JSON.stringify(e.meta, null, 2));
-  removePending(dir);
+    writeFileSync(join(dir, "tier.key.pem"), e.keyPem, { mode: 0o600 });
+    chmodSync(join(dir, "tier.key.pem"), 0o600);
+    writeFileSync(join(dir, "tier.pem"), e.tierPem);
+    writeFileSync(join(dir, "root.pem"), e.rootPem);
+    writeFileSync(join(dir, "tier.json"), JSON.stringify(e.meta, null, 2));
+    removePending(dir); // unconditional by design: a new enrolment makes any pending request moot
   } finally {
     lock.release();
   }
