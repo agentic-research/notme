@@ -51,3 +51,39 @@ export function tierRenewalBinding(spki: Uint8Array, iat: number): Uint8Array {
   out.set(ts, tag.length + spki.length);
   return out;
 }
+
+/**
+ * Renewal binding v2 (notme-747cc7): commits to the renewal GENERATION so a
+ * copied machine key is detected as a fork.
+ *
+ *   "notme/tier-renew/v2\0" || SPKI || uint64be(iat) || uint64be(generation)
+ *
+ * Distinct tag from v1, so a v1 proof never verifies as a v2 proof.
+ */
+export const TIER_RENEW_V2_TAG = "notme/tier-renew/v2\0";
+
+/** How long a renewal request may be retried against the same digest. */
+export const RENEWAL_RETRY_WINDOW_S = 3600;
+
+export function tierRenewalBindingV2(spki: Uint8Array, iat: number, generation: number): Uint8Array {
+  if (!Number.isSafeInteger(iat) || iat < 0) throw new Error("iat must be a non-negative integer");
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error("generation must be a non-negative safe integer");
+  }
+  const tag = new TextEncoder().encode(TIER_RENEW_V2_TAG);
+  const nums = new Uint8Array(16);
+  const view = new DataView(nums.buffer);
+  view.setBigUint64(0, BigInt(iat));
+  view.setBigUint64(8, BigInt(generation));
+  const out = new Uint8Array(tag.length + spki.length + 16);
+  out.set(tag, 0);
+  out.set(spki, tag.length);
+  out.set(nums, tag.length + spki.length);
+  return out;
+}
+
+/** Lowercase hex SHA-256 of a renewal binding: the idempotency key for retries. */
+export async function renewalRequestDigest(binding: Uint8Array): Promise<string> {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", binding));
+  return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
+}
