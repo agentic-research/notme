@@ -465,6 +465,12 @@ tasks:
     cmds:
       - pnpm exec tsx scripts/refresh-trust-anchor.ts {{.CLI_ARGS}}
 
+  ct:verify:
+    desc: "Check the deployed CT log's key against trust/notme-ct-log.json; exit 0 while not provisioned. `-- --write --metadata <url>` records the pin once (notme-1b46a8)"
+    deps: [deps:install]
+    cmds:
+      - pnpm exec tsx scripts/verify-ct-log.ts {{.CLI_ARGS}}
+
   task-cert:
     desc: "Machine-side task certificates — enroll (passkey approval) | mint | verify | status (notme-486e8a)"
     # e.g. task task-cert -- enroll

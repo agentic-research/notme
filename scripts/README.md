@@ -9,6 +9,7 @@ standalone tooling — small utilities run via `npx tsx` or by Taskfile targets,
 | `doc-check.ts` | verify `@doc-check` claims in markdown/html match the codebase | `task docs:check` (or `npx tsx scripts/doc-check.ts [--skip-external] [--format json]`) | `0` all pass · `1` any claim fails or no `@doc-check` blocks found |
 | `check-sha-pins.ts` | verify every external `uses:` in `.github/workflows` is pinned to a 40-char commit SHA | `task pin:check` | `0` all pinned · `1` any violation · `2` malformed workflow |
 | `check-image-versions.ts` | validate `server.json` against its declared schema, and verify its OCI artifacts + the notme melange recipes agree with the tag the publish job will push | `task server:check` (PR gate) · `task version:check VERSION=0.1.0` (release gate) | `0` agree · `1` any violation (including a `server.json` with no declared version) · `2` missing/invalid VERSION argument, or an unreadable/unparseable file |
+| `verify-ct-log.ts` | check the deployed CT log's key and log_id against `trust/notme-ct-log.json`; `--write --metadata <url>` records the pin once | `task ct:verify` | `0` match, or pin is `not-provisioned` · `1` mismatch/unreadable/malformed · `2` `--write` refused (a different pin is recorded) |
 
 ## how check-image-versions works
 

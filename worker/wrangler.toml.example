@@ -117,6 +117,23 @@ class_name = "SigningAuthority"
 name = "REVOCATION"
 class_name = "RevocationAuthority"
 
+# Issuance transparency log (notme-1b46a8). OPTIONAL. Leave this block
+# commented out and notme behaves exactly as it did before the log existed:
+# nothing is submitted, no SCT is embedded, no backlog row is written.
+# Uncomment ONLY after the notme-ct Worker is deployed (ct/README.md, operator
+# runbook). With it bound, every bridge cert pair is logged; a log that is slow
+# (2 s) or down does not block issuance, it queues the pair in ct_backlog and
+# the refresh alarm drains it. `service` is the deployed Worker's name: azul's
+# ct_worker is named "static-ct" and `-e notme` deploys it as "static-ct-notme"
+# — confirm with `npx wrangler -e=notme deployments list` in azul's crate.
+# [[services]]
+# binding = "CT_LOG"
+# service = "static-ct-notme"
+#
+# Base path of the log behind CT_LOG. The default is /logs/notme, so set this
+# only if the log shard is named differently in ct/config.notme.json.
+# CT_LOG_PATH = "/logs/notme"   # a [vars] entry, not a [[services]] key
+
 [[migrations]]
 tag = "v1"
 new_classes = ["RevocationAuthority"]

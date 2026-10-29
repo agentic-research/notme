@@ -255,6 +255,34 @@ does not add: the workflow signs what is in the repository, so anyone who can
 push a tag can sign a root. The review on the commit that changes `trust/` is
 still the control on *which* root is signed.
 
+## The CT log key pin
+
+`notme-ct-log.json` pins the public key of notme's issuance transparency log
+(`ct/README.md`), by the same logic as the root: `metadata.json` fetched from
+the log authenticates nothing by itself, so the key is also committed here and
+signed by the release workflow.
+
+Two states, and tooling recognises exactly these:
+
+- `{"status": "not-provisioned", ...}`: the log does not exist yet. This is
+  today's state. `task ct:verify` exits 0 and says so; the release does not
+  sign the file.
+- `{"status": "provisioned", "log_name", "metadata_url", "log_id", "key",
+  "key_spki_sha256", "observed_at"}`: `key` is the base64 SPKI DER, `log_id`
+  its SHA-256 (base64), `key_spki_sha256` the same digest in hex. Written only
+  by `task ct:verify -- --write --metadata <url>`, which refuses if a
+  different pin is already recorded.
+
+`task ct:verify` then exits 1 if the live log serves a different key or a
+`log_id` that is not the SHA-256 of its key. As with the root, a changed key is
+a different log, not a refresh: replace the pin only by a reviewed manual edit.
+
+Once `provisioned`, the `trust-anchor` release job signs it as
+`notme-ct-log.json` with a `.sigstore.json` bundle, verified exactly like the
+root (the section above, with `notme-ct-log.json` in place of
+`notme-root.pem`). Unlike the root, the release job does not compare it to the
+live log before signing; run `task ct:verify` first.
+
 ## Updating this anchor
 
 A change to `notme-root.pem` is a change to the trust root and must be reviewed

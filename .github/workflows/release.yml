@@ -206,9 +206,26 @@ jobs:
             exit 1
           fi
 
+      # The CT log key pin is signed only once it records a key. While it is
+      # the not-provisioned placeholder there is nothing to attest, and a
+      # signature over "nothing is pinned" would read as endorsement of a log
+      # that does not exist. A pin that is neither state fails the release.
+      - name: Is the CT log key pinned?
+        id: ctpin
+        run: |
+          status=$(jq -r '.status' trust/notme-ct-log.json)
+          case "$status" in
+            provisioned) echo "signed=true" >> "$GITHUB_OUTPUT" ;;
+            not-provisioned) echo "signed=false" >> "$GITHUB_OUTPUT"
+                             echo "::notice::trust/notme-ct-log.json is the not-provisioned placeholder; not signing it." ;;
+            *) echo "::error::trust/notme-ct-log.json has unrecognised status '$status'"; exit 1 ;;
+          esac
+
       - name: Sign
         run: |
-          for f in notme-root.pem notme-root.json; do
+          files="notme-root.pem notme-root.json"
+          if [ "${{ steps.ctpin.outputs.signed }}" = "true" ]; then files="$files notme-ct-log.json"; fi
+          for f in $files; do
             cosign sign-blob --yes --bundle "$f.sigstore.json" "trust/$f"
           done
 
@@ -222,3 +239,7 @@ jobs:
           gh release upload "$TAG" --clobber \
             trust/notme-root.pem notme-root.pem.sigstore.json \
             trust/notme-root.json notme-root.json.sigstore.json
+          if [ "${{ steps.ctpin.outputs.signed }}" = "true" ]; then
+            gh release upload "$TAG" --clobber \
+              trust/notme-ct-log.json notme-ct-log.json.sigstore.json
+          fi

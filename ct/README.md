@@ -43,21 +43,32 @@ minted by notme's own `mintBridgeCertPair`:
   but unrelated P-256 key drops the count to zero, and the precertificate —
   poison, no SCT list — is refused outright.
 
+**Wired in the Worker (tested against a stub log, not a deployed one):**
+with a `CT_LOG` service binding, the online authority logs every bridge pair
+and every tier certificate; certs carry embedded SCTs when the log answers
+within 2000 ms. Otherwise the pair goes to the `ct_backlog` table and the
+refresh alarm drains it through `add-chain` (20 rows per fire, 4 concurrent,
+giving up on a row after 24 attempts). Health is served at
+`/admin/alarm-health` as a `ct` object. With no binding, behaviour is exactly
+as before. The tests run under `worker/vitest.workers.ct.config.mts` with a
+stub log that signs real SCTs.
+
 **Not yet done**, and not claimed anywhere in this repo:
 
-- Wiring the submit-between-mints flow into the three authority mint paths,
-  plus a submission client for the offline producer `mintTaskCertPair`.
-  `worker/src/ct-full-cycle.do.test.ts` does the flow by hand against a
-  running log; no production route does it.
-- Wiring the submit-between-mints flow into the three authority mint paths,
-  plus a submission client for the offline producer `mintTaskCertPair`.
-- Publishing the log key via pipeline-signed trust material rather than only
-  `/metadata` (`notme-8e8836`).
-- `cosign verify --ctfe=...` accepting a notme artifact while a cert with no
-  valid SCT is rejected. signet currently passes `--no-default-ctfe
-  --insecure-ignore-sct`; removing the latter is what turns the log from a
+- **The log is not provisioned.** No notme-ct Worker, R2 bucket, KV namespace
+  or keys exist; `trust/notme-ct-log.json` is the `not-provisioned`
+  placeholder; nothing in production is bound to `CT_LOG`. See the operator
+  runbook below.
+- **Verifiers do not require SCTs.** signet still passes `--no-default-ctfe
+  --insecure-ignore-sct`. Removing the latter is what turns the log from a
   record into an enforced requirement, and it is the only step that actually
-  defends anything.
+  defends anything: a thief with the CA key mints with no SCT at all, and
+  nothing refuses that certificate until a verifier does.
+- **Offline task certificates are not logged.** `mintTaskCertPair` runs on the
+  operator's machine and has no submission client. The tier certificate that
+  authorises it is logged; the per-task certificates it signs are not.
+- `cosign verify --ctfe=...` accepting a notme artifact while a cert with no
+  valid SCT is rejected has not been run.
 
 ## Why embedding needs a PAIRED mint
 
@@ -102,7 +113,7 @@ exactly that EKU, and the signing leaf has no EKU extension at all — so
 the spike had already fixed. RFC 6962 §3.1's requirement is right for WebPKI
 logs and wrong for a workload-identity CA.
 
-Upstream change prepared: add the flag to the per-log config, default `true`
+Upstream change: draft PR cloudflare/azul#322 (fork branch `jamestexas/azul:ct-configurable-server-auth-eku`): add the flag to the per-log config, default `true`
 so no existing log changes behaviour.
 
 ## Reproducing the proof
@@ -121,7 +132,9 @@ the Ed25519 arm would be the suspect.
 
 | file | what it is |
 |---|---|
-| `config.notme.json` | the log shards, copied into azul's `crates/ct_worker/` as `config.<DEPLOY_ENV>.json` |
+| `config.notme.json` | the log shards, copied into azul's `crates/ct_worker/` as `config.<DEPLOY_ENV>.json`. `notmedev` / `notmestrict` are local test shards; `notme` is the production log |
+| `scripts/prove-chain-accepted.sh` | the lenient-vs-strict A/B against a running local log |
+| `../trust/notme-ct-log.json` | the log's public-key pin; `../scripts/verify-ct-log.ts` (`task ct:verify`) checks the deployed log against it |
 
 ## Where the roots file comes from
 
@@ -142,7 +155,121 @@ The certificates are real notme output from the real mint path, with the same
 extensions, algorithms and EKUs; only the issuing instance differs. That is
 what makes the proof valid and what keeps it from needing a production key.
 
-`reject_expired` is `false` on both shards: notme leaves live five minutes,
-so a fixture minted minutes earlier would be refused for a reason that has
-nothing to do with the property under test. A production shard should set it
-`true` — submission happens at issuance.
+`reject_expired` is `false` on both local shards: notme leaves live five
+minutes, so a fixture minted minutes earlier would be refused for a reason that
+has nothing to do with the property under test. The production shard `notme`
+leaves it at azul's production default, `true` (written explicitly): submission
+happens at issuance, so an expired leaf is never legitimate there. One
+consequence to know about: the backlog drain submits late, and a row that sat
+in `ct_backlog` past its certificate's 5-minute life is expected to be refused
+by the log as expired (`reject_expired`), so it would be retried until
+`gaveUp` rather than logged. This has not been exercised against a real log.
+
+## The production shard `notme`
+
+In `config.notme.json`:
+
+| field | value | why |
+|---|---|---|
+| `intended_use` | `production` | this is the real log, not a test shard |
+| `temporal_interval` | 2026-01-01Z to 2027-07-01Z (end exclusive) | the log accepts only certificates whose `notAfter` falls in this window; a new shard is needed after it |
+| `require_server_auth_eku` | `false` | notme leaves are clientAuth or have no EKU. Needs the azul fork (below) |
+| `enable_ccadb_roots` | `false` | this log accepts notme's root and nothing from the WebPKI |
+| `reject_expired` | `true` | see above |
+| `submission_endpoint` / `monitoring_endpoint` | `https://REPLACE-ME.example/logs/notme/` | **placeholder.** JSON has no comments, so it is explained here: replace both with the URL the deployed log is actually served at (the notme-ct Worker's route, or the R2 public bucket for the monitoring endpoint) before deploying. The log publishes these URLs in its `metadata.json`. |
+
+The file was brought up to the schema in the azul checkout on the fork branch
+(`operator_name`, `friendly_name`, `intended_use`, `status`,
+`status_timestamp`, `submission_endpoint`, `monitoring_endpoint`): the
+`description` / `log_type` / `submission_url` fields the earlier version used
+are not in that schema. `config.notme.json` validates against
+`crates/ct_worker/config.schema.json`.
+
+**Roots for the production log are the production root,
+`trust/notme-root.pem`**, copied verbatim to `roots.notme.pem` (the roots file
+is selected by `DEPLOY_ENV=notme`). Do not commit a second copy here.
+
+## Operator runbook
+
+Everything below touches real Cloudflare resources. None of it has been run;
+it is written from azul's `AGENTS.md`, `scripts/create-log.sh` and
+`wrangler.jsonc`.
+
+### 1. Provision the log
+
+1. Check out azul on the fork branch that carries `require_server_auth_eku`:
+   `jamestexas/azul`, branch `ct-configurable-server-auth-eku` (commit
+   `00a9a84` adds the flag; the branch head also adds an integration test).
+   This is the draft upstream PR cloudflare/azul#322. **Until it merges,
+   deploy from that branch.** On upstream `main` every notme certificate is
+   refused (clientAuth-only leaves). Once #322 merges, switch to azul `main`.
+2. `cp config.notme.json <azul>/crates/ct_worker/config.notme.json` after
+   replacing the two `REPLACE-ME` URLs, and
+   `cp trust/notme-root.pem <azul>/crates/ct_worker/roots.notme.pem`.
+3. In `<azul>/crates/ct_worker/wrangler.jsonc` add an `env.notme` block modelled
+   on `env.dev` (account, route, `build.command` with `DEPLOY_ENV=notme`, the
+   `SEQUENCER` / `BATCHER` / `CLEANER` Durable Object bindings and migrations).
+4. From `<azul>/crates/ct_worker`:
+   `ENV=notme LOG_NAME=notme CLOUDFLARE_ACCOUNT_ID=<id> ./scripts/create-log.sh`.
+   It prompts, then creates the R2 bucket `static-ct-public-notme`, the KV
+   namespace `static-ct-cache-notme`, and the secrets `WITNESS_KEY_notme`
+   (Ed25519) and `SIGNING_KEY_notme` (P-256), each only if absent. Those are the
+   exact names: `SIGNING_KEY_<LOG_NAME>` and `WITNESS_KEY_<LOG_NAME>`. If you
+   set the signing key by hand instead:
+   `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 | npx wrangler -e=notme secret put SIGNING_KEY_notme`.
+   Treat the signing key as write-once: replacing it is a different log.
+5. `npx wrangler -e=notme deploy`.
+
+### 2. Record the key
+
+The log publishes `GET /logs/notme/metadata.json` with `log_id` and `key`
+(base64 SPKI DER). Record them in the repo, from a checkout of notme:
+
+    task ct:verify -- --write --metadata https://<log-host>/logs/notme/metadata.json
+
+`--write` refuses (exit 2) if a different pin is already recorded, and checks
+that `log_id` is the SHA-256 of `key`. Then commit `trust/notme-ct-log.json`
+through normal review and cut a release: the `trust-anchor` job signs it
+(keyless, with its bundle, next to `notme-root.pem`) once its status is
+`provisioned`. From then on `task ct:verify` compares the live log to the pin
+and exits 1 on any difference. See `trust/README.md`.
+
+### 3. Bind `CT_LOG` on notme
+
+Uncomment the `[[services]] binding = "CT_LOG"` block in `worker/wrangler.toml`
+(template: `worker/wrangler.toml.example`), pointing at the deployed log
+Worker (`CT_LOG_PATH` only if the shard is not named `notme`), then use the
+normal canary path (`task worker:canary` / `worker:promote`). **Unbound means no
+logging, by design:** that is also the rollback.
+
+### 4. Health and alerting
+
+`GET /admin/alarm-health` (authority-manage session) returns a `ct` object:
+
+| field | meaning |
+|---|---|
+| `backlog` | unlogged rows still being retried |
+| `oldestUnloggedAgeS` | age of the oldest such row, `null` when none |
+| `gaveUp` | unlogged rows that hit 24 attempts and are no longer retried |
+| `lastError` / `lastErrorAt` | last submission failure |
+| `unloggable` | `{count, lastAt}`: mints that went out with no SCT and **no backlog row** because the root could not be read |
+
+Alert on:
+
+- **`gaveUp > 0`.** The alarm fires every 4 minutes and a row gets one attempt
+  per fire, so 24 attempts is about **96 minutes**. A log outage longer than
+  that moves every queued row to `gaveUp`, and `backlog` then reads **0**:
+  the healthiest-looking number during the worst outage. `gaveUp` never
+  decreases by itself; those certificates are unlogged for good.
+- **`unloggable.count` increasing, or `> 0`.** Those certificates are not in the
+  backlog and cannot be recovered by the drain.
+- **`backlog` growing** (or `oldestUnloggedAgeS` climbing toward the 5-minute
+  certificate life and beyond): the log is slow or down, and rows left past
+  their certificate's life are expected to be refused as expired (see above).
+
+## What is NOT done
+
+- Verifiers still do not require SCTs (signet `--insecure-ignore-sct`). Until
+  they do, the log records issuance and enforces nothing.
+- Offline task certificates (`mintTaskCertPair`) are not logged; their tier is.
+- The log is not provisioned and nothing is pinned or bound.
