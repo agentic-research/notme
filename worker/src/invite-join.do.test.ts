@@ -19,9 +19,10 @@
  * refused and stores nothing.
  */
 import { env, runInDurableObject } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { SoftwareAuthenticator } from "./__tests__/helpers/software-authenticator";
+import { type GhaSigner, installGhaSigner } from "./__tests__/helpers/gha-token";
 import { verifySessionCookie } from "./auth/session";
 import { ADMIN_SCOPES } from "./auth/admin-scopes";
 
@@ -194,8 +195,62 @@ describe("invite reserve-then-consume (notme-3dfe15 parts 4/5)", () => {
     });
     expect(res.status).toBe(403);
     expect(res.headers.get("set-cookie")).toBeNull();
+    // A constant body (review L4): the verifier's message ("malformed JWT",
+    // "wrong audience: expected …") is logged, not returned.
+    expect(((await res.json()) as { error: string }).error).toBe("invalid oidc proof");
     // Still usable.
     await options(inv.token);
+  });
+});
+
+describe("POST /join with an OIDC proof (review L4)", () => {
+  // The OIDC branch had one test — the bad-proof one. Its success path and
+  // its 409 were claims checked only by reading.
+  let signer: GhaSigner;
+  beforeAll(async () => {
+    signer = await installGhaSigner({ owner: "example", repo: "joiner", audience: "notme.bot" });
+  });
+  afterAll(() => signer.restore());
+
+  const sub = (tag: string) => `repo:example/joiner:ref:refs/heads/${tag}`;
+
+  it("invite.join.oidc-success — a verified proof joins with the invite's scopes, and the identity signs in again", async () => {
+    const inv = await invite(["bridgeCert", "sign:git"]);
+    const res = await post("/join", {
+      token: inv.token,
+      proof: { type: "oidc", token: await signer.token({ sub: sub("ok") }) },
+    });
+    expect(res.status, await res.clone().text()).toBe(200);
+    const { principalId, scopes } = (await res.json()) as { principalId: string; scopes: string[] };
+    expect(scopes.sort()).toEqual(["bridgeCert", "sign:git"]);
+    expect((await authority().getPrincipalScopes(principalId)).sort()).toEqual(["bridgeCert", "sign:git"]);
+    expect(await scopesIn(res)).toEqual(scopes);
+
+    // The link is real: the same identity lands on the same principal.
+    const login = await post("/auth/oidc/login", { token: await signer.token({ sub: sub("ok") }) });
+    expect(login.status, await login.clone().text()).toBe(200);
+    expect(((await login.json()) as { principalId: string }).principalId).toBe(principalId);
+  });
+
+  it("invite.join.oidc-already-linked — an identity that already belongs to a principal is 409, and the invite is unspent", async () => {
+    const first = await invite(["bridgeCert"]);
+    const proof = async () => ({ type: "oidc", token: await signer.token({ sub: sub("taken") }) });
+    expect((await post("/join", { token: first.token, proof: await proof() })).status).toBe(200);
+
+    const second = await invite(["bridgeCert", "authorityManage"]);
+    const res = await post("/join", { token: second.token, proof: await proof() });
+    expect(res.status).toBe(409);
+    expect(res.headers.get("set-cookie")).toBeNull();
+    await options(second.token);
+  });
+
+  it("invite.join.oidc-no-link-oracle — with an invalid invite the answer is 403 whether or not the identity is linked", async () => {
+    // Linked by the previous case; a garbage invite must not reveal that.
+    const res = await post("/join", {
+      token: "not-a-real-invite",
+      proof: { type: "oidc", token: await signer.token({ sub: sub("taken") }) },
+    });
+    expect(res.status).toBe(403);
   });
 });
 

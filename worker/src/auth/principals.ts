@@ -400,7 +400,7 @@ export interface InviteGrant {
 }
 
 /** An invite that exists, is unredeemed and unexpired. A read — never a write. */
-function liveInvite(sql: any, token: string): InviteGrant | null {
+export function liveInvite(sql: any, token: string): InviteGrant | null {
   ensurePrincipalSchema(sql);
   if (typeof token !== "string" || token === "") return null;
   const rows = sql.exec(

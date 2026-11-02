@@ -334,6 +334,7 @@ import {
   findPrincipalByFederated,
   grantCapability,
   linkFederatedIdentity,
+  liveInvite,
   redeemInvite,
   reserveInvite,
 } from "./auth/principals";
@@ -3480,6 +3481,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * happens. Refuses an identity already linked to a principal: the link
    * table's INSERT OR REPLACE would otherwise move someone's existing
    * identity onto the new principal.
+   *
+   * The INVITE is checked first (review L4): answering "already linked" for
+   * a garbage invite told any holder of an id_token whether that identity
+   * had joined. Synchronous throughout, so the two reads and the writes
+   * cannot interleave with another join.
    */
   async joinInviteWithFederated(
     token: string,
@@ -3491,6 +3497,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   > {
     const sql = this.ctx.storage.sql;
     ensurePrincipalSchema(sql);
+    if (!liveInvite(sql, token)) return { ok: false, reason: "invalid_invite" };
     if (findPrincipalByFederated(sql, provider, providerSub)) {
       return { ok: false, reason: "already_linked" };
     }

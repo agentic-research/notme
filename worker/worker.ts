@@ -2659,7 +2659,10 @@ export default {
         try {
           identity = await verifyOIDC(body.proof.token, "notme.bot");
         } catch (e: any) {
-          return jsonErr("invalid oidc proof: " + e.message, 403);
+          // Logged, not returned (review L4): verifier messages describe
+          // what the server expected (audience, issuer, key id).
+          console.error("[join] oidc proof rejected:", e?.message);
+          return jsonErr("invalid oidc proof", 403);
         }
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
