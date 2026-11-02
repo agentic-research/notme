@@ -80,6 +80,12 @@ scopes in the same step (notme-3dfe15). The gate is enforced again at verify
 time: a verified credential with no live reservation, no claim, and no
 first-user standing is refused and stored nowhere.
 
+"The first" is not "no passkey user yet": an authority whose administrator
+signs in by OIDC has none. First-user standing means no passkey user and no
+`authorityManage` holder with a linked identity, and it is recorded as a mark
+on the registration when options accepts the bootstrap code; verify makes a
+registrant the administrator only on that mark (review L2, notme-3dfe15).
+
 **Scopes come from the invite, never from the request.** A caller that could
 name its own scopes would make the gate decorative — the same reason
 `/cert/gha` hardcodes its scopes and `canGrant` refuses to pass on authority

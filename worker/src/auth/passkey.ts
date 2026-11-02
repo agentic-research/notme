@@ -120,9 +120,13 @@ export async function verifyRegistration(
    * Returning false refuses the registration and stores nothing. This is
    * where the caller decides whether this registration was authorized — an
    * invite reservation consumed, a claim marked — so the decision and the
-   * credential it admits cannot be separated (notme-3dfe15).
+   * credential it admits cannot be separated (notme-3dfe15). It also decides
+   * whether the registrant is the ADMIN (review L2): `isFirstUser` is only
+   * "passkey_users is empty", which is not the same as "nobody administers
+   * this authority". The default keeps the old count-based answer for
+   * callers with no gate of their own.
    */
-  admit: (isFirstUser: boolean) => boolean = () => true,
+  admit: (isFirstUser: boolean) => false | { isAdmin: boolean } = (f) => ({ isAdmin: f }),
   /**
    * Wraps admit AND the stores in one transaction (review L1). In a Durable
    * Object pass `fn => ctx.storage.transactionSync(fn)`: a throwing insert
@@ -193,7 +197,8 @@ export async function verifyRegistration(
       .toArray() as Array<{ count: number }>;
     const isFirstUser = (users[0]?.count ?? 0) === 0;
 
-    if (!admit(isFirstUser)) {
+    const decision = admit(isFirstUser);
+    if (!decision) {
       return { verified: false, isAdmin: false, refused: true as const };
     }
 
@@ -202,7 +207,7 @@ export async function verifyRegistration(
       "INSERT OR IGNORE INTO passkey_users (user_id, display_name, is_admin) VALUES (?, ?, ?)",
       userId,
       displayName,
-      isFirstUser ? 1 : 0,
+      decision.isAdmin ? 1 : 0,
     );
 
     // Store credential — base64 encode public key for SQLite TEXT column
@@ -224,7 +229,7 @@ export async function verifyRegistration(
       userId,
     );
 
-    return { verified: true, isAdmin: isFirstUser };
+    return { verified: true, isAdmin: decision.isAdmin };
   });
 }
 

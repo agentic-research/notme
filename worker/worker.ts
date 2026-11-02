@@ -933,7 +933,11 @@ async function handlePasskey(
       }
       // First user requires bootstrap code (proves deployer ownership)
       // Everyone else can register freely — gets bridgeCert scope only
-      if (result.isFirstUser && !body.bootstrapCode) {
+      // First-user standing is the authority's answer, not passkey.ts's
+      // "passkey_users is empty" (review L2): an authority whose admin signs
+      // in by OIDC has no passkey user, and that sent every invitee here.
+      const firstUser = await authority.registrationIsFirstUser();
+      if (firstUser && !body.bootstrapCode) {
         // A READ, not a mint (notme-addef9). This route is unauthenticated,
         // so calling getOrCreateBootstrapCode() here meant any stranger's
         // first request caused an admin credential to be minted and logged —
@@ -990,8 +994,10 @@ async function handlePasskey(
             );
         }
       }
-      if (result.isFirstUser) {
-        const valid = await authority.consumeBootstrapCode(body.bootstrapCode!);
+      if (firstUser) {
+        // Consumes the code AND marks this userId, so verify admits it as the
+        // admin — the mark, not a passkey count, is what verify trusts.
+        const valid = await authority.beginFirstUserRegistration(body.bootstrapCode!, userId);
         if (!valid) {
           return jsonErr("invalid or already-used bootstrap code", 403);
         }
@@ -1013,7 +1019,7 @@ async function handlePasskey(
       // could name its own scopes would make the gate decorative.
       let invitedScopes: string[] | null = null;
       let reservationSecret: string | null = null;
-      if (!result.isFirstUser) {
+      if (!firstUser) {
         if (!body.inviteToken) {
           return jsonErr(
             "registration is invite-only — ask an administrator for an invite link",
@@ -1036,11 +1042,11 @@ async function handlePasskey(
       }
 
       // Deployer gets all; an invited user gets exactly what the invite says.
-      const scopes = result.isFirstUser
+      const scopes = firstUser
         ? [...(await import("./src/auth/admin-scopes")).ADMIN_SCOPES]
         : (invitedScopes ?? ["bridgeCert"]);
 
-      const res = Response.json({ ...result, userId, scopes });
+      const res = Response.json({ ...result, isFirstUser: firstUser, userId, scopes });
       if (reservationSecret) {
         // The reservation belongs to THIS browser (review M1): verify must
         // present the secret, and HttpOnly keeps it out of page script, so

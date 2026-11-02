@@ -362,7 +362,20 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //             linkFederatedId), so no new capability class; it also
       //             refuses an identity that is already linked, which
       //             linkFederatedId does not.
-    ).toBe(63);
+      //
+      // 63 → 65: registrationIsFirstUser, beginFirstUserRegistration
+      // (review L2). Reviewed:
+      //   registrationIsFirstUser — a boolean read: "no passkey user and no
+      //             administrator with a linked identity". Strictly less than
+      //             getBootstrapState already tells an anonymous caller.
+      //   beginFirstUserRegistration — marks a userId as the deployer's
+      //             registration, but only after consumeBootstrapCode accepts
+      //             the code, which a stub holder could already call (and
+      //             with the code could already register as admin through
+      //             the route). It moves the admin decision OFF the
+      //             passkey_users count, which any stub-issued challenge on
+      //             an authority with no passkey user used to satisfy.
+    ).toBe(65);
   });
 });
 
