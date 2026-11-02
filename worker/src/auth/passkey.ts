@@ -114,7 +114,16 @@ export async function verifyRegistration(
   rpId: string,
   origin: string,
   sql: any,
-): Promise<{ verified: boolean; isAdmin: boolean }> {
+  /**
+   * Runs after the attestation verifies and BEFORE anything is stored, in the
+   * same synchronous block as the inserts below (no await between them).
+   * Returning false refuses the registration and stores nothing. This is
+   * where the caller decides whether this registration was authorized — an
+   * invite reservation consumed, a claim marked — so the decision and the
+   * credential it admits cannot be separated (notme-3dfe15).
+   */
+  admit: (isFirstUser: boolean) => boolean = () => true,
+): Promise<{ verified: boolean; isAdmin: boolean; refused?: true }> {
   ensurePasskeySchema(sql);
 
   // Get stored challenge
@@ -158,6 +167,10 @@ export async function verifyRegistration(
     .exec("SELECT COUNT(*) as count FROM passkey_users")
     .toArray() as Array<{ count: number }>;
   const isFirstUser = (users[0]?.count ?? 0) === 0;
+
+  if (!admit(isFirstUser)) {
+    return { verified: false, isAdmin: false, refused: true };
+  }
 
   // Store user
   sql.exec(

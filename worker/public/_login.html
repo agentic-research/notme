@@ -283,12 +283,20 @@ async function registerPasskey() {
   var bootstrapCode = document.getElementById('bootstrapInput').value.trim();
   setStatus('requesting registration...', 'info');
   try {
-    var body = inviteToken ? {} : (bootstrapCode ? { bootstrapCode: bootstrapCode } : {});
-    var optRes = await fetch('/auth/passkey/register/options', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
+    // An invite RESERVES at /join and is consumed only when the passkey
+    // below verifies (notme-3dfe15): a cancelled prompt does not spend it,
+    // and the new principal gets the invite's scopes.
+    var optRes = inviteToken
+      ? await fetch('/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: inviteToken })
+        })
+      : await fetch('/auth/passkey/register/options', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(bootstrapCode ? { bootstrapCode: bootstrapCode } : {})
+        });
 
     if (!optRes.ok) {
       var err = (await optRes.json()).error || 'failed';
@@ -319,22 +327,11 @@ async function registerPasskey() {
 
     setStatus('verifying...', 'info');
 
-    // If invite token, redeem via /join
-    if (inviteToken) {
-      var joinRes = await fetch('/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: inviteToken })
-      });
-      if (!joinRes.ok) throw new Error((await joinRes.json()).error || 'join failed');
-    }
-
     var verifyRes = await fetch('/auth/passkey/register/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         userId: data.userId,
-        scopes: data.scopes,
         response: {
           id: cred.id,
           rawId: bufToB64url(cred.rawId),
@@ -383,20 +380,11 @@ async function submitToken() {
 
   setStatus('verifying token...', 'info');
 
-  // Try as invite token first (short, UUID-like)
+  // An invite token (short, UUID-like) is not a login: it admits you to
+  // REGISTER a passkey, and is spent only when that passkey verifies.
   if (token.length < 40 && !token.includes('.')) {
-    try {
-      var joinRes = await fetch('/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: token })
-      });
-      if (joinRes.ok) {
-        setStatus('joined — redirecting...', 'ok');
-        setTimeout(function() { window.location.href = returnTo; }, 800);
-        return;
-      }
-    } catch(e) {}
+    inviteToken = token;
+    return registerPasskey();
   }
 
   // Try as OIDC JWT

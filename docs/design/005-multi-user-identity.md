@@ -284,14 +284,25 @@ The deployer's principal gets all three capability grants:
 
 3. New user opens the URL
 4. System validates invite token (not expired, not redeemed)
-5. System creates a new principal with the scopes specified in the invite
-6. User is presented with authentication options:
+5. User is presented with authentication options:
    a. Register a passkey (preferred)
    b. Sign in with OIDC (if any provider tokens are available)
-7. Chosen credential is linked to the new principal
-8. Invite marked as redeemed
-9. Session cookie issued
+6. Chosen credential is verified
+7. Only then: invite marked as redeemed, principal created with the invite's
+   scopes, credential linked to it -- one atomic step in the DO
+8. Session cookie issued
 ```
+
+> **As built (notme-3dfe15).** The first version redeemed the invite and
+> created the principal at step 4, before any credential existed: a failed
+> passkey ceremony burned the invite, a successful one enrolled the principal
+> with `bridgeCert` whatever the invite said, and `POST /join` with no proof
+> issued a session to a principal with no authenticator. Now `POST /join`
+> without a proof (or `register/options` with `inviteToken`) only *reserves*
+> the invite for one WebAuthn user id and returns registration options;
+> `register/verify` consumes the reservation. `POST /join` with an OIDC proof
+> verifies the proof first (bad proof: 403, invite untouched) and refuses an
+> identity already linked to a principal (409).
 
 The invite token is the authorization to create an account. It replaces the
 "admin must be present" requirement. The invite is time-limited (default 1 hour),

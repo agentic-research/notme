@@ -343,7 +343,24 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //   revoke  — only ever STOPS renewal (narrows). A leaked stub could
       //             revoke machines: a denial of service strictly weaker than
       //             revokeEpoch.
-    ).toBe(62);
+      //
+      // 62 → 63: redeemInviteToken REMOVED; reserveInviteToken and
+      // joinInviteWithFederated added (notme-3dfe15). Reviewed:
+      //   redeemInviteToken — burned an invite without creating anything, so
+      //             the route that called it had to create the principal in a
+      //             second call; the gap between the two is the defect. Off
+      //             the surface.
+      //   reserve — writes a reservation row and grants nothing. The invite
+      //             is consumed only inside passkeyVerifyRegistration, by a
+      //             credential that verified. A stub holder needs the invite
+      //             token to reserve, and with it could already register.
+      //   joinInviteWithFederated — redeems an invite and links an identity
+      //             the caller claims to have verified. A stub holder could
+      //             already do both (createPrincipalWithCapabilities,
+      //             linkFederatedId), so no new capability class; it also
+      //             refuses an identity that is already linked, which
+      //             linkFederatedId does not.
+    ).toBe(63);
   });
 });
 

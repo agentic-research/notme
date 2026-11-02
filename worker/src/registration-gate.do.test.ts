@@ -66,7 +66,7 @@ describe("registration is gated (notme-2c4209)", () => {
     expect(res.status).toBe(403);
     const body = (await res.json()) as { error: string };
     // The SPECIFIC refusal, not just "some 403 mentioning invites". Removing
-    // the no-token guard still yields 403 — redeemInviteToken(undefined)
+    // the no-token guard still yields 403 — reserveInviteToken(undefined)
     // fails too — so an assertion on the status, or on /invite/i, cannot
     // tell a present gate from an absent one. Mutation testing found exactly
     // that: the guard could be deleted with every test still green.
@@ -82,6 +82,23 @@ describe("registration is gated (notme-2c4209)", () => {
     );
     const res = await registerOptions({ inviteToken: invite.token });
     expect(res.status, await res.clone().text()).toBe(200);
+
+    // Options only RESERVES (notme-3dfe15): the invite is consumed when the
+    // passkey verifies, so a cancelled ceremony does not spend it.
+    const { userId, options } = (await res.json()) as {
+      userId: string;
+      options: { challenge: string };
+    };
+    const user = await SoftwareAuthenticator.create("localhost", ORIGIN);
+    const verify = await worker.fetch(
+      new Request(`${ORIGIN}/auth/passkey/register/verify`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId, response: await user.register(options.challenge) }),
+      }),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(verify.status, await verify.clone().text()).toBe(200);
 
     // Single-use: the same token cannot admit a second stranger.
     const replay = await registerOptions({ inviteToken: invite.token });

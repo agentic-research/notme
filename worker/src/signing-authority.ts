@@ -327,7 +327,16 @@ const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
 import { ADMIN_SCOPES, PRIOR_ADMIN_SCOPES, SIGNING_SCOPES } from "./auth/admin-scopes";
-import { ensurePrincipalSchema, grantCapability } from "./auth/principals";
+import {
+  consumeInviteReservation,
+  createPrincipal,
+  ensurePrincipalSchema,
+  findPrincipalByFederated,
+  grantCapability,
+  linkFederatedIdentity,
+  redeemInvite,
+  reserveInvite,
+} from "./auth/principals";
 import type { CommitmentErrorCode } from "./receipts/commitment";
 import type { DelegatedJwtErrorCode } from "./jwt/delegated-claims";
 
@@ -3236,7 +3245,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     response: any,
     rpId: string,
     origin: string,
-  ): Promise<{ verified: boolean; isAdmin: boolean }> {
+  ): Promise<{ verified: boolean; isAdmin: boolean; refused?: true }> {
     const { verifyRegistration } = await import("./auth/passkey");
     return verifyRegistration(
       userId,
@@ -3245,7 +3254,50 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       rpId,
       origin,
       this.ctx.storage.sql,
+      // transactionSync: the redeem, the principal and its grants commit
+      // together or not at all, even if one of the writes throws.
+      (isFirstUser) =>
+        this.ctx.storage.transactionSync(() => this.#admitRegistration(userId, isFirstUser)),
     );
+  }
+
+  /**
+   * Is this verified registration authorized? Runs synchronously inside
+   * verifyRegistration, after the attestation checks out and before the
+   * credential is stored (notme-3dfe15).
+   *
+   * Exactly three registrations are admitted, mirroring the gates on
+   * /auth/passkey/register/options:
+   *   - the first credential on the authority (options demanded the
+   *     bootstrap code, or opened a claim);
+   *   - a claim registration, marked at options and finalized by the route;
+   *   - one holding a live invite reservation, which is CONSUMED here — the
+   *     invite is redeemed and the principal created with the invite's
+   *     scopes in the same block that stores the credential.
+   * Anything else — a reservation superseded by a registration that verified
+   * first, one past its window, none at all — stores nothing. Before this the
+   * gate lived only at options, so the bridgeCert fallback in
+   * ensurePasskeyPrincipal admitted any verified registration that slipped it.
+   */
+  #admitRegistration(userId: string, isFirstUser: boolean): boolean {
+    if (isFirstUser) return true;
+    const sql = this.ctx.storage.sql;
+    this.#ensureClaimSchema();
+    const [{ n }] = [
+      ...sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM bootstrap_claim_registrations WHERE user_id = ? AND expires_at > ?",
+        userId,
+        Math.floor(Date.now() / 1000),
+      ),
+    ];
+    if (n > 0) return true;
+    const invite = consumeInviteReservation(sql, userId);
+    if (!invite) return false;
+    createPrincipal(sql, userId, undefined, invite.createdBy);
+    for (const scope of invite.scopes) {
+      grantCapability(sql, userId, scope, invite.createdBy);
+    }
+    return true;
   }
 
   async passkeyAuthenticationOptions(rpId: string): Promise<any> {
@@ -3304,12 +3356,52 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return { token: invite.token, expiresAt: invite.expiresAt };
   }
 
-  async redeemInviteToken(
+  /**
+   * Reserve an invite for the passkey registration `userId` is starting
+   * (notme-3dfe15). Spends nothing: the invite is consumed only when that
+   * registration's credential verifies (#admitRegistration). Returns the
+   * scopes the invite will grant, or null when it is not live.
+   */
+  async reserveInviteToken(
     token: string,
-    redeemedBy: string,
+    userId: string,
   ): Promise<{ scopes: string[] } | null> {
-    const { redeemInvite } = await import("./auth/principals");
-    return redeemInvite(this.ctx.storage.sql, token, redeemedBy);
+    const invite = reserveInvite(this.ctx.storage.sql, token, userId);
+    return invite ? { scopes: invite.scopes } : null;
+  }
+
+  /**
+   * Join by invite with an OIDC identity the caller has ALREADY VERIFIED
+   * (notme-3dfe15). One synchronous block: the invite is redeemed, the
+   * principal created with its scopes, and the identity linked — or nothing
+   * happens. Refuses an identity already linked to a principal: the link
+   * table's INSERT OR REPLACE would otherwise move someone's existing
+   * identity onto the new principal.
+   */
+  async joinInviteWithFederated(
+    token: string,
+    provider: string,
+    providerSub: string,
+  ): Promise<
+    | { ok: true; principalId: string; scopes: string[] }
+    | { ok: false; reason: "invalid_invite" | "already_linked" }
+  > {
+    const sql = this.ctx.storage.sql;
+    ensurePrincipalSchema(sql);
+    if (findPrincipalByFederated(sql, provider, providerSub)) {
+      return { ok: false, reason: "already_linked" };
+    }
+    const principalId = crypto.randomUUID();
+    return this.ctx.storage.transactionSync(() => {
+      const invite = redeemInvite(sql, token, principalId);
+      if (!invite) return { ok: false as const, reason: "invalid_invite" as const };
+      createPrincipal(sql, principalId, undefined, invite.createdBy);
+      for (const scope of invite.scopes) {
+        grantCapability(sql, principalId, scope, invite.createdBy);
+      }
+      linkFederatedIdentity(sql, principalId, provider, providerSub);
+      return { ok: true as const, principalId, scopes: invite.scopes };
+    });
   }
 
   // ── Principal management ──
@@ -3536,6 +3628,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // they are the audit trail of who joined by whom, not a way in.
     ensurePrincipalSchema(this.ctx.storage.sql);
     this.ctx.storage.sql.exec("DELETE FROM invites WHERE redeemed_at IS NULL");
+    this.ctx.storage.sql.exec("DELETE FROM invite_reservations");
 
     // Rotate the session secret, invalidating every cookie issued before
     // this reset. Without it a reset revoked NOTHING: the secret was minted

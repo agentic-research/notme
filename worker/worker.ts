@@ -1019,14 +1019,18 @@ async function handlePasskey(
             403,
           );
         }
-        const redeemed = await authority.redeemInviteToken(
+        // RESERVE, do not redeem (notme-3dfe15). Redeeming here burned the
+        // invite before the ceremony had happened, so a cancelled prompt
+        // spent it. The invite is consumed when THIS userId's credential
+        // verifies, and the principal is created with its scopes then.
+        const reserved = await authority.reserveInviteToken(
           body.inviteToken,
           userId,
         );
-        if (!redeemed) {
+        if (!reserved) {
           return jsonErr("invalid, expired or already-used invite", 403);
         }
-        invitedScopes = redeemed.scopes;
+        invitedScopes = reserved.scopes;
       }
 
       // Deployer gets all; an invited user gets exactly what the invite says.
@@ -1053,6 +1057,12 @@ async function handlePasskey(
         host,
         origin,
       );
+      if (result.refused) {
+        // Verified, but not authorized: no live invite reservation (another
+        // registration consumed the invite first, or the window passed), no
+        // claim, not the first credential. Nothing was stored (notme-3dfe15).
+        return jsonErr("invalid, expired or already-used invite", 403);
+      }
       if (!result.verified) {
         return jsonErr("registration verification failed", 400);
       }
@@ -1084,7 +1094,11 @@ async function handlePasskey(
       // Scopes come from the GRANT STORE — never from the client body (scope
       // escalation vector) and no longer from the is_admin bit alone. The
       // passkey user becomes a principal with grants here, so its authority
-      // has one source and one revoke path (notme-77a024 finding b).
+      // has one source and one revoke path (notme-77a024 finding b). An
+      // invited registration's principal already exists by now, created
+      // with the INVITE's scopes when verification consumed the reservation
+      // (notme-3dfe15), so this returns those rather than enrolling it with
+      // bridgeCert.
       const scopes = await authority.ensurePasskeyPrincipal(
         body.userId,
         result.isAdmin,
@@ -2562,66 +2576,77 @@ export default {
         return env.ASSETS.fetch(new Request(`${baseUrl}/_login`));
       }
 
-      // POST /join — redeem invite + register (passkey or OIDC)
+      // POST /join — start joining by invite (notme-3dfe15).
+      //
+      // WITHOUT a proof: reserve the invite and start a passkey registration
+      // — exactly /auth/passkey/register/options with this invite. Returns
+      // { options, userId, scopes } and NO session. The invite is consumed,
+      // and the principal created with its scopes, only when that passkey
+      // verifies at /auth/passkey/register/verify. This route used to redeem
+      // the invite and hand out a session immediately, for a principal with
+      // no authenticator at all: invisible to #hasAuthenticator, and the
+      // reason a failed passkey ceremony after it burned the invite.
+      //
+      // WITH an OIDC proof: the proof is verified FIRST — a bad one is 403
+      // (ERROR_STATUS.OIDC_PROOF_REJECTED) and spends nothing — and then the
+      // invite is redeemed, the principal created and the identity linked in
+      // one synchronous DO call. The link failure used to be swallowed, so a
+      // bad proof still burned the invite and returned a session.
       if (pathname === "/join" && request.method === "POST") {
         const body = (await request.json()) as {
           token: string;
           proof?: { type: string; token?: string };
         };
-        if (!body.token) return jsonErr("invite token required", 400);
+        if (!body.token || typeof body.token !== "string") {
+          return jsonErr("invite token required", 400);
+        }
+
+        if (!body.proof) {
+          return handlePasskey(
+            "/auth/passkey/register/options",
+            new Request(new URL("/auth/passkey/register/options", request.url), {
+              method: "POST",
+              headers: request.headers,
+              body: JSON.stringify({ inviteToken: body.token }),
+            }),
+            env,
+          );
+        }
+        if (body.proof.type !== "oidc" || !body.proof.token) {
+          return jsonErr("unsupported proof — omit it to join with a passkey, or send an oidc token", 400);
+        }
+
+        const { verifyOIDC } = await import("./src/auth/verify-proof");
+        let identity;
+        try {
+          identity = await verifyOIDC(body.proof.token, "notme.bot");
+        } catch (e: any) {
+          return jsonErr("invalid oidc proof: " + e.message, 403);
+        }
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-
-        // Create principal
-        const principalId = crypto.randomUUID();
-        const result = await authority.redeemInviteToken(
+        const joined = await authority.joinInviteWithFederated(
           body.token,
-          principalId,
+          identity.issuer,
+          identity.subject,
         );
-        if (!result) return jsonErr("invalid or expired invite", 403);
-
-        // Create principal with the invite's scopes
-        await authority.createPrincipalWithCapabilities(
-          principalId,
-          result.scopes,
-        );
-
-        // If OIDC proof provided, link it
-        if (body.proof?.type === "oidc" && body.proof.token) {
-          const { verifyOIDC } = await import("./src/auth/verify-proof");
-          try {
-            const identity = await verifyOIDC(body.proof.token, "notme.bot");
-            await authority.linkFederatedId(
-              principalId,
-              identity.issuer,
-              identity.subject,
-            );
-          } catch {
-            // OIDC link is optional — principal is created regardless
-          }
+        if (!joined.ok) {
+          return joined.reason === "already_linked"
+            ? jsonErr("this identity already belongs to a principal — sign in with it at /auth/oidc/login", 409)
+            : jsonErr("invalid or expired invite", 403);
         }
 
-        // Issue session
         const { createSessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
         const cookie = await createSessionCookie(
-          { principalId, scopes: result.scopes, authMethod: "invite" },
-          sessionSecret,
+          { principalId: joined.principalId, scopes: joined.scopes, authMethod: "invite" },
+          await authority.getSessionSecret(),
         );
-
         return new Response(
-          JSON.stringify({
-            joined: true,
-            principalId,
-            scopes: result.scopes,
-          }),
+          JSON.stringify({ joined: true, principalId: joined.principalId, scopes: joined.scopes }),
           {
             status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              "Set-Cookie": cookie,
-            },
+            headers: { "Content-Type": "application/json", "Set-Cookie": cookie },
           },
         );
       }

@@ -469,7 +469,7 @@ describe("invites are inside the reset, and inside a ceiling (notme-2131e8)", ()
   // An invite is a way in: redeeming one creates a principal with whatever
   // scopes it names, authorityManage included. #hasAuthenticator does not
   // count invites, so "reset left nobody able to authenticate" was only true
-  // if no invite survived the reset. redeemInviteToken checked redeemed_at
+  // if no invite survived the reset. Redemption checked redeemed_at
   // and expires_at and nothing else — so one did.
   it("invite.reset.revokes — an invite minted before resetPasskeyData cannot be redeemed after it", async () => {
     const stub = authority("bs-reset-revokes-invites");
@@ -479,7 +479,7 @@ describe("invites are inside the reset, and inside a ceiling (notme-2131e8)", ()
       3600,
     );
     await stub.resetPasskeyData();
-    expect(await stub.redeemInviteToken(invite.token, "post-reset-stranger")).toBeNull();
+    expect(await stub.reserveInviteToken(invite.token, "post-reset-stranger")).toBeNull();
   });
 
   // The TTL was caller-supplied and unclamped: `body.ttl ?? 3600` went
