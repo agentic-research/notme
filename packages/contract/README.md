@@ -1,6 +1,6 @@
 # `@notme/contract`
 
-Single source of truth for invariants the **consumer** (this repo, `notme`) and the **server** (`notme.bot`) must agree on. Drift here is how confused-deputy bugs slip in between the two halves.
+Single source of truth for invariants the **server** (the signing authority in `worker/`) and its **consumers** (`action/`, `proxy/`) must agree on. Drift here is how confused-deputy bugs slip in between the two halves.
 
 ## What's in here
 
@@ -17,7 +17,7 @@ Single source of truth for invariants the **consumer** (this repo, `notme`) and 
 
 - `notme/worker/` — workspace dep (`@notme/contract`: `workspace:*`).
 - `notme/action/`, `notme/proxy/`, `notme/vault/` — workspace dep if/when they need any of these constants.
-- `notme.bot` (separate repo) — currently keeps a **synced mirror** at `src/contract.ts`. A future move to a published `@notme/contract` will replace the mirror with an `npm install`. The mirror is byte-diff'd in CI on the notme.bot side via `src/auth/contract.test.ts`.
+- The separate `notme.bot` repo once kept a mirror of this file. It is archived, so there is no mirror and no cross-repo check; the server lives in `worker/` and uses the workspace dep.
 
 ## Rules of the road
 

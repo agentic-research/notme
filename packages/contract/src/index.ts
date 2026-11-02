@@ -1,19 +1,16 @@
 // @notme/contract — cross-repo contract for the notme ecosystem.
 //
-// Single source of truth for invariants shared between the two repos that
-// implement the notme protocol:
-//   - `notme`     (this package's home) — the CONSUMER side: GHA action,
-//                  worker that holds the bridge cert + AuthService, proxy.
-//   - `notme.bot` (separate repo) — the SERVER side: the signing authority,
-//                  passkey/OIDC login, /cert/* mint endpoints.
+// Single source of truth for invariants shared by the parts of this repo
+// that implement the notme protocol on both sides of the wire: the signing
+// authority and its /cert/* and login endpoints (worker/), and the
+// consumers that hold or present its credentials (action/, proxy/).
 //
-// Drift between the two is how confused-deputy bugs and silent breakage
-// slip in.
+// Drift between the two sides is how confused-deputy bugs and silent
+// breakage slip in.
 //
-// Consumed by notme components via the workspace alias `@notme/contract`.
-// notme.bot keeps a byte-identical mirror at src/contract.ts because it is
-// a separate git repo; its src/auth/contract.test.ts byte-diffs against
-// this file in CI when both repos are checked out side-by-side.
+// Consumed via the workspace alias `@notme/contract`. The separate
+// notme.bot repo once kept a byte-identical mirror of this file; it is
+// archived, so there is no mirror and no cross-repo check.
 //
 // Bump CONTRACT_VERSION on any breaking shape change; the consumer's pinned
 // version gates the upgrade. See ./README.md for the rules of the road.
