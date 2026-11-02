@@ -58,6 +58,12 @@ them.
 8. **notme-cf288e → tag → notme-8e8836:** promote staging → canary →
    production (`task ship-prod`, **owner**), then cut the tag. The signed
    trust anchor (8e8836) closes when the release job signs it from that tag.
+   **Deploy note (phase 2):** upgrade every `task-cert` checkout to 2a5dd9b
+   or later before approving new machines. An older checkout mints tasks with
+   no `.1.10` under a new enrollment; its own old `verify` accepts them, the
+   new `task-cert verify` (and later signet and LLO) refuses them with `tier
+   carries criteria; the task names none`. Nothing breaks at deploy; recovery
+   is `git pull` (mint reads `tier.pem` by default, no re-enrolment).
 9. **notme-bed754** closes when 1–8 are closed.
 
 Waiting on someone else: **notme-bc4cd2** (adopt LLO v0.21.0) waits for LLO
@@ -105,9 +111,9 @@ What exists:
 - subtasks and pause/resume;
 - copies detected at renewal (phase 1);
 - **landed: phase 2 (notme-bdc850)**, criteria in the cert (`.1.10`),
-  enforced at mint and in `task-cert verify`. Commits b06b8ea through
-  2a5dd9b, plus the docs commit
-  `[notme-bdc850] docs(mint-path): phase 2 criteria; …`. It settles
+  enforced at mint and in `task-cert verify`. Commits b06b8ea, b0e9fd8,
+  ad1ada8, 2a5dd9b and d9f863e, plus the review-fix commit
+  `[notme-bdc850] fix(task-cert): the legacy cutoff never silently turns off; …`. It settles
   **notme-1a5465**: the goal hash and confinementDigest are different facts
   (spec §12, decision 4).
 

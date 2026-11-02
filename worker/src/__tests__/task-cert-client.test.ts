@@ -11,6 +11,7 @@
 import { X509Certificate, X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, utimesSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mintIssuingCaCert, OID_CRITERIA } from "../cert-authority";
@@ -976,7 +977,7 @@ describe("what a human is told when renewal fails", () => {
 });
 
 // ── criteria (notme-bdc850): mint picks the tier's; verify enforces them ────
-import { parseLegacyCutoff, renewedTierMeta } from "../../../scripts/task-cert/lib";
+import { parseLegacyCutoff, renewedTierMeta, resolveLegacyCutoff } from "../../../scripts/task-cert/lib";
 
 describe("task-cert mint picks the tier's criteria (Review Focus 5)", () => {
   const AS: Criteria = { name: "agent-session", version: 1 };
@@ -1091,6 +1092,36 @@ describe("the legacy cutoff the CLI accepts", () => {
         message: `legacy cutoff ${JSON.stringify(bad)} is not an ISO date (e.g. 2026-12-01 or 2026-12-01T00:00:00Z)`,
       });
     }
+  });
+});
+
+describe("the legacy cutoff never silently turns off (flag vs env)", () => {
+  it("a flag value parses; the flag wins over the env var", () => {
+    expect(resolveLegacyCutoff("2026-12-01", undefined)).toEqual({ ok: true, cutoff: new Date("2026-12-01T00:00:00Z") });
+    expect(resolveLegacyCutoff("2026-12-01", "2027-01-01")).toEqual({ ok: true, cutoff: new Date("2026-12-01T00:00:00Z") });
+    expect(resolveLegacyCutoff("tomorrow", "2027-01-01")).toMatchObject({ ok: false });
+  });
+  it("a bare or empty flag is an error, never the env var or no cutoff", () => {
+    for (const env of [undefined, "", "2027-01-01"]) {
+      expect(resolveLegacyCutoff("", env)).toEqual({ ok: false, message: expect.stringContaining("needs a value") });
+    }
+  });
+  it("only the env var keeps empty-means-unset", () => {
+    expect(resolveLegacyCutoff(undefined, "")).toEqual({ ok: true, cutoff: undefined });
+    expect(resolveLegacyCutoff(undefined, undefined)).toEqual({ ok: true, cutoff: undefined });
+    expect(resolveLegacyCutoff(undefined, "2027-01-01")).toEqual({ ok: true, cutoff: new Date("2027-01-01T00:00:00Z") });
+  });
+  it("the CLI parses --legacy-cutoff=DATE like --legacy-cutoff DATE, and a bare flag exits 2", () => {
+    const run = (...a: string[]) =>
+      spawnSync("pnpm", ["exec", "tsx", "scripts/task-cert/cli.ts", "verify", "--cert", "/nonexistent", "--dir", "/nonexistent", ...a], {
+        cwd: join(__dirname, "../../.."), encoding: "utf8", env: { ...process.env, NOTME_LEGACY_CUTOFF: "" },
+      });
+    expect(run("--legacy-cutoff").status).toBe(2);
+    expect(run("--legacy-cutoff=").status).toBe(2);
+    expect(run("--legacy-cutoff=tomorrow").status).toBe(2);
+    // a valid value gets past the cutoff check (then fails on the missing dir, not exit 2)
+    expect(run("--legacy-cutoff=2026-12-01").status).not.toBe(2);
+    expect(run("--legacy-cutoff", "2026-12-01").status).not.toBe(2);
   });
 });
 

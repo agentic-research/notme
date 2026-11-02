@@ -254,6 +254,21 @@ export function parseLegacyCutoff(raw: string | undefined): { ok: true; cutoff: 
   return { ok: true, cutoff: d };
 }
 
+/**
+ * Decide the cutoff from the flag and the env var. `flag` is undefined when
+ * `--legacy-cutoff` was not given at all; "" when it was given with no value
+ * (bare, or `--legacy-cutoff=`). A flag the operator typed must never
+ * silently turn the cutoff off, so that is an error. Only the ENV var keeps
+ * "empty means unset". The flag wins over the env var.
+ */
+export function resolveLegacyCutoff(
+  flag: string | undefined,
+  env: string | undefined,
+): { ok: true; cutoff: Date | undefined } | { ok: false; message: string } {
+  if (flag === "") return { ok: false, message: "--legacy-cutoff needs a value (an ISO date, e.g. 2026-12-01)" };
+  return parseLegacyCutoff(flag ?? env);
+}
+
 // ── Renewal, subtasks, ledger, local revocation (notme-337d82, notme-9f84e6) ─
 
 /**

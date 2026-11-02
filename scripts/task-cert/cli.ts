@@ -3,12 +3,12 @@
  * notme task certificates from a machine (notme-486e8a).
  *
  *   task-cert enroll [--authority URL] [--dir DIR]   (alias: enrol)
- *   task-cert mint   --task ID --goal TEXT [--scopes a,b] [--ttl-min N] [--criteria ID] [--out DIR] [--dir DIR]
+ *   task-cert mint   --task ID --goal TEXT [--scopes a,b] [--ttl-min N (at most 5: agent-session/1, 300 s)] [--criteria ID] [--out DIR] [--dir DIR]
  *                    (--out defaults to ~/.notme/tasks/<task>)
  *   task-cert mint   --parent TASK --task SUB --goal TEXT   (a subtask)
  *   task-cert renew  [--dir DIR]
  *   task-cert revoke --task TASK                           (and everything under it)
- *   task-cert verify --cert FILE [--legacy-cutoff ISO] [--dir DIR]
+ *   task-cert verify --cert FILE [--legacy-cutoff ISO | --legacy-cutoff=ISO] [--dir DIR]
  *   task-cert status [--dir DIR]
  *   (every command takes --tasks-dir DIR, default ~/.notme/tasks)
  *
@@ -35,7 +35,9 @@
  * parent's), mints a legacy task under a tier that grants none, and refuses
  * when it grants several. `verify` refuses a task without criteria under a
  * tier that has them, and a legacy task past --legacy-cutoff (or env
- * NOTME_LEGACY_CUTOFF); an unparseable cutoff exits 2.
+ * NOTME_LEGACY_CUTOFF); an unparseable or valueless flag exits 2 (only the
+ * env var treats empty as unset). `mint --ttl-min` above 5 is refused, not
+ * clamped: agent-session/1 allows at most 300 s.
  *
  * TRUST, stated plainly: the root is fetched over TLS from the authority at
  * enroll time and pinned. After that, mint and verify never touch the network.
@@ -50,7 +52,7 @@ import { X509Certificate } from "@peculiar/x509";
 import { appendFileSync } from "node:fs";
 import {
   enrollInDir, importPrivateKeyPem,
-  explainRenewalFailure, isRevokedTask, mintTask, parseLegacyCutoff, renewedTierMeta, renewTierInDir, taskOutDir, verifyChain,
+  explainRenewalFailure, isRevokedTask, mintTask, renewedTierMeta, resolveLegacyCutoff, renewTierInDir, taskOutDir, verifyChain,
 } from "./lib";
 
 
@@ -59,7 +61,12 @@ import {
 function args(argv: string[]) {
   const out: Record<string, string> = {};
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i]!.startsWith("--")) out[argv[i]!.slice(2)] = argv[i + 1] ?? "";
+    const tok = argv[i]!;
+    if (!tok.startsWith("--")) continue;
+    const eq = tok.indexOf("=");
+    // --flag=value; otherwise --flag value (a bare trailing flag is "").
+    if (eq > 2) out[tok.slice(2, eq)] = tok.slice(eq + 1);
+    else out[tok.slice(2)] = argv[i + 1] ?? "";
   }
   return out;
 }
@@ -232,12 +239,12 @@ async function mint() {
 }
 
 async function verify() {
-  if (!a.cert) throw new Error("--cert is required");
-  const cutoff = parseLegacyCutoff(a["legacy-cutoff"] || process.env.NOTME_LEGACY_CUTOFF);
+  const cutoff = resolveLegacyCutoff(a["legacy-cutoff"], process.env.NOTME_LEGACY_CUTOFF);
   if (!cutoff.ok) {
     console.error(`task-cert verify: ${cutoff.message}`);
     process.exit(2);
   }
+  if (!a.cert) throw new Error("--cert is required");
   const r = await verifyChain(need("root.pem"), need("tier.pem"), readFileSync(a.cert, "utf8"), new Date(), {
     legacyCutoff: cutoff.cutoff,
   });
