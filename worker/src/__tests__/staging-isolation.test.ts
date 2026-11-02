@@ -6,7 +6,7 @@
 // promise, and each fails silently if someone edits it later:
 //
 //   1. No vpc_services under env.staging. worker.ts guards `if (env.VPC_AUTH)`
-//      and falls through to a 503, so ADDING a VPC binding would quietly give
+//      and falls through to a constant 404, so ADDING a VPC binding would quietly give
 //      staging a live path to the production signet backend on Fly — the one
 //      thing staging must never reach.
 //   2. A distinct Worker name, so staging gets its own Durable Objects (its

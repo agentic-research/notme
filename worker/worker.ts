@@ -133,8 +133,10 @@ export class ReceiptSigner extends WorkerEntrypoint<any> {
    * Cloister needs both to build a commitment and `signReceipt` rejects any
    * that disagree, so serving them from the same authority that enforces them
    * removes a whole class of "receipt rejected, epoch drifted" failures.
-   * Cache it, but re-read on an EPOCH_MISMATCH rather than polling — rotation
-   * here is alarm-driven.
+   * Cache it, but re-read on an EPOCH_MISMATCH rather than polling. Neither
+   * field moves on a timer — `alarm()` calls `generateBundle()`, never
+   * `rotate()` or `revokeEpoch()`. `epoch` moves on `revokeEpoch()`;
+   * `actor_fp` moves on `rotate()` (ADR-014).
    */
   async receiptFacts(): Promise<{
     /**
@@ -4255,7 +4257,7 @@ export default {
       // unmatched path under the authority host answered with Cloudflare's
       // error 1101 — a Worker exception, not a routing answer (notme-cb0354,
       // live in production 2026-08-05 while known routes were healthy).
-      // Staging cannot catch this: with no VPC_AUTH binding it takes the 503
+      // Staging cannot catch this: with no VPC_AUTH binding it takes the 404
       // fallthrough below, so the environments diverge exactly at this branch
       // and a green staging run says nothing about this path.
       //

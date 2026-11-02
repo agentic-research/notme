@@ -38,6 +38,12 @@ that name the command to run.
   born in staging), own RevocationAuthority, own KV — and deliberately **no
   `VPC_AUTH` binding**, so staging can never proxy traffic to the production
   signet backend (worker.ts guards `if (env.VPC_AUTH)` and 503s instead).
+  > **CORRECTION (2026-11-02, `notme-c16e0d`).** The isolation holds (pinned
+  > by `staging-isolation.test.ts`), but the fallthrough is a constant
+  > **404** `{"error":"not_found"}`, not a 503. The 503 was removed
+  > (`notme-cb0354`) because it made an unmatched path answer differently
+  > depending on whether a VPC binding existed, and disclosed deployment
+  > state to unauthenticated callers.
 - **Config-driven authority host** (`authorityHostFromEnv` in
   `worker/worker.ts`): the authority surface is selected by
   `SIGNET_AUTHORITY_URL`'s host in addition to the hardcoded
