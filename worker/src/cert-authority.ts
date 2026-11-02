@@ -71,7 +71,7 @@ const SIGNING_KEY_USAGE = new KeyUsagesExtension(
 // IANA PEN application: https://pen.iana.org/pen/PenApplication.page (free,
 // few business days). Until then, ANY third-party verifier that pins our OID
 // arc will be pinning the placeholder.
-const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigned PEN
+export const OID_PEN = "1.3.6.1.4.1.99999"; // TODO(notme-229dc3): replace with assigned PEN
 // Exported because verification has to read back exactly what minting wrote.
 // A second copy of these strings in the verifier would let the two drift, and
 // the failure mode of that drift is silent: `getExtension` returns undefined
@@ -113,6 +113,7 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 //   .1.7   — (task scope moved off it)  —                     confinementDigest  DO NOT REUSE
 //   .1.8   principal kind               (recognised only)     —
 //   .1.9   task scope                   —                     —
+//   .1.10  criteria (SEQ OF SEQ{name,v}) —                     —
 //
 // SIGNET'S .1.5/.1.6 COLLISION WAS LIVE, unlike LLO's. LLO's sat behind an
 // earlier RFC 5280 rejection (see below); nothing shielded signet's.
@@ -202,6 +203,7 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 // (notme-229dc3), which is free and takes days.
 export const OID_PRINCIPAL_KIND = `${OID_PEN}.1.8`; // UTF8String: human|agent|workload|organization
 export const OID_TASK_SCOPE = `${OID_PEN}.1.9`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
+export const OID_CRITERIA = `${OID_PEN}.1.10`; // SEQUENCE OF SEQUENCE { UTF8String name, INTEGER version } (criteria.ts)
 
 /**
  * What the certificate's subject IS — a different axis from HOW it was
@@ -274,7 +276,7 @@ function derLength(n: number): Uint8Array {
 
 // Wrap a value in its tag and length. Every hand-rolled structure below goes
 // through here so none of them can reintroduce a single-byte length ceiling.
-function derTlv(tag: number, value: Uint8Array): Uint8Array {
+export function derTlv(tag: number, value: Uint8Array): Uint8Array {
   const len = derLength(value.length);
   const buf = new Uint8Array(1 + len.length + value.length);
   buf[0] = tag;
@@ -284,7 +286,7 @@ function derTlv(tag: number, value: Uint8Array): Uint8Array {
 }
 
 // Encode a string as ASN.1 UTF8String DER (tag 0x0C + length + value)
-function derUtf8String(s: string): Uint8Array {
+export function derUtf8String(s: string): Uint8Array {
   return derTlv(0x0c, new TextEncoder().encode(s));
 }
 
@@ -1006,7 +1008,7 @@ export async function mintTaskCertPair(
 }
 
 /** Scopes at OID_SCOPES — a local reader so this module has no import cycle with verify-chain. */
-function readScopes(cert: { getExtension(oid: string): { value: ArrayBuffer } | null }): string[] | null {
+export function readScopes(cert: { getExtension(oid: string): { value: ArrayBuffer } | null }): string[] | null {
   const ext = cert.getExtension(OID_SCOPES);
   if (!ext) return null;
   const der = new Uint8Array(ext.value);
