@@ -18,7 +18,7 @@ unwired, and the gotcha that bit us. Structure lives in
 
 | # | title | status | one-line decision | code / files |
 |---|---|---|---|---|
-| **005** | [multi-user identity](design/005-multi-user-identity.md) | accepted | replace single-admin model with `principals` + `capability_grants` + invite flow; `is_admin` boolean retired in favor of capability scopes | `worker/src/auth/principals.ts`, `worker/src/auth/connections.ts` |
+| **005** | [multi-user identity](design/005-multi-user-identity.md) | accepted | replace single-admin model with `principals` + `capability_grants` + invite flow; authority comes from grants (read live per request), with `is_admin` now only seeding a passkey user's first grant set — the Phase 3 table removals were not executed | `worker/src/auth/principals.ts`, `worker/src/auth/connections.ts` |
 | **006** | [DPoP tokens](design/006-dpop-tokens.md) | accepted | sender-constrained JWT access tokens (RFC 9449); same Ed25519 master key signs certs and tokens | `worker/src/auth/dpop.ts`, `worker/src/auth/dpop-handler.ts`, `worker/src/auth/token.ts` |
 | **007** | [secretless local proxy](design/007-secretless-local-proxy.md) | accepted (phase A done; phase C partial) | two-plane model — workerd holds non-extractable keys locally, edge validates independently; `extractable: false` invariant enforced everywhere | `worker/src/platform.ts`, `worker/src/signing-authority.ts`, `proxy/src/main.rs` |
 | **007** | [secretless plan](design/007-secretless-plan.md) | implementation plan (sibling of design 007) | task-by-task TDD checklist for executing 007 | — (drives changes across `worker/`, `Taskfile.yml`) |

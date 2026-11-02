@@ -8,6 +8,7 @@
 **Status:** Accepted
 **Date:** 2026-03-28
 **Status updated:** 2026-05-09 — principal model + capability_grants shipped (`worker/src/auth/principals.ts`, `worker/src/auth/connections.ts`)
+**Status amended:** 2026-11-02 (`notme-c006aa`) — as of 2026-08-28 (`notme-77a024`) the passkey path also enrols a principal with grants, and every authority gate reads grants live. Phase 2 item 5 and all of Phase 3 were not executed: `passkey_users.is_admin` and the `connections` table are still live, and `/auth/federated/link` does not exist. See the notes under "What disappears", "Session Payload" and "Migration Path".
 **Bead:** notme-7c7f83
 **Relates to:** ADR-004 (bridge certs), ADR-0002 (identity & secrets architecture)
 
@@ -167,6 +168,25 @@ CREATE TABLE challenges (
 - `connections` table -- replaced by `federated_identities`
 - The `isAdmin` field in session cookies -- replaced by a list of active scopes
 
+> **CORRECTION (2026-11-02, `notme-c006aa`).** Only the grant model shipped;
+> none of the four removals did.
+>
+> - `passkey_users` and its `is_admin` column still exist
+>   (`worker/src/auth/passkey.ts`). Since 2026-08-28 they no longer decide a
+>   passkey user's authority on each login: `ensurePasskeyPrincipal`
+>   (`worker/src/signing-authority.ts`) creates a `principals` row with grants
+>   the first time a passkey user registers or signs in, and `is_admin` only
+>   chooses the initial grant set then (all three scopes vs `bridgeCert`).
+>   After that the grant store is the source. Before 2026-08-28 the passkey
+>   path created no principal and derived scopes from `is_admin` on every
+>   login.
+> - `connections` was not replaced. `POST /connections` still writes the
+>   legacy table, keyed by `session.userId`. `federated_identities` exists
+>   and is written by `/join` and the OIDC path, but the two tables coexist.
+> - The session cookie still carries an `isAdmin` field, now derived from
+>   `scopes.includes("authorityManage")` (`worker/src/auth/session.ts`) for
+>   older readers; it is not consulted by authority gates.
+
 ### Session Payload
 
 ```typescript
@@ -186,6 +206,17 @@ expiry (max 24 hours), which is acceptable for the TTLs involved.
 For operations that require real-time authorization checks (e.g., `authorityManage`
 scope), the route handler re-validates against `capability_grants` at request time
 rather than trusting the session alone.
+
+> **Note (2026-11-02, `notme-c006aa`).** This was not true when written and
+> became true on 2026-08-28 (`notme-77a024`). Until then every gate read only
+> the signed cookie, so a revoked grant stayed usable until the session expired
+> (`SESSION_TTL_SECONDS` = 24h). Now `liveScopes()`
+> (`worker/src/auth/session.ts`) intersects the cookie's scopes with
+> `getPrincipalScopes()` on each request, and the authority gates in
+> `worker/worker.ts` call it — not only for `authorityManage`. The previous
+> paragraph's "existing sessions remain valid until expiry" therefore no
+> longer describes authority checks: the cookie stays valid, but a revoked
+> scope stops working on the next request.
 
 ### Bridge Cert Subject
 
@@ -349,6 +380,11 @@ POST /auth/federated/link { proof: { type: "oidc", token: "<jwt>" } }
 (requires active session, links identity to session.principalId)
 ```
 
+> **Not built (2026-11-02, `notme-c006aa`).** `/auth/federated/link` does not
+> exist. Linking an identity to a signed-in user is `POST /connections`, which
+> writes the legacy `connections` table keyed by `session.userId` — the shape
+> Issue 1 above describes.
+
 ### Flow 6: Self-Hoster Without Passkeys
 
 A self-hoster whose users cannot use passkeys (corporate browsers, old Android):
@@ -444,6 +480,14 @@ But delegation is always bounded by the grantor's own capabilities.
 3. Drop `is_admin` references
 4. Update identity.capnp to add `OIDCProof` to the Proof union (generic, not GHA-specific)
 
+> **Execution status (2026-11-02, `notme-c006aa`).** Phase 2 items 1, 2, 4 and
+> 6 shipped; item 3 shipped as create only (`POST /invites` plus the `GET`
+> form — there is no invite list or revoke route). Item 5 (`/connections` -> `/auth/federated/link`) did not. Phase 3 was not
+> executed: `passkey_users`, `connections` and `is_admin` are all still
+> present. Phase 1 was done in effect rather than as a one-shot migration —
+> passkey users are enrolled as principals lazily, on their next
+> registration or sign-in.
+
 ## Open Questions
 
 1. **Open registration:** Should a new OIDC identity automatically create a principal,
@@ -506,6 +550,8 @@ A principal's `authorityManage` grant is revoked, but their session still carrie
 the scope. Mitigations:
 - Session TTL is 24 hours maximum
 - `authorityManage` operations re-check grants at request time (not session-only)
+  — true since 2026-08-28 via `liveScopes()`, for every authority gate; see the
+  note under "Session Payload"
 - For higher assurance: reduce session TTL or implement a session revocation list
 
 ## Consequences
