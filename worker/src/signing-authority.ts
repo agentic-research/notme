@@ -3263,18 +3263,23 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         rpId,
         origin,
         this.ctx.storage.sql,
-        // transactionSync: the redeem, the principal and its grants commit
-        // together or not at all, even if one of the writes throws.
-        (isFirstUser) =>
-          this.ctx.storage.transactionSync(() =>
-            this.#admitRegistration(userId, isFirstUser, secretHash),
-          ),
+        (isFirstUser) => this.#admitRegistration(userId, isFirstUser, secretHash),
+        // ONE transaction around admit AND the credential stores (review
+        // L1): the redeem, the principal, its grants, the passkey user and
+        // the credential commit together or not at all.
+        (fn) => this.ctx.storage.transactionSync(fn),
       );
     } catch (e: any) {
       // A failed ceremony is an answer, not an exception to ship across RPC
       // (review M1): verifier messages can name the expected challenge, and
       // a thrown message is what the route used to hand back to the caller.
       console.error("[passkey] registration verify failed:", e?.message);
+      // Burn the challenge here too: a store that threw rolled back with the
+      // transaction, challenge deletion included.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
+        userId,
+      );
       return { verified: false, isAdmin: false };
     }
   }

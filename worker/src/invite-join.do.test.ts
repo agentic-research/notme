@@ -294,6 +294,41 @@ describe("invites minted before the ceiling are not grandfathered (review M3)", 
   });
 });
 
+describe("consume and store are one transaction (review L1)", () => {
+  // admit ran in its own transactionSync and COMMITTED; the passkey_users and
+  // passkey_credentials inserts came after it, outside. A credential insert
+  // that threw (a colliding credential_id — attacker-chosen in the
+  // attestation) left the invite spent and a principal holding its scopes
+  // with no credential at all.
+  it("invite.join.store-atomic — a failing credential insert leaves the invite unspent and no principal", async () => {
+    const inv = await invite(["bridgeCert", "authorityManage"]);
+    const user = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
+    // Squat the credential id this authenticator will present.
+    await runInDurableObject(authority(), async (_auth, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO passkey_credentials (credential_id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)",
+        user.credentialIdB64u,
+        "squatter",
+        "AA==",
+        0,
+        "[]",
+      );
+    });
+    const o = await options(inv.token);
+    const res = await verify(user, o);
+    expect(res.status).not.toBe(200);
+    expect(await authority().getPrincipalScopes(o.userId)).toEqual([]);
+    await runInDurableObject(authority(), async (_auth, state) => {
+      const rows = state.storage.sql
+        .exec("SELECT COUNT(*) AS n FROM passkey_users WHERE user_id = ?", o.userId)
+        .toArray() as Array<{ n: number }>;
+      expect(rows[0]!.n).toBe(0);
+    });
+    // Unspent: another registration can still start under it.
+    await options(inv.token);
+  });
+});
+
 describe("the invite token stays out of request URLs (notme-3dfe15 part 2)", () => {
   // Workers invocation logs (wrangler.toml [observability.logs]) record the
   // request URL. A link of the form /join?t=<token> therefore wrote a bearer

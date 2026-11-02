@@ -123,6 +123,14 @@ export async function verifyRegistration(
    * credential it admits cannot be separated (notme-3dfe15).
    */
   admit: (isFirstUser: boolean) => boolean = () => true,
+  /**
+   * Wraps admit AND the stores in one transaction (review L1). In a Durable
+   * Object pass `fn => ctx.storage.transactionSync(fn)`: a throwing insert
+   * (e.g. a colliding credential_id) then rolls back the consumed invite and
+   * the principal admit created, instead of committing them with no
+   * credential. The default runs it bare, for callers with no transaction.
+   */
+  transact: <T>(fn: () => T) => T = (fn) => fn(),
 ): Promise<{ verified: boolean; isAdmin: boolean; refused?: true }> {
   ensurePasskeySchema(sql);
 
@@ -178,44 +186,46 @@ export async function verifyRegistration(
 
   const { credential } = verification.registrationInfo;
 
-  // Check if first user (auto-admin)
-  const users = sql
-    .exec("SELECT COUNT(*) as count FROM passkey_users")
-    .toArray() as Array<{ count: number }>;
-  const isFirstUser = (users[0]?.count ?? 0) === 0;
+  return transact(() => {
+    // Check if first user (auto-admin)
+    const users = sql
+      .exec("SELECT COUNT(*) as count FROM passkey_users")
+      .toArray() as Array<{ count: number }>;
+    const isFirstUser = (users[0]?.count ?? 0) === 0;
 
-  if (!admit(isFirstUser)) {
-    return { verified: false, isAdmin: false, refused: true };
-  }
+    if (!admit(isFirstUser)) {
+      return { verified: false, isAdmin: false, refused: true as const };
+    }
 
-  // Store user
-  sql.exec(
-    "INSERT OR IGNORE INTO passkey_users (user_id, display_name, is_admin) VALUES (?, ?, ?)",
-    userId,
-    displayName,
-    isFirstUser ? 1 : 0,
-  );
+    // Store user
+    sql.exec(
+      "INSERT OR IGNORE INTO passkey_users (user_id, display_name, is_admin) VALUES (?, ?, ?)",
+      userId,
+      displayName,
+      isFirstUser ? 1 : 0,
+    );
 
-  // Store credential — base64 encode public key for SQLite TEXT column
-  const pubKeyB64 = btoa(
-    String.fromCharCode(...new Uint8Array(credential.publicKey)),
-  );
-  sql.exec(
-    "INSERT INTO passkey_credentials (credential_id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)",
-    credential.id,
-    userId,
-    pubKeyB64,
-    credential.counter,
-    JSON.stringify(response.response.transports ?? []),
-  );
+    // Store credential — base64 encode public key for SQLite TEXT column
+    const pubKeyB64 = btoa(
+      String.fromCharCode(...new Uint8Array(credential.publicKey)),
+    );
+    sql.exec(
+      "INSERT INTO passkey_credentials (credential_id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)",
+      credential.id,
+      userId,
+      pubKeyB64,
+      credential.counter,
+      JSON.stringify(response.response.transports ?? []),
+    );
 
-  // Clean up challenge
-  sql.exec(
-    "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
-    userId,
-  );
+    // Clean up challenge
+    sql.exec(
+      "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
+      userId,
+    );
 
-  return { verified: true, isAdmin: isFirstUser };
+    return { verified: true, isAdmin: isFirstUser };
+  });
 }
 
 // ── Authentication ──
