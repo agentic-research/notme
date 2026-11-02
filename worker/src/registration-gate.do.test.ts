@@ -17,6 +17,7 @@ import { env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { SoftwareAuthenticator } from "./__tests__/helpers/software-authenticator";
+import { ADMIN_SCOPES } from "./auth/admin-scopes";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
@@ -40,6 +41,9 @@ function registerOptions(body: unknown) {
 // it — the first user is established through the actual ceremony, with the
 // deployment's bootstrap code, exactly as an operator would.
 beforeAll(async () => {
+  // A real granter (review M2): an invite is honoured only while its inviter
+  // could still grant it. Not an authenticator — no passkey, no identity.
+  await authority().createPrincipalWithCapabilities("granter-principal", [...ADMIN_SCOPES]);
   const admin = await SoftwareAuthenticator.create("localhost", ORIGIN);
   const opts = await registerOptions({
     bootstrapCode: (env as { BOOTSTRAP_CODE?: string }).BOOTSTRAP_CODE,

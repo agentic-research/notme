@@ -411,7 +411,14 @@ function liveInvite(sql: any, token: string): InviteGrant | null {
   const invite = rows[0];
   if (invite.redeemed_at) return null;
   if (new Date(invite.expires_at) < new Date()) return null;
-  return { scopes: JSON.parse(invite.scopes), createdBy: invite.created_by };
+  const scopes = JSON.parse(invite.scopes) as string[];
+  // The inviter's CURRENT grants must still allow every scope (review M2).
+  // canGrant ran only at mint, so revoking an admin left their outstanding
+  // invites able to hand out what was just taken away. All-or-nothing: an
+  // invite is refused rather than silently narrowed.
+  const granter = getCapabilities(sql, invite.created_by);
+  if (!scopes.every((s) => canGrant(granter, s))) return null;
+  return { scopes, createdBy: invite.created_by };
 }
 
 /**

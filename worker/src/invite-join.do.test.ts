@@ -23,6 +23,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { SoftwareAuthenticator } from "./__tests__/helpers/software-authenticator";
 import { verifySessionCookie } from "./auth/session";
+import { ADMIN_SCOPES } from "./auth/admin-scopes";
 
 const ORIGIN = "http://localhost:8788";
 const RP_ID = "localhost";
@@ -87,11 +88,14 @@ async function scopesIn(res: Response): Promise<string[]> {
 }
 
 const invite = (scopes: string[]) =>
-  authority().createInviteToken("admin-under-test", scopes, 3600);
+  authority().createInviteToken("inviter", scopes, 3600);
 
 let adminCookie = "";
 
 beforeAll(async () => {
+  // The inviter really holds what its invites grant (review M2). Grants only:
+  // no passkey and no identity, so it is not an authenticator.
+  await authority().createPrincipalWithCapabilities("inviter", [...ADMIN_SCOPES]);
   // First user through the real ceremony, so every registration below is
   // an "everyone else" registration that needs an invite.
   const admin = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
@@ -237,6 +241,30 @@ describe("a reservation belongs to the browser that made it (review M1)", () => 
     const again = await options(inv.token);
     const ok = await verify(user, again);
     expect(ok.status, await ok.clone().text()).toBe(200);
+  });
+});
+
+describe("an invite is only as good as its inviter's CURRENT grants (review M2)", () => {
+  // canGrant ran once, when the invite was minted. Revoking the inviter left
+  // every invite they had already minted live for its whole lifetime — so a
+  // de-privileged admin's 7-day authorityManage link undid the revocation.
+  it("invite.consume.inviter-live — an inviter who lost authorityManage cannot have it consumed", async () => {
+    await authority().createPrincipalWithCapabilities("inviter-revoked", [...ADMIN_SCOPES]);
+    const inv = await authority().createInviteToken(
+      "inviter-revoked",
+      ["bridgeCert", "authorityManage"],
+      3600,
+    );
+    const o = await options(inv.token);
+    await authority().revokeCapability("inviter-revoked", "authorityManage", "test");
+
+    const user = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
+    const res = await verify(user, o);
+    expect(res.status).toBe(403);
+    expect(await authority().getPrincipalScopes(o.userId)).toEqual([]);
+    // …and it cannot be reserved again either.
+    const again = await post("/auth/passkey/register/options", { inviteToken: inv.token });
+    expect(again.status).toBe(403);
   });
 });
 

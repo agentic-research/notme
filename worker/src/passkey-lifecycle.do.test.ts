@@ -16,7 +16,8 @@
  * here, hardware could have produced.
  */
 import { env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { ADMIN_SCOPES } from "./auth/admin-scopes";
 import worker from "../worker";
 import { SoftwareAuthenticator } from "./__tests__/helpers/software-authenticator";
 import { verifySessionCookie } from "./auth/session";
@@ -97,6 +98,13 @@ async function scopesIn(cookie: string): Promise<string[]> {
   const s = await verifySessionCookie(raw, await authority().getSessionSecret());
   return s!.scopes;
 }
+
+// Invites are minted by a principal that really holds what they grant: since
+// review M2 an invite is honoured only while its inviter could still grant it.
+// No passkey, no linked identity — this principal is not an authenticator.
+beforeAll(async () => {
+  await authority().createPrincipalWithCapabilities("admin-under-test", [...ADMIN_SCOPES]);
+});
 
 describe("passkey lifecycle through the real routes", () => {
   it("first user: registers as a principal with admin GRANTS; revocation survives re-login", async () => {

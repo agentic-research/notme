@@ -473,11 +473,16 @@ describe("invites are inside the reset, and inside a ceiling (notme-2131e8)", ()
   // and expires_at and nothing else — so one did.
   it("invite.reset.revokes — an invite minted before resetPasskeyData cannot be redeemed after it", async () => {
     const stub = authority("bs-reset-revokes-invites");
+    // A real granter, so the invite is live on its own terms before the reset
+    // (an invite whose inviter cannot grant it is dead anyway — review M2 —
+    // which would make this test pass for the wrong reason).
+    await stub.createPrincipalWithCapabilities("pre-reset-admin", ["bridgeCert", "authorityManage"]);
     const invite = await stub.createInviteToken(
       "pre-reset-admin",
       ["bridgeCert", "authorityManage"],
       3600,
     );
+    expect(await stub.reserveInviteToken(invite.token, "pre-reset-probe")).not.toBeNull();
     await stub.resetPasskeyData();
     expect(await stub.reserveInviteToken(invite.token, "post-reset-stranger")).toBeNull();
   });
