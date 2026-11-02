@@ -2463,6 +2463,11 @@ export default {
           ttl?: number;
         };
         const scopes = body.scopes ?? ["bridgeCert"];
+        // The DO clamps the lifetime to INVITE_MAX_TTL_SECONDS (notme-2131e8);
+        // a ttl that is not a finite number is a caller error, not a 500.
+        if (body.ttl !== undefined && (typeof body.ttl !== "number" || !Number.isFinite(body.ttl))) {
+          return jsonErr("ttl must be a finite number of seconds", 400);
+        }
         // Delegated authorization — granter must hold authorityManage AND
         // the specific scope being granted. canGrant() is the single source
         // of truth for the predicate (was duplicated inline pre-rosary-8119d0).

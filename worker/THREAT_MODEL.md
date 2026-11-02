@@ -27,6 +27,15 @@
 | issuer spoofing          | unrecognized `iss` claim used to bypass JWKS routing                                                                                                  | `TRUSTED_ISSUERS` allowlist in verify-proof.ts (Google, GitHub Actions, auth.notme.bot)                                                                                                                                                                                                                                                                                                                                                                                       | covered via verify-proof's SSRF guard                                |
 | CA pem shape mismatch    | caller passes SPKI "PUBLIC KEY" to verifyX509 instead of "CERTIFICATE" — X509Certificate constructor throws and every legitimate x509 connection 401s | **FIXED (rosary-9b7d67)** — /connections now calls `getCACertificatePem()` (returns full X.509 CA cert) instead of `getPublicKeyPem()` (returns SPKI). Variable renamed from `caKey` to `caCertPem` for clarity. Test guards the dispatcher path.                                                                                                                                                                                                                             | `oidc.x509.ca-pem-shape`                                             |
 
+### 1c. invites (POST /invites, POST /join)
+
+An invite is a bearer way in: whoever holds the token gets the scopes it names, `authorityManage` included.
+
+| threat | attack | defense | test |
+| --- | --- | --- | --- |
+| invite outlives a reset | mint an `authorityManage` invite, then rely on it after `resetPasskeyData` wiped every passkey — a way in `#hasAuthenticator` does not count | **FIXED (notme-2131e8)** — `resetPasskeyData` deletes every unredeemed invite in the same call that wipes the credentials and rotates the session secret. Redeemed rows stay as the audit trail. | `invite.reset.revokes` |
+| unbounded invite lifetime | `POST /invites` with `ttl` of years — the TTL was caller-supplied and went straight into `expires_at` | **FIXED (notme-2131e8)** — `createInvite` clamps to `INVITE_MAX_TTL_SECONDS` (7 days, the ceiling the invite form already stated) and refuses a non-finite TTL; the route answers 400 for a non-numeric one. | `invite.ttl.ceiling`, `invite.ttl.finite` |
+
 ### 2. GHA OIDC cert exchange (POST /cert/gha)
 
 | threat            | attack                             | defense                                                | test                              |

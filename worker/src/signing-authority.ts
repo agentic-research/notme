@@ -3490,12 +3490,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // deletes from passkey_credentials, federated_identities, principals, or
   // invites. Two invariants currently rest on that being true:
   //
-  //   1. The known gap in #hasAuthenticator — that it does not count
-  //      outstanding invites — is UNREACHABLE, because reaching "no
+  //   1. #hasAuthenticator does not count outstanding invites. That is safe
+  //      because this method now REVOKES them (notme-2131e8): "reset" is
+  //      total, so it cannot leave a live authorityManage invite behind. It
+  //      was already unreachable before that, and still is: reaching "no
   //      authenticator but a live authorityManage invite" requires losing a
   //      credential, which requires this method, which requires consuming a
   //      bootstrap code, which requires already having no authenticator. The
-  //      transition is circular (notme-2131e8). That last step is now
+  //      transition is circular. The revocation is what keeps that from
+  //      mattering when the circularity breaks. That last step is now
   //      ENFORCED rather than emergent: consumeBootstrapCode refuses once
   //      anyone can authenticate. The circularity used to hold only because
   //      a consumed code stayed consumed, which is a weaker reason.
@@ -3525,6 +3528,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec("DELETE FROM passkey_credentials");
     this.ctx.storage.sql.exec("DELETE FROM passkey_users");
     this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
+
+    // Revoke every outstanding invite (notme-2131e8). An invite is a way in
+    // that #hasAuthenticator does not count, so a reset that left one live
+    // left a way in the predicate cannot see — an authorityManage invite
+    // outliving the wipe it was supposed to be inside. Redeemed rows stay:
+    // they are the audit trail of who joined by whom, not a way in.
+    ensurePrincipalSchema(this.ctx.storage.sql);
+    this.ctx.storage.sql.exec("DELETE FROM invites WHERE redeemed_at IS NULL");
 
     // Rotate the session secret, invalidating every cookie issued before
     // this reset. Without it a reset revoked NOTHING: the secret was minted

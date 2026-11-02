@@ -299,7 +299,8 @@ single-use, and scoped (the inviter chooses what capabilities the invitee gets).
 
 **Security properties:**
 - The invite URL is a bearer token -- anyone who has it can use it
-- Time-limited (configurable, default 1 hour)
+- Time-limited (configurable, default 1 hour, clamped to a 7-day ceiling —
+  `INVITE_MAX_TTL_SECONDS`, notme-2131e8)
 - Single-use (redeemed_at is set on first use)
 - Scoped (invitee cannot escalate beyond what the invite grants)
 - Auditable (created_by, redeemed_by tracked)
@@ -521,11 +522,12 @@ But delegation is always bounded by the grantor's own capabilities.
 
 An invite URL is a bearer token. If leaked, anyone can create an account with the
 granted scopes. Mitigations:
-- Short TTL (default 1 hour, configurable)
+- Short TTL (default 1 hour, configurable up to a 7-day ceiling)
 - Single-use
 - Scoped (invitee gets only what the invite specifies)
 - Auditable (created_by is recorded)
-- Revocable (delete the invite before it is redeemed)
+- Revoked wholesale by `/auth/passkey/reset`, which deletes every unredeemed
+  invite (notme-2131e8). There is no per-invite revoke route.
 
 ### Threat: OIDC issuer compromise
 

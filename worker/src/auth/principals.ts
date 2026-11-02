@@ -342,14 +342,30 @@ export function getFederatedIdentities(sql: any, principalId: string): Federated
 
 // ── Invites ──
 
-const INVITE_DEFAULT_TTL_SECONDS = 3600;
+export const INVITE_DEFAULT_TTL_SECONDS = 3600;
+
+/**
+ * The longest an invite may live: 7 days (notme-2131e8).
+ *
+ * An invite is a bearer way in — whoever holds the link gets the scopes it
+ * names, authorityManage included — so its lifetime is exposure. The TTL is
+ * caller-supplied and was unclamped. 168 hours is not a new number: it is
+ * the ceiling the invite form (public/_invite.html, max="168") has always
+ * stated; the API simply did not enforce it. Enforced HERE, in the one
+ * function that writes expires_at, so no route can forget it.
+ */
+export const INVITE_MAX_TTL_SECONDS = 7 * 24 * 3600;
 
 export function createInvite(
   sql: any, createdBy: string, scopes: string[], ttlSeconds = INVITE_DEFAULT_TTL_SECONDS,
 ): Invite {
   ensurePrincipalSchema(sql);
+  if (typeof ttlSeconds !== "number" || !Number.isFinite(ttlSeconds)) {
+    throw new Error("invite ttl must be a finite number of seconds");
+  }
+  const ttl = Math.min(ttlSeconds, INVITE_MAX_TTL_SECONDS);
   const token = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
   sql.exec(
     "INSERT INTO invites (token, created_by, scopes, expires_at) VALUES (?, ?, ?, ?)",
     token, createdBy, JSON.stringify(scopes), expiresAt,
