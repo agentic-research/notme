@@ -329,6 +329,50 @@ describe("consume and store are one transaction (review L1)", () => {
   });
 });
 
+describe("POST /join forwards only the headers it means to (review L3)", () => {
+  // The proof-less branch rebuilt the request with a DIFFERENT body
+  // ({"inviteToken":…} is longer than {"token":…}) but copied every original
+  // header — including the browser's Content-Length.
+  it("invite.join.forwarded-headers — a browser's Content-Length does not break the delegated request", async () => {
+    const inv = await invite(["bridgeCert"]);
+    const body = JSON.stringify({ token: inv.token });
+    const res = await worker.fetch(
+      new Request(`${ORIGIN}/join`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(new TextEncoder().encode(body).length),
+        },
+        body,
+      }),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(res.status, await res.clone().text()).toBe(200);
+    expect(((await res.json()) as Opts).userId).toBeTruthy();
+  });
+
+  it("invite.join.forwarded-headers — the client IP still reaches the registration rate limiter", async () => {
+    const inv = await invite(["bridgeCert"]);
+    const keys: string[] = [];
+    const res = await worker.fetch(
+      new Request(`${ORIGIN}/join`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9" },
+        body: JSON.stringify({ token: inv.token }),
+      }),
+      {
+        ...env,
+        ...LOCAL_ENV,
+        PASSKEY_LIMITER: {
+          limit: async ({ key }: { key: string }) => (keys.push(key), { success: true }),
+        },
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(keys).toEqual(["passkey:203.0.113.9"]);
+  });
+});
+
 describe("the invite token stays out of request URLs (notme-3dfe15 part 2)", () => {
   // Workers invocation logs (wrangler.toml [observability.logs]) record the
   // request URL. A link of the form /join?t=<token> therefore wrote a bearer

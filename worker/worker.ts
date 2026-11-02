@@ -2633,11 +2633,18 @@ export default {
         }
 
         if (!body.proof) {
+          // Forward ONLY what the delegate reads (review L3): the body is
+          // rebuilt and differs in length, so copying the original headers
+          // carried a stale Content-Length; cf-connecting-ip keys the
+          // registration rate limit.
+          const forwarded = new Headers({ "content-type": "application/json" });
+          const ip = request.headers.get("cf-connecting-ip");
+          if (ip) forwarded.set("cf-connecting-ip", ip);
           return handlePasskey(
             "/auth/passkey/register/options",
             new Request(new URL("/auth/passkey/register/options", request.url), {
               method: "POST",
-              headers: request.headers,
+              headers: forwarded,
               body: JSON.stringify({ inviteToken: body.token }),
             }),
             env,
