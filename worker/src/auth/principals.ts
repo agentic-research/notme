@@ -404,13 +404,21 @@ function liveInvite(sql: any, token: string): InviteGrant | null {
   ensurePrincipalSchema(sql);
   if (typeof token !== "string" || token === "") return null;
   const rows = sql.exec(
-    "SELECT scopes, created_by, expires_at, redeemed_at FROM invites WHERE token = ?", token,
-  ).toArray() as Array<{ scopes: string; created_by: string; expires_at: string; redeemed_at: string | null }>;
+    "SELECT scopes, created_by, created_at, expires_at, redeemed_at FROM invites WHERE token = ?", token,
+  ).toArray() as Array<{ scopes: string; created_by: string; created_at: string; expires_at: string; redeemed_at: string | null }>;
 
   if (rows.length === 0) return null;
   const invite = rows[0];
   if (invite.redeemed_at) return null;
   if (new Date(invite.expires_at) < new Date()) return null;
+  // The ceiling applies to EXISTING rows too (review M3). The clamp is in
+  // createInvite, so an invite minted before it with a years-long TTL — the
+  // population whose ?t= links sit in invocation logs — would otherwise stay
+  // live. created_at is SQLite's "YYYY-MM-DD HH:MM:SS" (UTC, whole seconds),
+  // hence the slack; an unparsable row fails closed.
+  const createdMs = Date.parse(invite.created_at.replace(" ", "T") + "Z");
+  const lifetimeMs = Date.parse(invite.expires_at) - createdMs;
+  if (!Number.isFinite(lifetimeMs) || lifetimeMs > (INVITE_MAX_TTL_SECONDS + 60) * 1000) return null;
   const scopes = JSON.parse(invite.scopes) as string[];
   // The inviter's CURRENT grants must still allow every scope (review M2).
   // canGrant ran only at mint, so revoking an admin left their outstanding

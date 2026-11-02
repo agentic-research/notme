@@ -18,7 +18,7 @@
  * stores the credential. A registration that holds no live reservation is
  * refused and stores nothing.
  */
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { SoftwareAuthenticator } from "./__tests__/helpers/software-authenticator";
@@ -265,6 +265,32 @@ describe("an invite is only as good as its inviter's CURRENT grants (review M2)"
     // …and it cannot be reserved again either.
     const again = await post("/auth/passkey/register/options", { inviteToken: inv.token });
     expect(again.status).toBe(403);
+  });
+});
+
+describe("invites minted before the ceiling are not grandfathered (review M3)", () => {
+  // The 7-day clamp lived only in createInvite, so an invite minted earlier
+  // with a years-long TTL stayed live — and those are exactly the invites
+  // whose /join?t= links were written into the invocation log.
+  it("invite.ttl.legacy-dead — an invite whose lifetime exceeds the ceiling is dead, whenever it was minted", async () => {
+    const token = crypto.randomUUID();
+    await runInDurableObject(authority(), async (_auth, state) => {
+      // A pre-fix row, written the way createInvite used to write it:
+      // created now, expiring in ten years.
+      state.storage.sql.exec(
+        "INSERT INTO invites (token, created_by, scopes, expires_at) VALUES (?, ?, ?, ?)",
+        token,
+        "inviter",
+        JSON.stringify(["bridgeCert", "authorityManage"]),
+        new Date(Date.now() + 10 * 365 * 24 * 3600 * 1000).toISOString(),
+      );
+    });
+    const res = await post("/auth/passkey/register/options", { inviteToken: token });
+    expect(res.status).toBe(403);
+
+    // The boundary: an invite minted AT the ceiling is still live.
+    const atCeiling = await authority().createInviteToken("inviter", ["bridgeCert"], 7 * 24 * 3600);
+    await options(atCeiling.token);
   });
 });
 

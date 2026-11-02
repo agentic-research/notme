@@ -24,4 +24,12 @@ describe("invite links carry the token in the fragment", () => {
   it("_login.html reads the invite token from location.hash", () => {
     expect(loginPage).toMatch(/location\.hash/);
   });
+
+  // Review M3: a ?t= link is one whose token was already written to a log.
+  // Honouring it kept that population usable from the page; the server has
+  // never read it since part 2. A logged token can still be PASTED, which is
+  // why liveInvite also kills any invite that outlives the 7-day ceiling.
+  it("_login.html no longer accepts a legacy ?t= token", () => {
+    expect(loginPage).not.toMatch(/urlParams\.get\(\s*['"]t['"]\s*\)/);
+  });
 });

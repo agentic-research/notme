@@ -217,14 +217,13 @@ if (returnTo.indexOf('/') !== 0 || returnTo.indexOf('//') === 0) returnTo = '/me
 
 // Invite token: from the URL FRAGMENT (/join#t=…), which the browser never
 // sends to the server, so it stays out of request logs (notme-3dfe15). A
-// legacy ?t= link is still honoured; either way the token is scrubbed from
-// the address bar and history once read.
+// legacy ?t= link is NOT honoured: its token already reached a log, so the
+// page will not treat it as an invitation (review M3). The fragment is
+// scrubbed from the address bar and history once read.
 var hashParams = new URLSearchParams(window.location.hash.slice(1));
-var inviteToken = hashParams.get('t') || urlParams.get('t');
+var inviteToken = hashParams.get('t');
 if (inviteToken && window.history && window.history.replaceState) {
-  urlParams.delete('t');
-  var q = urlParams.toString();
-  window.history.replaceState(null, '', window.location.pathname + (q ? '?' + q : ''));
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
 }
 if (inviteToken) {
   addLine('invite token detected.', 'info');
