@@ -269,6 +269,48 @@ export default {
 
 ## Enforcement guarantees
 
+> **CORRECTION (2026-11-02, `notme-c72e03`).** The isolation rows in the first
+> table (no `globalOutbound`, V8 isolate boundary, no disk bindings, service
+> binding as the only channel) are properties of the workerd config, not of
+> notme code, and are unchanged by this note. The "Escalate scope" row and the
+> flowchart below describe `AuthService.proxy()` (`worker/worker.ts`), which
+> is listed above as already implemented — and four of its five gates differ
+> from what that method does. What `proxy()` actually does, in order:
+>
+> 1. Throws `"not authenticated"` if no certs are held.
+> 2. Throws `"credentials expired — re-authenticate"` if the held certs have
+>    expired. Nothing re-authenticates transparently; the caller must call
+>    `authenticate()` again.
+> 3. Throws if `isDeniedDestination(url)` is true. That is a **denylist**, not
+>    an allowlist: three metadata hostnames (`169.254.169.254`,
+>    `metadata.google.internal`, `100.100.100.200`), any hostname starting
+>    `169.254.` or `fd00:`, and unparseable URLs. Every other destination is
+>    permitted.
+> 4. Throws unless the held cert's scopes include `bridgeCert`. This is a
+>    single capability check. The request carries no scopes, so there is no
+>    `request.scopes ⊆ cert.scopes` relation to check.
+> 5. Calls plain `fetch(url, { method, headers, body })`. The held P-256 cert
+>    is not attached; there is no mTLS on this path. (mTLS with the bridge key
+>    is what the Rust proxy in `proxy/` does; that is a different code path.)
+> 6. Logs a JSON line with `scope_checked: "bridgeCert"` and `allowed: true`.
+>    Both are constants: the log line is written only after the checks above
+>    passed, so it never records a denial.
+>
+> There is no epoch check in `proxy()`: it keeps working on certs from a
+> rotated-out epoch until they expire.
+>
+> Not yet:
+> - no destination allowlist (`proxy()` permits anything not on the denylist);
+> - no epoch / revocation check on held certs;
+> - no mTLS on outbound requests from `proxy()`;
+> - the IPv6 entries in the denylist do not match as written: `new URL()`
+>   returns an IPv6 literal's hostname in brackets (`[fd00:ec2::254]`), so the
+>   `startsWith("fd00:")` test never fires, and an IPv4-mapped literal such as
+>   `[::ffff:169.254.169.254]` (normalised to `[::ffff:a9fe:a9fe]`) is not
+>   caught by the `169.254.` test either.
+>
+> The table and flowchart below are kept as the original intent.
+
 ### What the agent CANNOT do
 
 | Action | Why it's blocked |
@@ -340,6 +382,12 @@ graph TD
 
 Cloud metadata endpoints are hard-denied (same approach as [nono](https://nono.sh)). The allowlist is configured at startup via environment variable.
 
+> **CORRECTION (2026-11-02, `notme-c72e03`).** No allowlist exists and no
+> environment variable configures one. Only the denied half is implemented,
+> as a hardcoded `DENIED_HOSTS` set plus `169.254.`/`fd00:` prefix tests in
+> `worker/worker.ts`; see the correction under "Enforcement guarantees" for
+> its IPv6 gap.
+
 ## Audit trail
 
 Every proxied request and signing operation is logged as structured JSON:
@@ -357,6 +405,11 @@ Every proxied request and signing operation is logged as structured JSON:
   "duration_ms": 145
 }
 ```
+
+> **Note (2026-11-02, `notme-c72e03`).** For `type: "proxy"` entries,
+> `scope_checked` and `allowed` are constants in the code that writes them;
+> a denied request throws before logging, so no entry ever has
+> `allowed: false`.
 
 These logs feed into APAS attestations — the identity service IS the execution evidence for the agent's session. Each proxy/sign event becomes a verifiable entry in the provenance chain.
 

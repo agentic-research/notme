@@ -464,8 +464,12 @@ export class AuthService extends WorkerEntrypoint<any> {
   }
 
   /**
-   * Proxy an HTTP request with mTLS using the held P-256 bridge cert.
-   * The agent Worker calls this instead of fetch() (which is disabled).
+   * Proxy an HTTP request for the agent Worker, which calls this instead of
+   * fetch() (which is disabled). Gates: held certs present and unexpired,
+   * destination not on the metadata denylist, `bridgeCert` scope held. The
+   * outbound request is a plain fetch — the held P-256 cert is NOT attached
+   * (no mTLS on this path), and there is no epoch check. ADR-009
+   * §"Enforcement guarantees" records the gap (notme-c72e03).
    */
   async proxy(request: {
     url: string;
