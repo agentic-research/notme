@@ -54,7 +54,7 @@ graph TD
     SIG002["signet ADR-002<br/>protocol spec"]:::external
     SIG007["signet ADR-007<br/>http-pop (CBOR/COSE sibling)"]:::external
     APAS["signet docs/apas<br/>agent provenance standard"]:::external
-    LL["ley-line-open / ley-line<br/>operadic substrate, workerd composition"]:::external
+    LL["ley-line-open + a private substrate<br/>operadic substrate, workerd composition"]:::external
 
     SIG004 --> A005
     SIG002 --> A006
@@ -109,9 +109,9 @@ they share a number because the plan is scoped to the design doc — keeping the
 ## where other design lives
 
 - **APAS spec** — moved to signet at `signet/docs/apas/agent-provenance-standard.md`. notme issues the Ed25519 signing certs that sign APAS attestations (008), but the spec itself is signet's.
-- **operadic substrate / workerd composition** — moved to ley-line:
+- **operadic substrate / workerd composition** — moved out of notme:
   - decade `ley-line-open-9d30ac` (operadic Merkle DAG over Σ — substrate-level)
-  - bead `ley-line-3278b4` (workerd-specific composition)
+  - the workerd-specific composition is tracked in a private substrate repo
   - notme-side mTLS-injector chunk-spec stays in this repo as a future ADR (bead `notme-e005a8`)
 - **top-level architecture** — [`../ARCHITECTURE.md`](../ARCHITECTURE.md). subsystem map, data flow, file-level pointers.
 - **threat model** — [`../worker/THREAT_MODEL.md`](../worker/THREAT_MODEL.md). every row links to the test that defends it. cross-references ADR-005 (principal model), ADR-006 (DPoP JTI replay), ADR-007 (key extraction invariants), ADR-008 (cert chain), and ADR-009 (proxy boundary).
