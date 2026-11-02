@@ -128,6 +128,23 @@ describe("receipt signing — real SigningAuthority (ADR-014)", () => {
     expect(res.code).toBe("EPOCH_MISMATCH");
   });
 
+  it("refuses a backdated or postdated timestamp against the authority's own clock", async () => {
+    // notme-ad2a7a, at the real boundary. The unit suite injects nowMs; this
+    // proves the DO actually supplies its clock rather than anything the
+    // caller sent. Otherwise a compromised binding holder backfills a
+    // fabricated history of validly-signed receipts across years.
+    const stub = authority();
+    const facts = await stub.getReceiptFacts();
+    for (const timestampMs of [0, Date.now() - 86_400_000, Date.now() + 86_400_000]) {
+      const res = await stub.signReceiptCommitment(
+        commitment(facts, { timestampMs }),
+      );
+      expect(res.ok, `timestamp_ms=${timestampMs} was signed`).toBe(false);
+      if (res.ok) return;
+      expect(res.code).toBe("TIMESTAMP_OUT_OF_RANGE");
+    }
+  });
+
   it("refuses an X.509 TBSCertificate body at the real boundary", async () => {
     // The forgery ADR-014 exists to prevent, asserted where it would actually
     // happen rather than only against the validator in isolation.

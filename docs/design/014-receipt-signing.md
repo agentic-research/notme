@@ -120,6 +120,28 @@ rather than signing what it was told. The wire shape is unchanged — a correct
 caller sends correct values and nothing happens — but a lying one is refused
 instead of served.
 
+### `timestamp_ms` is bounded to notme's clock
+
+`timestamp_ms` is caller-chosen, but notme has a clock, so it is checked:
+anything outside **±300s** of the authority's `Date.now()` is refused with
+`TIMESTAMP_OUT_OF_RANGE` (notme-ad2a7a). The window is RECEIPTS.md §2.2.1
+step 12's, the one a conformant peer already applies against its own clock.
+A tighter window would reject receipts every conformant verifier accepts.
+
+Without the bound, a compromised binding holder could date a fabricated
+receipt anywhere from 1970 to year 287396 and get a valid master-key
+signature on it. With it, a fabrication can only be dated to the window in
+which the attacker actually held the binding.
+
+**Residual, structurally unboundable.** Even with the clamp, a compromised
+binding holder still chooses `nonce`, `request_hash`, `body_hash` and
+`headers_hash` freely. They describe a request notme never sees, so notme has
+nothing to check them against. Within the time window, then, a compromised
+binding holder can mint a validly signed receipt for a request that never
+happened, and an offline auditor can't tell it from a genuine one. Bounding
+that takes the binding itself: who holds it, and notme's own record of when
+it was used.
+
 ## What is deliberately not built
 
 - **No `/internal/sign-jwt`** (notme-d87ef2). Identical hazard class and it

@@ -72,6 +72,9 @@ to publish the tag.
   Code already fails closed (751d082, `worker/worker.ts:1768-1769`); the
   hostless-scheme cases are now pinned in `authority-host.test.ts`.
 - notme-ad2a7a: an unbounded `timestamp_ms` lets a binding holder backdate.
+  Code already clamps to ±300s of the authority clock (e1ab2cd,
+  `worker/src/receipts/commitment.ts`); now also pinned at the DO boundary,
+  with the residual stated in ADR-014.
 - notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
   there's a binding-version oracle.
 - notme-1629fe: the canonical fixture gate has no integrity anchor.
