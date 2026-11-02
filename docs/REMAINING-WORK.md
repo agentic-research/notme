@@ -69,6 +69,8 @@ to publish the tag.
   the URL; the invite is consumed before the passkey verifies.
 - notme-2131e8: invites survive a passkey reset and have no TTL ceiling.
 - notme-159805: `authorityHostFromEnv` returns `""` for a hostless URL.
+  Code already fails closed (751d082, `worker/worker.ts:1768-1769`); the
+  hostless-scheme cases are now pinned in `authority-host.test.ts`.
 - notme-ad2a7a: an unbounded `timestamp_ms` lets a binding holder backdate.
 - notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
   there's a binding-version oracle.
