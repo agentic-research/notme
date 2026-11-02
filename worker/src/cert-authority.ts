@@ -861,6 +861,12 @@ export function certTaskScope(cert: {
  *              an expired parent fails at first use
  *   POSSESSION the private key must match the tier certificate's public key;
  *              the producer refuses to sign with a key that is not the tier's
+ *   CRITERIA   task ⊆ tier (notme-bdc850): the task's `.1.10` is one its tier
+ *              grants, or both are absent (legacy); within the definition's
+ *              mintedBy, lifetime and scope ceiling; a subtask carries its
+ *              parent's; llo-run/1 is refused until phase 5. Each refusal is
+ *              the reason checkCriteria gives, and the result is run through
+ *              checkCriteria before it is returned
  *
  * Epoch is the caller's to supply because the machine is offline: it stamps
  * the epoch it enrolled under, and a rotation since then is caught by the
@@ -890,10 +896,18 @@ export async function mintTaskCertPair(
      * revoking by prefix reaches everything derived from a task.
      */
     parent?: string;
+    /**
+     * The criteria this task is minted under (notme-bdc850), stamped as
+     * `.1.10`. Required when the tier carries `.1.10`, refused when it does
+     * not; one of the tier's, and for a subtask, the parent's.
+     */
+    criteria?: Criteria;
   },
 ): Promise<BridgeCertPairResult> {
   const { X509Certificate, SubjectAlternativeNameExtension } = await import("@peculiar/x509");
   const { narrowScopes, escalatedScopes } = await import("./auth/scope-chain");
+  // Lazy for the same reason as in mintIssuingCaCert.
+  const { CRITERIA, checkCriteria, criteriaId, encodeCriteria, readCriteria } = await import("./criteria");
   const tier = new X509Certificate(tierCertPem);
 
   // Possession: the private key must be the tier's. Sign a probe and verify
@@ -928,6 +942,7 @@ export async function mintTaskCertPair(
   let boundScopes = tierScopes;
   let boundNotAfter = tier.notAfter.getTime();
   let boundName = "the tier";
+  let parentCert: InstanceType<typeof X509Certificate> | null = null;
   if (opts.parent !== undefined) {
     let parent: InstanceType<typeof X509Certificate>;
     try {
@@ -960,6 +975,7 @@ export async function mintTaskCertPair(
     boundScopes = parentScopes;
     boundNotAfter = parent.notAfter.getTime();
     boundName = "the parent task";
+    parentCert = parent;
   }
 
   const requested = [...new Set(opts.scopes)];
@@ -996,12 +1012,46 @@ export async function mintTaskCertPair(
   }
   const ttlMs = Math.min(requestedTtl, untilTierExpiry, boundNotAfter - Date.now());
 
+  // Criteria: task ⊆ tier, in checkCriteria's order and with its reasons.
+  const tierCriteria = readCriteria(tier);
+  if (tierCriteria.present && !tierCriteria.ok) throw new Error("malformed criteria on tier");
+  if (tierCriteria.present && !opts.criteria) throw new Error("tier carries criteria; the task names none");
+  if (!tierCriteria.present && opts.criteria) throw new Error("task claims criteria its tier does not carry");
+  if (opts.criteria) {
+    const id = criteriaId(opts.criteria);
+    const def = CRITERIA.get(id);
+    if (!def) throw new Error(`unknown criteria ${id}`);
+    if (def.mintedBy === "authority") throw new Error(`${id} is minted by the authority only`);
+    if (tierCriteria.present && !tierCriteria.list.some((c) => criteriaId(c) === id)) {
+      throw new Error(`task criteria ${id} is not granted by its tier`);
+    }
+    if (parentCert) {
+      const p = readCriteria(parentCert);
+      if (!p.present || !p.ok || p.list.length !== 1 || criteriaId(p.list[0]!) !== id) {
+        throw new Error("a subtask carries its parent's criteria");
+      }
+    }
+    if (def.requiresConfinementDigest) {
+      throw new Error(
+        `${id} needs the run's confinementDigest from the LLO host; supplied from phase 5 (notme-bdffc7)`,
+      );
+    }
+    // ceil(x) > n iff x > n for an integer n: refused exactly when ttlMs / 1000 > maxLifetimeS.
+    const spanS = Math.ceil(ttlMs / 1000);
+    if (spanS > def.maxLifetimeS) {
+      throw new Error(`${id} allows at most ${def.maxLifetimeS}s, this certificate spans ${spanS}s`);
+    }
+    for (const s of scopes) {
+      if (!def.scopeCeiling.has(s)) throw new Error(`${id} does not allow scope ${s}`);
+    }
+  }
+
   const authMethodExt = tier.getExtension(OID_AUTH_METHOD);
   const authMethod = authMethodExt
     ? new TextDecoder().decode(new Uint8Array(authMethodExt.value).subarray(2))
     : "task";
 
-  return mintBridgeCertPair(
+  const minted = await mintBridgeCertPair(
     taskPath,
     identity,
     mtlsPublicKeyPem,
@@ -1016,9 +1066,20 @@ export async function mintTaskCertPair(
       // A task is exercised by the same agent the tier names; the task scope
       // bounds WHAT it may do, it does not make the task a separate kind.
       principalKind: "agent",
-      extraExtensions: [new Extension(OID_TASK_SCOPE, false, derTaskScope(taskPath, opts.goalHash))],
+      extraExtensions: [
+        new Extension(OID_TASK_SCOPE, false, derTaskScope(taskPath, opts.goalHash)),
+        ...(opts.criteria ? [new Extension(OID_CRITERIA, false, encodeCriteria([opts.criteria]))] : []),
+      ],
     },
   );
+
+  // Self-check: the producer never hands out a certificate its own verifier
+  // refuses.
+  for (const pem of [minted.certificates.signing, minted.certificates.mtls]) {
+    const verdict = checkCriteria(tier, new X509Certificate(pem));
+    if (!verdict.ok) throw new Error(verdict.reason);
+  }
+  return minted;
 }
 
 /** Scopes at OID_SCOPES — a local reader so this module has no import cycle with verify-chain. */

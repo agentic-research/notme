@@ -14,7 +14,7 @@
  * `confinementDigest` is LLO's "what the run may touch"; neither derives from
  * the other. This module only checks `.1.7` is present, never its contents.
  */
-import { OID_CRITERIA, OID_PEN, derTlv, derUtf8String, readScopes } from "./cert-authority";
+import { OID_CRITERIA, OID_PEN, OID_SCOPES, derTlv, derUtf8String, readScopes } from "./cert-authority";
 import { CERT_ELIGIBLE_SCOPES } from "./auth/passkey-cert-scopes";
 
 export interface Criteria {
@@ -239,7 +239,11 @@ export function checkCriteria(
   if (spanS > def.maxLifetimeS) {
     return refuse(`${id} allows at most ${def.maxLifetimeS}s, this certificate spans ${spanS}s`);
   }
-  for (const s of readScopes(leaf) ?? []) {
+  // An absent .1.3 carries no scopes; a present one that does not parse is
+  // refused, never read as zero scopes (which would pass the ceiling).
+  const leafScopes = leaf.getExtension(OID_SCOPES) ? readScopes(leaf) : [];
+  if (leafScopes === null) return refuse("malformed scopes on leaf");
+  for (const s of leafScopes) {
     if (!def.scopeCeiling.has(s)) return refuse(`${id} does not allow scope ${s}`);
   }
   if (def.requiresConfinementDigest && !leaf.getExtension(OID_CONFINEMENT_DIGEST)) {

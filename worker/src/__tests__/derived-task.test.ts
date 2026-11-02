@@ -14,6 +14,7 @@ import { X509Certificate, X509CertificateGenerator, BasicConstraintsExtension, K
 import { describe, expect, it } from "vitest";
 import { certTaskScope, mintIssuingCaCert, mintTaskCertPair } from "../cert-authority";
 import { ED25519 } from "../platform";
+import { checkCriteria, type Criteria } from "../criteria";
 
 const GOAL_A = "a".repeat(64);
 const GOAL_B = "b".repeat(64);
@@ -25,7 +26,7 @@ async function pubPem(k: CryptoKey) {
 const ed = () => crypto.subtle.generateKey(ED25519, true, ["sign", "verify"]) as Promise<CryptoKeyPair>;
 const p256 = () => crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]) as Promise<CryptoKeyPair>;
 
-async function tier(scopes = ["bridgeCert", "sign:git"]) {
+async function tier(scopes = ["bridgeCert", "sign:git"], criteria?: Criteria[]) {
   const root = await ed();
   await X509CertificateGenerator.createSelfSigned({
     name: "CN=signet-authority,O=notme", notBefore: new Date(Date.now() - 864e5), notAfter: new Date(Date.now() + 864e5),
@@ -34,13 +35,14 @@ async function tier(scopes = ["bridgeCert", "sign:git"]) {
   });
   const tk = await ed();
   const t = await mintIssuingCaCert("alice", "wimse://notme.bot/principal/alice", await pubPem(tk.publicKey), root.privateKey,
-    { scopes, epoch: 1, authMethod: "passkey" });
+    { scopes, epoch: 1, authMethod: "passkey", criteria });
   return { pem: t.certificate, key: tk.privateKey };
 }
 
-async function task(t: { pem: string; key: CryptoKey }, name: string, opts: { scopes?: string[]; ttlMs?: number; parent?: string; goalHash?: string } = {}) {
+async function task(t: { pem: string; key: CryptoKey }, name: string, opts: { scopes?: string[]; ttlMs?: number; parent?: string; goalHash?: string; criteria?: Criteria } = {}) {
   return mintTaskCertPair(t.pem, t.key, await pubPem((await p256()).publicKey), await pubPem((await ed()).publicKey), {
     task: name, goalHash: opts.goalHash ?? GOAL_A, scopes: opts.scopes ?? ["bridgeCert"], epoch: 1, ttlMs: opts.ttlMs, parent: opts.parent,
+    criteria: opts.criteria,
   });
 }
 
@@ -114,5 +116,46 @@ describe("a re-mint is the same task, again", () => {
     const b = await task(t, "rosary-056d96");
     expect(b.identity).toBe(a.identity);
     expect(new X509Certificate(b.certificates.signing).serialNumber).not.toBe(new X509Certificate(a.certificates.signing).serialNumber);
+  });
+});
+
+describe("a subtask of a criteria task carries exactly its parent's criteria (Review Focus 3)", () => {
+  const AS: Criteria = { name: "agent-session", version: 1 };
+  const LLO: Criteria = { name: "llo-run", version: 1 };
+
+  it("matching criteria: minted, and checks ok against the tier", async () => {
+    const t = await tier(undefined, [AS]);
+    const p = await task(t, "build", { criteria: AS });
+    const c = await task(t, "compile", { parent: p.certificates.signing, criteria: AS });
+    expect(checkCriteria(new X509Certificate(t.pem), new X509Certificate(c.certificates.signing))).toEqual({
+      ok: true, criteria: AS, legacy: false,
+    });
+  });
+
+  it("missing criteria under a criteria parent is refused", async () => {
+    const t = await tier(undefined, [AS]);
+    const p = await task(t, "build", { criteria: AS });
+    await expect(task(t, "compile", { parent: p.certificates.signing })).rejects.toThrow(/^tier carries criteria; the task names none$/);
+  });
+
+  it("different criteria from the parent is refused, even one the tier grants", async () => {
+    // A tier granting two; the parent picked agent-session/1. The child may not switch.
+    const t = await tier(undefined, [AS, LLO]);
+    const p = await task(t, "build", { criteria: AS });
+    await expect(task(t, "compile", { parent: p.certificates.signing, criteria: LLO })).rejects.toThrow(
+      /^a subtask carries its parent's criteria$/,
+    );
+  });
+
+  it("a legacy parent requires a legacy child", async () => {
+    const t = await tier();
+    const p = await task(t, "build");
+    const c = await task(t, "compile", { parent: p.certificates.signing });
+    expect(checkCriteria(new X509Certificate(t.pem), new X509Certificate(c.certificates.signing))).toEqual({
+      ok: true, criteria: null, legacy: true,
+    });
+    await expect(task(t, "compile", { parent: p.certificates.signing, criteria: AS })).rejects.toThrow(
+      /^task claims criteria its tier does not carry$/,
+    );
   });
 });

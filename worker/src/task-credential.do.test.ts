@@ -10,7 +10,8 @@
  */
 import { X509Certificate, X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
-import { mintIssuingCaCert, mintTaskCertPair, certTaskScope } from "./cert-authority";
+import { mintIssuingCaCert, mintTaskCertPair, certTaskScope, OID_CRITERIA } from "./cert-authority";
+import { checkCriteria, encodeCriteria, type Criteria } from "./criteria";
 import { ED25519 } from "./platform";
 import { verifyCertChain } from "./auth/verify-chain";
 import { correlationKey, parseCorrelationKey, taskCorrelationKey } from "./auth/correlation-key";
@@ -25,7 +26,7 @@ const genP256 = async () => (await crypto.subtle.generateKey({ name: "ECDSA", na
 const MACHINE_ID = "wimse://notme.bot/passkey/alice";
 const GOAL = "a".repeat(64);
 
-async function machine(tierScopes = ["bridgeCert", "sign:git"]) {
+async function machine(tierScopes = ["bridgeCert", "sign:git"], criteria?: Criteria[]) {
   const ca = await gen();
   const rootCert = await X509CertificateGenerator.createSelfSigned({
     name: "CN=signet-authority,O=notme",
@@ -35,7 +36,7 @@ async function machine(tierScopes = ["bridgeCert", "sign:git"]) {
   });
   const keys = await gen();
   const tier = await mintIssuingCaCert("alice", MACHINE_ID, await pem(keys.publicKey), ca.privateKey,
-    { scopes: tierScopes, epoch: 1, authMethod: "passkey" });
+    { scopes: tierScopes, epoch: 1, authMethod: "passkey", criteria });
   return { rootPem: rootCert.toString("pem"), keys, tier };
 }
 
@@ -226,5 +227,80 @@ describe("a tier past its own notAfter cannot mint (pause/resume)", () => {
     const taskExp = new X509Certificate(task.certificates.mtls).notAfter.getTime();
     expect(taskExp).toBeLessThanOrEqual(tierExp);
     expect(taskExp).toBeGreaterThan(Date.now()); // genuinely usable, not a corpse
+  });
+});
+
+describe("criteria: the minter refuses criteria its tier did not grant (notme-bdc850)", () => {
+  const AS: Criteria = { name: "agent-session", version: 1 };
+  const LLO: Criteria = { name: "llo-run", version: 1 };
+  const DEP: Criteria = { name: "deploy", version: 1 };
+  const mint = async (m: Awaited<ReturnType<typeof machine>>, o: { criteria?: Criteria; scopes?: string[]; ttlMs?: number } = {}) => {
+    const k = await taskKeys();
+    return mintTaskCertPair(m.tier.certificate, m.keys.privateKey, k.mtlsPem, k.signingPem, {
+      task: "bead-1", goalHash: GOAL, scopes: o.scopes ?? ["bridgeCert"], epoch: 1, ttlMs: o.ttlMs, criteria: o.criteria,
+    });
+  };
+
+  it("an honest mint under an agent-session/1 tier stamps .1.10 and checks as not legacy", async () => {
+    const m = await machine(undefined, [AS]);
+    const task = await mint(m, { criteria: AS, scopes: ["sign:git"] });
+    const tier = new X509Certificate(m.tier.certificate);
+    for (const pem of [task.certificates.signing, task.certificates.mtls]) {
+      const c = new X509Certificate(pem);
+      const ext = c.getExtension(OID_CRITERIA)!;
+      expect(ext.critical).toBe(false);
+      expect(new Uint8Array(ext.value)).toEqual(encodeCriteria([AS]));
+      expect(checkCriteria(tier, c)).toEqual({ ok: true, criteria: AS, legacy: false });
+    }
+  });
+
+  it("a legacy tier with no criteria mints a task that checks as legacy", async () => {
+    const m = await machine();
+    const task = await mint(m);
+    const c = new X509Certificate(task.certificates.signing);
+    expect(c.getExtension(OID_CRITERIA)).toBeNull();
+    expect(checkCriteria(new X509Certificate(m.tier.certificate), c)).toEqual({ ok: true, criteria: null, legacy: true });
+  });
+
+  it("rule 6: the tier carries criteria and the task names none", async () => {
+    const m = await machine(undefined, [AS]);
+    await expect(mint(m)).rejects.toThrow(/^tier carries criteria; the task names none$/);
+  });
+
+  it("rule 5: the task names criteria its tier does not carry", async () => {
+    const m = await machine();
+    await expect(mint(m, { criteria: AS })).rejects.toThrow(/^task claims criteria its tier does not carry$/);
+  });
+
+  it("rule 9: criteria not in the tier's list", async () => {
+    const m = await machine(undefined, [AS]);
+    await expect(mint(m, { criteria: LLO })).rejects.toThrow(/^task criteria llo-run\/1 is not granted by its tier$/);
+  });
+
+  it("rule 8: deploy/1 is the authority's to mint, never a tier's", async () => {
+    const m = await machine(undefined, [DEP]);
+    await expect(mint(m, { criteria: DEP })).rejects.toThrow(/^deploy\/1 is minted by the authority only$/);
+  });
+
+  it("llo-run/1 is refused until LLO supplies the confinementDigest", async () => {
+    const m = await machine(undefined, [LLO]);
+    await expect(mint(m, { criteria: LLO })).rejects.toThrow(
+      "llo-run/1 needs the run's confinementDigest from the LLO host; supplied from phase 5 (notme-bdffc7)",
+    );
+  });
+
+  it("rule 10: a lifetime past the criteria's maximum", async () => {
+    const m = await machine(undefined, [AS]);
+    await expect(mint(m, { criteria: AS, ttlMs: 301_000 })).rejects.toThrow(
+      /^agent-session\/1 allows at most 300s, this certificate spans 301s$/,
+    );
+    await expect(mint(m, { criteria: AS, ttlMs: 300_000 })).resolves.toBeDefined();
+  });
+
+  it("rule 11: a scope the tier holds but the criteria's ceiling does not", async () => {
+    const m = await machine(["bridgeCert", "certMint"], [AS]);
+    await expect(mint(m, { criteria: AS, scopes: ["certMint"] })).rejects.toThrow(
+      /^agent-session\/1 does not allow scope certMint$/,
+    );
   });
 });

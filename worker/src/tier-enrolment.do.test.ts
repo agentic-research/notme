@@ -265,7 +265,8 @@ describe("end to end: a task certificate, minted offline, chains to the root", (
       e.key.kp.privateKey,
       await pem(mtls.publicKey),
       await pem(signing.publicKey),
-      { task: "notme-486e8a", goalHash, scopes: ["bridgeCert"], epoch: tierRes.authority.epoch },
+      // A new enrollment's tier carries agent-session/1, so the task must name it.
+      { task: "notme-486e8a", goalHash, scopes: ["bridgeCert"], epoch: tierRes.authority.epoch, criteria: { name: "agent-session", version: 1 } },
     );
 
     const root = new X509Certificate(await authority().getCACertificatePem());

@@ -24,7 +24,7 @@ const seq = (...parts: Uint8Array[]) => derTlv(0x30, new Uint8Array(parts.flatMa
 interface Spec {
   spanS?: number;
   criteria?: Uint8Array | { name: string; version: number }[];
-  scopes?: string[];
+  scopes?: string[] | Uint8Array;
   confinement?: boolean;
 }
 
@@ -34,7 +34,10 @@ async function mk(spec: Spec = {}) {
     const der = spec.criteria instanceof Uint8Array ? spec.criteria : encodeCriteria(spec.criteria);
     exts.push(new x509.Extension(OID_CRITERIA, false, der));
   }
-  if (spec.scopes) exts.push(new x509.Extension(OID_SCOPES, false, scopesDer(spec.scopes)));
+  if (spec.scopes) {
+    const der = spec.scopes instanceof Uint8Array ? spec.scopes : scopesDer(spec.scopes);
+    exts.push(new x509.Extension(OID_SCOPES, false, der));
+  }
   if (spec.confinement) exts.push(new x509.Extension(OID_CONFINEMENT, false, new Uint8Array([0x04, 0x01, 0x00])));
   return x509.X509CertificateGenerator.createSelfSigned({
     serialNumber: "01",
@@ -245,6 +248,22 @@ describe("checkCriteria rules", () => {
       ok: false,
       reason: "deploy/1 does not allow scope sign:git",
     });
+  });
+
+  it("rule 11: a malformed .1.3 is refused, not read as zero scopes", async () => {
+    const tier = await mk({ criteria: [AS] });
+    // An OCTET STRING where the SEQUENCE OF UTF8String belongs: readScopes gives null.
+    expect(checkCriteria(tier, await mk({ criteria: [AS], scopes: new Uint8Array([0x04, 0x01, 0x00]) }))).toEqual({
+      ok: false,
+      reason: "malformed scopes on leaf",
+    });
+    // A SEQUENCE holding a non-UTF8String element.
+    expect(checkCriteria(tier, await mk({ criteria: [AS], scopes: seq(new Uint8Array([0x02, 0x01, 0x01])) }))).toEqual({
+      ok: false,
+      reason: "malformed scopes on leaf",
+    });
+    // An absent .1.3 is unchanged.
+    expect(checkCriteria(tier, await mk({ criteria: [AS] }))).toEqual({ ok: true, criteria: AS, legacy: false });
   });
 
   it("rule 12: llo-run requires .1.7", async () => {
