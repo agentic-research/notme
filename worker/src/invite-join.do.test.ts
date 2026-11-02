@@ -66,6 +66,8 @@ async function scopesIn(res: Response): Promise<string[]> {
 const invite = (scopes: string[]) =>
   authority().createInviteToken("admin-under-test", scopes, 3600);
 
+let adminCookie = "";
+
 beforeAll(async () => {
   // First user through the real ceremony, so every registration below is
   // an "everyone else" registration that needs an invite.
@@ -75,7 +77,9 @@ beforeAll(async () => {
   });
   expect(res.status, await res.clone().text()).toBe(200);
   const o = (await res.json()) as Opts;
-  expect((await verify(admin, o)).status).toBe(200);
+  const v = await verify(admin, o);
+  expect(v.status).toBe(200);
+  adminCookie = v.headers.get("set-cookie")!.split(";")[0]!;
 });
 
 describe("invite reserve-then-consume (notme-3dfe15 parts 4/5)", () => {
@@ -160,5 +164,32 @@ describe("invite reserve-then-consume (notme-3dfe15 parts 4/5)", () => {
     expect(res.headers.get("set-cookie")).toBeNull();
     // Still usable.
     await options(inv.token);
+  });
+});
+
+describe("the invite token stays out of request URLs (notme-3dfe15 part 2)", () => {
+  // Workers invocation logs (wrangler.toml [observability.logs]) record the
+  // request URL. A link of the form /join?t=<token> therefore wrote a bearer
+  // credential — authorityManage, possibly — into the log of every request
+  // that opened it. A URL FRAGMENT is never sent to the server, so the
+  // browser keeps it and POSTs it in a body, which is not logged.
+  it("invite.link.fragment — POST /invites returns a link with the token in the fragment, not the query", async () => {
+    const res = await post("/invites", { scopes: ["bridgeCert"] }, adminCookie);
+    expect(res.status, await res.clone().text()).toBe(200);
+    const { token, url } = (await res.json()) as { token: string; url: string };
+    const u = new URL(url);
+    expect(u.pathname).toBe("/join");
+    expect(u.search).toBe("");
+    expect(u.hash).toBe(`#t=${token}`);
+  });
+
+  it("invite.link.fragment — GET /join serves the page without a token in the query", async () => {
+    const res = await worker.fetch(new Request(`${ORIGIN}/join`), {
+      ...env,
+      ...LOCAL_ENV,
+      ASSETS: { fetch: async (r: Request) => new Response(`asset:${new URL(r.url).pathname}`) },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("asset:/_login");
   });
 });

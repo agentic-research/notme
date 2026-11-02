@@ -126,14 +126,16 @@
           '<p class="err">' + (body.error ?? res.status) + "</p>";
         return;
       }
-      const code = body.code ?? body.invite ?? body.token ?? "";
-      const url = new URL("/join", location.origin);
-      if (code) url.searchParams.set("code", code);
+      // The server's link, verbatim: it carries the token in the FRAGMENT
+      // (/join#t=…), which never reaches a server log (notme-3dfe15). This
+      // page used to build its own link with ?code=, which both put the
+      // token in the query and named a parameter /join never read.
+      const url = body.url;
       out.innerHTML =
         "<p>Send this to the person you are inviting. It expires, and it is " +
         "single-use.</p><span id='link'></span>" +
         "<p class='sub'>Scopes: <code>" + scopes.join(", ") + "</code></p>";
-      document.getElementById("link").textContent = url.toString();
+      document.getElementById("link").textContent = url;
     } catch (err) {
       out.innerHTML = '<p class="err">' + err.message + "</p>";
     } finally {

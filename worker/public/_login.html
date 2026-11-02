@@ -215,8 +215,17 @@ var returnTo = urlParams.get('return_to') || '/me';
 // Safety: only allow same-origin paths (no open redirect)
 if (returnTo.indexOf('/') !== 0 || returnTo.indexOf('//') === 0) returnTo = '/me';
 
-// Check for invite token in URL
-var inviteToken = urlParams.get('t');
+// Invite token: from the URL FRAGMENT (/join#t=…), which the browser never
+// sends to the server, so it stays out of request logs (notme-3dfe15). A
+// legacy ?t= link is still honoured; either way the token is scrubbed from
+// the address bar and history once read.
+var hashParams = new URLSearchParams(window.location.hash.slice(1));
+var inviteToken = hashParams.get('t') || urlParams.get('t');
+if (inviteToken && window.history && window.history.replaceState) {
+  urlParams.delete('t');
+  var q = urlParams.toString();
+  window.history.replaceState(null, '', window.location.pathname + (q ? '?' + q : ''));
+}
 if (inviteToken) {
   addLine('invite token detected.', 'info');
   addLine('register a passkey or paste an oidc token to join.', 'dim');

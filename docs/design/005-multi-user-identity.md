@@ -278,7 +278,9 @@ The deployer's principal gets all three capability grants:
 ```
 1. Existing user (with authorityManage scope) creates an invite:
    POST /invites { scopes: ["bridgeCert"], ttl: 3600 }
-   -> returns { token: "a1b2c3d4...", url: "https://auth.example.com/join?t=a1b2c3d4" }
+   -> returns { token: "a1b2c3d4...", url: "https://auth.example.com/join#t=a1b2c3d4" }
+      (token in the fragment, never the query: a fragment is not sent to the
+      server, so it stays out of request logs -- notme-3dfe15)
 
 2. Inviter shares the URL (text message, email, QR code -- out of band)
 

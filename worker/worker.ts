@@ -2500,7 +2500,10 @@ export default {
         const host = request.headers.get("host") || "auth.notme.bot";
         return Response.json({
           token: invite.token,
-          url: `https://${host}/join?t=${invite.token}`,
+          // The token rides in the FRAGMENT, which a browser never sends to
+          // the server (notme-3dfe15). As ?t= it was written into the
+          // invocation log of every request that opened the link.
+          url: `https://${host}/join#t=${invite.token}`,
           expiresAt: invite.expiresAt,
           scopes,
         });
@@ -2567,11 +2570,10 @@ export default {
         }
       }
 
-      // GET /join?t=<token> — redeem an invite (shows registration page)
+      // GET /join#t=<token> — the invite landing page. The token is in the
+      // fragment, so this request does not carry it (and must not require
+      // it); the page reads it from location.hash and POSTs it to /join.
       if (pathname === "/join" && request.method === "GET") {
-        const token = new URL(request.url).searchParams.get("t");
-        if (!token) return jsonErr("missing invite token", 400);
-        // Serve the login page — it will handle the invite token
         const baseUrl = env.SITE_URL || "https://notme.bot";
         return env.ASSETS.fetch(new Request(`${baseUrl}/_login`));
       }

@@ -17,6 +17,7 @@
     "src/__tests__/ct-log-client.test.ts",
     "src/__tests__/verify-ct-log.test.ts",
     "src/__tests__/criteria.test.ts",
+    "src/__tests__/invite-link-pages.test.ts",
     "../scripts/verify-ct-log.ts"
   ],
   "exclude": ["node_modules"]
