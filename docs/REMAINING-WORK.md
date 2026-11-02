@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 76 in notme (`rsry status --json` →
+**Updated:** 2026-11-02 · **Open beads:** 72 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -24,10 +24,13 @@ feel finished rather than merely argued.
 
 ## Stage 0: in flight now
 
-- **notme-bdc850**, mint path phase 2 (criteria in the certificate). Plan:
-  `docs/superpowers/plans/2026-11-02-mint-path-phase-2-criteria.md`. All five
-  tasks are committed on `goalzero`, and the mutation check passed. It awaits
-  review and merge; see stage 3.
+- **notme-2131e8 and notme-3dfe15** (invites and `/join`, H1) are being
+  worked in a side branch.
+- **Done today:**
+  - phase 2, notme-bdc850 (see stage 3);
+  - the P1 proxy IPv6 fix, notme-bad2e5 (daa3ab2);
+  - notme-159805 and notme-ad2a7a: the code was already fixed; the missing
+    tests were added (c40a134, a37e4b2).
 - **The doc-drift batch** merged 2026-11-02 (0b584d5). Ten beads closed with
   their commits. Two stay open, each with what remains:
   - notme-8fb37f: the alarm tests are weak;
@@ -53,8 +56,8 @@ them.
 6. **notme-229dc3:** apply for the IANA PEN (**owner**, then days to weeks at
    IANA), then swap `1.3.6.1.4.1.99999` for the assigned arc. This also
    removes the shared-arc collisions.
-7. **The stage 2 gate:** the release tag waits on the six live-path security
-   fixes and the release-pipeline fixes (stage 2 groups H1 and H2).
+7. **The stage 2 gate:** the release tag waits on the remaining live-path
+   security fixes and the release-pipeline fixes (stage 2 groups H1 and H2).
 8. **notme-cf288e → tag → notme-8e8836:** promote staging → canary →
    production (`task ship-prod`, **owner**), then cut the tag. The signed
    trust anchor (8e8836) closes when the release job signs it from that tag.
@@ -75,13 +78,6 @@ to publish the tag.
 - notme-3dfe15: `/join` — no server-issued OIDC nonce; the invite token is in
   the URL; the invite is consumed before the passkey verifies.
 - notme-2131e8: invites survive a passkey reset and have no TTL ceiling.
-- notme-159805: `authorityHostFromEnv` returns `""` for a hostless URL.
-  Code already fails closed (751d082, `worker/worker.ts:1768-1769`); the
-  hostless-scheme cases are now pinned in `authority-host.test.ts`.
-- notme-ad2a7a: an unbounded `timestamp_ms` lets a binding holder backdate.
-  Code already clamps to ±300s of the authority clock (e1ab2cd,
-  `worker/src/receipts/commitment.ts`); now also pinned at the DO boundary,
-  with the residual stated in ADR-014.
 - notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
   there's a binding-version oracle.
 - notme-1629fe: the canonical fixture gate has no integrity anchor.
@@ -99,6 +95,7 @@ to publish the tag.
 **H3, correctness and hygiene.** Doesn't gate the tag.
 - notme-baea8c: `proxy()` lacks ADR-009's promised gates.
 - notme-8fb37f: the alarm-defence tests are weak.
+- notme-2098f4: `readScopes` doesn't check lengths.
 - notme-7aa6dd, notme-7ec6fb, notme-c0db9b, notme-32003c, notme-32270b,
   notme-c071be, notme-3ee3b0, notme-230b40, notme-131c8e.
 - CT: notme-a806d0 (warn before the shard closes); notme-afa9d8 (per-cert
@@ -112,8 +109,8 @@ What exists:
 - copies detected at renewal (phase 1);
 - **landed: phase 2 (notme-bdc850)**, criteria in the cert (`.1.10`),
   enforced at mint and in `task-cert verify`. Commits b06b8ea, b0e9fd8,
-  ad1ada8, 2a5dd9b and d9f863e, plus the review-fix commit
-  `[notme-bdc850] fix(task-cert): the legacy cutoff never silently turns off; …`. It settles
+  ad1ada8, 2a5dd9b and d9f863e, plus the review-fix commit 6db9196.
+  It settles
   **notme-1a5465**: the goal hash and confinementDigest are different facts
   (spec §12, decision 4).
 
@@ -169,12 +166,19 @@ Listed so the count doesn't creep up unnoticed:
   notme-ea76bb, notme-9087aa, and ten doc-drift beads: notme-3ef3af,
   notme-8e6863, notme-a040c1, notme-be5691, notme-c006aa, notme-c07956,
   notme-c72e03, notme-c16e0d, notme-c7819f, notme-ae3130.
+- **Closed by work (2026-11-02):** notme-bad2e5, notme-159805, notme-ad2a7a,
+  notme-bdc850, notme-1a5465.
 - **Filed from the doc-drift batch (2026-11-02):**
   - notme-bad2e5 and notme-baea8c (proxy gaps);
   - a gen/go scope-check note, added to notme-ea5c65 rather than filed as a
     new bead;
   - notme-8fb37f, kept open (weak tests).
-- **Expected:** one signet bead, for `signet verify` enforcing `.1.10`
-  (phase 2 Task 5).
+- **From the phase 2 final review (2026-11-02):** one new bead,
+  notme-2098f4. The other deferred items became comments on beads that
+  already own the area: notme-bdffc7, notme-bdeeb5, notme-070a8f,
+  notme-229dc3.
+- **Not filed:** the signet enforcement bead already existed
+  (signet-be49b9). It now has the final encoding and a testable close
+  condition, and notme-bdffc7 depends on it.
 
 Each is added here as it's filed.
