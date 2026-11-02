@@ -66,8 +66,12 @@ to publish the tag.
 
 **H1, live-path security.** This gates the release tag.
 - notme-3dfe15: `/join` — no server-issued OIDC nonce; the invite token is in
-  the URL; the invite is consumed before the passkey verifies.
+  the URL; the invite is consumed before the passkey verifies. Parts 4/5
+  (reserve, then consume on verify) and 2 (token in the fragment) are fixed
+  on `fix/h1-invites-join`; part 1 (the nonce) is open — GitHub Actions
+  tokens take no nonce, so binding one is an audience-contract decision.
 - notme-2131e8: invites survive a passkey reset and have no TTL ceiling.
+  Fixed on `fix/h1-invites-join` (reset revokes; 7-day ceiling).
 - notme-159805: `authorityHostFromEnv` returns `""` for a hostless URL.
 - notme-ad2a7a: an unbounded `timestamp_ms` lets a binding holder backdate.
 - notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
