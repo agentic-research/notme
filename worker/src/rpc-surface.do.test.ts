@@ -361,7 +361,8 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //             already do both (createPrincipalWithCapabilities,
       //             linkFederatedId), so no new capability class; it also
       //             refuses an identity that is already linked, which
-      //             linkFederatedId does not.
+      //             linkFederatedId did not until review I1 (it now throws
+      //             on an existing link instead of moving it).
       //
       // 63 → 65: registrationIsFirstUser, beginFirstUserRegistration
       // (review L2). Reviewed:

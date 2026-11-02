@@ -325,7 +325,11 @@ export function linkFederatedIdentity(
   ensurePrincipalSchema(sql);
   const id = crypto.randomUUID();
   sql.exec(
-    "INSERT OR REPLACE INTO federated_identities (id, principal_id, provider, provider_sub, provider_email) VALUES (?, ?, ?, ?, ?)",
+    // Plain INSERT, not OR REPLACE (review I1): UNIQUE(provider, provider_sub)
+    // made "replace" MOVE an identity that already belonged to someone onto
+    // this principal. An existing link now throws; no caller relied on
+    // re-pointing.
+    "INSERT INTO federated_identities (id, principal_id, provider, provider_sub, provider_email) VALUES (?, ?, ?, ?, ?)",
     id, principalId, provider, providerSub, providerEmail ?? null,
   );
 }

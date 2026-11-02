@@ -19,7 +19,12 @@ import { beforeAll, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { SoftwareAuthenticator } from "./__tests__/helpers/software-authenticator";
 import { ADMIN_SCOPES } from "./auth/admin-scopes";
-import { createPrincipal, grantCapability, linkFederatedIdentity } from "./auth/principals";
+import {
+  createPrincipal,
+  findPrincipalByFederated,
+  grantCapability,
+  linkFederatedIdentity,
+} from "./auth/principals";
 import { verifySessionCookie } from "./auth/session";
 
 const ORIGIN = "http://localhost:8788";
@@ -100,5 +105,22 @@ describe("first-user standing comes from who can administer (review L2)", () => 
     // passkey the authority had ever seen.
     expect(s!.scopes).toEqual(["bridgeCert"]);
     expect(await authority().getPrincipalScopes(userId)).toEqual(["bridgeCert"]);
+  });
+});
+
+describe("a federated link is never silently moved (review I1)", () => {
+  // linkFederatedIdentity was INSERT OR REPLACE on UNIQUE(provider,
+  // provider_sub): linking an identity that already belonged to someone
+  // re-pointed it at the new principal. POST /join guards against that with
+  // a 409, but the linkFederatedId RPC called it unguarded.
+  it("federated.link.no-replace — linking an identity owned by another principal fails and leaves the owner in place", async () => {
+    await runInDurableObject(authority(), async (_auth, state) => {
+      const sql = state.storage.sql;
+      createPrincipal(sql, "usurper", undefined, "test");
+      const iss = "https://token.actions.githubusercontent.com";
+      const sub = "repo:example/deploy:ref:refs/heads/main"; // oidc-admin's
+      expect(() => linkFederatedIdentity(sql, "usurper", iss, sub)).toThrow();
+      expect(findPrincipalByFederated(sql, iss, sub)).toBe("oidc-admin");
+    });
   });
 });
