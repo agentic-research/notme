@@ -202,4 +202,25 @@ describe("site claims stay coupled to what the code does", () => {
       ).toBe(false);
     }
   });
+
+  it("puts no number in the homepage stat block without a source link", () => {
+    // notme-8639dd: two hero tiles (9/10, 21%) had no source, date or link,
+    // and a third ("0 open-source agent identity standards") contradicted
+    // ADR-020. A stat a sceptical reader cannot check discredits the
+    // accurate claims below it, so every tile must carry a .stat-src link.
+    const index = pages.find((p) => p.name === "index.html");
+    expect(index, "index.html not found").toBeDefined();
+    const block = index!.text.match(/<div class="stats">([\s\S]*?)\n        <\/div>/);
+    expect(block, "homepage .stats block not found").toBeTruthy();
+    const tiles = block![1]!.split('<div class="stat">').slice(1);
+    expect(tiles.length).toBeGreaterThan(0);
+    for (const tile of tiles) {
+      const num = tile.match(/class="stat-num[^"]*">([^<]+)</)?.[1] ?? "?";
+      expect(
+        /<a class="stat-src" href="[^"]+">[^<]+<\/a>/.test(tile),
+        `index.html stat tile "${num}" has no .stat-src link. Cite where the ` +
+          `number comes from, or remove the tile.`,
+      ).toBe(true);
+    }
+  });
 });
