@@ -5,7 +5,7 @@
 # 007: Secretless Local Proxy
 
 **Status:** Partially implemented (audited 2026-08-04)
-**Bead:** notme-ae3130 (open — Platform interface in this doc differs from the implementation)
+**Bead:** notme-ae3130 (Platform interface and Files-changed drift — resolved: the interface block and file list below match `worker/src/platform.ts` as of 2026-11-02)
 
 > **AUDIT NOTE (2026-08-04).** This doc had no Status line, so it read as a
 > live problem statement with no indication which problems were solved. State
