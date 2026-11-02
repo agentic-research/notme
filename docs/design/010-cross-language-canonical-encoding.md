@@ -136,6 +136,18 @@ The closed loop currently works (JSON ↔ JSON within notme), so a sudden swap r
 >
 > The wiring gap itself is `notme-8d3018`; choosing the revocation mechanism
 > is `notme-77a024`.
+>
+> **Amended 2026-11-02.** Two code facts in the correction above have moved.
+> (a) `isBundleStale` now has a second production caller: since 2026-08-27
+> `ensureCurrentCABundle` (`worker/src/internal-ca-bundle.ts`) checks a cached
+> bundle's staleness at the read and **regenerates** a stale one rather than
+> serving it. That keeps the serving path from handing out an old bundle; it
+> is not a revocation check, and it does not fail closed — it does not refuse
+> anything. (b) The ordering dependency now lives at the `BUNDLE_REFRESH_MS`
+> definition in `worker/src/signing-authority.ts` (about line 288), not line 88.
+> The substance stands: `checkRevocation` still has no in-worker caller, so the
+> fail-closed property the decision cited is still not exercised by any
+> request path in this worker.
 
 If/when notme has production deployments with persistent signed bundles that pre-date this migration, switch to strategy (A) before bumping CBOR alignment further. The CABundle `signatureFormat` discriminant remains a future option (deferred to a follow-on ADR or a re-revisited (A) path); not implemented in this landing.
 
