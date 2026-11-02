@@ -303,11 +303,13 @@ export default {
 > - no destination allowlist (`proxy()` permits anything not on the denylist);
 > - no epoch / revocation check on held certs;
 > - no mTLS on outbound requests from `proxy()`;
-> - the IPv6 entries in the denylist do not match as written: `new URL()`
->   returns an IPv6 literal's hostname in brackets (`[fd00:ec2::254]`), so the
->   `startsWith("fd00:")` test never fires, and an IPv4-mapped literal such as
->   `[::ffff:169.254.169.254]` (normalised to `[::ffff:a9fe:a9fe]`) is not
->   caught by the `169.254.` test either.
+> - (fixed, `notme-bad2e5`) the IPv6 gap in the denylist: `new URL()` keeps
+>   brackets on IPv6 hostnames, so the old `startsWith("fd00:")` test never
+>   fired and IPv4-mapped literals slipped through. The policy now lives in
+>   `worker/src/destination-policy.ts`, strips brackets, parses addresses to
+>   bytes, and denies fe80::/10, fc00::/7, 169.254.0.0/16 and IPv4-mapped /
+>   IPv4-compatible forms of denied IPv4s; covered by
+>   `worker/src/__tests__/destination-policy.test.ts`.
 >
 > The table and flowchart below are kept as the original intent.
 
@@ -384,9 +386,9 @@ Cloud metadata endpoints are hard-denied (same approach as [nono](https://nono.s
 
 > **CORRECTION (2026-11-02, `notme-c72e03`).** No allowlist exists and no
 > environment variable configures one. Only the denied half is implemented,
-> as a hardcoded `DENIED_HOSTS` set plus `169.254.`/`fd00:` prefix tests in
-> `worker/worker.ts`; see the correction under "Enforcement guarantees" for
-> its IPv6 gap.
+> as a hardcoded `DENIED_HOSTS` set plus IPv4/IPv6 range checks in
+> `worker/src/destination-policy.ts` (the earlier IPv6 gap, `notme-bad2e5`,
+> is fixed; see the note under "Enforcement guarantees").
 
 ## Audit trail
 

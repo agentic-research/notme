@@ -73,8 +73,6 @@ to publish the tag.
 - notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
   there's a binding-version oracle.
 - notme-1629fe: the canonical fixture gate has no integrity anchor.
-- notme-bad2e5 (P1): IPv6 hosts bypass the `proxy()` metadata denylist.
-  `[fd00:ec2::254]` and `[::ffff:a9fe:a9fe]` both get through.
 
 **H2, a trustworthy release pipeline and gates.** This gates the release tag.
 - notme-16b2d5: `worker:promote` has no gate.

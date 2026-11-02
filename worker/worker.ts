@@ -45,13 +45,6 @@ type HeldCerts = {
   expiresAt: number;
 };
 
-// Cloud metadata endpoints — hard-denied, not configurable
-const DENIED_HOSTS = new Set([
-  "169.254.169.254", // AWS/GCP metadata
-  "metadata.google.internal", // GCP metadata
-  "100.100.100.200", // Alibaba metadata
-]);
-
 // Audience allowlist — every endpoint that mints an access token must check
 // the requested audience against this set. Hoisted to module scope so /token
 // and /authorize/token (and any future minting route) share one source of
@@ -65,20 +58,7 @@ import { principalIdentity } from "./src/cert-authority";
 import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
 import { buildInfo } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
-
-function isDeniedDestination(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    if (DENIED_HOSTS.has(parsed.hostname)) return true;
-    // fd00:ec2::254 and other IPv6 metadata
-    if (parsed.hostname.startsWith("fd00:")) return true;
-    // Link-local IPv4
-    if (parsed.hostname.startsWith("169.254.")) return true;
-    return false;
-  } catch {
-    return true; // unparseable URL = denied
-  }
-}
+import { isDeniedDestination } from "./src/destination-policy";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
