@@ -14,8 +14,9 @@
 > path and no `client_credentials` grant. What ships is `POST /token`, which
 > mints DPoP-bound tokens (RFC 9449) for a first-party session cookie and,
 > as the one advertised grant, RFC 8693 token exchange with a GitHub Actions
-> OIDC subject token (`AUTHORITY_GRANT_TYPES`, `worker/src/as-metadata.ts`). The proposed `token.ts` line and open
-> question 4 inherited the false premise; both are annotated below.
+> OIDC subject token (`AUTHORITY_GRANT_TYPES`, `worker/src/as-metadata.ts`).
+> The proposed `token.ts` line and open question 4 inherited the false
+> premise; both are annotated below.
 **Companion reading:** [Cloudflare "OAuth for All" (2026-06)](https://blog.cloudflare.com/oauth-for-all/)
 
 > **Client registration: replacement PROPOSED in [ADR-022](./022-client-registration.md) (status: proposed, 2026-10-26).** ADR-022 proposes replacing the apps registry below (`client_id` / `client_secret` rows, `apps-registry.ts`, open question 2) with Client ID Metadata Documents, with DCR accepted and stored as notme-hosted CIMD and no client secrets. Until ADR-022 is accepted, this ADR's registry design stands as written; nothing in this banner is implemented. Consent, introspection and revocation remain this ADR's scope either way.
