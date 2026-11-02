@@ -421,6 +421,10 @@ function b64ToBytes(b64: string): Uint8Array {
   return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
 
+async function sha256Hex(s: string): Promise<string> {
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s))));
+}
+
 function hex(b: Uint8Array): string {
   return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
 }
@@ -3245,20 +3249,34 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     response: any,
     rpId: string,
     origin: string,
+    /** The reservation secret from the browser's HttpOnly cookie (review M1). */
+    reservationSecret?: string,
   ): Promise<{ verified: boolean; isAdmin: boolean; refused?: true }> {
     const { verifyRegistration } = await import("./auth/passkey");
-    return verifyRegistration(
-      userId,
-      displayName,
-      response,
-      rpId,
-      origin,
-      this.ctx.storage.sql,
-      // transactionSync: the redeem, the principal and its grants commit
-      // together or not at all, even if one of the writes throws.
-      (isFirstUser) =>
-        this.ctx.storage.transactionSync(() => this.#admitRegistration(userId, isFirstUser)),
-    );
+    // Hashed BEFORE the ceremony, so the admit block below stays synchronous.
+    const secretHash = reservationSecret ? await sha256Hex(reservationSecret) : "";
+    try {
+      return await verifyRegistration(
+        userId,
+        displayName,
+        response,
+        rpId,
+        origin,
+        this.ctx.storage.sql,
+        // transactionSync: the redeem, the principal and its grants commit
+        // together or not at all, even if one of the writes throws.
+        (isFirstUser) =>
+          this.ctx.storage.transactionSync(() =>
+            this.#admitRegistration(userId, isFirstUser, secretHash),
+          ),
+      );
+    } catch (e: any) {
+      // A failed ceremony is an answer, not an exception to ship across RPC
+      // (review M1): verifier messages can name the expected challenge, and
+      // a thrown message is what the route used to hand back to the caller.
+      console.error("[passkey] registration verify failed:", e?.message);
+      return { verified: false, isAdmin: false };
+    }
   }
 
   /**
@@ -3279,7 +3297,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * gate lived only at options, so the bridgeCert fallback in
    * ensurePasskeyPrincipal admitted any verified registration that slipped it.
    */
-  #admitRegistration(userId: string, isFirstUser: boolean): boolean {
+  #admitRegistration(userId: string, isFirstUser: boolean, secretHash: string): boolean {
     if (isFirstUser) return true;
     const sql = this.ctx.storage.sql;
     this.#ensureClaimSchema();
@@ -3291,7 +3309,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ),
     ];
     if (n > 0) return true;
-    const invite = consumeInviteReservation(sql, userId);
+    const invite = consumeInviteReservation(sql, userId, secretHash);
     if (!invite) return false;
     createPrincipal(sql, userId, undefined, invite.createdBy);
     for (const scope of invite.scopes) {
@@ -3365,9 +3383,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async reserveInviteToken(
     token: string,
     userId: string,
-  ): Promise<{ scopes: string[] } | null> {
-    const invite = reserveInvite(this.ctx.storage.sql, token, userId);
-    return invite ? { scopes: invite.scopes } : null;
+  ): Promise<{ scopes: string[]; secret: string } | null> {
+    // The secret goes to the reserving browser in an HttpOnly cookie and is
+    // required at verify (review M1); only its hash is stored here.
+    const secret = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const invite = reserveInvite(this.ctx.storage.sql, token, userId, await sha256Hex(secret));
+    return invite ? { scopes: invite.scopes, secret } : null;
   }
 
   /**

@@ -354,6 +354,8 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //             is consumed only inside passkeyVerifyRegistration, by a
       //             credential that verified. A stub holder needs the invite
       //             token to reserve, and with it could already register.
+      //             It returns a fresh reservation secret (review M1) — the
+      //             caller's own, binding only the reservation it just made.
       //   joinInviteWithFederated — redeems an invite and links an identity
       //             the caller claims to have verified. A stub holder could
       //             already do both (createPrincipalWithCapabilities,

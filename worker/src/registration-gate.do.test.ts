@@ -90,10 +90,12 @@ describe("registration is gated (notme-2c4209)", () => {
       options: { challenge: string };
     };
     const user = await SoftwareAuthenticator.create("localhost", ORIGIN);
+    // The reservation cookie options set (review M1), carried as a browser would.
+    const rsv = /notme_invite_reservation=[^;,\s]+/.exec(res.headers.get("set-cookie") ?? "")?.[0] ?? "";
     const verify = await worker.fetch(
       new Request(`${ORIGIN}/auth/passkey/register/verify`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", cookie: rsv },
         body: JSON.stringify({ userId, response: await user.register(options.challenge) }),
       }),
       { ...env, ...LOCAL_ENV },

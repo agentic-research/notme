@@ -1012,6 +1012,7 @@ async function handlePasskey(
       // Scopes come from the INVITE, never from the request: a caller that
       // could name its own scopes would make the gate decorative.
       let invitedScopes: string[] | null = null;
+      let reservationSecret: string | null = null;
       if (!result.isFirstUser) {
         if (!body.inviteToken) {
           return jsonErr(
@@ -1031,6 +1032,7 @@ async function handlePasskey(
           return jsonErr("invalid, expired or already-used invite", 403);
         }
         invitedScopes = reserved.scopes;
+        reservationSecret = reserved.secret;
       }
 
       // Deployer gets all; an invited user gets exactly what the invite says.
@@ -1038,7 +1040,18 @@ async function handlePasskey(
         ? [...(await import("./src/auth/admin-scopes")).ADMIN_SCOPES]
         : (invitedScopes ?? ["bridgeCert"]);
 
-      return Response.json({ ...result, userId, scopes });
+      const res = Response.json({ ...result, userId, scopes });
+      if (reservationSecret) {
+        // The reservation belongs to THIS browser (review M1): verify must
+        // present the secret, and HttpOnly keeps it out of page script, so
+        // learning the userId and challenge is no longer enough to finish
+        // someone else's ceremony.
+        res.headers.append(
+          "Set-Cookie",
+          `${INVITE_RESERVATION_COOKIE}=${reservationSecret}; Path=/auth/passkey/register; HttpOnly; Secure; SameSite=Strict; Max-Age=300`,
+        );
+      }
+      return res;
     }
 
     if (pathname === "/auth/passkey/register/verify") {
@@ -1056,6 +1069,7 @@ async function handlePasskey(
         body.response,
         host,
         origin,
+        parseCookie(request.headers.get("cookie") || "", INVITE_RESERVATION_COOKIE) ?? undefined,
       );
       if (result.refused) {
         // Verified, but not authorized: no live invite reservation (another
@@ -1136,8 +1150,10 @@ async function handlePasskey(
           origin,
         );
       } catch (verifyErr: any) {
+        // Logged, not returned: verifier messages can carry the expected
+        // challenge (review M1).
         console.error("[passkey] verify error:", verifyErr.message);
-        return jsonErr("verification error: " + verifyErr.message, 400);
+        return jsonErr("verification error", 400);
       }
       if (!result.verified || !result.userId) {
         return jsonErr(
@@ -1177,9 +1193,16 @@ async function handlePasskey(
 
     return jsonErr("not found", 404);
   } catch (e: any) {
-    return jsonErr(e.message || "passkey error", 500);
+    // A constant body (review M1). @simplewebauthn's challenge-mismatch error
+    // names the EXPECTED challenge, so returning e.message handed the secret
+    // half of an in-flight ceremony to anyone who sent a wrong one.
+    console.error("[passkey] error:", e?.message);
+    return jsonErr("passkey error", 500);
   }
 }
+
+/** HttpOnly cookie binding an invite reservation to the reserving browser (review M1). */
+const INVITE_RESERVATION_COOKIE = "notme_invite_reservation";
 
 function parseCookie(cookieHeader: string, name: string): string | null {
   const match = cookieHeader

@@ -69,10 +69,14 @@ async function register(
     userId: string;
     options: { challenge: string };
   };
-  const verify = await post("/auth/passkey/register/verify", {
-    userId,
-    response: await auth.register(options.challenge),
-  });
+  // An invited registration is bound to the browser that reserved it
+  // (review M1): carry the reservation cookie options set, as a browser would.
+  const rsv = /notme_invite_reservation=[^;,\s]+/.exec(opts.headers.get("set-cookie") ?? "")?.[0];
+  const verify = await post(
+    "/auth/passkey/register/verify",
+    { userId, response: await auth.register(options.challenge) },
+    rsv,
+  );
   expect(verify.status, await verify.clone().text()).toBe(200);
   return { cookie: cookieOf(verify), principalId: userId };
 }

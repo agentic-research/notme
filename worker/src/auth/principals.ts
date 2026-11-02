@@ -147,13 +147,24 @@ export function ensurePrincipalSchema(sql: any): void {
   `);
   // notme-3dfe15: one row per in-flight passkey registration started under an
   // invite. Never a grant by itself — see reserveInvite.
+  //
+  // secret_hash: SHA-256 (hex) of the reservation secret held ONLY in the
+  // reserving browser's HttpOnly cookie. Consumption requires it, so knowing
+  // the userId and challenge is not enough to finish someone else's
+  // ceremony. A row without one ('' — a pre-column row) can never be consumed.
   sql.exec(`
     CREATE TABLE IF NOT EXISTS invite_reservations (
-      user_id    TEXT PRIMARY KEY,
-      token      TEXT NOT NULL,
-      expires_at INTEGER NOT NULL
+      user_id     TEXT PRIMARY KEY,
+      token       TEXT NOT NULL,
+      expires_at  INTEGER NOT NULL,
+      secret_hash TEXT NOT NULL DEFAULT ''
     )
   `);
+  try {
+    sql.exec("ALTER TABLE invite_reservations ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''");
+  } catch {
+    /* column exists */
+  }
 }
 
 // ── Principal CRUD ──
@@ -436,31 +447,42 @@ export function redeemInvite(sql: any, token: string, redeemedBy: string): Invit
 /** Same window as a registration challenge (passkey.ts, 5 minutes). */
 export const INVITE_RESERVATION_TTL_SECONDS = 300;
 
-/** Reserve `token` for registration `userId`. null when the invite is not live. */
-export function reserveInvite(sql: any, token: string, userId: string): InviteGrant | null {
+/**
+ * Reserve `token` for registration `userId`, bound to the browser holding the
+ * secret whose SHA-256 is `secretHash` (review M1). null when the invite is
+ * not live.
+ */
+export function reserveInvite(
+  sql: any, token: string, userId: string, secretHash: string,
+): InviteGrant | null {
   const invite = liveInvite(sql, token);
   const now = Math.floor(Date.now() / 1000);
   sql.exec("DELETE FROM invite_reservations WHERE expires_at <= ?", now);
-  if (!invite) return null;
+  if (!invite || !secretHash) return null;
   sql.exec(
-    "INSERT OR REPLACE INTO invite_reservations (user_id, token, expires_at) VALUES (?, ?, ?)",
-    userId, token, now + INVITE_RESERVATION_TTL_SECONDS,
+    "INSERT OR REPLACE INTO invite_reservations (user_id, token, expires_at, secret_hash) VALUES (?, ?, ?, ?)",
+    userId, token, now + INVITE_RESERVATION_TTL_SECONDS, secretHash,
   );
   return invite;
 }
 
 /**
  * Consume `userId`'s reservation: redeem the invite it names, for `userId`.
- * The reservation is deleted whether or not consumption succeeds. null when
- * there is no live reservation or the invite is no longer live.
+ * Requires the reserving browser's secret (as its SHA-256): without it the
+ * reservation is left alone — so a caller who merely knows the userId can
+ * neither use it nor cancel it — and null is returned. With it, the
+ * reservation is deleted whether or not the invite is still live.
  */
-export function consumeInviteReservation(sql: any, userId: string): InviteGrant | null {
+export function consumeInviteReservation(
+  sql: any, userId: string, secretHash: string,
+): InviteGrant | null {
   ensurePrincipalSchema(sql);
   const rows = sql.exec(
-    "SELECT token, expires_at FROM invite_reservations WHERE user_id = ?", userId,
-  ).toArray() as Array<{ token: string; expires_at: number }>;
-  sql.exec("DELETE FROM invite_reservations WHERE user_id = ?", userId);
+    "SELECT token, expires_at, secret_hash FROM invite_reservations WHERE user_id = ?", userId,
+  ).toArray() as Array<{ token: string; expires_at: number; secret_hash: string }>;
   if (rows.length === 0) return null;
+  if (!secretHash || rows[0].secret_hash === "" || rows[0].secret_hash !== secretHash) return null;
+  sql.exec("DELETE FROM invite_reservations WHERE user_id = ?", userId);
   if (rows[0].expires_at <= Math.floor(Date.now() / 1000)) return null;
   return redeemInvite(sql, rows[0].token, userId);
 }

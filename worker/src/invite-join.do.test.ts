@@ -42,19 +42,42 @@ function post(path: string, body: unknown, cookie?: string) {
   );
 }
 
-type Opts = { userId: string; options: { challenge: string }; scopes: string[] };
+type Opts = {
+  userId: string;
+  options: { challenge: string };
+  scopes: string[];
+  /** The reservation cookie the browser was handed, if any (review M1). */
+  rsv?: string;
+};
+
+/** The `name=value` of the invite-reservation cookie a response set, if any. */
+function rsvCookie(res: Response): string | undefined {
+  const sc = res.headers.get("set-cookie") ?? "";
+  const m = /notme_invite_reservation=[^;,\s]+/.exec(sc);
+  return m?.[0];
+}
+
+async function asOpts(res: Response): Promise<Opts> {
+  return { ...((await res.json()) as Opts), rsv: rsvCookie(res) };
+}
 
 async function options(inviteToken: string): Promise<Opts> {
   const res = await post("/auth/passkey/register/options", { inviteToken });
   expect(res.status, await res.clone().text()).toBe(200);
-  return (await res.json()) as Opts;
+  return asOpts(res);
 }
 
-async function verify(auth: SoftwareAuthenticator, o: Opts, challenge = o.options.challenge) {
-  return post("/auth/passkey/register/verify", {
-    userId: o.userId,
-    response: await auth.register(challenge),
-  });
+async function verify(
+  auth: SoftwareAuthenticator,
+  o: Opts,
+  challenge = o.options.challenge,
+  cookie: string | undefined = o.rsv,
+) {
+  return post(
+    "/auth/passkey/register/verify",
+    { userId: o.userId, response: await auth.register(challenge) },
+    cookie,
+  );
 }
 
 async function scopesIn(res: Response): Promise<string[]> {
@@ -91,6 +114,11 @@ describe("invite reserve-then-consume (notme-3dfe15 parts 4/5)", () => {
     const first = await options(inv.token);
     const bad = await verify(user, first, "d3JvbmctY2hhbGxlbmdl");
     expect(bad.status).not.toBe(200);
+    // …and the failure must not tell the caller what the RIGHT challenge
+    // was. @simplewebauthn's mismatch error names the expected challenge,
+    // and the route used to return e.message as the 500 body — handing
+    // anyone who knew a userId the secret half of someone else's ceremony.
+    expect(await bad.text()).not.toContain(first.options.challenge);
 
     // The same invite still admits the same person on a retry.
     const retry = await options(inv.token);
@@ -146,7 +174,7 @@ describe("invite reserve-then-consume (notme-3dfe15 parts 4/5)", () => {
     // The invite was only reserved: the passkey ceremony it started still
     // completes and gets the invite's scopes.
     expect(res.status, await res.clone().text()).toBe(200);
-    const o = (await res.json()) as Opts;
+    const o = await asOpts(res);
     expect(o.userId).toBeTruthy();
     const user = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
     const v = await verify(user, o);
@@ -164,6 +192,51 @@ describe("invite reserve-then-consume (notme-3dfe15 parts 4/5)", () => {
     expect(res.headers.get("set-cookie")).toBeNull();
     // Still usable.
     await options(inv.token);
+  });
+});
+
+describe("a reservation belongs to the browser that made it (review M1)", () => {
+  // The reservation was keyed only on the server-random userId, which comes
+  // back in the same response as the challenge. Anyone who learned both —
+  // and the 500 body handed out the challenge — could finish the ceremony
+  // with their own authenticator and take the invite's scopes. Now /join and
+  // register/options set an HttpOnly reservation cookie, and verify must
+  // present it.
+  it("invite.join.reservation-cookie — the reservation response sets an HttpOnly, Secure, SameSite=Strict cookie", async () => {
+    const inv = await invite(["bridgeCert"]);
+    const res = await post("/join", { token: inv.token });
+    expect(res.status).toBe(200);
+    const sc = res.headers.get("set-cookie") ?? "";
+    expect(sc).toMatch(/notme_invite_reservation=/);
+    expect(sc).toMatch(/HttpOnly/i);
+    expect(sc).toMatch(/Secure/i);
+    expect(sc).toMatch(/SameSite=Strict/i);
+  });
+
+  it("invite.join.failed-verify-burns-challenge — a failed verify burns the challenge it was tried against", async () => {
+    const inv = await invite(["bridgeCert"]);
+    const o = await options(inv.token);
+    const user = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
+    expect((await verify(user, o, "d3JvbmctY2hhbGxlbmdl")).status).not.toBe(200);
+    // Even the right signature, with the right cookie, cannot use it now.
+    expect((await verify(user, o)).status).not.toBe(200);
+  });
+
+  it("invite.join.reservation-cookie — a verify without the reservation cookie is refused and spends nothing", async () => {
+    const inv = await invite(["bridgeCert", "authorityManage"]);
+    const o = await options(inv.token);
+    const thief = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
+    // Knows the userId and the challenge; does not hold the browser's cookie.
+    const stolen = await verify(thief, o, o.options.challenge, "");
+    expect(stolen.status).toBe(403);
+    expect(stolen.headers.get("set-cookie") ?? "").not.toMatch(/notme_session=/);
+    expect(await authority().getPrincipalScopes(o.userId)).toEqual([]);
+
+    // The invitee still gets in with a fresh reservation.
+    const user = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
+    const again = await options(inv.token);
+    const ok = await verify(user, again);
+    expect(ok.status, await ok.clone().text()).toBe(200);
   });
 });
 

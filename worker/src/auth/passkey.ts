@@ -149,14 +149,30 @@ export async function verifyRegistration(
 
   const expectedChallenge = challenges[0]!.challenge;
 
-  const verification = await verifyRegistrationResponse({
-    response,
-    expectedChallenge,
-    expectedOrigin: origin,
-    expectedRPID: rpId,
-  });
+  // A FAILED ceremony burns its challenge (review M1). Left in place, a
+  // challenge outlived every wrong guess at it for the full window; combined
+  // with an error body that named the expected value, one probe was enough
+  // to learn it and a second to use it.
+  const burnChallenge = () =>
+    sql.exec(
+      "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
+      userId,
+    );
+  let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
+  try {
+    verification = await verifyRegistrationResponse({
+      response,
+      expectedChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpId,
+    });
+  } catch (e) {
+    burnChallenge();
+    throw e;
+  }
 
   if (!verification.verified || !verification.registrationInfo) {
+    burnChallenge();
     return { verified: false, isAdmin: false };
   }
 
