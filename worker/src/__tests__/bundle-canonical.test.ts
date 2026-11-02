@@ -8,10 +8,10 @@
 // Signature field (would be 7) is NOT included in the signing input.
 //
 // These tests live under src/__tests__/ so they actually run in CI
-// (vitest.config.ts only includes src/__tests__/**). The legacy tests
-// at src/revocation.test.ts use cloudflare:test (DO bindings) and have
-// not been wired into vitest's pool — see notme-c38bb6 (P1, "revocation
-// tests dead since vitest config carved them out").
+// (vitest.config.ts only includes src/__tests__/**). The DO-backed
+// revocation tests now run under the workers pool as
+// src/revocation.do.test.ts (`pnpm test:do`); notme-c38bb6 flagged the
+// original dead-test gap and is closed.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";

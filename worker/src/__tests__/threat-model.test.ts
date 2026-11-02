@@ -395,9 +395,11 @@ describe("contract.cabundle.signing-canonical", () => {
 // ── 4. Revocation seqno monotonicity ───────────────────────────────────────
 
 describe("contract.revocation.seqno-monotonic", () => {
-  // The DO has an atomic SetLastSeenSeqnoIfGreater. We exercise the same
-  // decision rule the DO uses, without standing up a workerd DO instance
-  // (the runInDurableObject pool config is tracked separately as notme-c38bb6).
+  // NOTE: applySeqnoRule below is a copy of the rule, defined in this file;
+  // these assertions do not reach RevocationAuthority. The real DO's seqno
+  // handling is tested against workerd in revocation.do.test.ts (the pool
+  // config notme-c38bb6 waited on has existed since 2026-07-22). This block is
+  // kept only until it is repointed or removed (notme-8fb37f).
   function applySeqnoRule(last: number, incoming: number): "advance" | "noop" | "rollback" {
     if (typeof incoming !== "number" || !Number.isFinite(incoming) || incoming < 1) {
       return "rollback";
