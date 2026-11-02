@@ -60,7 +60,8 @@ verifies; with the log unreachable the mint still succeeds and both chains
 are backlogged; when the log returns, one alarm fire drains them, and azul's
 own `integration_tests` code finds both certificates as X509 entries in the
 log's signed tree with Merkle inclusion proven. This is a LOCAL log built from
-the fork branch, not a deployed one.
+the reviewed #322 head `97cbdf7` (identical to the upstream merge commit
+`d9402ec`), not a deployed one.
 
 **Not yet done**, and not claimed anywhere in this repo:
 
@@ -122,8 +123,18 @@ exactly that EKU, and the signing leaf has no EKU extension at all — so
 the spike had already fixed. RFC 6962 §3.1's requirement is right for WebPKI
 logs and wrong for a workload-identity CA.
 
-Upstream change: draft PR cloudflare/azul#322 (fork branch `jamestexas/azul:ct-configurable-server-auth-eku`): add the flag to the per-log config, default `true`
-so no existing log changes behaviour.
+Upstream change: cloudflare/azul#322, merged 2026-11-02 as `d9402ec`. Its
+diff is identical to the reviewed fork head `97cbdf7`. The change: add the
+flag to the per-log config, default `true` so no existing log changes
+behaviour.
+
+`false` deliberately means "do not require serverAuth," not "require
+clientAuth." The configured roots remain the log's inclusion boundary and
+every other chain and CT validation still runs. That is the right transparency
+policy here: an unexpected leaf profile should become visible in the log, not
+be hidden by an EKU allowlist. The issuing CA and relying party enforce the
+certificate's authorized purpose. It also matches notme's pair: the mTLS leaf
+is clientAuth-only and the signing leaf has no EKU extension.
 
 ## Reproducing the proof
 
@@ -188,12 +199,12 @@ In `config.notme.json`:
 |---|---|---|
 | `intended_use` | `production` | this is the real log, not a test shard |
 | `temporal_interval` | 2026-07-01Z to 2027-07-01Z (end exclusive) | the log accepts only certificates whose `notAfter` falls in this window. azul's `build.rs` requires a production shard to span 3 to 12 months, so this is the maximum; the next shard must be live before 2027-07-01 (runbook step 6) |
-| `require_server_auth_eku` | `false` | notme leaves are clientAuth or have no EKU. Needs the azul fork (below) |
+| `require_server_auth_eku` | `false` | skips only the serverAuth presence check, so the clientAuth mTLS leaf and no-EKU signing leaf are both recorded; configured roots and every other validation still apply. Needs azul at or after `d9402ec` (#322) |
 | `enable_ccadb_roots` | `false` | this log accepts notme's root and nothing from the WebPKI |
 | `reject_expired` | `false` | the backlog submits after the leaf has expired; `true` would refuse every drained row (see above) |
 | `submission_endpoint` / `monitoring_endpoint` | `https://REPLACE-ME.example/logs/notme/` | **placeholder.** JSON has no comments, so it is explained here: replace both with the URL the deployed log is actually served at (the notme-ct Worker's route, or the R2 public bucket for the monitoring endpoint) before deploying. The log publishes these URLs in its `metadata.json`. |
 
-The file was brought up to the schema in the azul checkout on the fork branch
+The file was brought up to the schema in the azul checkout at the #322 head
 (`operator_name`, `friendly_name`, `intended_use`, `status`,
 `status_timestamp`, `submission_endpoint`, `monitoring_endpoint`): the
 `description` / `log_type` / `submission_url` fields the earlier version used
@@ -228,8 +239,8 @@ azul's `CtClient::get_raw` reads with `wrangler r2 object get --local`.
 
 ### Running it
 
-    # 1. a throwaway worktree of the azul fork branch (require_server_auth_eku)
-    git -C <azul> worktree add --detach /tmp/azul-ct ct-configurable-server-auth-eku
+    # 1. a throwaway worktree at the #322 merge commit (require_server_auth_eku)
+    git -C <azul> worktree add --detach /tmp/azul-ct d9402ec
     ct/scripts/local-log.sh /tmp/azul-ct
     # 2. serve the log (first start compiles the Worker: minutes)
     (cd /tmp/azul-ct/crates/ct_worker && \
@@ -282,12 +293,10 @@ it is written from azul's `AGENTS.md`, `scripts/create-log.sh` and
 
 ### 1. Provision the log
 
-1. Check out azul on the fork branch that carries `require_server_auth_eku`:
-   `jamestexas/azul`, branch `ct-configurable-server-auth-eku` (commit
-   `00a9a84` adds the flag; the branch head also adds an integration test).
-   This is the draft upstream PR cloudflare/azul#322. **Until it merges,
-   deploy from that branch.** On upstream `main` every notme certificate is
-   refused (clientAuth-only leaves). Once #322 merges, switch to azul `main`.
+1. Check out upstream azul at commit `d9402ec`, the merge of
+   cloudflare/azul#322, or any later commit. Deploy a pinned commit, not a
+   moving branch. Commits before `d9402ec` refuse every notme certificate:
+   the pair has a clientAuth-only leaf and a no-EKU leaf.
 2. `cp config.notme.json <azul>/crates/ct_worker/config.notme.json` after
    replacing the two `REPLACE-ME` URLs (`task ct:verify` exits 1 if the pin is
    provisioned while any remain), and

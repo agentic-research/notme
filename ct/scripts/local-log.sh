@@ -3,9 +3,9 @@
 #
 # Usage: ct/scripts/local-log.sh <azul-checkout>
 #
-# <azul-checkout> must be on the fork branch that carries
-# require_server_auth_eku (jamestexas/azul ct-configurable-server-auth-eku,
-# draft PR cloudflare/azul#322). Use a throwaway `git worktree`: this writes
+# <azul-checkout> must carry require_server_auth_eku (cloudflare/azul#322,
+# merged as d9402ec; use that commit or later). Use a throwaway
+# `git worktree`: this writes
 # files into crates/ct_worker, none of which may be committed:
 #
 #   config.notmelocal.json   ct/config.notme.json minus the production shard
@@ -33,7 +33,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 CTW="${AZUL}/crates/ct_worker"
 [ -f "${CTW}/config.schema.json" ] || { echo "not an azul checkout: ${AZUL}" >&2; exit 2; }
 grep -q require_server_auth_eku "${CTW}/config.schema.json" || {
-  echo "this azul checkout has no require_server_auth_eku; use the fork branch" >&2; exit 2; }
+  echo "this azul checkout has no require_server_auth_eku; use azul d9402ec (cloudflare/azul#322) or later" >&2; exit 2; }
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
 
 jq 'del(.logs.notme)' "${HERE}/config.notme.json" > "${CTW}/config.notmelocal.json"
