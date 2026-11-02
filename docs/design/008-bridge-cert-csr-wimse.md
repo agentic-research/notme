@@ -90,6 +90,15 @@ correction above.**
 
 The trust domain is a FQDN. The path is scoped within the trust domain. This follows `draft-ietf-wimse-arch-02` Section 3.1 and is compatible with SPIFFE ID conventions.
 
+> **CORRECTION (2026-11-02, `notme-c07956`).** Both halves of that sentence
+> overstate. `draft-ietf-wimse-arch-02` §3.1 deliberately does not define a
+> URI scheme (it names SPIFFE ID only as an example of a conforming format),
+> so the `wimse` scheme is notme's own, not the draft's. The identifier is
+> *structurally* conformant to WIMSE §3.1 — a URI whose authority is the trust
+> domain — and no more. It is deliberately **not** a SPIFFE ID: the SPIFFE ID
+> standard requires the `spiffe` scheme, so SPIFFE implementations such as
+> SPIRE will not accept `wimse://notme.bot/...` as one.
+
 #### `{context}` encoding, and which copy is canonical
 
 For session-minted certs the `{context}` segment is the session's auth
@@ -334,6 +343,26 @@ for each cert in chain (leaf to root):
 
 If any step fails, reject the entire chain.
 
+> **CORRECTION (2026-11-02, `notme-c07956`).** Read literally, step 3 rejects
+> every chain notme issues: the self-signed root carries only
+> BasicConstraints and KeyUsage, no scopes extension, so `parent.scopes` is
+> empty at the top hop, and an empty parent admits only an empty child
+> (`worker/src/auth/scope-chain.ts`). The rule applies only at hops whose
+> parent is a **delegation tier** — an issuing-CA cert from
+> `mintIssuingCaCert` (ADR-019), which carries `.1.3` scopes. That is what
+> notme's own chain walker does: `verifyCertChain`
+> (`worker/src/auth/verify-chain.ts`) checks `child.scopes ⊆ parent.scopes`
+> for each tier→child hop, refuses a tier with no scope list, and does not
+> treat the root as a scope parent. What the root grants the first cert below
+> it is bounded at issuance by the minting route (for session-minted certs,
+> narrowed from the session's live scopes) — not by anything a verifier can
+> check from the chain. A bridge cert signed directly by the root has no hop to which the
+> rule applies.
+>
+> Not yet: the Go reference verifier does not run this step.
+> `VerifyClientCert` (`gen/go/verify/identity.go`) validates the X.509 path
+> and extracts identity; `VerifyScopeSubset` exists there with no caller.
+
 ### BasicConstraints and path length
 
 | Level | BasicConstraints | pathlen | KeyUsage |
@@ -563,7 +592,7 @@ The scopes in the cert extensions are **claims offered by the identity provider*
 | Git commit signing | Ed25519 cert, `gpg.format=x509`, `gpgsm` 2.3+ |
 | APAS / in-toto | Ed25519 cert in DSSE envelope (`signingCert` field) |
 | WIMSE-aware services | SAN URI is a valid WIMSE identity |
-| SPIFFE/SPIRE | SAN URI follows SPIFFE URI convention |
+| SPIFFE/SPIRE | SAN URI follows SPIFFE URI convention — **corrected 2026-11-02 (`notme-c07956`): it does not.** `wimse://` is not a SPIFFE ID and SPIRE will not accept it; see the correction under the URI format |
 | Kubernetes | Projected SA token → cert exchange (same as GHA OIDC) |
 | Sigstore/Fulcio | Parallel model (OIDC → short-lived cert) |
 
