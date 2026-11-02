@@ -25,8 +25,9 @@ feel finished rather than merely argued.
 ## Stage 0: in flight now
 
 - **notme-bdc850**, mint path phase 2 (criteria in the certificate). Plan:
-  `docs/superpowers/plans/2026-11-02-mint-path-phase-2-criteria.md`. Tasks 1–2
-  are committed (Task 2 under review); Tasks 3–5 follow.
+  `docs/superpowers/plans/2026-11-02-mint-path-phase-2-criteria.md`. All five
+  tasks are committed on `goalzero`, and the mutation check passed. It awaits
+  review and merge; see stage 3.
 - **The doc-drift batch** merged 2026-11-02 (0b584d5). Ten beads closed with
   their commits. Two stay open, each with what remains:
   - notme-8fb37f: the alarm tests are weak;
@@ -102,22 +103,25 @@ to publish the tag.
 What exists:
 - renewable tiers and 5-minute task certs;
 - subtasks and pause/resume;
-- copies detected at renewal (phase 1).
+- copies detected at renewal (phase 1);
+- **landed: phase 2 (notme-bdc850)**, criteria in the cert (`.1.10`),
+  enforced at mint and in `task-cert verify`. Commits b06b8ea through
+  2a5dd9b, plus the docs commit
+  `[notme-bdc850] docs(mint-path): phase 2 criteria; …`. It settles
+  **notme-1a5465**: the goal hash and confinementDigest are different facts
+  (spec §12, decision 4).
 
 The rest, in order:
-1. **notme-bdc850:** phase 2, criteria in the cert, enforced at mint and in
-   `task-cert verify`. It closes **notme-1a5465**: the goal hash and
-   confinementDigest are different facts.
-2. **notme-bdd7f9:** phase 3, `task-cert serve`, so workloads stop holding
+1. **notme-bdd7f9:** phase 3, `task-cert serve`, so workloads stop holding
    tier keys.
-3. **notme-bdffc7:** phase 5. Make `llo-run/1` mintable, write `.1.7`, and
+2. **notme-bdffc7:** phase 5. Make `llo-run/1` mintable, write `.1.7`, and
    have signet and LLO refuse on criteria. Needs LLO's agreement and the PEN
    (stage 1 step 6), plus beads in signet and LLO.
-4. **notme-bdeeb5:** phase 4, `deploy/1` approved from your phone, and the
+3. **notme-bdeeb5:** phase 4, `deploy/1` approved from your phone, and the
    mount lever.
-5. **notme-be1ecd:** branches, counted clones under `replicas:N`.
-6. **notme-be13b0:** phase 6, the path key in hardware, plus receipts.
-7. **notme-bd2a72:** reshape `mintBridgeCertPair` into `/identity/lease`.
+4. **notme-be1ecd:** branches, counted clones under `replicas:N`.
+5. **notme-be13b0:** phase 6, the path key in hardware, plus receipts.
+6. **notme-bd2a72:** reshape `mintBridgeCertPair` into `/identity/lease`.
    This is decided after phase 3, which may make it unnecessary.
 
 The order puts phase 5 before phase 4 on purpose. Until a verifier outside

@@ -1,6 +1,6 @@
 # The mint path — offline task certificates that copying cannot forge
 
-**Status:** approved 2026-10-28; phase 1 implemented
+**Status:** approved 2026-10-28; phase 1 and 2 implemented
 **Builds on:** ADR-019 (delegation authority), notme-337d82 (renewable tiers),
 notme-9f84e6 (derived tasks), notme-1b46a8 / notme-907299 (transparency),
 rosary-056d96 (per-dispatch identity)
@@ -280,6 +280,14 @@ A new extension, `.1.10` criteria. It is allocated in the
 `cert-authority.ts` sub-arc registry and moves with the arc to the PEN
 (notme-229dc3). It carries `SEQUENCE { UTF8String name, INTEGER version }`.
 
+**Encoding rulings** *(phase 2, notme-bdc850)*:
+- The extension value is `SEQUENCE OF` that shape, so a tier can carry
+  several. A task certificate carries exactly one element. `name` has no
+  version suffix: `agent-session/1` is name `agent-session`, version `1`.
+- The extension is **non-critical**, like every other notme extension.
+  Enforcement lives in verifiers (§9). A critical flag would make every stock
+  X.509 validator, signet's and LLO's included, reject every new certificate.
+
 **Binding** *(builder check; my call)*:
 - The approver chooses the criteria at `/enroll`, alongside clone policy and
   horizon.
@@ -512,3 +520,13 @@ enforced as configuration in each verifier, never hardcoded.
    opt-in window as my call.
 3. **Who can pull a workspace mount:** notme at check-in, and the host
    locally. Local actors can only revoke. My call (§5.6).
+4. **Goal hash vs confinementDigest (notme-1a5465):** they are different
+   facts.
+   - `.1.9`'s goal hash stays notme's "which work".
+   - `confinementDigest` is LLO's "what the run may touch". It appears only
+     in `.1.7`, with LLO's registered meaning, and only under `llo-run/1`.
+   - It is supplied by the LLO host that configures the run. The party
+     vouching for it knows the deployment, and LLO itself checks equality,
+     so LLO ADR-0036 O1's unknown-deployment case doesn't arise.
+   - It is written only from phase 5, after LLO agrees and after the PEN
+     (notme-229dc3), because the shared arc still collides at `.1.5`.

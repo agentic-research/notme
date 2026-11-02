@@ -133,6 +133,8 @@ graph LR
 
 **scopes only narrow, and it is checked at every mint:** your *live* grants ∩ what a cert may carry (`bridgeCert`, `sign:git`, `sign:attestation` — never `certMint` or `authorityManage`) → the tier → each task → each subtask.
 
+**criteria say what kind of task a cert is, and they only narrow too.** when you approve a machine you grant it *criteria* (default `agent-session/1`: at most 5 minutes, the usual cert scopes), stamped into the tier as OID `.1.10`. each task cert names exactly one of the tier's criteria, and must keep to its lifetime and scope ceiling; a subtask keeps its parent's. `task-cert mint` uses the tier's criteria when it grants one, and `--criteria agent-session/1` picks when it grants several — it can choose, never add. `task-cert verify` refuses a task cert with no criteria under a tier that has them. a cert from a machine approved before criteria existed verifies as **legacy**, until the cutoff you set with `--legacy-cutoff <ISO date>` or `NOTME_LEGACY_CUTOFF`. two more criteria are defined but can't be minted yet: `llo-run/1` (waits on its binding to LLO's `confinementDigest`) and `deploy/1` (minted only by the authority, after a phone approval).
+
 **pause and resume.** a VM that pauses past its tier's lifetime resumes, renews with no human, and carries on. it needs a human again only when the approval ends — and it says why:
 
 | renewal refused | because | to continue |
