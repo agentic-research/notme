@@ -20,6 +20,7 @@ import { chmodSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, 
 import { join } from "node:path";
 import { X509Certificate, BasicConstraintsExtension } from "@peculiar/x509";
 import { mintTaskCertPair } from "../../worker/src/cert-authority";
+import { checkCriteria, criteriaId, parseCriteriaId, readCriteria, type Criteria } from "../../worker/src/criteria";
 import { ED25519 } from "../../worker/src/platform";
 import {
   deviceCodeHash, RENEWAL_RETRY_WINDOW_S, RENEWAL_SKEW_S, tierEnrolmentBinding, tierRenewalBinding, tierRenewalBindingV2,
@@ -135,15 +136,45 @@ async function spkiPemOf(key: CryptoKey): Promise<string> {
 }
 
 /**
+ * The criteria a task is minted under (notme-bdc850). An explicit id wins.
+ * Otherwise a subtask takes its parent's (the minter requires equality), and
+ * a top-level task takes the TIER CERT's `.1.10` — read from the certificate,
+ * not tier.json, so a tier.json written by an older client is no obstacle:
+ * exactly one → it; none → legacy (undefined); several → refuse and name them,
+ * rather than mint a task verify would later refuse.
+ */
+export function chooseCriteria(tierPem: string, opts: { criteria?: string; parent?: string }): Criteria | undefined {
+  if (opts.criteria !== undefined) {
+    const c = parseCriteriaId(opts.criteria);
+    if (!c) throw new Error(`criteria must be name/version, e.g. agent-session/1, got ${JSON.stringify(opts.criteria)}`);
+    return c;
+  }
+  let source: X509Certificate;
+  try {
+    source = new X509Certificate(opts.parent ?? tierPem);
+  } catch {
+    throw new Error(opts.parent !== undefined ? "parent is not a certificate" : "tier is not a certificate");
+  }
+  const r = readCriteria(source);
+  if (!r.present) return undefined;
+  if (!r.ok) throw new Error(`malformed criteria on ${opts.parent !== undefined ? "the parent task" : "tier"}`);
+  if (r.list.length > 1) {
+    throw new Error(`tier grants several criteria (${r.list.map(criteriaId).join(", ")}); choose one with --criteria`);
+  }
+  return r.list[0];
+}
+
+/**
  * Mint a task cert pair OFFLINE under the tier. Generates the task's own
  * keys; the goal is hashed here so the certificate commits to it without
- * carrying the text.
+ * carrying the text. `criteria` is an id ("agent-session/1"); see chooseCriteria.
  */
 export async function mintTask(
   tierPem: string,
   tierPrivateKey: CryptoKey,
-  opts: { task: string; goal: string; epoch: number; scopes?: string[]; ttlMs?: number; parent?: string },
+  opts: { task: string; goal: string; epoch: number; scopes?: string[]; ttlMs?: number; parent?: string; criteria?: string },
 ) {
+  const criteria = chooseCriteria(tierPem, opts);
   const mtls = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
   const signing = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
   const goalHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(opts.goal))));
@@ -152,11 +183,13 @@ export async function mintTask(
     tierPrivateKey,
     await spkiPemOf(mtls.publicKey),
     await spkiPemOf(signing.publicKey),
-    { task: opts.task, goalHash, scopes: opts.scopes ?? ["bridgeCert"], epoch: opts.epoch, ttlMs: opts.ttlMs, parent: opts.parent },
+    { task: opts.task, goalHash, scopes: opts.scopes ?? ["bridgeCert"], epoch: opts.epoch, ttlMs: opts.ttlMs, parent: opts.parent, criteria },
   );
   return {
     ...result,
     goalHash,
+    /** The criteria id stamped as `.1.10`, or null for a legacy task. */
+    criteria: criteria ? criteriaId(criteria) : null,
     keys: {
       mtls: pemWrap("PRIVATE KEY", new Uint8Array((await crypto.subtle.exportKey("pkcs8", mtls.privateKey)) as ArrayBuffer)),
       signing: pemWrap("PRIVATE KEY", new Uint8Array((await crypto.subtle.exportKey("pkcs8", signing.privateKey)) as ArrayBuffer)),
@@ -168,13 +201,17 @@ export async function mintTask(
  * root → tier → task. Signatures checked with the library; validity windows
  * checked HERE, inclusively, because @peculiar/x509's date check is a strict
  * `notBefore < t` and reads a cert as invalid at the instant it was minted.
+ * Then criteria (notme-bdc850): the task's `.1.10` must be one its tier
+ * grants, and a task without one under a criteria tier is refused. A task
+ * under a pre-criteria tier is `legacy`, refused past `legacyCutoff`.
  */
 export async function verifyChain(
   rootPem: string,
   tierPem: string,
   leafPem: string,
   at: Date = new Date(),
-): Promise<{ ok: true } | { ok: false; reason: string }> {
+  opts: { legacyCutoff?: Date } = {},
+): Promise<{ ok: true; criteria: string | null; legacy: boolean } | { ok: false; reason: string }> {
   const root = new X509Certificate(rootPem);
   const tier = new X509Certificate(tierPem);
   const leaf = new X509Certificate(leafPem);
@@ -194,7 +231,27 @@ export async function verifyChain(
   for (const [c, name] of [[root, "root"], [tier, "tier"], [leaf, "task cert"]] as const) {
     if (!within(c)) return { ok: false, reason: `${name} is not valid at ${at.toISOString()}` };
   }
-  return { ok: true };
+  const v = checkCriteria(tier, leaf, { at, legacyCutoff: opts.legacyCutoff });
+  if (!v.ok) return v;
+  return { ok: true, criteria: v.criteria ? criteriaId(v.criteria) : null, legacy: v.legacy };
+}
+
+/**
+ * `--legacy-cutoff` / NOTME_LEGACY_CUTOFF. Verifier configuration, never
+ * hardcoded. Empty or absent is no cutoff; anything but an ISO date is refused
+ * rather than silently read as "no cutoff".
+ */
+export function parseLegacyCutoff(raw: string | undefined): { ok: true; cutoff: Date | undefined } | { ok: false; message: string } {
+  if (raw === undefined || raw === "") return { ok: true, cutoff: undefined };
+  const m = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2}))?$/.exec(raw);
+  const d = new Date(raw);
+  // Date.parse rolls 2026-02-30 into March; the calendar date must exist.
+  const day = m ? new Date(Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!)) : null;
+  const calendar = !!m && !!day && day.getUTCFullYear() === +m[1]! && day.getUTCMonth() + 1 === +m[2]! && day.getUTCDate() === +m[3]!;
+  if (!m || Number.isNaN(d.getTime()) || !calendar) {
+    return { ok: false, message: `legacy cutoff ${JSON.stringify(raw)} is not an ISO date (e.g. 2026-12-01 or 2026-12-01T00:00:00Z)` };
+  }
+  return { ok: true, cutoff: d };
 }
 
 // ── Renewal, subtasks, ledger, local revocation (notme-337d82, notme-9f84e6) ─
@@ -222,7 +279,25 @@ export type RenewalResult = {
   renew_until: number;
   authority: { epoch: number };
   generation: number;
+  /** Criteria ids the renewed tier carries; null for a legacy enrollment; absent from an older authority. */
+  criteria?: string[] | null;
 };
+
+/**
+ * tier.json after a renewal. The response's `criteria` replaces the stored
+ * value (so `status` reports what the renewed tier carries); an authority that
+ * predates the field leaves the stored value alone.
+ */
+export function renewedTierMeta(meta: Record<string, unknown>, r: RenewalResult): Record<string, unknown> {
+  return {
+    ...meta,
+    expires_at: r.expires_at,
+    epoch: r.authority.epoch,
+    renew_until: r.renew_until,
+    generation: r.generation,
+    ...(r.criteria === null || Array.isArray(r.criteria) ? { criteria: r.criteria } : {}),
+  };
+}
 
 /**
  * The authority refused the request (its JSON `{ error }`, 4xx): a FIRST
@@ -739,6 +814,8 @@ export async function enrollInDir(
       // none, so this machine renews as legacy v1 (never assume 0).
       ...(Number.isSafeInteger(tier.generation) && tier.generation >= 0 ? { generation: tier.generation } : {}),
       ...(typeof tier.clone_policy === "string" ? { clone_policy: tier.clone_policy } : {}),
+      // Criteria ids, or null for a legacy enrollment; absent from an authority that predates them.
+      ...(tier.criteria === null || Array.isArray(tier.criteria) ? { criteria: tier.criteria } : {}),
     },
   });
   return { tier, root };

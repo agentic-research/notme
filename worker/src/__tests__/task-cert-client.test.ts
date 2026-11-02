@@ -13,7 +13,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mintIssuingCaCert } from "../cert-authority";
+import { mintIssuingCaCert, OID_CRITERIA } from "../cert-authority";
+import { readCriteria, type Criteria } from "../criteria";
 import { ED25519 } from "../platform";
 import { deviceCodeHash, tierEnrolmentBinding } from "../auth/tier-enrolment-binding";
 import {
@@ -23,7 +24,7 @@ import {
 
 const ROOT_NAME = "CN=signet-authority,O=notme";
 
-async function rootAndTier(opts: { tierTtlMs?: number } = {}) {
+async function rootAndTier(opts: { tierTtlMs?: number; criteria?: Criteria[] } = {}) {
   const root = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
   const rootCert = await X509CertificateGenerator.createSelfSigned({
     name: ROOT_NAME,
@@ -43,7 +44,7 @@ async function rootAndTier(opts: { tierTtlMs?: number } = {}) {
     "wimse://notme.bot/principal/alice",
     tier.pem,
     root.privateKey,
-    { scopes: ["bridgeCert"], epoch: 3, authMethod: "passkey", ttlMs: opts.tierTtlMs },
+    { scopes: ["bridgeCert"], epoch: 3, authMethod: "passkey", ttlMs: opts.tierTtlMs, criteria: opts.criteria },
   );
   return { rootPem: rootCert.toString("pem"), tier, tierPem: tierCert.certificate };
 }
@@ -114,7 +115,7 @@ describe("minting a task certificate offline", () => {
     const t = await mintTask(tierPem, tier.privateKey, { task: "rosary-056d96", goal: "dispatch identity", epoch: 3 });
     expect(t.identity).toBe("wimse://notme.bot/principal/alice/rosary-056d96");
     for (const leaf of [t.certificates.signing, t.certificates.mtls]) {
-      expect(await verifyChain(rootPem, tierPem, leaf)).toEqual({ ok: true });
+      expect(await verifyChain(rootPem, tierPem, leaf)).toEqual({ ok: true, criteria: null, legacy: true });
     }
   });
 
@@ -971,5 +972,157 @@ describe("what a human is told when renewal fails", () => {
   it("an ended approval still says so", () => {
     expect(explainRenewalFailure(new AuthorityRefusal("fork_detected")).message).toMatch(/approval for this machine has ended \(fork_detected\).*task-cert enroll/);
     expect(explainRenewalFailure(new AuthorityRefusal("stale_proof")).message).toMatch(/clock/);
+  });
+});
+
+// ── criteria (notme-bdc850): mint picks the tier's; verify enforces them ────
+import { parseLegacyCutoff, renewedTierMeta } from "../../../scripts/task-cert/lib";
+
+describe("task-cert mint picks the tier's criteria (Review Focus 5)", () => {
+  const AS: Criteria = { name: "agent-session", version: 1 };
+  const LLO: Criteria = { name: "llo-run", version: 1 };
+  const taskCriteria = (pem: string) => {
+    const r = readCriteria(new X509Certificate(pem));
+    return r.present && r.ok ? r.list : r;
+  };
+
+  it("under a tier with exactly one criteria, mint without --criteria uses it, and verify reports it", async () => {
+    const { rootPem, tier, tierPem } = await rootAndTier({ criteria: [AS] });
+    const t = await mintTask(tierPem, tier.privateKey, { task: "t1", goal: "g", epoch: 3 });
+    expect(t.criteria).toBe("agent-session/1");
+    for (const leaf of [t.certificates.signing, t.certificates.mtls]) {
+      expect(taskCriteria(leaf)).toEqual([AS]);
+      expect(await verifyChain(rootPem, tierPem, leaf)).toEqual({ ok: true, criteria: "agent-session/1", legacy: false });
+    }
+  });
+
+  it("under a tier with several, mint without --criteria refuses and names them", async () => {
+    const { tier, tierPem } = await rootAndTier({ criteria: [AS, LLO] });
+    await expect(mintTask(tierPem, tier.privateKey, { task: "t1", goal: "g", epoch: 3 })).rejects.toThrow(
+      "tier grants several criteria (agent-session/1, llo-run/1); choose one with --criteria",
+    );
+    // and choosing one mints it
+    const t = await mintTask(tierPem, tier.privateKey, { task: "t1", goal: "g", epoch: 3, criteria: "agent-session/1" });
+    expect(taskCriteria(t.certificates.signing)).toEqual([AS]);
+  });
+
+  it("under a pre-criteria tier, mint without --criteria is legacy, and verify says so", async () => {
+    const { rootPem, tier, tierPem } = await rootAndTier();
+    const t = await mintTask(tierPem, tier.privateKey, { task: "t1", goal: "g", epoch: 3 });
+    expect(taskCriteria(t.certificates.signing)).toEqual({ present: false });
+    expect(t.criteria).toBeNull();
+    expect(await verifyChain(rootPem, tierPem, t.certificates.signing)).toEqual({ ok: true, criteria: null, legacy: true });
+  });
+
+  it("--criteria must be an id; an ungranted one is refused by the minter", async () => {
+    const { tier, tierPem } = await rootAndTier({ criteria: [AS] });
+    await expect(mintTask(tierPem, tier.privateKey, { task: "t1", goal: "g", epoch: 3, criteria: "agent-session" })).rejects.toThrow(
+      'criteria must be name/version, e.g. agent-session/1, got "agent-session"',
+    );
+    await expect(mintTask(tierPem, tier.privateKey, { task: "t1", goal: "g", epoch: 3, criteria: "llo-run/1" })).rejects.toThrow(
+      "task criteria llo-run/1 is not granted by its tier",
+    );
+  });
+
+  it("a subtask without --criteria takes its parent's", async () => {
+    const { rootPem, tier, tierPem } = await rootAndTier({ criteria: [AS, LLO] });
+    const parent = await mintTask(tierPem, tier.privateKey, { task: "p", goal: "g", epoch: 3, criteria: "agent-session/1" });
+    const child = await mintTask(tierPem, tier.privateKey, { task: "c", goal: "g", epoch: 3, parent: parent.certificates.signing });
+    expect(taskCriteria(child.certificates.signing)).toEqual([AS]);
+    expect(await verifyChain(rootPem, tierPem, child.certificates.signing)).toMatchObject({ ok: true, criteria: "agent-session/1" });
+  });
+});
+
+describe("verifyChain enforces criteria", () => {
+  const AS: Criteria = { name: "agent-session", version: 1 };
+
+  it("a task re-signed by the tier with .1.10 stripped is refused (a pre-criteria minter cannot get past verify)", async () => {
+    const { rootPem, tier, tierPem } = await rootAndTier({ criteria: [AS] });
+    const t = await mintTask(tierPem, tier.privateKey, { task: "t1", goal: "g", epoch: 3 });
+    const honest = new X509Certificate(t.certificates.signing);
+    const stripped = await X509CertificateGenerator.create({
+      serialNumber: honest.serialNumber,
+      subject: honest.subject,
+      issuer: honest.issuer,
+      notBefore: honest.notBefore,
+      notAfter: honest.notAfter,
+      publicKey: honest.publicKey,
+      signingKey: tier.privateKey,
+      signingAlgorithm: ED25519,
+      extensions: honest.extensions.filter((e) => e.type !== OID_CRITERIA),
+    });
+    // Positive control: everything but .1.10 survived, and the signature is the tier's.
+    expect(stripped.extensions.length).toBe(honest.extensions.length - 1);
+    expect(await stripped.verify({ publicKey: await new X509Certificate(tierPem).publicKey.export(), signatureOnly: true })).toBe(true);
+    expect(await verifyChain(rootPem, tierPem, honest.toString("pem"))).toMatchObject({ ok: true });
+    expect(await verifyChain(rootPem, tierPem, stripped.toString("pem"))).toEqual({
+      ok: false,
+      reason: "tier carries criteria; the task names none",
+    });
+  });
+
+  it("applies the legacy cutoff from the option", async () => {
+    const { rootPem, tier, tierPem } = await rootAndTier();
+    const t = await mintTask(tierPem, tier.privateKey, { task: "t1", goal: "g", epoch: 3 });
+    const at = new Date();
+    expect(await verifyChain(rootPem, tierPem, t.certificates.signing, at, { legacyCutoff: new Date(at.getTime() - 1000) })).toEqual({
+      ok: false,
+      reason: "legacy certificate past the operator's cutoff",
+    });
+    expect(await verifyChain(rootPem, tierPem, t.certificates.signing, at, { legacyCutoff: new Date(at.getTime() + 60_000) })).toEqual({
+      ok: true, criteria: null, legacy: true,
+    });
+    // a criteria task is not legacy, so the cutoff does not touch it
+    const c = await rootAndTier({ criteria: [AS] });
+    const ct = await mintTask(c.tierPem, c.tier.privateKey, { task: "t1", goal: "g", epoch: 3 });
+    expect(await verifyChain(c.rootPem, c.tierPem, ct.certificates.signing, new Date(), { legacyCutoff: new Date(0) })).toMatchObject({ ok: true, legacy: false });
+  });
+});
+
+describe("the legacy cutoff the CLI accepts", () => {
+  it("absent is no cutoff; an ISO date parses; anything else is refused with a clear message", () => {
+    expect(parseLegacyCutoff(undefined)).toEqual({ ok: true, cutoff: undefined });
+    expect(parseLegacyCutoff("")).toEqual({ ok: true, cutoff: undefined });
+    expect(parseLegacyCutoff("2026-12-01")).toEqual({ ok: true, cutoff: new Date("2026-12-01T00:00:00Z") });
+    expect(parseLegacyCutoff("2026-12-01T12:00:00Z")).toEqual({ ok: true, cutoff: new Date("2026-12-01T12:00:00Z") });
+    for (const bad of ["tomorrow", "2026-13-45", "2026-02-30", "2026-02-30T00:00:00Z", "1", "12/01/2026"]) {
+      expect(parseLegacyCutoff(bad)).toEqual({
+        ok: false,
+        message: `legacy cutoff ${JSON.stringify(bad)} is not an ISO date (e.g. 2026-12-01 or 2026-12-01T00:00:00Z)`,
+      });
+    }
+  });
+});
+
+describe("tier.json records the criteria the authority granted", () => {
+  const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status });
+
+  it("collect: criteria ids are saved, null (a legacy enrollment) is saved as null, absent stays absent", async () => {
+    for (const collected of [{ criteria: ["agent-session/1"] }, { criteria: null }, {}]) {
+      const dir = mkdtempSync(join(tmpdir(), "task-cert-test-"));
+      const fetchFn = (async (u: string) => {
+        if (u.endsWith("/cert/issuing-ca/device")) {
+          return reply(200, { device_code: "dc", user_code: "UC", verification_uri: "https://a/enroll", key_fingerprint: "ab".repeat(32), expires_in: 60, interval: 0 });
+        }
+        if (u.endsWith("/device/token")) {
+          return reply(200, { certificate: "TIER", identity: "id", scopes: ["bridgeCert"], expires_at: 1, renew_until: 2, authority: { epoch: 3 }, generation: 0, ...collected });
+        }
+        return { ok: true, status: 200, text: async () => "ROOT" } as unknown as Response;
+      }) as unknown as typeof fetch;
+      await enrollInDir(dir, "https://a", { fetchFn, sleep: async () => {} });
+      const meta = JSON.parse(readFileSync(join(dir, "tier.json"), "utf8"));
+      if ("criteria" in collected) expect(meta.criteria).toEqual(collected.criteria);
+      else expect("criteria" in meta).toBe(false);
+    }
+  });
+
+  it("renew: the response's criteria replace the stored ones; a response without the field keeps them", () => {
+    const meta = { identity: "id", scopes: ["bridgeCert"], expires_at: 1, epoch: 3, renew_until: 2, generation: 4, criteria: ["agent-session/1"] };
+    const r = { certificate: "T", expires_at: 10, renew_until: 20, authority: { epoch: 3 }, generation: 5 };
+    expect(renewedTierMeta(meta, { ...r, criteria: ["agent-session/1", "llo-run/1"] })).toEqual({
+      ...meta, expires_at: 10, renew_until: 20, generation: 5, criteria: ["agent-session/1", "llo-run/1"],
+    });
+    expect(renewedTierMeta(meta, { ...r, criteria: null })).toMatchObject({ criteria: null });
+    expect(renewedTierMeta(meta, r)).toMatchObject({ generation: 5, criteria: ["agent-session/1"] });
   });
 });

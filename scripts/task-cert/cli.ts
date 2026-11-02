@@ -3,12 +3,12 @@
  * notme task certificates from a machine (notme-486e8a).
  *
  *   task-cert enroll [--authority URL] [--dir DIR]   (alias: enrol)
- *   task-cert mint   --task ID --goal TEXT [--scopes a,b] [--ttl-min N] [--out DIR] [--dir DIR]
+ *   task-cert mint   --task ID --goal TEXT [--scopes a,b] [--ttl-min N] [--criteria ID] [--out DIR] [--dir DIR]
  *                    (--out defaults to ~/.notme/tasks/<task>)
  *   task-cert mint   --parent TASK --task SUB --goal TEXT   (a subtask)
  *   task-cert renew  [--dir DIR]
  *   task-cert revoke --task TASK                           (and everything under it)
- *   task-cert verify --cert FILE [--dir DIR]
+ *   task-cert verify --cert FILE [--legacy-cutoff ISO] [--dir DIR]
  *   task-cert status [--dir DIR]
  *   (every command takes --tasks-dir DIR, default ~/.notme/tasks)
  *
@@ -29,6 +29,14 @@
  * State lives in --dir (default ~/.notme/tier): the tier cert, its private
  * key (0600, PKCS#8), the authority root pinned at enroll time, and metadata.
  *
+ * CRITERIA (notme-bdc850). A task states which unit of identity it is
+ * (`.1.10`, e.g. agent-session/1), one its tier grants. `mint` without
+ * --criteria uses the tier's when it grants exactly one (a subtask: its
+ * parent's), mints a legacy task under a tier that grants none, and refuses
+ * when it grants several. `verify` refuses a task without criteria under a
+ * tier that has them, and a legacy task past --legacy-cutoff (or env
+ * NOTME_LEGACY_CUTOFF); an unparseable cutoff exits 2.
+ *
  * TRUST, stated plainly: the root is fetched over TLS from the authority at
  * enroll time and pinned. After that, mint and verify never touch the network.
  * The private key on disk is the tier — anyone who reads it can mint task
@@ -42,7 +50,7 @@ import { X509Certificate } from "@peculiar/x509";
 import { appendFileSync } from "node:fs";
 import {
   enrollInDir, importPrivateKeyPem,
-  explainRenewalFailure, isRevokedTask, mintTask, renewTierInDir, taskOutDir, verifyChain,
+  explainRenewalFailure, isRevokedTask, mintTask, parseLegacyCutoff, renewedTierMeta, renewTierInDir, taskOutDir, verifyChain,
 } from "./lib";
 
 
@@ -114,14 +122,7 @@ async function renewNow(quiet = false) {
         // The new tier reaches disk before the pending request is dropped.
         persist: (r) => {
           writeFileSync(join(dir, "tier.pem"), r.certificate);
-          writeFileSync(
-            join(dir, "tier.json"),
-            JSON.stringify(
-              { ...meta, expires_at: r.expires_at, epoch: r.authority.epoch, renew_until: r.renew_until, generation: r.generation },
-              null,
-              2,
-            ),
-          );
+          writeFileSync(join(dir, "tier.json"), JSON.stringify(renewedTierMeta(meta, r), null, 2));
           out = r;
         },
       },
@@ -196,6 +197,7 @@ async function mint() {
     scopes: a.scopes ? a.scopes.split(",") : undefined,
     ttlMs: a["ttl-min"] ? Number(a["ttl-min"]) * 60_000 : undefined,
     parent,
+    criteria: a.criteria || undefined,
   });
   // Default OUTSIDE the working directory. These are private keys, and the
   // working directory is usually a repo: notme's deny-by-default .gitignore
@@ -218,20 +220,33 @@ async function mint() {
       goal_sha256: t.goalHash,
       serial: new X509Certificate(t.certificates.signing).serialNumber,
       scopes: t.scopes,
+      criteria: t.criteria,
       expires_at: t.expires_at,
     }) + "\n",
     { mode: 0o600 },
   );
   console.log(`Minted offline: ${t.identity}`);
   console.log(`  goal sha256 ${t.goalHash}`);
+  console.log(`  criteria ${t.criteria ?? "none (legacy: the tier grants no criteria)"}`);
   console.log(`  expires ${new Date(t.expires_at * 1000).toISOString()}  →  ${out}/`);
 }
 
 async function verify() {
   if (!a.cert) throw new Error("--cert is required");
-  const r = await verifyChain(need("root.pem"), need("tier.pem"), readFileSync(a.cert, "utf8"));
-  console.log(r.ok ? "OK: root → tier → task" : `FAIL: ${r.reason}`);
-  if (!r.ok) process.exitCode = 1;
+  const cutoff = parseLegacyCutoff(a["legacy-cutoff"] || process.env.NOTME_LEGACY_CUTOFF);
+  if (!cutoff.ok) {
+    console.error(`task-cert verify: ${cutoff.message}`);
+    process.exit(2);
+  }
+  const r = await verifyChain(need("root.pem"), need("tier.pem"), readFileSync(a.cert, "utf8"), new Date(), {
+    legacyCutoff: cutoff.cutoff,
+  });
+  if (r.ok) {
+    console.log(`OK: root → tier → task (${r.criteria ? `criteria ${r.criteria}` : "legacy: issued under a pre-criteria tier"})`);
+  } else {
+    console.log(`FAIL: ${r.reason}`);
+    process.exitCode = 1;
+  }
 }
 
 async function status() {
@@ -242,6 +257,9 @@ async function status() {
   console.log(meta.identity);
   console.log(`  tier: ${left > 0 ? `valid for ${Math.round(left / 60000)} min` : "expired"}`);
   console.log(`  generation ${meta.generation ?? "none (legacy enrolment)"}`);
+  console.log(
+    `  criteria: ${Array.isArray(meta.criteria) ? meta.criteria.join(", ") : meta.criteria === null ? "none (legacy enrollment)" : "unknown (enrolled by an older task-cert; the tier cert decides)"}`,
+  );
   if (meta.clone_policy !== undefined) console.log(`  clone policy: ${typeof meta.clone_policy === "string" ? meta.clone_policy : JSON.stringify(meta.clone_policy)}`);
   console.log(
     `  renewal: ${renewLeft > 0 ? `without a human for ${Math.round(renewLeft / 3_600_000)} h more` : "ended — run enroll and approve again"}`,
