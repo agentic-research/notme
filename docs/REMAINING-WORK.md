@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 84 in notme (`rsry status --json` →
+**Updated:** 2026-11-02 · **Open beads:** 76 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -25,14 +25,14 @@ feel finished rather than merely argued.
 ## Stage 0: in flight now
 
 - **notme-bdc850**, mint path phase 2 (criteria in the certificate). Plan:
-  `docs/superpowers/plans/2026-11-02-mint-path-phase-2-criteria.md`. Task 1
-  is committed and under review; Tasks 2–5 follow.
-- **The doc-drift batch:** notme-3ef3af, notme-8e6863, notme-8fb37f,
-  notme-a040c1, notme-be5691, notme-c006aa, notme-c07956, notme-c72e03,
-  notme-c16e0d, notme-c7819f, notme-ae3130, notme-8639dd. A fix is in
-  progress on a side branch. Where a doc promises a security property the
-  code lacks, the doc is corrected and a code bead is filed. The promise is
-  never just deleted.
+  `docs/superpowers/plans/2026-11-02-mint-path-phase-2-criteria.md`. Tasks 1–2
+  are committed (Task 2 under review); Tasks 3–5 follow.
+- **The doc-drift batch** merged 2026-11-02 (0b584d5). Ten beads closed with
+  their commits. Two stay open, each with what remains:
+  - notme-8fb37f: the alarm tests are weak;
+  - notme-8639dd: one stat tile still has no source.
+  Security promises the code didn't keep became notme-bad2e5 and
+  notme-baea8c.
 
 ## Stage 1: the release (Goal Zero, notme-bed754)
 
@@ -153,7 +153,9 @@ Listed so the count doesn't creep up unnoticed:
   notme-9da488 → cloister-c9cf2d.
 - **Rescoped rather than closed:** notme-3dfe15, notme-e005a8, notme-3ee3b0.
 - **Closed in triage:** notme-3e6ecc, notme-5464ee, notme-ce0903,
-  notme-ea76bb, notme-9087aa.
+  notme-ea76bb, notme-9087aa, and ten doc-drift beads: notme-3ef3af,
+  notme-8e6863, notme-a040c1, notme-be5691, notme-c006aa, notme-c07956,
+  notme-c72e03, notme-c16e0d, notme-c7819f, notme-ae3130.
 - **Filed from the doc-drift batch (2026-11-02):**
   - notme-bad2e5 and notme-baea8c (proxy gaps);
   - a gen/go scope-check note, added to notme-ea5c65 rather than filed as a
