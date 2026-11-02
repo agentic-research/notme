@@ -62,6 +62,7 @@ import { getAllowedAudiences } from "./src/allowed-audiences";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
 import { principalIdentity } from "./src/cert-authority";
+import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
 import { buildInfo } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
 
@@ -1177,6 +1178,25 @@ function parseCookie(cookieHeader: string, name: string): string | null {
 // All params are injected via data attributes on a hidden div — no inline
 // script variables, no eval. The JS reads them via dataset.
 
+/** The criteria ids an approver may grant at /enroll this phase (notme-bdc850). */
+const GRANTABLE_CRITERIA = [...CRITERIA.values()].filter((d) => d.grantable).map((d) => d.id);
+
+/**
+ * An approver's criteria: a non-empty list of distinct ids, each defined and
+ * grantable. Null otherwise — the route answers 400, never a partial grant.
+ */
+function grantedCriteria(ids: unknown): Criteria[] | null {
+  if (!Array.isArray(ids) || ids.length === 0 || new Set(ids).size !== ids.length) return null;
+  const out: Criteria[] = [];
+  for (const id of ids) {
+    if (typeof id !== "string" || !GRANTABLE_CRITERIA.includes(id)) return null;
+    const c = parseCriteriaId(id);
+    if (!c) return null;
+    out.push(c);
+  }
+  return out;
+}
+
 /**
  * The tier-enrolment approval page (notme-486e8a). The fingerprint is the
  * point: device flow's known weakness is a human approving SOMEONE ELSE'S
@@ -1232,6 +1252,10 @@ function enrolPageHtml(
       </select></label>
   </p>
   <p class="muted">Replicas need authorityManage and a renewal horizon of at most 7 days. For now every line still acts as a singleton.</p>
+  <p>Criteria
+    ${GRANTABLE_CRITERIA.map((id) => `<label><input type="checkbox" name="criteria" value="${esc(id)}" checked> ${esc(id)}</label>`).join("\n    ")}
+  </p>
+  <p class="muted">What this machine's task certificates may say they are. Every tier it collects or renews carries these.</p>
   <button id="approve">approve</button>` : `<p>This enrollment is already ${esc(status)}.</p>`}
   <p id="out" class="muted"></p>
   <script>
@@ -1244,7 +1268,11 @@ function enrolPageHtml(
         body: JSON.stringify({
           user_code: document.body.dataset.code,
           renew_days: Number(document.getElementById('renew').value),
-          clone_policy: document.getElementById('clone').value
+          clone_policy: document.getElementById('clone').value,
+          criteria: Array.prototype.map.call(
+            document.querySelectorAll('input[name=criteria]:checked'),
+            function (el) { return el.value; }
+          )
         })
       });
       var data = await res.json().catch(function () { return {}; });
@@ -3042,7 +3070,7 @@ export default {
         if (typeof session.authMethod !== "string" || !session.authMethod) {
           return jsonErr("session carries no authMethod", 401);
         }
-        let body: { user_code?: unknown; renew_days?: unknown; clone_policy?: unknown } = {};
+        let body: { user_code?: unknown; renew_days?: unknown; clone_policy?: unknown; criteria?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
         } catch {
@@ -3072,6 +3100,13 @@ export default {
           if (!live.includes("authorityManage")) return jsonErr("replicas requires authorityManage", 403);
           if (renewDays === 30) return jsonErr("replicas allows a renewal horizon of at most 7 days", 400);
         }
+        // Criteria (notme-bdc850): which units of identity this machine's
+        // tasks may be. Only definitions grantable this phase; default
+        // agent-session/1. Every tier the enrollment yields carries them.
+        const criteria = grantedCriteria(body.criteria === undefined ? ["agent-session/1"] : body.criteria);
+        if (!criteria) {
+          return jsonErr(`criteria must be grantable criteria ids: ${GRANTABLE_CRITERIA.join(", ")}`, 400);
+        }
         const pending = await authority.getTierEnrolment(userCode);
         if (!pending) return jsonErr("no such enrolment", 404);
         const { narrowScopes } = await import("./src/auth/scope-chain");
@@ -3090,6 +3125,7 @@ export default {
           scopes,
           renewDays,
           clonePolicy,
+          criteria,
         });
         if (!r.ok) {
           return jsonErr(
@@ -3097,7 +3133,7 @@ export default {
             r.reason === "not_found" ? 404 : 409,
           );
         }
-        return Response.json({ ok: true, scopes, clone_policy: clonePolicy });
+        return Response.json({ ok: true, scopes, clone_policy: clonePolicy, criteria: criteria.map(criteriaId) });
       }
 
       // POST /cert/issuing-ca/device/token — the machine collects. Error

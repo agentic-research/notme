@@ -416,6 +416,11 @@ function hex(b: Uint8Array): string {
   return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+/** A row's granted criteria (notme-bdc850); null for a pre-phase-2 enrollment. */
+function storedCriteria(json: string | null): import("./criteria").Criteria[] | null {
+  return json === null ? null : (JSON.parse(json) as import("./criteria").Criteria[]);
+}
+
 function b64url(b: Uint8Array): string {
   return btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
@@ -2223,6 +2228,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     scopes: string[];
     authMethod: string;
     ttlMs?: number;
+    /** The criteria the approver granted (notme-bdc850); absent for a legacy enrollment. */
+    criteria?: import("./criteria").Criteria[];
   }): Promise<
     import("./cert-authority").IssuingCaCertResult & {
       authority: { epoch: number; key_id: string };
@@ -2266,6 +2273,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
             ttlMs: params.ttlMs,
             pin,
             extraExtensions: ct(0),
+            ...(params.criteria ? { criteria: params.criteria } : {}),
           },
         ),
       pems: (r) => [r.certificate],
@@ -2372,6 +2380,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // The approver's clone policy (notme-747cc7): recorded and shown only;
       // phase 1 has no branch endpoint, so every line acts as a singleton.
       "clone_policy TEXT NOT NULL DEFAULT 'singleton'",
+      // The criteria the approver granted (notme-bdc850), as a JSON list of
+      // { name, version }. NULL is a pre-phase-2 enrollment: its tiers carry
+      // no .1.10, at collect and at every renewal, so its tasks stay legacy.
+      "criteria TEXT",
     ]) {
       try {
         this.ctx.storage.sql.exec(`ALTER TABLE tier_enrolments ADD COLUMN ${col}`);
@@ -2497,6 +2509,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     renewDays: number;
     /** The ROUTE validates and authorizes; this records it. */
     clonePolicy: "singleton" | "replicas:2" | "replicas:4" | "replicas:8";
+    /** The criteria granted (notme-bdc850). The ROUTE checks each is grantable. */
+    criteria: import("./criteria").Criteria[];
   }): Promise<{ ok: true } | { ok: false; reason: "not_found" | "expired" | "not_pending" }> {
     this.#ensureTierEnrolmentSchema();
     const now = Math.floor(Date.now() / 1000);
@@ -2509,7 +2523,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec(
       `UPDATE tier_enrolments
           SET status = 'approved', principal_id = ?, identity = ?, auth_method = ?, granted_scopes = ?,
-              renew_until = ?, approved_epoch = ?, clone_policy = ?
+              renew_until = ?, approved_epoch = ?, clone_policy = ?, criteria = ?
         WHERE user_code = ? AND status = 'pending'`,
       params.principalId,
       params.identity,
@@ -2518,6 +2532,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       now + params.renewDays * 86400,
       (await this.getAuthorityState()).epoch,
       params.clonePolicy,
+      JSON.stringify(params.criteria.map(({ name, version }) => ({ name, version }))),
       params.userCode,
     );
     return { ok: true };
@@ -2531,7 +2546,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * the real holder's approval. A good one consumes it before minting.
    */
   async collectTierEnrolment(params: { deviceCode: string; proof: string }): Promise<
-    | ({ ok: true; principalId: string; authMethod: string; renewUntil: number; generation: number; clone_policy: string } &
+    | ({
+        ok: true;
+        principalId: string;
+        authMethod: string;
+        renewUntil: number;
+        generation: number;
+        clone_policy: string;
+        /** Criteria ids ("agent-session/1"); null for a pre-phase-2 enrollment. */
+        criteria: string[] | null;
+      } &
         import("./cert-authority").IssuingCaCertResult & {
           authority: { epoch: number; key_id: string };
         })
@@ -2563,6 +2587,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           renew_until: number | null;
           key_fingerprint: string;
           clone_policy: string;
+          criteria: string | null;
         }
       | undefined;
     if (!row) return { ok: false, reason: "invalid_grant" };
@@ -2616,12 +2641,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       row.key_fingerprint,
     );
 
+    const criteria = storedCriteria(row.criteria);
+    const { criteriaId } = await import("./criteria");
     const result = await this.mintIssuingCa({
       subject: row.principal_id,
       identity: row.identity,
       publicKeyPem: row.public_key_pem,
       scopes: JSON.parse(row.granted_scopes),
       authMethod: row.auth_method,
+      ...(criteria ? { criteria } : {}),
     });
     return {
       ok: true,
@@ -2630,6 +2658,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       renewUntil: row.renew_until ?? 0,
       generation: 0,
       clone_policy: row.clone_policy,
+      criteria: criteria?.map(criteriaId) ?? null,
       ...result,
     };
   }
@@ -2669,7 +2698,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // stale generation for someone's public key cannot shut it off.
 
   async renewTier(params: { publicKeyPem: string; iat: number; proof: string; generation?: number }): Promise<
-    | ({ ok: true; renewUntil: number; generation: number } & import("./cert-authority").IssuingCaCertResult & {
+    | ({ ok: true; renewUntil: number; generation: number; criteria: string[] | null } & import("./cert-authority").IssuingCaCertResult & {
         authority: { epoch: number; key_id: string };
       })
     | {
@@ -2711,6 +2740,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       public_key_pem: string;
       generation: number;
       binding_version: number | null;
+      criteria: string | null;
     };
     const readRow = () =>
       this.ctx.storage.sql
@@ -2810,6 +2840,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     // Never past the horizon the human set.
     const ttlMs = Math.min(60 * 60 * 1000, (row.renew_until - now) * 1000);
+    // The same criteria as at collect, never re-judged: they were checked
+    // grantable at approval. A legacy (NULL) row stays without .1.10.
+    const criteria = storedCriteria(row.criteria);
+    const { criteriaId } = await import("./criteria");
     const result = await this.mintIssuingCa({
       subject: row.principal_id,
       identity: row.identity,
@@ -2817,8 +2851,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       scopes,
       authMethod: row.auth_method,
       ttlMs,
+      ...(criteria ? { criteria } : {}),
     });
-    return { ok: true, renewUntil: row.renew_until, generation, ...result };
+    return { ok: true, renewUntil: row.renew_until, generation, criteria: criteria?.map(criteriaId) ?? null, ...result };
   }
 
   /**
@@ -2922,20 +2957,22 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   /** A principal's enrolled machines — what the human approved, and its state. */
   async listTierEnrolments(principalId: string): Promise<
-    Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; revoke_reason: string | null; scopes: string[]; clone_policy: string; generation: number }>
+    Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; revoke_reason: string | null; scopes: string[]; clone_policy: string; generation: number; criteria: string[] | null }>
   > {
     this.#ensureTierEnrolmentSchema();
     // revoke_reason (null unless revoked, e.g. fork_detected) so the human sees WHY a machine stopped.
     const rows = this.ctx.storage.sql
       .exec(
-        "SELECT key_fingerprint, status, renew_until, revoked_at, revoke_reason, granted_scopes, clone_policy, generation FROM tier_enrolments WHERE principal_id = ? AND status = 'active'",
+        "SELECT key_fingerprint, status, renew_until, revoked_at, revoke_reason, granted_scopes, clone_policy, generation, criteria FROM tier_enrolments WHERE principal_id = ? AND status = 'active'",
         principalId,
       )
-      .toArray() as Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; revoke_reason: string | null; granted_scopes: string; clone_policy: string; generation: number }>;
-    return rows.map(({ granted_scopes, ...r }) => ({
+      .toArray() as Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; revoke_reason: string | null; granted_scopes: string; clone_policy: string; generation: number; criteria: string | null }>;
+    const { criteriaId } = await import("./criteria");
+    return rows.map(({ granted_scopes, criteria, ...r }) => ({
       ...r,
       revoke_reason: r.revoked_at === null ? null : (r.revoke_reason ?? null),
       scopes: JSON.parse(granted_scopes),
+      criteria: storedCriteria(criteria)?.map(criteriaId) ?? null,
     }));
   }
 

@@ -26,7 +26,8 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { BasicConstraintsExtension, X509Certificate } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
 import { createSessionCookie } from "./auth/session";
-import { mintTaskCertPair } from "./cert-authority";
+import { OID_CRITERIA, mintTaskCertPair } from "./cert-authority";
+import { readCriteria } from "./criteria";
 import { ED25519 } from "./platform";
 import type { SigningAuthority } from "./signing-authority";
 
@@ -276,5 +277,88 @@ describe("end to end: a task certificate, minted offline, chains to the root", (
     expect(await leaf.verify({ publicKey: tierKey, signatureOnly: true })).toBe(true);
     expect(leaf.issuer).toBe(tier.subject);
     expect(task.identity.endsWith("/notme-486e8a")).toBe(true);
+  });
+});
+
+describe("the approver grants criteria (notme-bdc850)", () => {
+  const collect = async (e: Awaited<ReturnType<typeof started>>) =>
+    post(TOKEN, {
+      device_code: e.device_code,
+      proof: await proofFor(e.key.kp.privateKey, e.key.spki, e.device_code),
+    });
+
+  it("defaults to agent-session/1, carried in the tier's .1.10 and named in the collect response", async () => {
+    const e = await started();
+    const { cookie } = await humanWith(["bridgeCert", "certMint"]);
+    const ap = await post(APPROVE, { user_code: e.user_code }, { cookie });
+    expect(ap.status).toBe(200);
+    expect(await ap.json()).toMatchObject({ criteria: ["agent-session/1"] });
+    const res = await collect(e);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { certificate: string; criteria: string[] | null };
+    expect(body.criteria).toEqual(["agent-session/1"]);
+    const tier = new X509Certificate(body.certificate);
+    expect(readCriteria(tier)).toEqual({ present: true, ok: true, list: [{ name: "agent-session", version: 1 }] });
+    // Non-critical, like every notme extension: enforcement lives in verifiers.
+    expect(tier.getExtension(OID_CRITERIA)?.critical).toBe(false);
+  });
+
+  it("accepts an explicit grantable list", async () => {
+    const e = await started();
+    const { cookie } = await humanWith(["bridgeCert", "certMint"]);
+    const ap = await post(APPROVE, { user_code: e.user_code, criteria: ["agent-session/1"] }, { cookie });
+    expect(ap.status).toBe(200);
+    const body = (await (await collect(e)).json()) as { criteria: string[] | null };
+    expect(body.criteria).toEqual(["agent-session/1"]);
+  });
+
+  for (const criteria of [
+    ["llo-run/1"], // defined, not grantable until phase 5
+    ["deploy/1"], // minted by the authority only
+    ["nope/1"], // unknown
+    ["agent-session"], // malformed id
+    ["agent-session/1", "agent-session/1"], // duplicate
+    [], // empty
+    "agent-session/1", // not an array
+    [1], // not a string
+  ] as unknown[]) {
+    it(`refuses criteria ${JSON.stringify(criteria)} with 400, leaving the enrolment pending`, async () => {
+      const e = await started();
+      const { cookie } = await humanWith(["bridgeCert", "certMint"]);
+      const res = await post(APPROVE, { user_code: e.user_code, criteria }, { cookie });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ error: "criteria must be grantable criteria ids: agent-session/1" });
+      expect(await (await collect(e)).json()).toMatchObject({ error: "authorization_pending" });
+    });
+  }
+
+  it("a pre-phase-2 enrollment (criteria NULL) collects a tier with NO .1.10, and says criteria: null", async () => {
+    const e = await started();
+    const { cookie } = await humanWith(["bridgeCert", "certMint"]);
+    expect((await post(APPROVE, { user_code: e.user_code }, { cookie })).status).toBe(200);
+    // Simulate a row approved before this phase: the column it never wrote.
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec(
+        "UPDATE tier_enrolments SET criteria = NULL WHERE user_code = ?",
+        e.user_code,
+      );
+    });
+    const res = await collect(e);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { certificate: string; criteria: string[] | null };
+    expect(body.criteria).toBeNull();
+    expect(readCriteria(new X509Certificate(body.certificate))).toEqual({ present: false });
+  });
+
+  it("the /enroll page offers each grantable criteria as a checked checkbox, and sends the checked ids", async () => {
+    const e = await started();
+    const { cookie } = await humanWith(["bridgeCert", "certMint"]);
+    const html = await (await call(`${ORIGIN}/enroll?code=${e.user_code}`, { headers: { cookie } })).text();
+    expect(html).toContain("Criteria");
+    expect(html).toMatch(/<input type="checkbox" name="criteria" value="agent-session\/1" checked>/);
+    // Not grantable this phase: not offered.
+    expect(html).not.toContain('value="llo-run/1"');
+    expect(html).not.toContain('value="deploy/1"');
+    expect(html).toContain("criteria:");
   });
 });

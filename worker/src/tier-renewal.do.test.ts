@@ -23,6 +23,7 @@ import { X509Certificate } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
 import { createSessionCookie } from "./auth/session";
 import { tierEnrolmentBinding, deviceCodeHash, tierRenewalBindingV2 } from "./auth/tier-enrolment-binding";
+import { readCriteria } from "./criteria";
 import { ED25519 } from "./platform";
 import type { SigningAuthority } from "./signing-authority";
 
@@ -208,5 +209,43 @@ describe("a human can see and revoke their machines", () => {
     const admin = await human(["bridgeCert", "authorityManage", "certMint"]);
     expect((await post("/cert/issuing-ca/enrollments/revoke", { key_fingerprint: await fp(m.spki) }, { cookie: admin.cookie })).status).toBe(200);
     expect((await renew(m)).status).toBe(403);
+  });
+});
+
+describe("criteria survive renewal (notme-bdc850)", () => {
+  it("a criteria-bearing enrollment renews into a tier carrying the same .1.10", async () => {
+    // Dropping them would make every later task "legacy": a silent downgrade.
+    const { m, tier } = await enrolled();
+    expect(readCriteria(new X509Certificate(tier.certificate))).toEqual({ present: true, ok: true, list: [{ name: "agent-session", version: 1 }] });
+    for (let i = 0; i < 2; i++) {
+      const res = await renew(m);
+      expect(res.status, await res.clone().text()).toBe(200);
+      const body = (await res.json()) as { certificate: string; criteria: string[] | null };
+      expect(body.criteria).toEqual(["agent-session/1"]);
+      expect(readCriteria(new X509Certificate(body.certificate))).toEqual({ present: true, ok: true, list: [{ name: "agent-session", version: 1 }] });
+    }
+  });
+
+  it("a pre-phase-2 enrollment (criteria NULL) renews into a tier with NO .1.10, and says criteria: null", async () => {
+    // Adding criteria to a legacy row would make its in-flight tasks fail.
+    const { m, h } = await enrolled();
+    const f = await fp(m.spki);
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET criteria = NULL WHERE key_fingerprint = ?", f);
+    });
+    const res = await renew(m);
+    expect(res.status, await res.clone().text()).toBe(200);
+    const body = (await res.json()) as { certificate: string; criteria: string[] | null };
+    expect(body.criteria).toBeNull();
+    expect(readCriteria(new X509Certificate(body.certificate))).toEqual({ present: false });
+    const list = (await (await call(`${ORIGIN}/cert/issuing-ca/enrollments`, { headers: { cookie: h.cookie } })).json()) as Array<{ key_fingerprint: string; criteria: string[] | null }>;
+    expect(list.find((e) => e.key_fingerprint === f)?.criteria).toBeNull();
+  });
+
+  it("the enrollments list names each machine's criteria", async () => {
+    const { m, h } = await enrolled();
+    const f = await fp(m.spki);
+    const list = (await (await call(`${ORIGIN}/cert/issuing-ca/enrollments`, { headers: { cookie: h.cookie } })).json()) as Array<{ key_fingerprint: string; criteria: string[] | null }>;
+    expect(list.find((e) => e.key_fingerprint === f)?.criteria).toEqual(["agent-session/1"]);
   });
 });

@@ -15,6 +15,7 @@ import {
   ExtendedKeyUsageExtension,
 } from "@peculiar/x509";
 import { ED25519 } from "./platform";
+import type { Criteria } from "./criteria";
 
 // Leaf-cert extensions — declare what each cert is for so strict X.509
 // validators (rustls, boringssl, openssl 3) can enforce. Without these, the
@@ -717,6 +718,12 @@ export async function mintIssuingCaCert(
      * pin for why. Absent, the serial is random and the clock is read once.
      */
     pin?: { serial: string; notBefore: Date; notAfter: Date };
+    /**
+     * The criteria the approver granted (notme-bdc850), stamped as `.1.10`.
+     * Absent for a pre-phase-2 enrollment: its tier carries no `.1.10`, so
+     * its tasks stay `legacy` rather than failing.
+     */
+    criteria?: Criteria[];
   },
 ): Promise<IssuingCaCertResult> {
   // Longer-lived than the 5-minute leaves by design (ADR-019 D4: "a
@@ -737,6 +744,11 @@ export async function mintIssuingCaCert(
   const sanDer = derTlv(0x30, sanUri);
   const serial = crypto.getRandomValues(new Uint8Array(16));
   serial[0] &= 0x7f;
+  // Lazy: criteria.ts imports from this module, and its top level reads
+  // OID_PEN, so a static import here would evaluate it before OID_PEN exists.
+  const criteriaDer = opts.criteria
+    ? (await import("./criteria")).encodeCriteria(opts.criteria)
+    : null;
 
   const cert = await X509CertificateGenerator.create({
     subject: `CN=${subject},O=notme`,
@@ -765,6 +777,8 @@ export async function mintIssuingCaCert(
         derUtf8String(opts.principalKind ?? "agent"),
       ),
       new Extension("2.5.29.17", true, sanDer),
+      // Non-critical, like every notme extension: enforcement lives in verifiers.
+      ...(criteriaDer ? [new Extension(OID_CRITERIA, false, criteriaDer)] : []),
       ...(opts.extraExtensions ?? []),
     ],
   });
