@@ -14,7 +14,7 @@ import { env } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { createSessionCookie } from "./auth/session";
-import { type GhaSigner, installGhaSigner } from "./__tests__/helpers/gha-token";
+import { type GhaSigner, ghaPopBody, installGhaSigner } from "./__tests__/helpers/gha-token";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN, GHA_ALLOWED_OWNERS: "agentic-research" };
@@ -62,6 +62,14 @@ function limiter(allow: (key: string) => boolean) {
   };
 }
 
+// ONE GitHub signer for the file: validateGHAToken caches the JWKS at module
+// scope, so a second keypair would be checked against the first one's key.
+let signer: GhaSigner;
+beforeAll(async () => {
+  signer = await installGhaSigner({ owner: "agentic-research", repo: "pre-do-limits", audience: "notme.bot" });
+});
+afterAll(() => signer.restore());
+
 const call = (req: Request, extra: Record<string, unknown>) =>
   worker.fetch(req, { ...env, ...LOCAL_ENV, ...extra } as never);
 
@@ -108,12 +116,6 @@ describe("POST /token is limited before any SigningAuthority RPC", () => {
   });
 
   describe("token exchange", () => {
-    let signer: GhaSigner;
-    beforeAll(async () => {
-      signer = await installGhaSigner({ owner: "agentic-research", repo: "pre-do-limits", audience: "notme.bot" });
-    });
-    afterAll(() => signer.restore());
-
     it("a limited exchange makes no RPC: the GitHub subject is known without the DO", async () => {
       const spy = spiedAuthority();
       const rl = limiter(() => false);
@@ -130,5 +132,37 @@ describe("POST /token is limited before any SigningAuthority RPC", () => {
       expect(res.status).toBe(429);
       expect(spy.calls).toEqual([]);
     });
+  });
+});
+
+describe("POST /cert/gha is limited before any SigningAuthority RPC", () => {
+  it("a limited request does not publish the CA bundle on the way to its 429", async () => {
+    // The handler used to ensure the KV-published bundle FIRST — before the
+    // bearer token was even read — so on a KV miss every request, limited or
+    // anonymous, paid a generateBundle() on the singleton.
+    await env.CA_BUNDLE_CACHE.delete("bundle:current");
+    const spy = spiedAuthority();
+    const rl = limiter(() => false);
+    const token = await signer.token();
+    const res = await call(
+      new Request(`${ORIGIN}/cert/gha`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify(await ghaPopBody(token)),
+      }),
+      { SIGNING_AUTHORITY: spy.binding, CERT_LIMITER: rl.binding, GHA_CERT_AUDIENCE: "notme.bot" },
+    );
+    expect(res.status).toBe(429);
+    expect(spy.calls).toEqual([]);
+  });
+
+  it("an anonymous request makes no RPC either", async () => {
+    await env.CA_BUNDLE_CACHE.delete("bundle:current");
+    const spy = spiedAuthority();
+    const res = await call(new Request(`${ORIGIN}/cert/gha`, { method: "POST", body: "{}" }), {
+      SIGNING_AUTHORITY: spy.binding,
+    });
+    expect(res.status).toBe(401);
+    expect(spy.calls).toEqual([]);
   });
 });

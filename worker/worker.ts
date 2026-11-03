@@ -671,13 +671,6 @@ async function handleCertGHA(
 
   const cfg = getConfig(env);
 
-  try {
-    // Ensure CA bundle is published to KV (lazy init — first request bootstraps)
-    await ensureCurrentCABundle(env, platform);
-  } catch (e: any) {
-    return jsonErr("authority unavailable: " + e.message, 503);
-  }
-
   // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC)
   const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
   const authority = env.SIGNING_AUTHORITY.get(authorityId);
@@ -725,6 +718,17 @@ async function handleCertGHA(
     if (!allowed) {
       return jsonErr("rate limit exceeded", 429);
     }
+  }
+
+  try {
+    // Ensure CA bundle is published to KV (lazy init — first request
+    // bootstraps). AFTER the token, allowlist, jti and limiter checks
+    // (notme-ed6114): on a KV miss this is a generateBundle() on the
+    // singleton authority, and it used to run before the bearer token was
+    // read, so an anonymous or rate-limited request paid for it.
+    await ensureCurrentCABundle(env, platform);
+  } catch (e: any) {
+    return jsonErr("authority unavailable: " + e.message, 503);
   }
 
   // ── Bridge cert pair via PoP exchange (008) ──
