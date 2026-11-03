@@ -279,13 +279,19 @@ describe("dpop.rate-limit", () => {
         TOKEN_LIMITER: rl.binding,
       });
     }
-    expect(rl.keys).toEqual(["token:alice", "token:bob"]);
+    expect(rl.keys.filter((k) => k.startsWith("token:"))).toEqual(["token:alice", "token:bob"]);
+    // Each cookie is first charged to its source address, BEFORE the DO
+    // reads the secret that verifies it (notme-ed6114,
+    // pre-do-limits.do.test.ts). Without a cf-connecting-ip they share the
+    // "unknown" bucket; behind Cloudflare the header is always present.
+    expect(rl.keys).toEqual(["token-ip:unknown", "token:alice", "token-ip:unknown", "token:bob"]);
   });
 
   it("an unauthenticated caller never reaches the limiter", async () => {
-    // The limiter runs AFTER session resolution, deliberately: keying on a
-    // principal requires knowing one. A stranger gets 401 and consumes no
-    // budget, which is the property that makes per-principal keying safe.
+    // A caller with NO cookie is refused 401 before any limiter or DO call,
+    // and consumes no budget. One WITH a cookie is charged to its address
+    // first (above): the principal is not known until the DO's secret
+    // verifies the cookie, and that read must not be free (notme-ed6114).
     const rl = limiter(0);
     const res = await call("/token", tokenReq(), { TOKEN_LIMITER: rl.binding });
     expect(res.status).toBe(401);

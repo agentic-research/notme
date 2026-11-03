@@ -3926,6 +3926,23 @@ export default {
               const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
               const authority = env.SIGNING_AUTHORITY.get(authorityId);
 
+              // Rate limit — atomic, edge-fast (replaces the KV-based,
+              // TOCTOU-vulnerable limiter). EVERY check runs before the DO
+              // call it guards (notme-ed6114): the limiter used to run after
+              // getSessionSecret(), so any value in notme_session bought a
+              // billed RPC on the singleton authority before anything could
+              // refuse it. Two keys, because the principal is not known
+              // until the secret is in hand:
+              //   token-ip:<ip>  — before the secret is read for a cookie;
+              //   token:<sub>    — once the caller is known, before any
+              //                    further DO work on its behalf.
+              const rateLimited = async (key: string): Promise<boolean> => {
+                if (!env.TOKEN_LIMITER) return false;
+                const { success } = await env.TOKEN_LIMITER.limit({ key });
+                return !success;
+              };
+              const tooMany = () => Response.json({ error: "rate_limited" }, { status: 429 });
+
               // ── Resolve identity: session cookie OR client cert ──
               let principalId: string | null = null;
               let scopes: string[] = [];
@@ -3975,6 +3992,9 @@ export default {
                 principalId = claims.sub;
                 scopes = ["bridgeCert"];
                 exchanged = { jti: claims.jti, exp: Number(claims.exp) || 0 };
+                // GitHub-signed, so the subject is known (and not the
+                // caller's to vary) without asking the DO.
+                if (await rateLimited(`token:${principalId}`)) return tooMany();
                 sessionSecret = await authority.getSessionSecret();
               } else {
                 // Session cookie (browser/passkey users)
@@ -3983,6 +4003,11 @@ export default {
                   "notme_session",
                 );
                 if (cookie) {
+                  // Any string is a cookie until the secret says otherwise,
+                  // so this one is keyed on where it came from, not on what
+                  // it claims. No cookie, no DO call — and no budget spent.
+                  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+                  if (await rateLimited(`token-ip:${ip}`)) return tooMany();
                   const { verifySessionCookie, liveScopes } =
                     await import("./src/auth/session");
                   const secret: string = await authority.getSessionSecret();
@@ -3990,6 +4015,7 @@ export default {
                   const session = await verifySessionCookie(cookie, secret);
                   if (session) {
                     principalId = session.principalId;
+                    if (await rateLimited(`token:${principalId}`)) return tooMany();
                     // LIVE grants, not the cookie's copy (notme-486e8a): a
                     // revoked scope must not keep appearing in fresh tokens.
                     scopes = await liveScopes(session, authority);
@@ -4004,19 +4030,6 @@ export default {
                   return Response.json(
                     { error: "session_required" },
                     { status: 401 },
-                  );
-                }
-              }
-
-              // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
-              if (env.TOKEN_LIMITER) {
-                const { success } = await env.TOKEN_LIMITER.limit({
-                  key: `token:${principalId}`,
-                });
-                if (!success) {
-                  return Response.json(
-                    { error: "rate_limited" },
-                    { status: 429 },
                   );
                 }
               }

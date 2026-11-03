@@ -154,7 +154,7 @@ note: discovery (`/.well-known/signet-authority.json`) and the JSON landing page
 | `CA_BUNDLE_CACHE`      | KV namespace   | signed `CABundle` written by the SA alarm, read by edge revocation verifier  | wrangler.toml only (KV not in workerd) |
 | `VPC_AUTH`             | vpc_service    | private tunnel to signet (Go) on Fly — fall-through for unrouted auth paths  | wrangler.toml only                     |
 | `ASSETS`               | static assets  | `public/` directory; `run_worker_first = true`                               | wrangler.toml                          |
-| `TOKEN_LIMITER`        | rate limiter   | per-principal `/token` (20/min)                                              | wrangler.toml.example only             |
+| `TOKEN_LIMITER`        | rate limiter   | per-principal `/token` (20/min); per-IP before a cookie is verified                                              | wrangler.toml.example only             |
 | `CERT_LIMITER`         | rate limiter   | per-repo `/cert/gha` (10/min)                                                | wrangler.toml.example only             |
 | `PASSKEY_LIMITER`      | rate limiter   | per-IP passkey routes (5/min) — wired in `handlePasskey`                     | wrangler.toml.example                  |
 | `SITE_URL`             | var            | canonical site origin                                                        | both                                   |

@@ -82,6 +82,14 @@ Response: `{ "access_token": "<jwt>", "token_type": "DPoP", "expires_in": 300 }`
 > rate-limit `period` accepts only 10 or 60 seconds, so no hourly figure can
 > describe this binding. The effective ceiling is up to 1200 tokens per
 > principal per hour. The check runs only when the binding is present.
+>
+> **Order (2026-11-03, `notme-ed6114`).** Every check runs before the DO
+> call it guards. A request carrying a session cookie is first charged to
+> `token-ip:${cf-connecting-ip}` on the same binding (same 20/60 s), because
+> the principal is unknown until the DO's session secret verifies the
+> cookie; the `token:${principalId}` check then runs before the live scopes
+> are read. A token exchange is keyed `token:${sub}` from the GitHub-signed
+> subject, before any DO call.
 
 ### GET /authorize (auth.notme.bot)
 
