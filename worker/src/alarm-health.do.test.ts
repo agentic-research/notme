@@ -18,7 +18,7 @@
  * alarm scheduling via `runDurableObjectAlarm`, not a mock.
  */
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { SigningAuthority } from "./signing-authority";
 
 /** Just the storage surface these tests reach for. */
@@ -27,12 +27,48 @@ interface AlarmCtx {
     storage: {
       setAlarm(t: number): Promise<void>;
       getAlarm(): Promise<number | null>;
+      deleteAlarm(): Promise<void>;
     };
   };
 }
 
-const authority = (name: string) =>
-  env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+/**
+ * Where a test arms its alarm: far enough out that the platform's own timer
+ * can never fire it while the test runs (notme-070a8f).
+ *
+ * `runDurableObjectAlarm` "immediately runs and removes the Durable Object
+ * pointed to by stub's alarm if one is scheduled", whatever time it is set
+ * for (https://developers.cloudflare.com/workers/testing/vitest-integration/test-apis/;
+ * the DO testing guide arms `Date.now() + 60_000` and runs it at once:
+ * https://developers.cloudflare.com/durable-objects/examples/testing-with-durable-objects/).
+ * So the scheduled time only decides whether the REAL timer races the
+ * manual run. This file used `Date.now() + 50`: the real fire won often
+ * enough (3 runs in 10, with no load added) that `runDurableObjectAlarm`
+ * found no alarm, returned false, and the KV write landed at an arbitrary
+ * moment.
+ */
+const FAR_FUTURE_MS = 60 * 60 * 1000;
+
+/** Every authority this file has touched, so afterEach can disarm it. */
+const touched = new Set<string>();
+
+const authority = (name: string) => {
+  touched.add(name);
+  return env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+};
+
+// No alarm outlives the test that armed it. A fire re-arms itself (that is
+// the property under test) and so does resetAlarmHealth, so without this
+// each test leaves a real 4-minute alarm behind it (DO audit L11).
+afterEach(async () => {
+  for (const name of touched) {
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+    await runInDurableObject(stub, (auth) =>
+      (auth as unknown as AlarmCtx).ctx.storage.deleteAlarm(),
+    );
+  }
+  touched.clear();
+});
 
 /** Force the breaker open by writing the failure count the DO reads. */
 async function tripBreaker(stub: ReturnType<typeof authority>, failures: number) {
@@ -77,7 +113,7 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     // Arm it, then run it.
     await runInDurableObject(stub, (auth) =>
       (auth as unknown as AlarmCtx).ctx.storage.setAlarm(
-        Date.now() + 50,
+        Date.now() + FAR_FUTURE_MS,
       ),
     );
     const ran = await runDurableObjectAlarm(stub);
@@ -97,10 +133,10 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     const stub = authority("alarm-rearms");
     await runInDurableObject(stub, (auth) =>
       (auth as unknown as AlarmCtx).ctx.storage.setAlarm(
-        Date.now() + 50,
+        Date.now() + FAR_FUTURE_MS,
       ),
     );
-    await runDurableObjectAlarm(stub);
+    expect(await runDurableObjectAlarm(stub), "alarm did not run").toBe(true);
 
     const next = await runInDurableObject(stub, (auth) =>
       (auth as unknown as AlarmCtx).ctx.storage.getAlarm(),

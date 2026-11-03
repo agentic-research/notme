@@ -90,11 +90,21 @@ export const CT_BOUND_SUITES = ["src/ct-mint.do.test.ts"];
  */
 export const CT_LIVE_SUITES = ["src/ct-acceptance.do.test.ts"];
 
+/**
+ * Loads the Worker's module graph before a file's tests start, so the first
+ * test to reach a dynamically imported module does not pay the cold transform
+ * inside its own timeout. Under load that cold start pushed the first mint-path
+ * test of eight files past 5 s at once (notme-070a8f). See the file for the
+ * measurement; the timeout is NOT raised.
+ */
+export const WARM_SETUP_FILES = ["./src/__tests__/setup/warm-worker-modules.ts"];
+
 export default defineConfig({
   resolve: { alias: { "@peculiar/x509": x509Dir } },
   plugins: [cloudflareTest({ main: "./worker.ts", miniflare: baseMiniflare })],
   test: {
     include: ["src/**/*.do.test.ts"],
+    setupFiles: WARM_SETUP_FILES,
     exclude: [...configDefaults.exclude, ...CT_BOUND_SUITES, ...CT_LIVE_SUITES],
   },
 });

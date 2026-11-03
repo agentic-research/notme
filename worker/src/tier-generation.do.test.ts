@@ -19,6 +19,8 @@
 import worker from "../worker";
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+// Window-edge assertions run on one clock shared with the authority (notme-070a8f).
+import { withPinnedClock } from "./__tests__/helpers/pinned-clock";
 import { createSessionCookie } from "./auth/session";
 import {
   tierEnrolmentBinding,
@@ -291,8 +293,10 @@ describe("what is not a fork", () => {
     // The honest machine was offline (or met a 5xx or 429): its saved request
     // is resent byte for byte with its original iat, past the 120 s skew.
     const { m } = await enrolled();
-    await expectOk(await send(await renewalBody(m, 0, nowS() - 121)), 1);
-    await expectOk(await send(await renewalBody(m, 1, nowS() - 3599)), 2);
+    await withPinnedClock(async () => {
+      await expectOk(await send(await renewalBody(m, 0, nowS() - 121)), 1);
+      await expectOk(await send(await renewalBody(m, 1, nowS() - 3599)), 2);
+    });
     const row = await rowOf(m);
     expect(row.generation).toBe(2);
     expect(row.revoked_at).toBeNull();
@@ -309,7 +313,9 @@ describe("what is not a fork", () => {
 
   it("an iat beyond the skew ahead is stale at the current generation", async () => {
     const { m } = await enrolled();
-    await expectErr(await send(await renewalBody(m, 0, nowS() + 121)), 401, "stale_proof");
+    await withPinnedClock(async () =>
+      expectErr(await send(await renewalBody(m, 0, nowS() + 121)), 401, "stale_proof"),
+    );
     expect((await rowOf(m)).generation).toBe(0);
   });
 
@@ -409,9 +415,11 @@ describe("binding v1 is retired", () => {
     await runInDurableObject(authority(), (a) => {
       (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", f);
     });
-    expect((await renewV1(m, nowS() - 121)).status).toBe(200);
-    expect((await renewV1(m, nowS() - 3599)).status).toBe(200);
-    await expectErr(await renewV1(m, nowS() - 3601), 401, "stale_proof");
+    await withPinnedClock(async () => {
+      expect((await renewV1(m, nowS() - 121)).status).toBe(200);
+      expect((await renewV1(m, nowS() - 3599)).status).toBe(200);
+      await expectErr(await renewV1(m, nowS() - 3601), 401, "stale_proof");
+    });
     expect((await rowOf(m)).revoked_at).toBeNull();
   });
 });
