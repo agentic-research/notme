@@ -188,6 +188,58 @@ alarm.
 
 So within one maximum horizon of deploy, no copy can sidestep the counter.
 
+**Binding v3: naming the enrollment** (notme-c9fc8c). v2 does not commit to
+*which* enrollment a request is for. If the same key is enrolled twice
+through the API, a recent request signed for the first enrollment (≤ 1 h
+old) could claim the second one's generation, or (≤ 120 s old, at a spent
+generation) fork it. v3 adds the enrollment:
+
+    "notme/tier-renew/v3\0" || SPKI || uint64be(iat) || uint64be(generation) || enrollment_id
+
+`enrollment_id` is SHA-256(`"notme/tier-enrolment-id/v1\0"` ||
+SHA-256(device_code)), 32 bytes; the authority returns it as 64 lowercase hex
+at collect and on every renewal, and the request carries it as
+`enrollment_id`. A v3 request whose id is not the active enrollment's is
+answered `unknown_key` and changes nothing. Generations, retries and forks
+work exactly as in v2.
+
+Which binding a row accepts (`binding_version`):
+- NULL (legacy): v1, v2, v3. The first v2 or v3 renewal raises it.
+- 2: v2 and v3. A v1 request is `binding_v2_required`.
+- 3: v3 only. A v1 or v2 request is `binding_v3_required`. Its proof has
+  verified, so it came from the key but not from the current client (a
+  copied key without tier.json, or a downgraded binary): it is not revoked,
+  since the two look the same, but logged (`tier.renew_below_binding`) and
+  counted in `/admin/alarm-health` under `renewal.belowBinding` (review L1).
+- A key collected for the first time starts at 2, so a client that predates
+  v3 keeps renewing; a key that was enrolled before (re-enrollment) starts
+  at 3 (while the rollout gate below is on), which is the only case v2 left
+  open. The first v3 renewal raises a row to 3. The task-cert client always
+  generates a fresh key at enroll, so it never meets the re-enrollment case.
+- **What stays open** (review L2). A re-enrollment collected before deploy,
+  or while the gate is off, stays at 2, and nothing migrates it: forcing it
+  to 3 would strand a client that cannot sign v3. For such a row M4 stays
+  open until its client signs v3. Against it, a holder of the earlier
+  enrollment's key and tier.json can keep claiming or forking it with v2,
+  indefinitely; only holders of the same key can. A no-key attacker
+  replaying captured bytes is bounded by the request's age: 1 h to claim,
+  120 s to fork. Such rows are the active ones at binding 2 with a
+  superseded row for the same key.
+
+**Rollout gate** (review M1). Ids are handed out only while the worker var
+`RENEWAL_BINDING_V3` is `"on"` (default off). Off, no id goes out and a
+re-enrolled key collects at 2, but a v3 request is still accepted, so turning
+it off strands nobody. It goes on only after the release is promoted to
+100%, because a front from before v3 drops `enrollment_id` and answers a v3
+request `invalid_proof`; with it on, no rollback past that release. The
+client treats `invalid_proof` on a request it signed v3 as reversible: it
+keeps the request and resends the same bytes, instead of clearing it.
+
+**The proof is verified before the row is read** (notme-c9fc8c). Every
+binding is computed from the request alone, so a caller without the key
+gets `invalid_proof` whatever the row says: it cannot learn whether a key is
+enrolled (`unknown_key`) or which binding it speaks.
+
 ### 5.2 Clone policy on the enrollment
 
 `/enroll` gains a clone-policy control beside the renewal horizon:
@@ -447,7 +499,7 @@ Acceptance:
 | Existing piece | What changes | What keeps working untouched |
 |---|---|---|
 | `tier_enrolments` (signing-authority.ts) | adds `generation`, `last_renewal_digest`, `clone_policy`, `log_key`, `last_checkpoint`; branch rows | existing rows default to generation 0, `singleton`, no log (legacy) |
-| `/cert/issuing-ca/renew` | binding v2 with generation; fork handling | v1 binding accepted for enrollments with no log key, until they re-enroll |
+| `/cert/issuing-ca/renew` | binding v2 with generation; fork handling; binding v3 names the enrollment (§5.1) | v1 binding accepted for enrollments with no log key, until they re-enroll; v2 accepted on any enrollment that has not renewed with v3 and is not a re-enrollment |
 | `/enroll` page | clone-policy control; `replicas` gated on `authorityManage` | renewal horizon, fingerprint compare |
 | `mintTaskCertPair` (cert-authority.ts) | optional SCT embedding (existing `opts.pin` + `ct/sct.ts`); `.1.10` | `.1.9` task scope, narrowing, parent/subtask rules |
 | `task-cert` CLI | `serve`; local log; checkpoint at renew | `enroll`, `mint`, `renew`, `revoke`, `verify`, `status` |

@@ -44,6 +44,11 @@ export const baseMiniflare = {
     // rather than from the request, so a caller cannot name itself the
     // subject permitted to bootstrap.
     BOOTSTRAP_GHA_SUBJECT: "repo:agentic-research/notme:ref:refs/heads/main",
+    // Renewal binding v3 handed out (notme-c9fc8c, review M1): the suites
+    // test the state AFTER the release is promoted and the var turned on.
+    // Production and e2e default it off (wrangler.toml.example,
+    // wrangler.e2e.toml); tier-generation.do.test.ts covers off.
+    RENEWAL_BINDING_V3: "on",
     // Forwarded from the shell so ct-full-cycle.do.test.ts can be
     // pointed at a locally running transparency log. `env` in this pool
     // is the MINIFLARE binding set, not process.env, so a bare shell

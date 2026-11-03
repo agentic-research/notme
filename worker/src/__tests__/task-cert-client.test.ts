@@ -194,7 +194,7 @@ import {
   renewTier, renewTierInDir, saveEnrolment, loadPending, acquireRenewLock, savePendingExclusive, AuthorityRefusal, CLIENT_RESEND_WINDOW_S, type PendingRenewal,
   clearOwnPending, enrollInDir, explainRenewalFailure, CONNECT_PHASE_CODES,
 } from "../../../scripts/task-cert/lib";
-import { tierRenewalBindingV2 } from "../auth/tier-enrolment-binding";
+import { tierRenewalBindingV2, tierRenewalBindingV3 } from "../auth/tier-enrolment-binding";
 
 describe("renewal with a generation", () => {
   afterEach(() => vi.useRealTimers());
@@ -210,7 +210,7 @@ describe("renewal with a generation", () => {
     return {
       events,
       get saved() { return saved; },
-      opts: (extra: { generation?: number; pending?: PendingRenewal | null } = {}) => ({
+      opts: (extra: { generation?: number; enrollmentId?: string; pending?: PendingRenewal | null } = {}) => ({
         ...extra,
         savePending: (p: PendingRenewal) => { saved = p; events.push("save"); },
         clearPending: () => { saved = null; events.push("clear"); },
@@ -226,6 +226,31 @@ describe("renewal with a generation", () => {
     await renewTier("https://a", k, h.opts({ generation: 3 }), fetchFn);
     expect(sent.generation).toBe(3);
     expect(await crypto.subtle.verify(ED25519, k.publicKey, fromB64url(sent.proof), tierRenewalBindingV2(k.spki, sent.iat, 3))).toBe(true);
+  });
+
+  it("signs v3 over the generation and the enrollment id once it has one (notme-c9fc8c)", async () => {
+    const k = await generateTierKey();
+    const h = harness();
+    const id = "c9".repeat(32);
+    let sent: any;
+    const fetchFn = (async (_u: string, init: any) => { sent = JSON.parse(init.body); return reply(200, okBody); }) as unknown as typeof fetch;
+    await renewTier("https://a", k, h.opts({ generation: 3, enrollmentId: id }), fetchFn);
+    expect(sent.generation).toBe(3);
+    expect(sent.enrollment_id).toBe(id);
+    const idBytes = Uint8Array.from(id.match(/../g)!, (x) => parseInt(x, 16));
+    expect(await crypto.subtle.verify(ED25519, k.publicKey, fromB64url(sent.proof), tierRenewalBindingV3(k.spki, sent.iat, 3, idBytes))).toBe(true);
+    expect(await crypto.subtle.verify(ED25519, k.publicKey, fromB64url(sent.proof), tierRenewalBindingV2(k.spki, sent.iat, 3))).toBe(false);
+  });
+
+  it("an id that is not the authority's 64 hex digits, or an id with no generation, is not signed", async () => {
+    for (const [generation, enrollmentId] of [[3, "C9".repeat(32)], [3, "c9"], [3, "zz".repeat(32)], [undefined, "c9".repeat(32)]] as const) {
+      const k = await generateTierKey();
+      const h = harness();
+      let sent: any;
+      const fetchFn = (async (_u: string, init: any) => { sent = JSON.parse(init.body); return reply(200, okBody); }) as unknown as typeof fetch;
+      await renewTier("https://a", k, h.opts({ generation, enrollmentId }), fetchFn);
+      expect("enrollment_id" in sent, String(enrollmentId)).toBe(false);
+    }
   });
 
   it("saves the request before sending, clears it after a definitive answer", async () => {
@@ -362,7 +387,7 @@ describe("renewal with a generation", () => {
   });
 
   it("only refusals the authority could never reverse clear a first attempt", async () => {
-    const final = ["invalid_key", "invalid_proof", "binding_v2_required", "revoked", "fork_detected", "horizon_passed", "epoch_changed", "unknown_key", "bad_request"];
+    const final = ["invalid_key", "invalid_proof", "binding_v2_required", "binding_v3_required", "revoked", "fork_detected", "horizon_passed", "epoch_changed", "unknown_key", "bad_request"];
     for (const reason of final) {
       const h = harness();
       await expect(renewTier("https://a", await generateTierKey(), h.opts({ generation: 1 }), withFetch(() => reply(400, { error: reason })))).rejects.toThrow();
@@ -569,10 +594,57 @@ describe("renewal with a generation", () => {
     expect(h.events).toEqual(["save"]);
   });
 
+  describe("a v3 request answered invalid_proof (review M1: the authority may be an older build)", () => {
+    const id = "c9".repeat(32);
+    const V3_UNRECOGNISED =
+      "the authority did not recognise binding v3 — it may be running an older build; the request is kept, retry after it is updated";
+
+    it("a first attempt keeps the pending request and says why", async () => {
+      const h = harness();
+      const err = await renewTier("https://a", await generateTierKey(), h.opts({ generation: 1, enrollmentId: id }),
+        withFetch(() => reply(401, { error: "invalid_proof" }))).catch((e) => e);
+      expect(err).toBeInstanceOf(AuthorityRefusal);
+      expect(h.events, "a v3 invalid_proof must not clear").toEqual(["save"]);
+      expect(h.saved).not.toBeNull();
+      expect(explainRenewalFailure(err).message).toBe(V3_UNRECOGNISED);
+    });
+
+    it("a resend is kept too (not 'state lost'), and the same bytes are sent once the authority understands v3", async () => {
+      const k = await generateTierKey();
+      const h = harness();
+      const seen: string[] = [];
+      await renewTier("https://a", k, h.opts({ generation: 1, enrollmentId: id }), withFetch(() => reply(401, { error: "invalid_proof" }), seen)).catch(() => {});
+      const err = await renewTier("https://a", k, h.opts({ generation: 1, enrollmentId: id, pending: h.saved }),
+        withFetch(() => reply(401, { error: "invalid_proof" }), seen)).catch((e) => e);
+      expect(explainRenewalFailure(err).message).toBe(V3_UNRECOGNISED);
+      expect(h.saved).not.toBeNull();
+      await renewTier("https://a", k, h.opts({ generation: 1, enrollmentId: id, pending: h.saved }), withFetch(() => reply(200, okBody), seen));
+      expect(seen).toHaveLength(3);
+      expect(new Set(seen).size, "always the same bytes").toBe(1);
+      expect(h.saved).toBeNull();
+    });
+
+    it("a v2 request answered invalid_proof is still final", async () => {
+      const h = harness();
+      await expect(renewTier("https://a", await generateTierKey(), h.opts({ generation: 1 }),
+        withFetch(() => reply(401, { error: "invalid_proof" })))).rejects.toThrow();
+      expect(h.events).toEqual(["save", "clear"]);
+    });
+  });
+
   describe("on disk", () => {
     const tmp = () => mkdtempSync(join(tmpdir(), "task-cert-test-"));
     const inDir = (dir: string, k: Awaited<ReturnType<typeof generateTierKey>>, generation: number | undefined, f: typeof fetch, o: { fetchTimeoutMs?: number; persist?: (r: any) => void } = {}) =>
       renewTierInDir(dir, async () => ({ authority: "https://a", key: k, generation }), o, f);
+
+    it("a v3 request an older authority refuses as invalid_proof leaves renew-pending.json in place (review M1)", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      const load = async () => ({ authority: "https://a", key: k, generation: 2, enrollmentId: "ab".repeat(32) });
+      await expect(renewTierInDir(dir, load, {}, withFetch(() => reply(401, { error: "invalid_proof" })))).rejects.toThrow();
+      expect(existsSync(join(dir, "renew-pending.json"))).toBe(true);
+      expect(JSON.parse(JSON.parse(readFileSync(join(dir, "renew-pending.json"), "utf8")).body).enrollment_id).toBe("ab".repeat(32));
+    });
 
     it("re-enrolling clears a stale pending file", () => {
       const dir = tmp();
@@ -970,6 +1042,10 @@ describe("what a human is told when renewal fails", () => {
     expect(m).not.toMatch(/approval|ended|enroll/);
   });
 
+  it("binding_v3_required says the same: update task-cert (notme-c9fc8c)", () => {
+    expect(explainRenewalFailure(new AuthorityRefusal("binding_v3_required")).message).toBe("this task-cert is older than the authority; update it");
+  });
+
   it("an ended approval still says so", () => {
     expect(explainRenewalFailure(new AuthorityRefusal("fork_detected")).message).toMatch(/approval for this machine has ended \(fork_detected\).*task-cert enroll/);
     expect(explainRenewalFailure(new AuthorityRefusal("stale_proof")).message).toMatch(/clock/);
@@ -1155,5 +1231,35 @@ describe("tier.json records the criteria the authority granted", () => {
     });
     expect(renewedTierMeta(meta, { ...r, criteria: null })).toMatchObject({ criteria: null });
     expect(renewedTierMeta(meta, r)).toMatchObject({ generation: 5, criteria: ["agent-session/1"] });
+  });
+
+  it("renew: an enrollment id in the response is saved (so the next renewal signs v3); a bad or absent one is not (notme-c9fc8c)", () => {
+    const meta = { identity: "id", generation: 4 };
+    const r = { certificate: "T", expires_at: 10, renew_until: 20, authority: { epoch: 3 }, generation: 5 };
+    const id = "ab".repeat(32);
+    expect(renewedTierMeta(meta, { ...r, enrollment_id: id })).toMatchObject({ generation: 5, enrollment_id: id });
+    expect("enrollment_id" in renewedTierMeta(meta, r)).toBe(false);
+    expect("enrollment_id" in renewedTierMeta(meta, { ...r, enrollment_id: "nope" })).toBe(false);
+    // an id stored earlier survives a response from an authority that does not send one
+    expect(renewedTierMeta({ ...meta, enrollment_id: id }, r)).toMatchObject({ enrollment_id: id });
+  });
+
+  it("collect: the enrollment id is saved when the authority returns one", async () => {
+    for (const collected of [{ enrollment_id: "cd".repeat(32) }, {}]) {
+      const dir = mkdtempSync(join(tmpdir(), "task-cert-test-"));
+      const fetchFn = (async (u: string) => {
+        if (u.endsWith("/cert/issuing-ca/device")) {
+          return reply(200, { device_code: "dc", user_code: "UC", verification_uri: "https://a/enroll", key_fingerprint: "ab".repeat(32), expires_in: 60, interval: 0 });
+        }
+        if (u.endsWith("/device/token")) {
+          return reply(200, { certificate: "TIER", identity: "id", scopes: ["bridgeCert"], expires_at: 1, renew_until: 2, authority: { epoch: 3 }, generation: 0, ...collected });
+        }
+        return { ok: true, status: 200, text: async () => "ROOT" } as unknown as Response;
+      }) as unknown as typeof fetch;
+      await enrollInDir(dir, "https://a", { fetchFn, sleep: async () => {} });
+      const meta = JSON.parse(readFileSync(join(dir, "tier.json"), "utf8"));
+      if ("enrollment_id" in collected) expect(meta.enrollment_id).toBe(collected.enrollment_id);
+      else expect("enrollment_id" in meta).toBe(false);
+    }
   });
 });

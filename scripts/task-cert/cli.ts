@@ -123,6 +123,8 @@ async function renewNow(quiet = false) {
           key: { privateKey: await importPrivateKeyPem(need("tier.key.pem")), spki, pem },
           // tier.json without a generation is a legacy enrolment: it renews with v1.
           generation: meta.generation,
+          // Present once the authority has returned it: renewal then signs v3 (notme-c9fc8c).
+          enrollmentId: meta.enrollment_id,
         };
       },
       {

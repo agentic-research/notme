@@ -40,7 +40,11 @@ fi
 # The authority's pin (CT_LOG_ID / CT_LOG_KEY), from the log under test.
 # shellcheck disable=SC2016
 PIN="$(curl -s --max-time 10 "${CT_LOG_URL%/}/metadata.json" \
-  | node -e 'let s="";process.stdin.on("data",(d)=>s+=d).on("end",()=>{const m=JSON.parse(s);console.log(m.log_id+" "+m.key)})')"
+  | node -e 'let s="";process.stdin.on("data",(d)=>s+=d).on("end",()=>{const m=JSON.parse(s);const ok=(v)=>typeof v==="string"&&/^[A-Za-z0-9+/]+=*$/.test(v);if(!ok(m.log_id)||!ok(m.key))process.exit(1);console.log(m.log_id+" "+m.key)})')" \
+  || { echo "FAIL: metadata.json has no base64 log_id/key" >&2; exit 1; }
+# Both fields are checked as non-empty base64 strings above: a metadata.json
+# missing either would otherwise print "undefined undefined", which passes
+# the non-empty test below.
 CT_LOG_ID="${PIN%% *}"
 CT_LOG_KEY="${PIN#* }"
 [ -n "${CT_LOG_ID}" ] && [ -n "${CT_LOG_KEY}" ] || { echo "FAIL: no log_id/key in metadata.json" >&2; exit 1; }

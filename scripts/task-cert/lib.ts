@@ -23,7 +23,8 @@ import { mintTaskCertPair } from "../../worker/src/cert-authority";
 import { checkCriteria, criteriaId, parseCriteriaId, readCriteria, type Criteria } from "../../worker/src/criteria";
 import { ED25519 } from "../../worker/src/platform";
 import {
-  deviceCodeHash, RENEWAL_RETRY_WINDOW_S, RENEWAL_SKEW_S, tierEnrolmentBinding, tierRenewalBinding, tierRenewalBindingV2,
+  deviceCodeHash, ENROLMENT_ID_HEX, RENEWAL_RETRY_WINDOW_S, RENEWAL_SKEW_S, tierEnrolmentBinding, tierRenewalBinding,
+  tierRenewalBindingV2, tierRenewalBindingV3,
 } from "../../worker/src/auth/tier-enrolment-binding";
 
 const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b));
@@ -273,17 +274,25 @@ export function resolveLegacyCutoff(
 
 /**
  * The renewal proof — over the authority's shared binding, byte for byte. With
- * a generation it is the v2 binding; without one (a legacy tier.json) it is v1.
+ * a generation and an enrollment id it is v3 (notme-c9fc8c); with a generation
+ * only, v2; without one (a legacy tier.json) it is v1.
  */
 export async function renewProof(
   privateKey: CryptoKey,
   spki: Uint8Array,
   iat: number,
   generation?: number,
+  enrollmentId?: string,
 ): Promise<string> {
-  const input = generation === undefined ? tierRenewalBinding(spki, iat) : tierRenewalBindingV2(spki, iat, generation);
+  const input =
+    generation === undefined ? tierRenewalBinding(spki, iat)
+    : enrollmentId === undefined ? tierRenewalBindingV2(spki, iat, generation)
+    : tierRenewalBindingV3(spki, iat, generation, Uint8Array.from(enrollmentId.match(/../g)!, (h) => parseInt(h, 16)));
   return b64url(new Uint8Array(await crypto.subtle.sign(ED25519, privateKey, input)));
 }
+
+/** An enrollment id this client will sign: the authority's 64 lowercase hex digits, or nothing. */
+export const validEnrollmentId = (v: unknown): v is string => typeof v === "string" && ENROLMENT_ID_HEX.test(v);
 
 /** A signed renewal request, persisted BEFORE it is sent so it can be resent byte for byte. */
 export type PendingRenewal = { body: string; iat: number; generation: number };
@@ -294,6 +303,8 @@ export type RenewalResult = {
   renew_until: number;
   authority: { epoch: number };
   generation: number;
+  /** The enrollment's id (notme-c9fc8c); absent from an authority that predates binding v3. */
+  enrollment_id?: string;
   /** Criteria ids the renewed tier carries; null for a legacy enrollment; absent from an older authority. */
   criteria?: string[] | null;
 };
@@ -310,6 +321,9 @@ export function renewedTierMeta(meta: Record<string, unknown>, r: RenewalResult)
     epoch: r.authority.epoch,
     renew_until: r.renew_until,
     generation: r.generation,
+    // Learned on any renewal, so a machine collected before binding v3 signs
+    // v3 from its next renewal on (notme-c9fc8c).
+    ...(validEnrollmentId(r.enrollment_id) ? { enrollment_id: r.enrollment_id } : {}),
     ...(r.criteria === null || Array.isArray(r.criteria) ? { criteria: r.criteria } : {}),
   };
 }
@@ -320,7 +334,12 @@ export function renewedTierMeta(meta: Record<string, unknown>, r: RenewalResult)
  * Pending is cleared only for a final reason (see REVERSIBLE_REASONS).
  */
 export class AuthorityRefusal extends Error {
-  constructor(public reason: string, public resend = false) {
+  constructor(
+    public reason: string,
+    public resend = false,
+    /** A v3 request refused invalid_proof: the request is kept (see renewTier). */
+    public v3Unrecognised = false,
+  ) {
     super(reason);
   }
 }
@@ -336,8 +355,12 @@ export class AuthorityRefusal extends Error {
  *   - approval_withdrawn: the authority checks the principal's LIVE scopes,
  *     so restoring the grant makes the bytes acceptable again.
  * Final, and cleared on a first attempt: invalid_key, invalid_proof,
- * binding_v2_required, revoked, fork_detected, horizon_passed,
- * epoch_changed, unknown_key, and a malformed-body 4xx.
+ * binding_v2_required, binding_v3_required, revoked, fork_detected,
+ * horizon_passed, epoch_changed, unknown_key, and a malformed-body 4xx.
+ * EXCEPT invalid_proof for a request signed with binding v3 (review M1): an
+ * authority build from before v3 (a canary split, a rollback) verifies those
+ * bytes as v2 and refuses them, and a current build accepts the same bytes.
+ * That is reversible, so the request is kept, on any attempt.
  */
 export const REVERSIBLE_REASONS: ReadonlySet<string> = new Set(["stale_proof", "approval_withdrawn"]);
 
@@ -427,6 +450,8 @@ export async function renewTier(
   key: { privateKey: CryptoKey; spki: Uint8Array; pem: string },
   opts: {
     generation?: number;
+    /** With a generation: sign binding v3, naming this enrollment (notme-c9fc8c). */
+    enrollmentId?: string;
     pending?: PendingRenewal | null;
     savePending: (p: PendingRenewal) => void;
     /** Clear the pending request, but only if it is still THIS request (`body`). */
@@ -462,11 +487,14 @@ export async function renewTier(
     body = pending.body;
   } else {
     const gen = opts.generation;
+    // v3 needs both; an id without a generation (never written so) stays v1.
+    const id = gen !== undefined && validEnrollmentId(opts.enrollmentId) ? opts.enrollmentId : undefined;
     body = JSON.stringify({
       public_key: key.pem,
       iat: now,
-      proof: await renewProof(key.privateKey, key.spki, now, gen),
+      proof: await renewProof(key.privateKey, key.spki, now, gen, id),
       ...(gen === undefined ? {} : { generation: gen }),
+      ...(id === undefined ? {} : { enrollment_id: id }),
     });
     opts.savePending({ body, iat: now, generation: gen ?? 0 });
     if (opts.currentGeneration && (await opts.currentGeneration()) !== gen) {
@@ -506,6 +534,15 @@ export async function renewTier(
   const definitive =
     res.status >= 400 && res.status < 500 && !TRANSIENT_4XX.has(res.status) && typeof out?.error === "string";
   if (!definitive) throw new Error(`renewal not answered by the authority (HTTP ${res.status}) — try again`);
+  let sentV3 = false;
+  try {
+    sentV3 = "enrollment_id" in JSON.parse(body);
+  } catch { /* unparseable: not provably v3 */ }
+  if (sentV3 && out.error === "invalid_proof") {
+    // Our own signature does not fail; an authority that ignores
+    // enrollment_id does. Keep the bytes: a current authority accepts them.
+    throw new AuthorityRefusal(out.error, resend, true);
+  }
   if (resend && isV1Body(body)) {
     // v1 carries no fork risk: drop the refused request and sign a new one.
     await opts.clearPending(body);
@@ -528,14 +565,19 @@ const ENDED_REASONS = new Set([
 ]);
 
 export const BINDING_V2_REQUIRED_MESSAGE = "this task-cert is older than the authority; update it";
+export const V3_UNRECOGNISED_MESSAGE =
+  "the authority did not recognise binding v3 — it may be running an older build; the request is kept, retry after it is updated";
+/** binding_v3_required means the same thing to a human: this client signed below what the enrollment speaks. */
+export const BINDING_REQUIRED_REASONS: ReadonlySet<string> = new Set(["binding_v2_required", "binding_v3_required"]);
 
 /** What `task-cert renew` (and mint's resume) tells a human when renewal fails. */
 export function explainRenewalFailure(e: unknown): Error {
   const message = String((e as Error | null)?.message ?? e);
   if (message.startsWith("renewal state lost")) return e as Error;
   if (e instanceof AuthorityRefusal) {
+    if (e.v3Unrecognised) return new Error(V3_UNRECOGNISED_MESSAGE);
     // Not an ended approval: the authority has retired v1 for this machine, and this client signed v1.
-    if (e.reason === "binding_v2_required") return new Error(BINDING_V2_REQUIRED_MESSAGE);
+    if (BINDING_REQUIRED_REASONS.has(e.reason)) return new Error(BINDING_V2_REQUIRED_MESSAGE);
     if (e.reason === "stale_proof") {
       return new Error(
         e.resend
@@ -737,19 +779,25 @@ function lockHandle(path: string, token: string) {
  */
 export async function renewTierInDir(
   dir: string,
-  load: () => Promise<{ authority: string; key: { privateKey: CryptoKey; spki: Uint8Array; pem: string }; generation?: number }>,
+  load: () => Promise<{
+    authority: string;
+    key: { privateKey: CryptoKey; spki: Uint8Array; pem: string };
+    generation?: number;
+    enrollmentId?: string;
+  }>,
   opts: { persist?: (r: RenewalResult) => void; fetchTimeoutMs?: number; lock?: LockOpts;
     /** test hooks */ beforeReserve?: () => void; beforeLinkBack?: () => void | Promise<void> },
   fetchFn: typeof fetch = fetch,
 ): Promise<RenewalResult> {
   const lock = acquireRenewLock(dir, opts.lock);
   try {
-    const { authority, key, generation } = await load();
+    const { authority, key, generation, enrollmentId } = await load();
     return await renewTier(
       authority,
       key,
       {
         generation,
+        enrollmentId,
         pending: loadPending(dir),
         savePending: (p) => {
           opts.beforeReserve?.();
@@ -828,6 +876,8 @@ export async function enrollInDir(
       // An authority that returns no generation predates generations: store
       // none, so this machine renews as legacy v1 (never assume 0).
       ...(Number.isSafeInteger(tier.generation) && tier.generation >= 0 ? { generation: tier.generation } : {}),
+      // What binding v3 signs (notme-c9fc8c); absent from an authority that predates it.
+      ...(validEnrollmentId(tier.enrollment_id) ? { enrollment_id: tier.enrollment_id } : {}),
       ...(typeof tier.clone_policy === "string" ? { clone_policy: tier.clone_policy } : {}),
       // Criteria ids, or null for a legacy enrollment; absent from an authority that predates them.
       ...(tier.criteria === null || Array.isArray(tier.criteria) ? { criteria: tier.criteria } : {}),
