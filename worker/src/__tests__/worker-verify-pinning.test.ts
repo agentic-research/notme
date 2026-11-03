@@ -28,7 +28,7 @@
  * except one route). Nothing here touches a Cloudflare account.
  */
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -56,6 +56,14 @@ let deployment: { version: Version; pct: number }[] = [];
 let sample: () => number = () => 0.99;
 let workerName = "notme-bot";
 let served: string[] = [];
+/** Whether Cloudflare honours a valid override (false models the silent-ignore failure). */
+let honour = true;
+/** Whether the Worker has the version-metadata binding (serves version_id). */
+let versionMeta = true;
+/** What \`wrangler deployments status\` reports; defaults to the routing table. */
+let listed: { version_id: string; percentage: number }[] | null = null;
+let wranglerStub = "";
+let deployFile = "";
 
 let server: Server;
 let base = "";
@@ -66,7 +74,7 @@ function route(req: IncomingMessage): Version {
   const m = header.match(/^\s*([a-z0-9-]+)\s*=\s*"([^"]+)"\s*$/);
   if (m && m[1] === workerName) {
     const pinned = deployment.find((d) => d.version.id === m[2]);
-    if (pinned) return pinned.version; // honoured: version is in the deployment
+    if (pinned && honour) return pinned.version; // honoured: version is in the deployment
   }
   // Ignored (not in deployment / wrong name / malformed) → percentage routing.
   let r = sample() * 100;
@@ -100,7 +108,7 @@ function handle(req: IncomingMessage, res: ServerResponse) {
     case "/.well-known/jwks.json":
       return json(200, { keys: [{ kty: "OKP", crv: "Ed25519", x: "AA" }] });
     case "/.well-known/version":
-      return json(200, { commit: v.commit, stamped: true });
+      return json(200, { commit: v.commit, stamped: true, version_id: versionMeta ? v.id : "unknown" });
     case "/api/docs":
       return send(200, `docs for http://${host}`);
     case "/auth/passkey/status":
@@ -137,6 +145,10 @@ function verify(vars: Record<string, string>, evidenceDir: string): Promise<Run>
     `SITE_BASE=${base}`,
     ...Object.entries(vars).map(([k, v]) => `${k}=${v}`),
   ];
+  writeFileSync(
+    deployFile,
+    JSON.stringify({ versions: listed ?? deployment.map((d) => ({ version_id: d.version.id, percentage: d.pct })) }),
+  );
   return new Promise((resolve) => {
     const p = spawn("task", args, {
       env: {
@@ -144,6 +156,8 @@ function verify(vars: Record<string, string>, evidenceDir: string): Promise<Run>
         VERIFY_MAX_ATTEMPTS: "1",
         VERIFY_RETRY_DELAY_SECONDS: "0",
         NOTME_EVIDENCE_DIR: evidenceDir,
+        NOTME_WRANGLER_CMD: wranglerStub,
+        STUB_DEPLOYMENT_FILE: deployFile,
       },
     });
     let out = "";
@@ -170,6 +184,12 @@ beforeAll(async () => {
     "-addext", "basicConstraints=critical,CA:TRUE,pathlen:1",
   ], { stdio: "ignore" });
   caPem = readFileSync(crt, "utf8");
+  // A fake wrangler: \`deployments status --json\` prints the deployment the
+  // test declared. Nothing reaches Cloudflare.
+  wranglerStub = join(dir, "wrangler");
+  deployFile = join(dir, "deployment.json");
+  writeFileSync(wranglerStub, '#!/usr/bin/env bash\ncase "$*" in *"deployments status"*) cat "$STUB_DEPLOYMENT_FILE" ;; *) exit 9 ;; esac\n');
+  chmodSync(wranglerStub, 0o755);
   server = createServer(handle);
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -179,6 +199,9 @@ afterAll(() => new Promise<void>((r) => server.close(() => r())));
 
 beforeEach(() => {
   served = [];
+  honour = true;
+  versionMeta = true;
+  listed = null;
   sample = () => 0.99;
   workerName = "notme-bot";
   evidence = mkdtempSync(join(tmpdir(), "verify-pin-evidence-"));
@@ -243,7 +266,18 @@ describe("canary soak verify targets the new version (notme-325916)", () => {
     deployment = [{ version: old(), pct: 100 }];
     const r = await verify({ VERSION: NEW.id, EXPECT: NEW.commit, ENV: "production" }, evidence);
     expect(r.code).not.toBe(0);
-    expect(r.out).toMatch(/not honoured|answered by/i);
+    expect(r.out).toMatch(/not serving/i);
+    expect(existsSync(join(evidence, "production", `${NEW.id}.json`))).toBe(false);
+  });
+
+  it("…and the identity bracket fails it too, if Cloudflare's listing and its routing disagree", async () => {
+    // Listed as deployed (e.g. propagation lag), but the override did not apply.
+    honour = false;
+    versionMeta = false;
+    deployment = [{ version: healthyNew(), pct: 10 }, { version: old(), pct: 90 }];
+    const r = await verify({ VERSION: NEW.id, EXPECT: NEW.commit, ENV: "production" }, evidence);
+    expect(r.code).not.toBe(0);
+    expect(r.out).toMatch(/not honoured.*answered by build/i);
     expect(existsSync(join(evidence, "production", `${NEW.id}.json`))).toBe(false);
   });
 
@@ -259,5 +293,48 @@ describe("canary soak verify targets the new version (notme-325916)", () => {
     deployment = [{ version: healthyNew(), pct: 10 }, { version: old(), pct: 90 }];
     const r = await verify({ VERSION: NEW.id, EXPECT: NEW.commit }, evidence);
     expect(r.code).not.toBe(0);
+  });
+});
+
+describe("pinned soak — security review fixes (M4, M5)", () => {
+  /** Two versions built from the SAME commit: a config-only re-upload. */
+  const sameCommitNew = (): Version => ({ id: NEW.id, commit: OLD.commit, brokenToken: false });
+  const pinnedArgs = { VERSION: NEW.id, EXPECT: OLD.commit, ENV: "production" };
+  const record = () => join(evidence, "production", `${NEW.id}.json`);
+
+  it("M5: a version not in the deployment never earns evidence, even when the commits match", async () => {
+    // The override is ignored (NEW is not deployed), OLD answers every probe,
+    // and OLD reports the expected commit. No version metadata to tell them apart.
+    versionMeta = false;
+    deployment = [{ version: old(), pct: 100 }];
+    const r = await verify(pinnedArgs, evidence);
+    expect(r.code).not.toBe(0);
+    expect(r.out).toMatch(/not serving|not in the current deployment/i);
+    expect(existsSync(record())).toBe(false);
+  });
+
+  it("M5: with version metadata, an ignored pin fails on the version id even when Cloudflare lists NEW", async () => {
+    honour = false; // listed in the deployment, but the override did not apply
+    deployment = [{ version: sameCommitNew(), pct: 10 }, { version: old(), pct: 90 }];
+    const r = await verify(pinnedArgs, evidence);
+    expect(r.code).not.toBe(0);
+    expect(r.out).toMatch(/answered by version/i);
+    expect(existsSync(record())).toBe(false);
+  });
+
+  it("M5: a listed, honoured, same-commit version passes and records the version id it saw", async () => {
+    deployment = [{ version: sameCommitNew(), pct: 10 }, { version: old(), pct: 90 }];
+    const r = await verify(pinnedArgs, evidence);
+    expect(r.code, r.out).toBe(0);
+    expect(JSON.parse(readFileSync(record(), "utf8"))).toMatchObject({ version: NEW.id, version_id_checked: true });
+  });
+
+  it("M4: a failed pinned run removes an earlier pass for that version", async () => {
+    mkdirSync(join(evidence, "production"), { recursive: true });
+    writeFileSync(record(), JSON.stringify({ schema: "notme.release-evidence/v1", result: "pass", pinned: true }));
+    deployment = [{ version: brokenNew(), pct: 10 }, { version: old(), pct: 90 }];
+    const r = await verify({ VERSION: NEW.id, EXPECT: NEW.commit, ENV: "production" }, evidence);
+    expect(r.code).not.toBe(0);
+    expect(existsSync(record())).toBe(false);
   });
 });

@@ -141,6 +141,7 @@ else
     const age = Date.now() - Date.parse(r.checked_at);
     if (!(age >= 0 && age <= Number(ttlH) * 3600_000)) bad.push("checked_at " + r.checked_at + " is older than " + ttlH + "h (or unreadable) — re-run the pinned soak");
     if (bad.length) { console.error("evidence record rejected: " + bad.join(", ")); process.exit(1); }
+    if (r.version_id_checked !== true) console.error("⚠ evidence identified the version by build commit + deployment listing only — the Worker served no version_id (add [version_metadata] to wrangler.toml)");
     console.error("evidence: pinned verify passed for " + version + " (" + env + ", build " + r.commit.slice(0, 12) + ") at " + r.checked_at);
     process.stdout.write(r.commit);
   ' "$RECORD" "$NEW" "$ENV_NAME" "$AUTH_BASE" "$EVIDENCE_TTL_HOURS")" || die "evidence record for $NEW is not a fresh pinned pass ($RECORD)"

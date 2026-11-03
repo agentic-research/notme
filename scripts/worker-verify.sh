@@ -74,6 +74,36 @@ if [ -n "$VERSION" ]; then
     || { echo "✗ EXPECT=<40-hex build sha of $VERSION> is required (git HEAD unavailable)"; exit 1; }
   PIN=(-H "Cloudflare-Workers-Version-Overrides: ${WORKER_NAME}=\"${VERSION}\"")
   echo "▸ pinned to ${WORKER_NAME}@${VERSION} (expected build ${EXPECT:0:12})"
+
+  # A new pinned run SUPERSEDES any earlier record for this version: if this
+  # run fails, no older pass may survive it (review M4).
+  RECORD="$EVIDENCE_DIR/$ENV_NAME/$VERSION.json"
+  rm -f "$RECORD"
+fi
+
+# Does Cloudflare say VERSION is serving traffic in this environment right now?
+# The override is only applied to a version in the current deployment, and two
+# versions can share a commit, so without this a pin that was silently ignored
+# could pass on the old version's matching commit (review M5).
+WRANGLER_CMD="${NOTME_WRANGLER_CMD:-pnpm exec wrangler}"
+[ -n "${NOTME_WRANGLER_CMD:-}" ] && echo "⚠ NOTME_WRANGLER_CMD overrides wrangler: $WRANGLER_CMD"
+deployment_serves_version() {
+  local flags=()
+  [ "$ENV_NAME" = staging ] && flags=(--env staging)
+  # shellcheck disable=SC2086  # WRANGLER_CMD is a command line, split on purpose
+  (cd worker && $WRANGLER_CMD deployments status --json ${flags[@]+"${flags[@]}"} 2>/dev/null) | node -e '
+    let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+      try {
+        const v = (JSON.parse(s).versions || []).find((x) => x.version_id === process.argv[1]);
+        process.exit(v && v.percentage > 0 ? 0 : 1);
+      } catch { process.exit(1); }
+    });
+  ' "$VERSION"
+}
+if [ -n "$VERSION" ] && ! deployment_serves_version; then
+  echo "✗ ${VERSION} is not serving in the current ${ENV_NAME} deployment (wrangler deployments status) — run task worker:canary first; a pin to an undeployed version is silently ignored"
+  echo "SOME CHECKS FAILED"
+  exit 1
 fi
 
 # curl with the pin (when there is one) on every request — including the ones
@@ -81,21 +111,33 @@ fi
 pcurl() { curl ${PIN[@]+"${PIN[@]}"} "$@"; }
 
 PIN_BROKEN=0
+VERSION_ID_CHECKED=false
 # Prove the pin held for the request about to be checked: ask the same base,
-# pinned, which build is answering. $1 = base URL, $2 = label, $3 = attempts.
+# pinned, which build AND which version is answering. The commit must equal
+# EXPECT; the version id (from the version-metadata binding) must equal
+# VERSION whenever the Worker reports one — it is the only field two versions
+# of the same commit cannot share. $1 = base URL, $2 = label, $3 = attempts.
 assert_pinned() {
   [ -n "$VERSION" ] || return 0
-  local base="$1" label="$2" tries="${3:-1}" n=1 got=""
+  local base="$1" label="$2" tries="${3:-1}" n=1 body="" got="" vid=""
   while [ "$n" -le "$tries" ]; do
-    got=$(pcurl -sS --max-time 10 "${base}/.well-known/version" 2>/dev/null \
-      | grep -o '"commit":"[0-9a-f]*"' | cut -d'"' -f4)
-    [ "$got" = "$EXPECT" ] && return 0
+    body=$(pcurl -sS --max-time 10 "${base}/.well-known/version" 2>/dev/null)
+    got=$(printf '%s' "$body" | grep -o '"commit":"[0-9a-f]*"' | cut -d'"' -f4)
+    vid=$(printf '%s' "$body" | grep -o '"version_id":"[^"]*"' | cut -d'"' -f4)
+    if [ "$got" = "$EXPECT" ] && { [ -z "$vid" ] || [ "$vid" = unknown ] || [ "$vid" = "$VERSION" ]; }; then
+      [ "$vid" = "$VERSION" ] && VERSION_ID_CHECKED=true
+      return 0
+    fi
     # Only the opening probe retries: Cloudflare notes a deployment change can
     # take a couple of seconds to propagate. Mid-run, a miss is a miss.
     [ "$n" -lt "$tries" ] && sleep "$RETRY_DELAY_SECONDS"
     n=$((n + 1))
   done
-  echo "✗ pin not honoured before '$label': answered by build '${got:-none}', expected ${EXPECT:0:12} — ${VERSION} is not in the current deployment, or the override was ignored"
+  if [ "$got" != "$EXPECT" ]; then
+    echo "✗ pin not honoured before '$label': answered by build '${got:-none}', expected ${EXPECT:0:12} — ${VERSION} is not in the current deployment, or the override was ignored"
+  else
+    echo "✗ pin not honoured before '$label': answered by version '${vid}', not ${VERSION} (same commit — the override was ignored)"
+  fi
   FAIL=1
   PIN_BROKEN=1
   return 1
@@ -232,10 +274,19 @@ fi
 echo "All checks passed."
 
 if [ -n "$VERSION" ] && [ "$PIN_BROKEN" -eq 0 ]; then
+  # Still serving at the end? A version rolled out of the deployment mid-run
+  # would have had its later probes silently answered by another version.
+  if ! deployment_serves_version; then
+    echo "✗ ${VERSION} is no longer serving in the ${ENV_NAME} deployment — no evidence written"
+    exit 1
+  fi
   mkdir -p "$EVIDENCE_DIR/$ENV_NAME"
-  RECORD="$EVIDENCE_DIR/$ENV_NAME/$VERSION.json"
-  printf '{"schema":"notme.release-evidence/v1","result":"pass","pinned":true,"version":"%s","env":"%s","commit":"%s","auth_base":"%s","site_base":"%s","checks":%d,"checked_at":"%s"}\n' \
-    "$VERSION" "$ENV_NAME" "$EXPECT" "$AUTH_BASE" "$SITE_BASE" "$check_count_before_close" \
+  printf '{"schema":"notme.release-evidence/v1","result":"pass","pinned":true,"version":"%s","env":"%s","commit":"%s","version_id_checked":%s,"auth_base":"%s","site_base":"%s","checks":%d,"checked_at":"%s"}\n' \
+    "$VERSION" "$ENV_NAME" "$EXPECT" "$VERSION_ID_CHECKED" "$AUTH_BASE" "$SITE_BASE" "$check_count_before_close" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECORD"
-  echo "✓ evidence: $RECORD (every check answered by build ${EXPECT:0:12} under the pin)"
+  if [ "$VERSION_ID_CHECKED" = true ]; then
+    echo "✓ evidence: $RECORD (every check answered by version ${VERSION} under the pin)"
+  else
+    echo "✓ evidence: $RECORD (identity by build ${EXPECT:0:12} + deployment listing; the Worker reports no version_id — add the [version_metadata] binding)"
+  fi
 fi

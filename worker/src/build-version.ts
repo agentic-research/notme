@@ -59,3 +59,24 @@ export function buildInfo(env: { BUILD_SHA?: string }): BuildInfo {
   if (!raw || !COMMIT_SHA_RE.test(raw)) return UNSTAMPED;
   return { commit: raw, stamped: true };
 }
+
+/** A Cloudflare Worker version id (a UUID). */
+const VERSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * The Cloudflare VERSION serving this request, from the version-metadata
+ * binding (`[version_metadata] binding = "CF_VERSION_METADATA"`), or
+ * `"unknown"` when the binding is absent or malformed (notme-325916, review M5).
+ *
+ * WHY BOTH THIS AND THE COMMIT. Two versions can share a commit — a config- or
+ * secret-only re-upload, the same commit uploaded twice — so a pinned probe that
+ * Cloudflare silently routed to the OLD version could still report the
+ * expected commit. The version id cannot collide that way: Cloudflare mints a
+ * new one per upload. `worker-verify.sh` compares it whenever it is known.
+ *
+ * Same fail-honest rule as `buildInfo`: never a guess, never an omitted field.
+ */
+export function versionId(env: { CF_VERSION_METADATA?: { id?: unknown } }): string {
+  const id = env.CF_VERSION_METADATA?.id;
+  return typeof id === "string" && VERSION_ID_RE.test(id.toLowerCase()) ? id.toLowerCase() : "unknown";
+}

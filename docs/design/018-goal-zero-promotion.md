@@ -164,6 +164,16 @@ disposable by design (its CA is not trusted by anything).
 > `worker-verify-pinning.test.ts` (a broken canary fails the pinned soak under
 > every routing of unpinned traffic; an ignored override fails closed).
 >
+> **Same-commit versions (security review M5).** The bracket above compares
+> the build *commit*, and two versions can share one — a config- or
+> secret-only re-upload, or the same commit uploaded twice. So a pinned run
+> also (a) requires `wrangler deployments status` to list the version as
+> serving, at the start and again before it writes evidence, and (b) compares
+> the `version_id` that `/.well-known/version` now serves from the
+> `[version_metadata]` binding, whenever the Worker reports one. The record
+> says which (`version_id_checked`). Each pinned run first deletes any earlier
+> record for that version, so a failed re-soak leaves no stale pass behind.
+>
 > **Not yet measured against Cloudflare.** The pinned path has not run against
 > a real split since this change. The first run should be a staging
 > rehearsal — `task worker:canary NEW=<id> OLD=<cur> ENV=staging`, then

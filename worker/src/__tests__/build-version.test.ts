@@ -27,7 +27,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { buildInfo } from "../build-version";
+import { buildInfo, versionId } from "../build-version";
 
 describe("build version reporting (notme-9f2f79)", () => {
   it("reports the stamped commit when the build set one", () => {
@@ -76,5 +76,20 @@ describe("build version reporting (notme-9f2f79)", () => {
       commit: "a".repeat(40),
       stamped: true,
     });
+  });
+});
+
+describe("version id reporting (notme-325916, review M5)", () => {
+  const id = "4e700000-0000-4000-8000-000000000000";
+
+  it("reports the version id from the version-metadata binding", () => {
+    expect(versionId({ CF_VERSION_METADATA: { id } })).toBe(id);
+  });
+
+  it('reports "unknown" when the binding is absent or malformed — never a guess', () => {
+    expect(versionId({})).toBe("unknown");
+    for (const bad of ["", "not-a-uuid", 42, null]) {
+      expect(versionId({ CF_VERSION_METADATA: { id: bad } }), String(bad)).toBe("unknown");
+    }
   });
 });
