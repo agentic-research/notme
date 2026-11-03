@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 76 in notme (`rsry status --json` →
+**Updated:** 2026-11-02 · **Open beads:** 75 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -63,8 +63,9 @@ them.
    - **rig-ed460e:** the notme.bot rate-limit ruleset was never applied (it
      isn't in tofu state), and as written it exceeds the Free plan's limits.
      notme.bot has no edge spend guard today.
-   - **notme-ed6114:** /token and /.well-known reach the Durable Object before
-     any limit.
+   - **notme-ed6114: done (d3a0814).** Every unauthenticated path checks a
+     limit before the Durable Object, and the release won't sign a stale
+     anchor.
    - **Owner:** set billing alerts, around $10 and $25, since Workers Paid has
      no hard cap.
 8. **The stage 2 gate:** the release tag waits on the remaining live-path
@@ -193,7 +194,8 @@ Listed so the count doesn't creep up unnoticed:
   notme-c72e03, notme-c16e0d, notme-c7819f, notme-ae3130.
 - **Closed by work (2026-11-02):** notme-bad2e5, notme-159805, notme-ad2a7a,
   notme-bdc850, notme-1a5465, notme-2131e8, notme-b51777, notme-b52d7c,
-  notme-c9fc8c, notme-c0c9a2, notme-729801 (the P0), notme-1629fe.
+  notme-c9fc8c, notme-c0c9a2, notme-729801 (the P0), notme-1629fe,
+  notme-ed6114.
 - **Filed from the doc-drift batch (2026-11-02):**
   - notme-bad2e5 and notme-baea8c (proxy gaps);
   - a gen/go scope-check note, added to notme-ea5c65 rather than filed as a
