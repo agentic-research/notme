@@ -291,8 +291,17 @@ describe("POST /cert/issuing-ca/renew rejects a forged proof before the DO", () 
     const id = hex64();
     const v2 = tierRenewalBindingV2(m.spki, iat, 0);
     const v3 = tierRenewalBindingV3(m.spki, iat, 0, unhex(id));
+    // A real P-256 SPKI: importPublicKey accepts it, so this reaches the
+    // algorithm check on both sides rather than failing the import (F7).
+    const p256 = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
+    const p256Spki = new Uint8Array((await crypto.subtle.exportKey("spki", p256.publicKey)) as ArrayBuffer);
+    const p256Pem = `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...p256Spki)).match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
     const cases: Array<{ publicKeyPem: string; iat: number; proof: string; generation?: number; enrollmentId?: string }> = [
       { publicKeyPem: "junk", iat, proof: "x" },
+      { publicKeyPem: p256Pem, iat, proof: "x" },
+      { publicKeyPem: p256Pem, iat, proof: "x", generation: 0 },
+      { publicKeyPem: m.pem, iat: -1, proof: "x" },
+      { publicKeyPem: m.pem, iat: 1.5, proof: "x" },
       { publicKeyPem: m.pem, iat: NaN, proof: "x" },
       { publicKeyPem: m.pem, iat: -1, proof: "x", generation: 0 },
       { publicKeyPem: m.pem, iat, proof: "x", generation: -1 },
@@ -314,11 +323,18 @@ describe("POST /cert/issuing-ca/renew rejects a forged proof before the DO", () 
       expect(r.ok).toBe(false);
       expect(pre.ok ? undefined : pre.reason, JSON.stringify(c)).toBe(r.ok ? undefined : r.reason);
     }
-    // And a proof the pre-check admits is one only the DO can judge.
-    const valid = { publicKeyPem: m.pem, iat, proof: await sign(m.kp.privateKey, v3), generation: 0, enrollmentId: id };
-    expect(await precheckRenewalProof(valid)).toEqual({ ok: true });
-    const r = await stub.renewTier(valid);
-    expect(r.ok ? "ok" : r.reason).toBe("unknown_key");
+    // And a valid proof under each binding is admitted: what happens next
+    // depends on the row, so only the DO can judge it (here: unknown key).
+    const valids = [
+      { publicKeyPem: m.pem, iat, proof: await sign(m.kp.privateKey, tierRenewalBinding(m.spki, iat)) },
+      { publicKeyPem: m.pem, iat, proof: await sign(m.kp.privateKey, v2), generation: 0 },
+      { publicKeyPem: m.pem, iat, proof: await sign(m.kp.privateKey, v3), generation: 0, enrollmentId: id },
+    ];
+    for (const valid of valids) {
+      expect(await precheckRenewalProof(valid), JSON.stringify(valid)).toEqual({ ok: true });
+      const r = await stub.renewTier(valid);
+      expect(r.ok ? "ok" : r.reason).toBe("unknown_key");
+    }
   });
 
   it("a key that is not an Ed25519 SPKI is 400 invalid_key with no RPC", async () => {
