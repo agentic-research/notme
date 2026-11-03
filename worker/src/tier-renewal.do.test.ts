@@ -21,6 +21,8 @@ import worker from "../worker";
 import { env, runInDurableObject } from "cloudflare:test";
 import { X509Certificate } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
+// Window-edge assertions run on one clock shared with the authority (notme-070a8f).
+import { withPinnedClock } from "./__tests__/helpers/pinned-clock";
 import { createSessionCookie } from "./auth/session";
 import { tierEnrolmentBinding, deviceCodeHash, tierRenewalBindingV2 } from "./auth/tier-enrolment-binding";
 import { readCriteria } from "./criteria";
@@ -122,13 +124,15 @@ describe("renewal — the resumed machine, no human", () => {
     // (3600 s) old — the resend of one that never arrived — and at most
     // RENEWAL_SKEW_S (120 s) ahead (notme-747cc7).
     const { m } = await enrolled();
-    const now = Math.floor(Date.now() / 1000);
-    const old = await renew(m, now - 3601);
-    expect(old.status).toBe(401);
-    expect(await old.json()).toMatchObject({ error: "stale_proof" });
-    const ahead = await renew(m, now + 121);
-    expect(ahead.status).toBe(401);
-    expect(await ahead.json()).toMatchObject({ error: "stale_proof" });
+    await withPinnedClock(async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const old = await renew(m, now - 3601);
+      expect(old.status).toBe(401);
+      expect(await old.json()).toMatchObject({ error: "stale_proof" });
+      const ahead = await renew(m, now + 121);
+      expect(ahead.status).toBe(401);
+      expect(await ahead.json()).toMatchObject({ error: "stale_proof" });
+    });
   });
 
   it("refuses a key that was never enrolled", async () => {

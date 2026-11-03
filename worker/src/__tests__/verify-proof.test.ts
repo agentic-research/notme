@@ -12,6 +12,7 @@
 import { describe, expect, it, beforeAll } from "vitest";
 import { verifyOIDC, verifyProof, selectVerifyingKey } from "../auth/verify-proof";
 import { OID_EPOCH } from "../cert-authority";
+import { fakeIssuer } from "./helpers/oidc-issuer";
 
 /** The epoch stamped into this suite's leaf cert. */
 const TEST_EPOCH = 1;
@@ -106,43 +107,26 @@ describe("oidc.issuer.allowlist (notme-ae65a0, M1)", () => {
     );
   });
 
-  it("accepts auth.notme.bot as trusted issuer (still 'untrusted' would fail later)", async () => {
-    // Self-issued tokens get past trust + audience and proceed to JWKS
-    // fetch + signature verify. We can't run those without a network or
-    // mocked JWKS — but reaching that step (different error: JWKS fetch
-    // failure rather than "untrusted issuer") proves the issuer was
-    // accepted. Test asserts the failure message is NOT the trust error.
-    const token = makeJwt({
-      iss: "https://auth.notme.bot",
-      sub: "principal-test",
-      aud: "notme.bot",
-      exp: FUTURE_EXP,
-    });
-    let err: Error | null = null;
-    try {
-      await verifyOIDC(token, "notme.bot");
-    } catch (e) {
-      err = e as Error;
-    }
-    expect(err).toBeTruthy();
-    expect(err!.message).not.toMatch(/untrusted issuer/);
+  // These two used to send a junk-signed token and assert the error was NOT
+  // the trust error, which meant fetching live JWKS from the real issuer and
+  // passing on whatever the network did (notme-3fc74b). Now the issuer is a
+  // local fixture: the token verifies end to end, and the verifier asked the
+  // fixture for keys. That is positive evidence the issuer was trusted.
+  it("accepts auth.notme.bot as trusted issuer: the token verifies against its JWKS", async () => {
+    const issuer = await fakeIssuer("https://auth.notme.bot");
+    const token = await issuer.token({ sub: "principal-test", aud: "notme.bot" });
+    const id = await verifyOIDC(token, "notme.bot");
+    expect(id).toMatchObject({ type: "oidc", issuer: "https://auth.notme.bot", subject: "principal-test" });
+    expect(issuer.requests).toContain("https://auth.notme.bot/.well-known/jwks");
   });
 
   it("accepts GHA token issuer as trusted (workflow can request aud=notme.bot)", async () => {
-    const token = makeJwt({
-      iss: "https://token.actions.githubusercontent.com",
-      sub: "repo:agentic-research/notme:ref:refs/heads/main",
-      aud: "notme.bot",
-      exp: FUTURE_EXP,
-    });
-    let err: Error | null = null;
-    try {
-      await verifyOIDC(token, "notme.bot");
-    } catch (e) {
-      err = e as Error;
-    }
-    expect(err).toBeTruthy();
-    expect(err!.message).not.toMatch(/untrusted issuer/);
+    const issuer = await fakeIssuer("https://token.actions.githubusercontent.com");
+    const sub = "repo:agentic-research/notme:ref:refs/heads/main";
+    const token = await issuer.token({ sub, aud: "notme.bot" });
+    const id = await verifyOIDC(token, "notme.bot");
+    expect(id).toMatchObject({ issuer: "https://token.actions.githubusercontent.com", subject: sub });
+    expect(issuer.requests).toContain("https://token.actions.githubusercontent.com/.well-known/jwks");
   });
 
   it("rejects an attacker-controlled iss that's not in the allowlist", async () => {
