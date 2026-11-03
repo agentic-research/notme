@@ -166,3 +166,27 @@ describe("an OIDC proof is single-use at /join (notme-3dfe15 part 1, option A)",
     await expectUnspent(inv);
   });
 });
+
+describe("the consumed jti outlives the token (review F2)", () => {
+  // verifyOIDC refuses only `exp < now`, so a token is still accepted in the
+  // second `now == exp`. A DO row that expired AT `exp` was swept by the very
+  // consume that should have found it, and the replay re-inserted and won.
+  // Driven at the DO directly: two different subjects so the already-linked
+  // guard cannot stand in for the jti guard.
+  it("join.oidc-jti.expiry-boundary — a proof replayed at (or a little past) its exp second is still refused", async () => {
+    const iss = "https://token.actions.githubusercontent.com";
+    const exp = Math.floor(Date.now() / 1000);
+    const proof = { jti: crypto.randomUUID(), exp, spentElsewhere: false };
+    const first = await authority().joinInviteWithFederated(await invite(), iss, sub("boundary-a"), proof);
+    expect(first.ok).toBe(true);
+    const replay = await authority().joinInviteWithFederated(await invite(), iss, sub("boundary-b"), proof);
+    expect(replay).toEqual({ ok: false, reason: "proof_reused" });
+    // A verifier a few seconds of skew behind the DO would accept exp-3.
+    const skewed = { jti: crypto.randomUUID(), exp: exp - 3, spentElsewhere: false };
+    expect((await authority().joinInviteWithFederated(await invite(), iss, sub("boundary-c"), skewed)).ok).toBe(true);
+    expect(await authority().joinInviteWithFederated(await invite(), iss, sub("boundary-d"), skewed)).toEqual({
+      ok: false,
+      reason: "proof_reused",
+    });
+  });
+});

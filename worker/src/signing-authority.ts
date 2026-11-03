@@ -339,6 +339,17 @@ import {
   redeemInvite,
   reserveInvite,
 } from "./auth/principals";
+
+/**
+ * How long a consumed OIDC proof jti is kept PAST the token's `exp` (review
+ * F2). verifyOIDC still accepts a token at `now == exp`, and the worker that
+ * verified it and this DO read different clocks, so a row that expired AT
+ * `exp` could be swept by the replay's own consume and re-inserted. Must
+ * exceed any verifier leeway plus clock skew. Not the worker's
+ * `jtiMinTtlSeconds`: that is a KV TTL floor (default 60s) the DO cannot
+ * read, and a configurable 0 there would reopen this window.
+ */
+const OIDC_JTI_RETAIN_PAST_EXP_SECONDS = 300;
 import type { CommitmentErrorCode } from "./receipts/commitment";
 import type { DelegatedJwtErrorCode } from "./jwt/delegated-claims";
 
@@ -3563,7 +3574,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // Consumed in the same synchronous block as the invite and the link:
       // a replay cannot interleave with the first use, and a refused join
       // rolls the consume back with everything else (no burn on refusal).
-      if (!this.#consumeJti(jtiKey, proof.exp)) {
+      if (!this.#consumeJti(jtiKey, proof.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS)) {
         return { ok: false as const, reason: "proof_reused" as const };
       }
       const invite = redeemInvite(sql, token, principalId);
