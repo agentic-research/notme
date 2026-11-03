@@ -7,7 +7,9 @@
 // SQLite schema:
 //   keys  — singleton authority keypair (Ed25519)
 //   state — epoch, seqno, keyId for bundle generation
-//   dpop_jtis — atomically consumed DPoP proof identifiers
+//   dpop_jtis — atomically consumed single-use proof identifiers (DPoP proof
+//               jtis, and OIDC proof jtis spent at /join or /auth/oidc/login,
+//               both under the one `oidc:<issuer>#<jti>` key)
 //
 // The DO owns the full lifecycle: key generation, bundle signing, rotation.
 // The Worker writes signed bundles to KV for the revocation verifier.
@@ -332,12 +334,24 @@ import {
   createPrincipal,
   ensurePrincipalSchema,
   findPrincipalByFederated,
+  getCapabilities,
   grantCapability,
   linkFederatedIdentity,
   liveInvite,
   redeemInvite,
   reserveInvite,
 } from "./auth/principals";
+
+/**
+ * How long a consumed OIDC proof jti is kept PAST the token's `exp` (review
+ * F2). verifyOIDC still accepts a token at `now == exp`, and the worker that
+ * verified it and this DO read different clocks, so a row that expired AT
+ * `exp` could be swept by the replay's own consume and re-inserted. Must
+ * exceed any verifier leeway plus clock skew. Not the worker's
+ * `jtiMinTtlSeconds`: that is a KV TTL floor (default 60s) the DO cannot
+ * read, and a configurable 0 there would reopen this window.
+ */
+const OIDC_JTI_RETAIN_PAST_EXP_SECONDS = 300;
 import type { CommitmentErrorCode } from "./receipts/commitment";
 import type { DelegatedJwtErrorCode } from "./jwt/delegated-claims";
 
@@ -1102,6 +1116,23 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   /**
+   * Consume a single-use identifier: true the first time `key` is seen
+   * before `expiresAt` (unix seconds), false on every later call. SYNCHRONOUS
+   * on purpose: SQLite's PRIMARY KEY, not a read-then-write, decides the
+   * winner, and a caller can put it inside the same block as the write the
+   * identifier licenses. Shared by DPoP proofs (`mintDPoPTokenOnce`) and
+   * OIDC proofs (`joinInviteWithFederated`, `loginWithFederated`), which
+   * both spend the one `oidc:<issuer>#<jti>` key from `#oidcJtiKey`.
+   */
+  #consumeJti(key: string, expiresAt: number): boolean {
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM dpop_jtis WHERE expires_at <= ?", Math.floor(Date.now() / 1000));
+    sql.exec("INSERT OR IGNORE INTO dpop_jtis (jti, expires_at) VALUES (?, ?)", key, expiresAt);
+    const [change] = [...sql.exec<{ inserted: number }>("SELECT changes() AS inserted")];
+    return change.inserted === 1;
+  }
+
+  /**
    * Atomically consume a DPoP proof JTI and mint its bound access token.
    *
    * SQLite statements run synchronously before the first await, so concurrent
@@ -1123,21 +1154,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const now = Math.floor(Date.now() / 1000);
     const replayTtlSeconds = params.replayTtlSeconds ?? 600;
 
-    this.ctx.storage.sql.exec(
-      "DELETE FROM dpop_jtis WHERE expires_at <= ?",
-      now,
-    );
-    this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO dpop_jtis (jti, expires_at) VALUES (?, ?)",
-      params.proofJti,
-      now + replayTtlSeconds,
-    );
-    const [change] = [
-      ...this.ctx.storage.sql.exec<{ inserted: number }>(
-        "SELECT changes() AS inserted",
-      ),
-    ];
-    if (change.inserted !== 1) {
+    if (!this.#consumeJti(params.proofJti, now + replayTtlSeconds)) {
       return { ok: false, reason: "proof_reused" };
     }
 
@@ -3535,20 +3552,40 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     token: string,
     provider: string,
     providerSub: string,
+    proof: { jti: string; exp: number; spentElsewhere: boolean },
   ): Promise<
     | { ok: true; principalId: string; scopes: string[] }
-    | { ok: false; reason: "invalid_invite" | "already_linked" }
+    | { ok: false; reason: "invalid_invite" | "already_linked" | "proof_reused" }
   > {
     const sql = this.ctx.storage.sql;
+    this.#ensureSchema();
     ensurePrincipalSchema(sql);
     if (!liveInvite(sql, token)) return { ok: false, reason: "invalid_invite" };
+    // The proof is single-use (notme-3dfe15 part 1, option A). Checked AFTER
+    // the invite, like the link (review L4): a garbage invite answers the
+    // same whatever the token's history. `spentElsewhere` is the worker's
+    // read of the shared `jti:<jti>` keyspace /cert/gha, /cert and /token
+    // spend — the same aud-`notme.bot` tokens /join accepts.
+    if (proof.spentElsewhere) return { ok: false, reason: "proof_reused" };
     if (findPrincipalByFederated(sql, provider, providerSub)) {
       return { ok: false, reason: "already_linked" };
     }
     const principalId = crypto.randomUUID();
+    const jtiKey = SigningAuthority.#oidcJtiKey(provider, proof.jti);
     return this.ctx.storage.transactionSync(() => {
+      // Consumed in the same synchronous block as the invite and the link:
+      // a replay cannot interleave with the first use, and a refused join
+      // rolls the consume back with everything else (no burn on refusal).
+      if (!this.#consumeJti(jtiKey, proof.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS)) {
+        return { ok: false as const, reason: "proof_reused" as const };
+      }
       const invite = redeemInvite(sql, token, principalId);
-      if (!invite) return { ok: false as const, reason: "invalid_invite" as const };
+      if (!invite) {
+        // Throw-free rollback: undo the consume so a refused join spends
+        // nothing. (transactionSync commits on return.)
+        sql.exec("DELETE FROM dpop_jtis WHERE jti = ?", jtiKey);
+        return { ok: false as const, reason: "invalid_invite" as const };
+      }
       createPrincipal(sql, principalId, undefined, invite.createdBy);
       for (const scope of invite.scopes) {
         grantCapability(sql, principalId, scope, invite.createdBy);
@@ -3556,6 +3593,56 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       linkFederatedIdentity(sql, principalId, provider, providerSub);
       return { ok: true as const, principalId, scopes: invite.scopes };
     });
+  }
+
+  /**
+   * The ONE `dpop_jtis` key for an OIDC proof spent in this DO, whichever
+   * route spends it: /join (joinInviteWithFederated) and /auth/oidc/login
+   * (loginWithFederated). One key, not one per route (re-review N1): with
+   * per-route keys the only guard between the two legs was KV `jti:<jti>`,
+   * written after the DO commit and eventually consistent, so a token just
+   * spent at /join could still become a session. Namespaced so it cannot
+   * collide with a DPoP proof jti, and by issuer because a jti is unique
+   * only within its issuer. A DPoP client could choose a jti of this shape,
+   * but only to pre-spend an OIDC token whose jti it already knows — one it
+   * has already seen, whose replay is refused anyway.
+   */
+  static #oidcJtiKey(issuer: string, jti: string): string {
+    return `oidc:${issuer}#${jti}`;
+  }
+
+  /**
+   * Sign in with an OIDC identity the caller has ALREADY VERIFIED, spending
+   * the proof (review F1 of notme-3dfe15 part 1). The 24h session the route
+   * mints used to cost nothing but an unexpired token: any token for a
+   * linked identity — spent at /cert/gha, /cert, /token or /join, or read
+   * from a log — logged in, as often as it was presented.
+   *
+   * One synchronous block, as joinInviteWithFederated: the principal lookup,
+   * the jti consume (the shared `oidc:<issuer>#<jti>`, kept past exp per F2) and
+   * the scope read cannot interleave with a concurrent login. A refusal
+   * spends nothing: an unknown identity returns before the consume, so the
+   * same token still works once its holder joins. `spentElsewhere` is the
+   * worker's read of the shared `jti:<jti>` KV keyspace.
+   */
+  async loginWithFederated(
+    provider: string,
+    providerSub: string,
+    proof: { jti: string; exp: number; spentElsewhere: boolean },
+  ): Promise<
+    | { ok: true; principalId: string; scopes: string[] }
+    | { ok: false; reason: "unknown_identity" | "proof_reused" }
+  > {
+    const sql = this.ctx.storage.sql;
+    this.#ensureSchema();
+    ensurePrincipalSchema(sql);
+    if (proof.spentElsewhere) return { ok: false, reason: "proof_reused" };
+    const principalId = findPrincipalByFederated(sql, provider, providerSub);
+    if (!principalId) return { ok: false, reason: "unknown_identity" };
+    if (!this.#consumeJti(SigningAuthority.#oidcJtiKey(provider, proof.jti), proof.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS)) {
+      return { ok: false, reason: "proof_reused" };
+    }
+    return { ok: true, principalId, scopes: getCapabilities(sql, principalId) };
   }
 
   // ── Principal management ──
