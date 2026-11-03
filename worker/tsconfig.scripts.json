@@ -22,7 +22,7 @@
     "src/__tests__/invite-link-pages.test.ts",
     "../scripts/verify-ct-log.ts",
     "src/__tests__/bundle-canonical.test.ts",
-    "../scripts/fixture-manifest.ts"
+    "../scripts/fixture-manifest.ts",
     "../scripts/trust-anchor-freshness.ts",
     "src/__tests__/trust-anchor-freshness.test.ts"
   ],
