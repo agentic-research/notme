@@ -14,6 +14,9 @@ import { env } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { createSessionCookie } from "./auth/session";
+import { precheckRenewalProof } from "./auth/renewal-precheck";
+import { tierRenewalBinding, tierRenewalBindingV2, tierRenewalBindingV3 } from "./auth/tier-enrolment-binding";
+import { ED25519 } from "./platform";
 import { type GhaSigner, ghaPopBody, installGhaSigner } from "./__tests__/helpers/gha-token";
 
 const ORIGIN = "http://localhost:8788";
@@ -164,5 +167,154 @@ describe("POST /cert/gha is limited before any SigningAuthority RPC", () => {
     });
     expect(res.status).toBe(401);
     expect(spy.calls).toEqual([]);
+  });
+});
+
+describe("POST /cert/issuing-ca/renew rejects a forged proof before the DO", () => {
+  // The renewal bindings are request-only — tag || SPKI || iat [|| generation],
+  // every byte from the body — so the stateless front Worker can check the
+  // proof itself. The DO still verifies (defence in depth); this only stops a
+  // forgery costing the singleton a row read and an Ed25519 verify.
+  const b64u = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  async function machine() {
+    const kp = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", kp.publicKey)) as ArrayBuffer);
+    const pem = `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...spki)).match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----`;
+    return { kp, spki, pem };
+  }
+  const sign = async (key: CryptoKey, binding: Uint8Array) =>
+    b64u(new Uint8Array(await crypto.subtle.sign(ED25519, key, binding)));
+  const renew = (body: unknown, spy: ReturnType<typeof spiedAuthority>) =>
+    call(
+      new Request(`${ORIGIN}/cert/issuing-ca/renew`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      { SIGNING_AUTHORITY: spy.binding },
+    );
+  const now = () => Math.floor(Date.now() / 1000);
+  const hex64 = () =>
+    Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+  const unhex = (h: string) => Uint8Array.from(h.match(/../g)!, (x) => parseInt(x, 16));
+  const errorOf = async (res: Response) => ((await res.json()) as { error: string }).error;
+
+  it("v2: a proof signed by another key is 401 invalid_proof with no RPC", async () => {
+    const m = await machine();
+    const thief = await machine();
+    const iat = now();
+    const spy = spiedAuthority();
+    const res = await renew(
+      { public_key: m.pem, iat, generation: 0, proof: await sign(thief.kp.privateKey, tierRenewalBindingV2(m.spki, iat, 0)) },
+      spy,
+    );
+    expect(res.status).toBe(401);
+    expect(await errorOf(res)).toBe("invalid_proof");
+    expect(spy.calls).toEqual([]);
+  });
+
+  it("v1: a proof signed by another key is 401 invalid_proof with no RPC", async () => {
+    const m = await machine();
+    const thief = await machine();
+    const iat = now();
+    const spy = spiedAuthority();
+    const res = await renew({ public_key: m.pem, iat, proof: await sign(thief.kp.privateKey, tierRenewalBinding(m.spki, iat)) }, spy);
+    expect(res.status).toBe(401);
+    expect(await errorOf(res)).toBe("invalid_proof");
+    expect(spy.calls).toEqual([]);
+  });
+
+  it("a v1 proof presented as v2 is refused: the tags differ", async () => {
+    const m = await machine();
+    const iat = now();
+    const spy = spiedAuthority();
+    const res = await renew(
+      { public_key: m.pem, iat, generation: 0, proof: await sign(m.kp.privateKey, tierRenewalBinding(m.spki, iat)) },
+      spy,
+    );
+    expect(res.status).toBe(401);
+    expect(spy.calls).toEqual([]);
+  });
+
+  it("v3: a proof signed by another key is 401 invalid_proof with no RPC", async () => {
+    const m = await machine();
+    const thief = await machine();
+    const iat = now();
+    const id = hex64();
+    const spy = spiedAuthority();
+    const res = await renew(
+      {
+        public_key: m.pem,
+        iat,
+        generation: 0,
+        enrollment_id: id,
+        proof: await sign(thief.kp.privateKey, tierRenewalBindingV3(m.spki, iat, 0, unhex(id))),
+      },
+      spy,
+    );
+    expect(res.status).toBe(401);
+    expect(await errorOf(res)).toBe("invalid_proof");
+    expect(spy.calls).toEqual([]);
+  });
+
+  it("parity: every refusal the pre-check gives is the one the DO gives for the same request", async () => {
+    // The pre-check mirrors renewTier's stateless prefix; this pins it. Each
+    // case goes to BOTH: the pre-check, and the real DO directly.
+    const m = await machine();
+    const thief = await machine();
+    const iat = now();
+    const id = hex64();
+    const v2 = tierRenewalBindingV2(m.spki, iat, 0);
+    const v3 = tierRenewalBindingV3(m.spki, iat, 0, unhex(id));
+    const cases: Array<{ publicKeyPem: string; iat: number; proof: string; generation?: number; enrollmentId?: string }> = [
+      { publicKeyPem: "junk", iat, proof: "x" },
+      { publicKeyPem: m.pem, iat: NaN, proof: "x" },
+      { publicKeyPem: m.pem, iat: -1, proof: "x", generation: 0 },
+      { publicKeyPem: m.pem, iat, proof: "x", generation: -1 },
+      { publicKeyPem: m.pem, iat, proof: "x", generation: 1.5 },
+      { publicKeyPem: m.pem, iat, proof: "x", generation: 0, enrollmentId: "" },
+      { publicKeyPem: m.pem, iat, proof: "x", generation: 0, enrollmentId: "AB".repeat(32) },
+      { publicKeyPem: m.pem, iat, proof: "x", enrollmentId: id },
+      { publicKeyPem: m.pem, iat, proof: await sign(thief.kp.privateKey, tierRenewalBinding(m.spki, iat)) },
+      { publicKeyPem: m.pem, iat, proof: await sign(thief.kp.privateKey, v2), generation: 0 },
+      { publicKeyPem: m.pem, iat, proof: await sign(m.kp.privateKey, v2), generation: 0, enrollmentId: id },
+      { publicKeyPem: m.pem, iat, proof: await sign(m.kp.privateKey, v3), generation: 0 },
+      { publicKeyPem: m.pem, iat, proof: "", generation: 0 },
+    ];
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+    for (const c of cases) {
+      const pre = await precheckRenewalProof(c);
+      expect(pre.ok, JSON.stringify(c)).toBe(false);
+      const r = await stub.renewTier(c);
+      expect(r.ok).toBe(false);
+      expect(pre.ok ? undefined : pre.reason, JSON.stringify(c)).toBe(r.ok ? undefined : r.reason);
+    }
+    // And a proof the pre-check admits is one only the DO can judge.
+    const valid = { publicKeyPem: m.pem, iat, proof: await sign(m.kp.privateKey, v3), generation: 0, enrollmentId: id };
+    expect(await precheckRenewalProof(valid)).toEqual({ ok: true });
+    const r = await stub.renewTier(valid);
+    expect(r.ok ? "ok" : r.reason).toBe("unknown_key");
+  });
+
+  it("a key that is not an Ed25519 SPKI is 400 invalid_key with no RPC", async () => {
+    const spy = spiedAuthority();
+    const res = await renew({ public_key: "not a key", iat: now(), generation: 0, proof: "x" }, spy);
+    expect(res.status).toBe(400);
+    expect(await errorOf(res)).toBe("invalid_key");
+    expect(spy.calls).toEqual([]);
+  });
+
+  it("control: a VALID proof still reaches the DO, which decides (here: unknown key)", async () => {
+    // The front check refuses only what is wrong for every enrollment state;
+    // anything that depends on the row stays the DO's call.
+    const m = await machine();
+    const iat = now();
+    const spy = spiedAuthority();
+    const res = await renew(
+      { public_key: m.pem, iat, generation: 0, proof: await sign(m.kp.privateKey, tierRenewalBindingV2(m.spki, iat, 0)) },
+      spy,
+    );
+    expect(res.status).toBe(404);
+    expect(spy.calls).toEqual(["renewTier"]);
   });
 });

@@ -3291,8 +3291,7 @@ export default {
         } catch {
           /* empty body */
         }
-        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const r = await authority.renewTier({
+        const params = {
           publicKeyPem: typeof body.public_key === "string" ? body.public_key : "",
           iat: typeof body.iat === "number" ? body.iat : NaN,
           proof: typeof body.proof === "string" ? body.proof : "",
@@ -3304,13 +3303,22 @@ export default {
           ...(body.enrollment_id !== undefined
             ? { enrollmentId: typeof body.enrollment_id === "string" ? body.enrollment_id : "" }
             : {}),
-        });
+        };
+        const refusalStatus = (reason: string) =>
+          reason === "unknown_key" ? 404
+          : reason === "invalid_key" || reason === "binding_v2_required" || reason === "binding_v3_required" ? 400
+          : reason === "stale_proof" || reason === "invalid_proof" ? 401
+          : 403;
+        // The bindings are request-only, so a forged proof is refused here,
+        // before it costs the singleton anything (notme-ed6114). The DO runs
+        // the same checks again; src/auth/renewal-precheck.ts mirrors them.
+        const { precheckRenewalProof } = await import("./src/auth/renewal-precheck");
+        const pre = await precheckRenewalProof(params);
+        if (!pre.ok) return Response.json({ error: pre.reason }, { status: refusalStatus(pre.reason) });
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.renewTier(params);
         if (!r.ok) {
-          const status =
-            r.reason === "unknown_key" ? 404
-            : r.reason === "invalid_key" || r.reason === "binding_v2_required" || r.reason === "binding_v3_required" ? 400
-            : r.reason === "stale_proof" || r.reason === "invalid_proof" ? 401
-            : 403;
+          const status = refusalStatus(r.reason);
           // revoked / horizon_passed / epoch_changed / approval_withdrawn /
           // fork_detected all mean "a human must approve again" — named, so
           // the machine can say which. binding_v2_required and
