@@ -594,10 +594,57 @@ describe("renewal with a generation", () => {
     expect(h.events).toEqual(["save"]);
   });
 
+  describe("a v3 request answered invalid_proof (review M1: the authority may be an older build)", () => {
+    const id = "c9".repeat(32);
+    const V3_UNRECOGNISED =
+      "the authority did not recognise binding v3 — it may be running an older build; the request is kept, retry after it is updated";
+
+    it("a first attempt keeps the pending request and says why", async () => {
+      const h = harness();
+      const err = await renewTier("https://a", await generateTierKey(), h.opts({ generation: 1, enrollmentId: id }),
+        withFetch(() => reply(401, { error: "invalid_proof" }))).catch((e) => e);
+      expect(err).toBeInstanceOf(AuthorityRefusal);
+      expect(h.events, "a v3 invalid_proof must not clear").toEqual(["save"]);
+      expect(h.saved).not.toBeNull();
+      expect(explainRenewalFailure(err).message).toBe(V3_UNRECOGNISED);
+    });
+
+    it("a resend is kept too (not 'state lost'), and the same bytes are sent once the authority understands v3", async () => {
+      const k = await generateTierKey();
+      const h = harness();
+      const seen: string[] = [];
+      await renewTier("https://a", k, h.opts({ generation: 1, enrollmentId: id }), withFetch(() => reply(401, { error: "invalid_proof" }), seen)).catch(() => {});
+      const err = await renewTier("https://a", k, h.opts({ generation: 1, enrollmentId: id, pending: h.saved }),
+        withFetch(() => reply(401, { error: "invalid_proof" }), seen)).catch((e) => e);
+      expect(explainRenewalFailure(err).message).toBe(V3_UNRECOGNISED);
+      expect(h.saved).not.toBeNull();
+      await renewTier("https://a", k, h.opts({ generation: 1, enrollmentId: id, pending: h.saved }), withFetch(() => reply(200, okBody), seen));
+      expect(seen).toHaveLength(3);
+      expect(new Set(seen).size, "always the same bytes").toBe(1);
+      expect(h.saved).toBeNull();
+    });
+
+    it("a v2 request answered invalid_proof is still final", async () => {
+      const h = harness();
+      await expect(renewTier("https://a", await generateTierKey(), h.opts({ generation: 1 }),
+        withFetch(() => reply(401, { error: "invalid_proof" })))).rejects.toThrow();
+      expect(h.events).toEqual(["save", "clear"]);
+    });
+  });
+
   describe("on disk", () => {
     const tmp = () => mkdtempSync(join(tmpdir(), "task-cert-test-"));
     const inDir = (dir: string, k: Awaited<ReturnType<typeof generateTierKey>>, generation: number | undefined, f: typeof fetch, o: { fetchTimeoutMs?: number; persist?: (r: any) => void } = {}) =>
       renewTierInDir(dir, async () => ({ authority: "https://a", key: k, generation }), o, f);
+
+    it("a v3 request an older authority refuses as invalid_proof leaves renew-pending.json in place (review M1)", async () => {
+      const dir = tmp();
+      const k = await generateTierKey();
+      const load = async () => ({ authority: "https://a", key: k, generation: 2, enrollmentId: "ab".repeat(32) });
+      await expect(renewTierInDir(dir, load, {}, withFetch(() => reply(401, { error: "invalid_proof" })))).rejects.toThrow();
+      expect(existsSync(join(dir, "renew-pending.json"))).toBe(true);
+      expect(JSON.parse(JSON.parse(readFileSync(join(dir, "renew-pending.json"), "utf8")).body).enrollment_id).toBe("ab".repeat(32));
+    });
 
     it("re-enrolling clears a stale pending file", () => {
       const dir = tmp();

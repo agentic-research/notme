@@ -334,7 +334,12 @@ export function renewedTierMeta(meta: Record<string, unknown>, r: RenewalResult)
  * Pending is cleared only for a final reason (see REVERSIBLE_REASONS).
  */
 export class AuthorityRefusal extends Error {
-  constructor(public reason: string, public resend = false) {
+  constructor(
+    public reason: string,
+    public resend = false,
+    /** A v3 request refused invalid_proof: the request is kept (see renewTier). */
+    public v3Unrecognised = false,
+  ) {
     super(reason);
   }
 }
@@ -352,6 +357,10 @@ export class AuthorityRefusal extends Error {
  * Final, and cleared on a first attempt: invalid_key, invalid_proof,
  * binding_v2_required, binding_v3_required, revoked, fork_detected,
  * horizon_passed, epoch_changed, unknown_key, and a malformed-body 4xx.
+ * EXCEPT invalid_proof for a request signed with binding v3 (review M1): an
+ * authority build from before v3 (a canary split, a rollback) verifies those
+ * bytes as v2 and refuses them, and a current build accepts the same bytes.
+ * That is reversible, so the request is kept, on any attempt.
  */
 export const REVERSIBLE_REASONS: ReadonlySet<string> = new Set(["stale_proof", "approval_withdrawn"]);
 
@@ -525,6 +534,15 @@ export async function renewTier(
   const definitive =
     res.status >= 400 && res.status < 500 && !TRANSIENT_4XX.has(res.status) && typeof out?.error === "string";
   if (!definitive) throw new Error(`renewal not answered by the authority (HTTP ${res.status}) — try again`);
+  let sentV3 = false;
+  try {
+    sentV3 = "enrollment_id" in JSON.parse(body);
+  } catch { /* unparseable: not provably v3 */ }
+  if (sentV3 && out.error === "invalid_proof") {
+    // Our own signature does not fail; an authority that ignores
+    // enrollment_id does. Keep the bytes: a current authority accepts them.
+    throw new AuthorityRefusal(out.error, resend, true);
+  }
   if (resend && isV1Body(body)) {
     // v1 carries no fork risk: drop the refused request and sign a new one.
     await opts.clearPending(body);
@@ -547,6 +565,8 @@ const ENDED_REASONS = new Set([
 ]);
 
 export const BINDING_V2_REQUIRED_MESSAGE = "this task-cert is older than the authority; update it";
+export const V3_UNRECOGNISED_MESSAGE =
+  "the authority did not recognise binding v3 — it may be running an older build; the request is kept, retry after it is updated";
 /** binding_v3_required means the same thing to a human: this client signed below what the enrollment speaks. */
 export const BINDING_REQUIRED_REASONS: ReadonlySet<string> = new Set(["binding_v2_required", "binding_v3_required"]);
 
@@ -555,6 +575,7 @@ export function explainRenewalFailure(e: unknown): Error {
   const message = String((e as Error | null)?.message ?? e);
   if (message.startsWith("renewal state lost")) return e as Error;
   if (e instanceof AuthorityRefusal) {
+    if (e.v3Unrecognised) return new Error(V3_UNRECOGNISED_MESSAGE);
     // Not an ended approval: the authority has retired v1 for this machine, and this client signed v1.
     if (BINDING_REQUIRED_REASONS.has(e.reason)) return new Error(BINDING_V2_REQUIRED_MESSAGE);
     if (e.reason === "stale_proof") {

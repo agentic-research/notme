@@ -213,6 +213,15 @@ Which binding a row accepts (`binding_version`):
   row to 3. The task-cert client always generates a fresh key at enroll, so
   it never meets the re-enrollment case.
 
+**Rollout gate** (review M1). Ids are handed out only while the worker var
+`RENEWAL_BINDING_V3` is `"on"` (default off). Off, no id goes out and a
+re-enrolled key collects at 2, but a v3 request is still accepted, so turning
+it off strands nobody. It goes on only after the release is promoted to
+100%, because a front from before v3 drops `enrollment_id` and answers a v3
+request `invalid_proof`; with it on, no rollback past that release. The
+client treats `invalid_proof` on a request it signed v3 as reversible: it
+keeps the request and resends the same bytes, instead of clearing it.
+
 **The proof is verified before the row is read** (notme-c9fc8c). Every
 binding is computed from the request alone, so a caller without the key
 gets `invalid_proof` whatever the row says: it cannot learn whether a key is

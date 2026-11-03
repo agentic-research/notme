@@ -35,6 +35,13 @@ SIGNET_AUTHORITY_URL = "http://localhost:8787"
 # CA persists and its trust domain is one promotion away from production.
 GHA_ALLOWED_OWNERS = "agentic-research"
 ALLOWED_AUDIENCES = "http://localhost:8787"
+# Renewal binding v3 (notme-c9fc8c): "on" hands out enrollment ids, so
+# task-cert clients start signing v3. Leave it "off" through canary and
+# promote; set "on" only once the release is at 100%. With it on, never roll
+# back past the release that added it (a front from before it answers v3
+# invalid_proof). Off, v3 requests are still accepted: turning it off later
+# strands nobody.
+RENEWAL_BINDING_V3 = "off"
 # BOOTSTRAP_GHA_SUBJECT is supplied at runtime with --var, because it is the
 # `sub` of the job that is running, which cannot be known when this is written.
 

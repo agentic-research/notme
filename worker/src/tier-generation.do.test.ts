@@ -678,3 +678,59 @@ describe("without the key, a refusal says nothing about the enrollment (notme-c9
     ]);
   });
 });
+
+describe("RENEWAL_BINDING_V3 gates handing out enrollment ids (review M1)", () => {
+  /** Run `fn` with the authority's RENEWAL_BINDING_V3 set to `value` (undefined: unset), then restore it. */
+  async function withV3<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const prior = await runInDurableObject(authority(), (a) => {
+      const sa = a as unknown as { env: Record<string, unknown> };
+      const was = sa.env.RENEWAL_BINDING_V3;
+      const e = { ...sa.env };
+      if (value === undefined) delete e.RENEWAL_BINDING_V3;
+      else e.RENEWAL_BINDING_V3 = value;
+      sa.env = e;
+      return was as string | undefined;
+    });
+    try {
+      return await fn();
+    } finally {
+      await runInDurableObject(authority(), (a) => {
+        const sa = a as unknown as { env: Record<string, unknown> };
+        sa.env = { ...sa.env, RENEWAL_BINDING_V3: prior };
+      });
+    }
+  }
+  const bindingOf = async (m: Machine) => {
+    const f = await fp(m.spki);
+    return runInDurableObject(authority(), (a) =>
+      ((a as SigningAuthority)["ctx"].storage.sql
+        .exec("SELECT binding_version FROM tier_enrolments WHERE key_fingerprint = ? AND status = 'active'", f)
+        .toArray()[0] as { binding_version: number | null }).binding_version,
+    );
+  };
+
+  for (const off of [undefined, "off"]) {
+    it(`off (${off ?? "unset"}): no id at collect or renewal, and a re-enrolled key collects at v2`, async () => {
+      await withV3(off, async () => {
+        const { m, tier } = await enrolled();
+        expect("enrollment_id" in tier, "collect handed out an id with v3 off").toBe(false);
+        const r = await renew(m, 0);
+        expect(r.status).toBe(200);
+        expect("enrollment_id" in ((await r.json()) as object), "renewal handed out an id with v3 off").toBe(false);
+        // No client can learn an id, so a v3-only row would strand it.
+        await enrolled(m);
+        expect(await bindingOf(m)).toBe(2);
+        await expectOk(await renew(m, 0), 1);
+      });
+    });
+  }
+
+  it("turned off after ids went out: a v3 request is still accepted, so nobody is stranded", async () => {
+    const { m, tier } = await withV3("on", () => enrolled());
+    expect(tier.enrollment_id).toMatch(/^[0-9a-f]{64}$/);
+    await withV3(undefined, async () => {
+      await expectOk(await renewV3(m, tier.enrollment_id, 0), 1);
+      expect(await bindingOf(m)).toBe(3);
+    });
+  });
+});

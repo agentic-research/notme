@@ -61,6 +61,13 @@ SIGNET_AUTHORITY_URL = "https://auth.notme.bot"
 # Comma-separated list of GitHub org/user names allowed to exchange GHA OIDC tokens
 # for bridge certs at auth.notme.bot/cert/gha.
 GHA_ALLOWED_OWNERS = "your-org"
+# Renewal binding v3 (notme-c9fc8c): "on" hands out enrollment ids, so
+# task-cert clients start signing v3. Leave it "off" through canary and
+# promote; set "on" only once the release is at 100%. With it on, never roll
+# back past the release that added it (a front from before it answers v3
+# invalid_proof). Off, v3 requests are still accepted: turning it off later
+# strands nobody.
+RENEWAL_BINDING_V3 = "off"
 # Base path of the log behind the CT_LOG service binding (below). Default is
 # /logs/notme; set it only if the shard is named differently in
 # ct/config.notme.json. Has no effect while CT_LOG is unbound.
@@ -212,6 +219,9 @@ GHA_ALLOWED_OWNERS = "your-staging-org"
 # allowed-audiences.ts, which would let staging mint tokens for production's
 # resource servers.
 ALLOWED_AUDIENCES = "https://staging.notme.bot,https://auth-staging.notme.bot"
+# Same rule as production's RENEWAL_BINDING_V3 (above): "on" only after the
+# release is promoted to 100% here. Env vars are not inherited.
+RENEWAL_BINDING_V3 = "off"
 
 [[env.staging.kv_namespaces]]
 binding = "CA_BUNDLE_CACHE"

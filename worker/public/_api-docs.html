@@ -568,7 +568,7 @@
   "enrollment_id": "&lt;64 hex&gt;",
   "criteria": ["agent-session/1"]
 }</div>
-          <div class="ep-note"><code>generation</code> and <code>enrollment_id</code> are the values to sign into the next renewal.</div>
+          <div class="ep-note"><code>generation</code> and <code>enrollment_id</code> are the values to sign into the next renewal. <code>enrollment_id</code> is present (here and at collect) only while the authority hands out binding v3 (<code>RENEWAL_BINDING_V3 = "on"</code>); without it, sign v2.</div>
           <div class="ep-label">errors</div>
           <div class="ep-response">// 404 unknown_key   400 invalid_key   400 binding_v2_required   400 binding_v3_required
 // 401 stale_proof   401 invalid_proof

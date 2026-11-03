@@ -359,4 +359,28 @@ describe("mint path phase 1, end to end with the real client", () => {
     expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
     expect((await runClient(c)).generation).toBe(3);
   });
+
+  it("a v3 request through a front that predates v3 is kept, not cleared, and renews once the front is current (review M1)", async () => {
+    const c = await enroll();
+    expect(c.enrollmentId).toMatch(/^[0-9a-f]{64}$/);
+    // A canary split or a rollback: the front drops enrollment_id, so the
+    // real DO verifies the v3 signature as v2 and answers invalid_proof.
+    const oldFront: Fetch = async (url, init) => {
+      const { enrollment_id: _drop, ...rest } = JSON.parse(String(init?.body));
+      return direct(url, { ...init, body: JSON.stringify(rest) });
+    };
+    const refused = await refusal(runClient(c, oldFront));
+    expect(refused?.reason).toBe("invalid_proof");
+    expect(c.pending, "the client cleared a request a current authority would accept").not.toBeNull();
+    const kept = c.pending!.body;
+    // Back on a current front: the SAME bytes renew. Nothing re-signed, nothing forked.
+    const sent: string[] = [];
+    const watching: Fetch = (url, init) => {
+      sent.push(String(init?.body));
+      return direct(url, init);
+    };
+    expect((await runClient(c, watching)).generation).toBe(1);
+    expect(sent).toEqual([kept]);
+    expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
+  });
 });

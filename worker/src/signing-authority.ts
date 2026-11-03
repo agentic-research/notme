@@ -118,6 +118,17 @@ interface SigningAuthorityEnv {
    * once the pin is fixed), and health reports `configError`.
    */
   CT_LOG_ID?: string;
+  /**
+   * "on" hands out enrollment ids, at collect and on every renewal, so
+   * clients start signing renewal binding v3 (notme-c9fc8c, review M1).
+   * Anything else (the default): no ids go out and a re-enrolled key
+   * collects at v2, but a v3 request a client sends is still ACCEPTED, so
+   * turning it off later strands nobody. Turn it on only once the release
+   * that understands v3 is promoted to 100%: a front from before it drops
+   * `enrollment_id` and answers a v3 request invalid_proof. With it on, do
+   * not roll back past that release.
+   */
+  RENEWAL_BINDING_V3?: string;
   CT_LOG_KEY?: string;
 }
 
@@ -2655,8 +2666,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         authMethod: string;
         renewUntil: number;
         generation: number;
-        /** The enrollment's id, hex: what a v3 renewal signs (notme-c9fc8c). */
-        enrollmentId: string;
+        /** The enrollment's id, hex: what a v3 renewal signs (notme-c9fc8c). Only with RENEWAL_BINDING_V3 "on". */
+        enrollmentId?: string;
         clone_policy: string;
         /** Criteria ids ("agent-session/1"); null for a pre-phase-2 enrollment. */
         criteria: string[] | null;
@@ -2714,6 +2725,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const { tierEnrolmentId } = await import("./auth/tier-enrolment-binding");
     const enrollmentId = hex(await tierEnrolmentId(codeHashBytes));
+    const v3On = this.env.RENEWAL_BINDING_V3 === "on";
 
     // Consume first, atomically: of two concurrent collects with a valid
     // proof, exactly one sees changes() = 1.
@@ -2740,7 +2752,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // second collect finds status 'active' and is refused.
       // A collected enrollment starts at generation 0 (notme-747cc7).
       "UPDATE tier_enrolments SET status = 'active', generation = 0, binding_version = ? WHERE device_code_hash = ? AND status = 'approved'",
-      reEnrolled ? 3 : 2,
+      // While v3 is off no client can learn an id, so a v3-only row would
+      // strand it: re-enrolled keys collect at v2 too (M4 stays open for
+      // them until v3 is turned on).
+      reEnrolled && v3On ? 3 : 2,
       deviceCodeHash,
     );
     const [change] = [
@@ -2782,7 +2797,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       authMethod: row.auth_method,
       renewUntil: row.renew_until ?? 0,
       generation: 0,
-      enrollmentId,
+      ...(v3On ? { enrollmentId } : {}),
       clone_policy: row.clone_policy,
       criteria: criteria?.map(criteriaId) ?? null,
       ...result,
@@ -2843,7 +2858,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     /** Hex enrollment id: selects binding v3 (with `generation`). */
     enrollmentId?: string;
   }): Promise<
-    | ({ ok: true; renewUntil: number; generation: number; enrollmentId: string; criteria: string[] | null } & import("./cert-authority").IssuingCaCertResult & {
+    | ({ ok: true; renewUntil: number; generation: number; enrollmentId?: string; criteria: string[] | null } & import("./cert-authority").IssuingCaCertResult & {
         authority: { epoch: number; key_id: string };
       })
     | {
@@ -3023,13 +3038,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ttlMs,
       ...(criteria ? { criteria } : {}),
     });
+    // With RENEWAL_BINDING_V3 "on" (review M1),
     // enrollmentId on every renewal, v1 and v2 included: a machine collected
     // before v3 learns it here, and its next renewal signs v3.
     return {
       ok: true,
       renewUntil: row.renew_until,
       generation,
-      enrollmentId,
+      ...(this.env.RENEWAL_BINDING_V3 === "on" ? { enrollmentId } : {}),
       criteria: criteria?.map(criteriaId) ?? null,
       ...result,
     };
