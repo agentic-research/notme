@@ -869,7 +869,9 @@ async function handlePasskey(
   }
 
   if (env.PASSKEY_LIMITER) {
-    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    // IPv6 by its /64, no address its own bucket — as /token (notme-ed6114,
+    // src/client-ip-key.ts).
+    const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
     const { success } = await env.PASSKEY_LIMITER.limit({
       key: `passkey:${ip}`,
     });

@@ -205,17 +205,32 @@ describe("passkey.register.rate-limit", () => {
   });
 
   it("an absent IP header does not silently share one bucket with everyone", async () => {
-    // It does fall back to a single "unknown" bucket — recorded here as the
-    // measured behaviour rather than asserted as a defence, because behind CF
-    // the header is always present and a test that pretended otherwise would
-    // be describing a deployment that does not exist.
+    // It does fall back to a single bucket of its own, "none"
+    // (src/client-ip-key.ts) — recorded here as the measured behaviour rather
+    // than asserted as a defence, because behind CF the header is always
+    // present and a test that pretended otherwise would be describing a
+    // deployment that does not exist.
     const rl = limiter(10);
     await call(
       "/auth/passkey/register/options",
       { method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
       { PASSKEY_LIMITER: rl.binding },
     );
-    expect(rl.keys).toEqual(["passkey:unknown"]);
+    expect(rl.keys).toEqual(["passkey:none"]);
+  });
+
+  it("buckets an IPv6 caller by its /64, as /token does (notme-ed6114)", async () => {
+    // One subscriber is routinely handed a whole /64; per-address keying gave
+    // it about 2^64 registration budgets (re-review NEW-2).
+    const rl = limiter(10);
+    for (const ip of ["2001:db8:5:6::1", "2001:db8:5:6:dead:beef:0:1"]) {
+      await call(
+        "/auth/passkey/register/options",
+        { method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": ip }, body: "{}" },
+        { PASSKEY_LIMITER: rl.binding },
+      );
+    }
+    expect(rl.keys).toEqual(["passkey:2001:db8:5:6::/64", "passkey:2001:db8:5:6::/64"]);
   });
 
   it("is checked BEFORE any authority work, so a flood costs no DO time", async () => {

@@ -156,7 +156,7 @@ note: discovery (`/.well-known/signet-authority.json`) and the JSON landing page
 | `ASSETS`               | static assets  | `public/` directory; `run_worker_first = true`                               | wrangler.toml                          |
 | `TOKEN_LIMITER`        | rate limiter   | per-principal `/token` (20/min); per-IP before a cookie is verified                                              | wrangler.toml.example only             |
 | `CERT_LIMITER`         | rate limiter   | per-repo `/cert/gha` (10/min)                                                | wrangler.toml.example only             |
-| `PASSKEY_LIMITER`      | rate limiter   | per-IP passkey routes (5/min) — wired in `handlePasskey`                     | wrangler.toml.example                  |
+| `PASSKEY_LIMITER`      | rate limiter   | per-IP (IPv6 /64) passkey routes (5/min) — wired in `handlePasskey`         | wrangler.toml.example                  |
 | `SITE_URL`             | var            | canonical site origin                                                        | both                                   |
 | `SIGNET_AUTHORITY_URL` | var            | authority origin for self-references                                         | both                                   |
 | `GHA_ALLOWED_OWNERS`   | var            | CSV of GitHub orgs/users allowed to mint via `/cert/gha`                     | both                                   |
