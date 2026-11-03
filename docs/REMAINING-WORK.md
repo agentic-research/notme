@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 72 in notme (`rsry status --json` →
+**Updated:** 2026-11-02 · **Open beads:** 77 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -45,7 +45,9 @@ In order. Items marked **owner** need the operator, and an agent can't do
 them.
 
 1. **notme-c0c9a2:** if the log pin is misconfigured, write the cert to the
-   CT backlog so it drains once the pin is fixed. Must land before step 2.
+   CT backlog so it drains once the pin is fixed. **notme-b52d7c:** a CT-bound
+   mint can sign with a just-rotated key or a stale epoch. Both must land
+   before step 2.
 2. **notme-1b46a8 / notme-907299:** provision the CT log from upstream azul
    `d9402ec` (owner), fill the pin, bind `CT_LOG`, deploy. Closes when a
    production mint's SCT verifies against the live log.
@@ -80,6 +82,7 @@ to publish the tag.
   GitHub Actions tokens take no nonce, so this needs the owner's choice:
   (A) single-use jti on `/join`, or (B) change the shared audience setting.
   Parts 2 and 4/5 are merged.
+- notme-b51777 (P1): one bootstrap code can be spent twice (two admins).
 - notme-a2e75d: the first-user and claim marks are bound to the userId only,
   not to the browser like invite reservations are.
 - notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
@@ -100,6 +103,9 @@ to publish the tag.
 - notme-baea8c: `proxy()` lacks ADR-009's promised gates.
 - notme-8fb37f: the alarm-defence tests are weak.
 - notme-2098f4: `readScopes` doesn't check lengths.
+- From the Durable Objects audit (docs/audits/2026-11-03-durable-objects.md):
+  notme-b54368 (rotate() not atomic), notme-b556a4 (templates use the KV
+  storage backend), notme-b567c9 (error messages reach clients).
 - notme-7aa6dd, notme-7ec6fb, notme-c0db9b, notme-32003c, notme-32270b,
   notme-c071be, notme-3ee3b0, notme-230b40, notme-131c8e.
 - CT: notme-a806d0 (warn before the shard closes); notme-afa9d8 (per-cert
@@ -183,6 +189,10 @@ Listed so the count doesn't creep up unnoticed:
   notme-229dc3.
 - **From the invite/`/join` security reviews (2026-11-02):** one new bead,
   notme-a2e75d (first-user and claim marks not bound to the browser).
+- **From the Durable Objects audit (2026-11-03):** five beads: notme-b51777,
+  notme-b52d7c, notme-b54368, notme-b556a4, notme-b567c9. The Low items became
+  comments on notme-070a8f and notme-5c2511. The full audit is in
+  docs/audits/2026-11-03-durable-objects.md.
 - **Not filed:** the signet enforcement bead already existed
   (signet-be49b9). It now has the final encoding and a testable close
   condition, and notme-bdffc7 depends on it.
