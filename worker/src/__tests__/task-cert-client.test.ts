@@ -11,7 +11,7 @@
 import { X509Certificate, X509CertificateGenerator, BasicConstraintsExtension, KeyUsagesExtension, KeyUsageFlags } from "@peculiar/x509";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, utimesSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mintIssuingCaCert, OID_CRITERIA } from "../cert-authority";
@@ -1187,17 +1187,32 @@ describe("the legacy cutoff never silently turns off (flag vs env)", () => {
     expect(resolveLegacyCutoff(undefined, undefined)).toEqual({ ok: true, cutoff: undefined });
     expect(resolveLegacyCutoff(undefined, "2027-01-01")).toEqual({ ok: true, cutoff: new Date("2027-01-01T00:00:00Z") });
   });
-  it("the CLI parses --legacy-cutoff=DATE like --legacy-cutoff DATE, and a bare flag exits 2", () => {
+  it("the CLI parses --legacy-cutoff=DATE like --legacy-cutoff DATE, and a bare flag exits 2", async () => {
+    // The five CLI runs go in PARALLEL (notme-070a8f). One `pnpm exec tsx`
+    // start takes about 0.9 s at a load average of 24, so five run one after
+    // another sat at the 5 s timeout and timed out under load. That was the
+    // gate failing for the machine, not for the code.
     const run = (...a: string[]) =>
-      spawnSync("pnpm", ["exec", "tsx", "scripts/task-cert/cli.ts", "verify", "--cert", "/nonexistent", "--dir", "/nonexistent", ...a], {
-        cwd: join(__dirname, "../../.."), encoding: "utf8", env: { ...process.env, NOTME_LEGACY_CUTOFF: "" },
+      new Promise<number | null>((resolve, reject) => {
+        const p = spawn("pnpm", ["exec", "tsx", "scripts/task-cert/cli.ts", "verify", "--cert", "/nonexistent", "--dir", "/nonexistent", ...a], {
+          cwd: join(__dirname, "../../.."), env: { ...process.env, NOTME_LEGACY_CUTOFF: "" }, stdio: "ignore",
+        });
+        p.on("error", reject);
+        p.on("close", (code) => resolve(code));
       });
-    expect(run("--legacy-cutoff").status).toBe(2);
-    expect(run("--legacy-cutoff=").status).toBe(2);
-    expect(run("--legacy-cutoff=tomorrow").status).toBe(2);
+    const [bare, empty, junk, joined, spaced] = await Promise.all([
+      run("--legacy-cutoff"),
+      run("--legacy-cutoff="),
+      run("--legacy-cutoff=tomorrow"),
+      run("--legacy-cutoff=2026-12-01"),
+      run("--legacy-cutoff", "2026-12-01"),
+    ]);
+    expect(bare).toBe(2);
+    expect(empty).toBe(2);
+    expect(junk).toBe(2);
     // a valid value gets past the cutoff check (then fails on the missing dir, not exit 2)
-    expect(run("--legacy-cutoff=2026-12-01").status).not.toBe(2);
-    expect(run("--legacy-cutoff", "2026-12-01").status).not.toBe(2);
+    expect(joined).not.toBe(2);
+    expect(spaced).not.toBe(2);
   });
 });
 
