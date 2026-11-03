@@ -3444,6 +3444,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     await this.ctx.storage.put("prevKeyId", oldKeyId);
     await this.ctx.storage.put("prevPubKey", oldPubKeyB64);
 
+    // Publish straight away, as revokeEpoch() does (notme-ed6114, re-review
+    // NEW-1). The KV bundle is what verifiers and the trust-anchor gates
+    // read the CURRENT key from; left alone it named the old key until the
+    // next alarm or its staleness window, while the edge also still served
+    // the old root — so the two agreed and a release could sign it. After
+    // the new key and prevKey/prevPubKey are stored, so the bundle carries
+    // the grace-window key too.
+    await this.#publishBundle();
+
     const rows = this.ctx.storage.sql
       .exec("SELECT epoch FROM state WHERE id = 'authority'")
       .toArray() as Array<{ epoch: number }>;
@@ -4702,7 +4711,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    *
    * ECMAScript #private: a `private` method stays live on the DO's RPC
    * surface (ADR-016), and nothing outside this object should be able to
-   * force a republish. Shared by `alarm()` and `revokeEpoch()` so the two
+   * force a republish. Shared by `alarm()`, `revokeEpoch()` and `rotate()` so they
    * cannot drift — a revocation that published a differently-shaped bundle
    * than the refresh path would be a very bad day to debug.
    *

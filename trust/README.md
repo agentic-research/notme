@@ -63,9 +63,10 @@ gets past the cache, and nothing purges it on `rotate()`, so for up to its
 gate therefore first require the served root's key to be the one the no-store
 CABundle at `/internal/ca-bundle` names as current. If it is not (exit 3, or
 the release step's "edge copy predates a rotate"), wait out the `max-age` and
-run again. The bundle is itself up to about a minute behind a `rotate()` (its
-KV entry lives 60 s), so right after a rotation wait a few minutes before
-refreshing or tagging.
+run again. `rotate()` republishes the bundle to KV as it finishes, so what
+remains is KV's own edge caching: a colo can read the previous bundle for
+about 60 s after a rotation. Right after a rotation, wait a minute or two
+before refreshing or tagging.
 
 ## Why this exists
 
