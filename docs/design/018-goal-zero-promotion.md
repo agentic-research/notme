@@ -72,9 +72,17 @@ Every PR, no exceptions (`.github/workflows/ci.yml`):
 | Doc/bead integrity | `task docs:check` | claims citing dead code/beads |
 | Package manifest | `task server:check` | server.json schema/version drift |
 | Proxy | `task proxy:check` | Rust build/test/clippy |
+| Runtime contract | `task worker:contract` | the real Worker booted locally (`wrangler dev`, config derived from `wrangler.toml.example`, real DOs in local storage) answering `worker:verify`'s checks — before this, that contract only ran after a deploy (`notme-6ae724`) |
 
 **Entry:** PR opened. **Exit:** all green. **No rollback concept** — nothing
 deployed.
+
+**After merge, optionally:** `.github/workflows/staging-smoke.yml` deploys `main`
+to staging and runs `worker:await-convergence` + `worker:verify-staging`. It
+needs a staging-scoped API token on the `staging` GitHub environment and
+**does not run until the owner adds it** (it posts a skip notice instead). It
+never runs on pull requests: a PR job holding a deploy token runs the PR's
+code with that token.
 
 ### Phase 1 — Staging
 

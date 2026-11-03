@@ -199,7 +199,7 @@ check_request "token" "POST" "${AUTH_BASE}/token" "400" '"error":"dpop_proof_req
 # that must never regress: 1101 surfaces as 500.
 check_request "unmatched-path" "GET" "${AUTH_BASE}/.well-known/not-a-route-$VERIFY_NONCE" "404" '"error":"not_found"'
 
-echo "=== ${SITE_BASE#https://} ==="
+echo "=== ${SITE_BASE#http*://} ==="
 check_request "homepage" "GET" "${SITE_BASE}/" "200" "notme"
 check_request "apas" "GET" "${SITE_BASE}/apas?verify=$VERIFY_NONCE" "200" "0.2.1-draft"
 check_request "apas-schema" "GET" "${SITE_BASE}/provenance/dispatch/v1?verify=$VERIFY_NONCE" "200" '"workItemRef"' "" "application/schema+json"

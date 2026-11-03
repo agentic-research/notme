@@ -228,6 +228,7 @@ bash test-local.sh             # workerd smoke test (endpoints + invariant #1)
 bash test-e2e.sh               # Playwright e2e with virtual authenticator (contract tests)
 cd ../proxy && cargo test      # Rust tests (listen-addr parser, UDS bind, perms, round-trip)
 task worker:verify             # live endpoint checks against production or staging
+task worker:contract           # the same checks against the real Worker booted locally (CI, no account)
 ```
 
 Test categories (worker):

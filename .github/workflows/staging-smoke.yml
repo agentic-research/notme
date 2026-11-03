@@ -1,0 +1,102 @@
+# Deployed-runtime smoke on STAGING, after every merge to main (notme-6ae724).
+#
+# WHAT IT ADDS OVER ci.yml `contract`. That job boots the Worker locally, which
+# proves the code and its config template. It cannot prove what only a real
+# Cloudflare deployment shows: the account's bindings resolving, migrations
+# applying to existing staging DO state (not a fresh one), custom domains and
+# routing. This deploys main to the staging Worker — separate DOs, own CA, no
+# VPC, carries no traffic (ADR-018 Phase 1) — and runs the same
+# `worker:verify` checks against it.
+#
+# IT DOES NOT RUN UNTIL THE OWNER ADDS THE SECRET. Without
+# CLOUDFLARE_STAGING_API_TOKEN every step after the gate is skipped and the
+# run says so in a notice — it does not report a green it did not earn.
+#
+# Owner setup (GitHub → Settings → Environments → `staging`):
+#   secret CLOUDFLARE_STAGING_API_TOKEN — an API token scoped to Workers
+#          Scripts:Edit + Workers KV Storage:Edit on this account only. It can
+#          deploy any Worker in the account, so keep it in the environment, not
+#          as a repository secret, and add a required reviewer if wanted.
+#   var    CLOUDFLARE_ACCOUNT_ID
+#   var    STAGING_KV_NAMESPACE_ID — the staging CA_BUNDLE_CACHE id. The live
+#          worker/wrangler.toml is gitignored; this job rebuilds it from the
+#          committed template with that one placeholder filled. Production
+#          placeholders stay placeholders: `--env staging` never reads them.
+#
+# WHY NOT ON PULL REQUESTS. A PR job holding a deploy token runs the PR's code
+# with that token. Post-merge only; `workflow_dispatch` for a manual re-run.
+name: Staging smoke (deployed)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
+jobs:
+  staging-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    permissions:
+      contents: read
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_STAGING_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      STAGING_KV_NAMESPACE_ID: ${{ vars.STAGING_KV_NAMESPACE_ID }}
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - name: Gate on the staging token
+        id: gate
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ] || [ -z "$STAGING_KV_NAMESPACE_ID" ]; then
+            echo "::notice title=staging smoke skipped::CLOUDFLARE_STAGING_API_TOKEN (secret), CLOUDFLARE_ACCOUNT_ID and STAGING_KV_NAMESPACE_ID (vars) are not all set on the 'staging' environment — no deployed check ran."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: ./.github/actions/setup-task
+
+      - if: steps.gate.outputs.enabled == 'true'
+        run: task worker:install
+      - if: steps.gate.outputs.enabled == 'true'
+        run: task dpop:build
+
+      - name: Materialize worker/wrangler.toml from the template
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          grep -q '<your-staging-kv-namespace-id>' worker/wrangler.toml.example
+          sed "s|<your-staging-kv-namespace-id>|${STAGING_KV_NAMESPACE_ID}|" \
+            worker/wrangler.toml.example > worker/wrangler.toml
+
+      - if: steps.gate.outputs.enabled == 'true'
+        run: task worker:deploy-staging
+      # Convergence first (same reason as ship-prod): a verify during the
+      # rollover can pass against the build being replaced.
+      # The script reads AUTH_BASE/EXPECT from the process environment, not
+      # task vars, so they are set here rather than on the command line.
+      - if: steps.gate.outputs.enabled == 'true'
+        env:
+          AUTH_BASE: https://auth-staging.notme.bot
+          EXPECT: ${{ github.sha }}
+        run: task worker:await-convergence
+      - if: steps.gate.outputs.enabled == 'true'
+        run: task worker:verify-staging

@@ -218,6 +218,14 @@ tasks:
     cmds:
       - pnpm exec wrangler deploy --env staging --var BUILD_SHA:$(git rev-parse HEAD)
 
+  worker:contract:
+    desc: "Boot the real Worker locally (config derived from wrangler.toml.example) and run worker:verify's checks against it — no Cloudflare account (notme-6ae724)"
+    # CI runs this on every PR (ci.yml `contract`). Before it, the post-deploy
+    # contract only ever ran AFTER a build was serving production traffic.
+    deps: [dpop:build]
+    cmds:
+      - bash scripts/worker-contract.sh
+
   worker:verify-staging:
     desc: Smoke test staging endpoints (same checks as production verify)
     cmds:

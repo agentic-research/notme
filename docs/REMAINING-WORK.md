@@ -115,7 +115,12 @@ to publish the tag.
   each check with a pinned `/.well-known/version`; a pass writes the record
   promote needs. Owner: run the first pinned soak on staging against a real
   split before relying on it for production.
-- notme-6ae724: no runtime contract tests in CI.
+- notme-6ae724: CI had no runtime contract tests. Fixed on
+  fix/release-pipeline-gates: ci.yml `contract` boots the real Worker locally and
+  runs `worker:verify`'s checks on every PR (DO RPC was already covered by the
+  pool suite). The deployed half, `staging-smoke.yml`, is written but **does not
+  run until the owner adds `CLOUDFLARE_STAGING_API_TOKEN`** + two vars to the
+  `staging` environment.
 - The alarm epic **notme-5c2511**, with notme-e992ad and notme-5d358a.
 
 **H3, correctness and hygiene.** Doesn't gate the tag.
