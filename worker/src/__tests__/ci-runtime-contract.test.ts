@@ -13,7 +13,7 @@
  *   - worker:contract boots the Worker from config DERIVED from the committed
  *     production template, and runs the same scripts/worker-verify.sh;
  *   - the deployed-preview half (staging-smoke.yml) needs a token, so it never
- *     runs on pull_request and skips — loudly — until the owner adds it.
+ *     runs on pull_request and is skipped — not green — until the owner adds it.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -62,8 +62,10 @@ describe("CI runtime contract (notme-6ae724)", () => {
     const on = smoke.slice(smoke.indexOf("\non:"), smoke.indexOf("\npermissions:"));
     expect(on).not.toMatch(/pull_request/);
     expect(smoke).toMatch(/CLOUDFLARE_STAGING_API_TOKEN/);
-    // Absent token → an explicit skip notice, not a silent green.
-    expect(smoke).toMatch(/::notice[^\n]*CLOUDFLARE_STAGING_API_TOKEN/);
+    // Absent token → the deploy job is SKIPPED with a warning, not a silent green
+    // (staging-smoke-config.test.ts pins the details).
+    expect(smoke).toMatch(/::warning[^\n]*NOT RUN/);
+    expect(smoke).toMatch(/CLOUDFLARE_STAGING_API_TOKEN\(secret\)/);
     expect(smoke).toMatch(/task worker:verify-staging/);
   });
 });

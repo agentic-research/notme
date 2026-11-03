@@ -79,10 +79,15 @@ deployed.
 
 **After merge, optionally:** `.github/workflows/staging-smoke.yml` deploys `main`
 to staging and runs `worker:await-convergence` + `worker:verify-staging`. It
-needs a staging-scoped API token on the `staging` GitHub environment and
-**does not run until the owner adds it** (it posts a skip notice instead). It
-never runs on pull requests: a PR job holding a deploy token runs the PR's
-code with that token.
+is **skipped** (grey, not green, with a warning) until the owner configures
+the `staging` GitHub environment, and it never runs on pull requests or off
+`main`. Its token can deploy *production* too — Cloudflare API tokens scope to
+an account or zone, not to one Worker script — so a deployment-branch policy
+of `main` only on that environment is mandatory. Every staging var comes from
+the environment (`scripts/staging-config.ts`), and the deploy refuses if any
+template placeholder survives in a staging table: `wrangler deploy` makes the
+config's vars authoritative, and the template's `GHA_ALLOWED_OWNERS =
+"your-staging-org"` names an org anyone could register.
 
 ### Phase 1 — Staging
 
