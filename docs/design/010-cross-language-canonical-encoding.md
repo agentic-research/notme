@@ -166,6 +166,17 @@ reading these files — repointing it is `signet-0454a2`, and the Rust side is
 `ley-line-open-0466c0`. Until both land, three-way agreement is checked by
 hand-copied constants on two of the three sides.
 
+**Integrity anchor (2026-11-03, `notme-1629fe`).** The vectors were the
+encoder's own output restated, so an encoder + `.expected.hex` edit in one PR
+was green, and no check read `.bin`. Now every fixture file is pinned in
+`schema/fixtures/SHA256SUMS`. `scripts/fixture-manifest.ts` checks the pins and
+`.bin == hex_decode(.expected.hex)` before the test uses any fixture, and again
+in `task docs:check`. An independent RFC 8949 §4.2 encoder in the test
+re-derives both vectors and agrees with `bundleCanonical` over generated
+bundles, and CODEOWNERS covers the directory. ley-line-open has since vendored
+the files with recorded digests (`ley-line-open-0466c0`); signet has not yet
+(`signet-0454a2`).
+
 This catches the kind of drift that produced the original bug — silent JSON-canonical when CBOR-canonical was specified.
 
 ## Consequences

@@ -384,6 +384,10 @@ tasks:
       # reader trusts the claim BECAUSE it looks sourced.
       - pnpm exec tsx scripts/bead-ref-check.ts
       - pnpm exec tsx scripts/doc-check.ts --skip-external
+      # schema/fixtures/ is the ADR-010 signing-input contract other repos
+      # vendor; every file must match its pinned SHA-256 in SHA256SUMS and
+      # every .bin must equal its .expected.hex (notme-1629fe).
+      - pnpm exec tsx scripts/fixture-manifest.ts
 
   pin:check:
     desc: Verify every external `uses:` in .github/workflows is SHA-pinned

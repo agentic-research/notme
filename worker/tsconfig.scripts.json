@@ -20,7 +20,9 @@
     "src/__tests__/destination-policy.test.ts",
     "src/__tests__/authority-host.test.ts",
     "src/__tests__/invite-link-pages.test.ts",
-    "../scripts/verify-ct-log.ts"
+    "../scripts/verify-ct-log.ts",
+    "src/__tests__/bundle-canonical.test.ts",
+    "../scripts/fixture-manifest.ts"
   ],
   "exclude": ["node_modules"]
 }

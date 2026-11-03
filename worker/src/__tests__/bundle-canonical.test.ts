@@ -13,10 +13,12 @@
 // src/revocation.do.test.ts (`pnpm test:do`); notme-c38bb6 flagged the
 // original dead-test gap and is closed.
 
-import { readFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { assertFixtures } from "../../../scripts/fixture-manifest";
 import { type CABundle, bundleCanonical } from "../revocation";
 
 // The ADR-010 cross-implementation fixture gate (notme-e9d2b8). The input
@@ -29,12 +31,20 @@ const FIXTURES = join(
   "../../../schema/fixtures",
 );
 
-function loadFixture(name: string): {
+function loadFixture(
+  name: string,
+  dir: string = FIXTURES,
+): {
   bundle: CABundle;
   expected: Uint8Array;
 } {
+  // The integrity anchor (notme-1629fe): no fixture byte is trusted until
+  // every file in the dir matches schema/fixtures/SHA256SUMS and each .bin
+  // equals its .expected.hex. Checked BEFORE parsing, so a vector edited in
+  // step with the encoder is refused here rather than compared and accepted.
+  assertFixtures(dir);
   const input = JSON.parse(
-    readFileSync(join(FIXTURES, `${name}.json`), "utf-8"),
+    readFileSync(join(dir, `${name}.json`), "utf-8"),
   ) as {
     epoch: number;
     seqno: number;
@@ -43,7 +53,7 @@ function loadFixture(name: string): {
     prevKeyId: string;
     issuedAt: number;
   };
-  const hex = readFileSync(join(FIXTURES, `${name}.expected.hex`), "utf-8")
+  const hex = readFileSync(join(dir, `${name}.expected.hex`), "utf-8")
     .trim()
     .replace(/\s+/g, "");
   const expected = new Uint8Array(
@@ -144,5 +154,184 @@ describe("bundleCanonical (CBOR canonical, RFC 8949 §4.2)", () => {
     // come from sorting, never from insertion order.
     const { bundle, expected } = loadFixture("cabundle-multikey");
     expect(bundleCanonical(bundle)).toEqual(expected);
+  });
+});
+
+// --- notme-1629fe: the fixture gate's integrity anchor -----------------------
+//
+// The golden vectors above are the encoder's own output restated as a file, so
+// on their own they only catch an ACCIDENTAL encoder change. Two things below
+// make them a gate rather than a mirror:
+//
+//   1. Every fixture file is pinned by SHA-256 in schema/fixtures/SHA256SUMS,
+//      and loadFixture refuses to hand out bytes until the manifest checks out
+//      (including .bin == hex_decode(.expected.hex), which nothing used to
+//      read). An encoder change now needs a three-file diff (encoder, vector,
+//      manifest) that names itself and hits CODEOWNERS on schema/fixtures/.
+//   2. An independent RFC 8949 §4.2 encoder, written from the RFC and sharing
+//      no code with revocation.ts, re-derives both vectors from their .json
+//      and agrees with bundleCanonical over generated bundles. It does not
+//      share the encoder's provenance, so a paired encoder+vector edit fails
+//      here even if the manifest is updated too.
+
+/** Copy the fixture dir somewhere disposable so a test can tamper with it. */
+function fixtureCopy(): string {
+  const dir = mkdtempSync(join(tmpdir(), "notme-fixtures-"));
+  cpSync(FIXTURES, dir, { recursive: true });
+  return dir;
+}
+
+describe("fixture integrity anchor (notme-1629fe)", () => {
+  it("accepts the committed fixtures", () => {
+    expect(() => loadFixture("cabundle-basic")).not.toThrow();
+    expect(() => loadFixture("cabundle-multikey")).not.toThrow();
+  });
+
+  it("refuses a fixture whose .bin was edited (the file a Go/Rust consumer reads)", () => {
+    const dir = fixtureCopy();
+    const bin = readFileSync(join(dir, "cabundle-basic.bin"));
+    bin[bin.length - 1] ^= 0x01;
+    writeFileSync(join(dir, "cabundle-basic.bin"), bin);
+    expect(() => loadFixture("cabundle-basic", dir)).toThrow(/cabundle-basic\.bin/);
+  });
+
+  it("refuses a fixture whose .expected.hex was edited, before any encoder comparison", () => {
+    // The paired-edit attack: change the encoder AND the vector. Simulated by
+    // editing the vector alone and asserting the gate rejects it on the
+    // manifest, not on a comparison with an encoder the attacker also edited.
+    const dir = fixtureCopy();
+    const p = join(dir, "cabundle-multikey.expected.hex");
+    const hex = readFileSync(p, "utf-8").trim();
+    writeFileSync(p, `${hex.slice(0, -1)}${hex.endsWith("0") ? "1" : "0"}\n`);
+    expect(() => loadFixture("cabundle-multikey", dir)).toThrow(
+      /cabundle-multikey\.expected\.hex/,
+    );
+  });
+
+  it("refuses a fixture whose .json input was edited", () => {
+    const dir = fixtureCopy();
+    const p = join(dir, "cabundle-basic.json");
+    writeFileSync(p, readFileSync(p, "utf-8").replace('"seqno": 1', '"seqno": 2'));
+    expect(() => loadFixture("cabundle-basic", dir)).toThrow(/cabundle-basic\.json/);
+  });
+
+  it("refuses a fixture file that the manifest does not pin", () => {
+    const dir = fixtureCopy();
+    writeFileSync(join(dir, "cabundle-extra.bin"), new Uint8Array([0xa0]));
+    expect(() => loadFixture("cabundle-basic", dir)).toThrow(/cabundle-extra\.bin/);
+  });
+});
+
+// Independent RFC 8949 §4.2 deterministic encoder, restricted to the CABundle
+// shape (unsigned/negative ints, text, bytes, maps). Written from the RFC, not
+// from revocation.ts: map entries are ordered by the bytewise lexicographic
+// order of each key's ENCODED form (§4.2.1), the literal rule, rather than the
+// length-then-bytewise shortcut bundleCanonical uses.
+function refHead(major: number, n: number): number[] {
+  const m = major << 5;
+  if (n < 24) return [m | n];
+  if (n < 0x100) return [m | 24, n];
+  if (n < 0x10000) return [m | 25, n >> 8, n & 0xff];
+  if (n < 0x100000000) {
+    return [m | 26, (n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
+  }
+  let v = BigInt(n);
+  const bytes: number[] = [];
+  for (let i = 0; i < 8; i++) {
+    bytes.unshift(Number(v & 0xffn));
+    v >>= 8n;
+  }
+  return [m | 27, ...bytes];
+}
+
+const refInt = (n: number): number[] => (n >= 0 ? refHead(0, n) : refHead(1, -1 - n));
+
+function refText(s: string): number[] {
+  const b = [...new TextEncoder().encode(s)];
+  return [...refHead(3, b.length), ...b];
+}
+
+const refBytes = (b: Uint8Array): number[] => [...refHead(2, b.length), ...b];
+
+function refMap(entries: Array<[number[], number[]]>): number[] {
+  const sorted = [...entries].sort(([a], [b]) => {
+    for (let i = 0; i < Math.min(a.length, b.length); i++) {
+      if (a[i] !== b[i]) return a[i] - b[i];
+    }
+    return a.length - b.length;
+  });
+  return [...refHead(5, sorted.length), ...sorted.flatMap(([k, v]) => [...k, ...v])];
+}
+
+function refCanonical(b: Omit<CABundle, "signature">): Uint8Array {
+  const keys = refMap(
+    Object.entries(b.keys).map(([kid, b64]): [number[], number[]] => [
+      refText(kid),
+      refBytes(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))),
+    ]),
+  );
+  return new Uint8Array(
+    refMap([
+      [refInt(1), refInt(b.epoch)],
+      [refInt(2), refInt(b.seqno)],
+      [refInt(3), keys],
+      [refInt(4), refText(b.keyId)],
+      [refInt(5), refText(b.prevKeyId ?? "")],
+      [refInt(6), refInt(b.issuedAt)],
+    ]),
+  );
+}
+
+/** mulberry32 — a fixed seed keeps any failure reproducible. */
+function prng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+describe("independent RFC 8949 §4.2 derivation (notme-1629fe)", () => {
+  it("re-derives both golden vectors from their .json without bundleCanonical", () => {
+    for (const name of ["cabundle-basic", "cabundle-multikey"]) {
+      const { bundle, expected } = loadFixture(name);
+      expect(refCanonical(bundle), name).toEqual(expected);
+    }
+  });
+
+  it("agrees with bundleCanonical over generated key maps (key-ordering property)", () => {
+    const rand = prng(0x1629fe);
+    const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)];
+    // Digits are deliberate: JS orders integer-like object keys numerically
+    // ahead of the rest, which is neither insertion nor canonical order.
+    // Multi-byte chars make UTF-8 length differ from string length.
+    const alphabet = ["a", "b", "z", "A", "0", "1", "9", "-", "_", "é", "ß", "€", "😀"];
+    const ints = [0, 1, 23, 24, 255, 256, 65535, 65536, 0xffffffff, 1700000000];
+    const randInt = () => (rand() < 0.5 ? pick(ints) : Math.floor(rand() * 0x100000000));
+    for (let i = 0; i < 500; i++) {
+      const keys: Record<string, string> = {};
+      const nKeys = Math.floor(rand() * 8);
+      for (let k = 0; k < nKeys; k++) {
+        let kid = "";
+        // some keys run long enough to cross the 24-byte text-header boundary
+        const len = Math.floor(rand() * (rand() < 0.2 ? 30 : 5));
+        for (let c = 0; c < len; c++) kid += pick(alphabet);
+        const val = new Uint8Array(Math.floor(rand() * 40));
+        for (let v = 0; v < val.length; v++) val[v] = Math.floor(rand() * 256);
+        keys[kid] = btoa(String.fromCharCode(...val));
+      }
+      const bundle = makeBundle({
+        epoch: randInt(),
+        seqno: randInt(),
+        keys,
+        keyId: Object.keys(keys)[0] ?? "",
+        prevKeyId: rand() < 0.5 ? "" : pick(alphabet),
+        issuedAt: randInt(),
+      });
+      expect(bundleCanonical(bundle), JSON.stringify(bundle)).toEqual(refCanonical(bundle));
+    }
   });
 });
