@@ -199,7 +199,9 @@ jobs:
       # the parsed DER, never file bytes (their framing differs by a newline).
       - name: Confirm trust/ is what production serves
         run: |
-          curl -fsS "https://auth.notme.bot/.well-known/ca-bundle.pem?r=$GITHUB_RUN_ID" -o live.pem
+          # No cache-busting query: /.well-known/* cache keys ignore it
+          # (notme-ed6114). This reads what clients are served.
+          curl -fsS "https://auth.notme.bot/.well-known/ca-bundle.pem" -o live.pem
           if ! cmp -s <(openssl x509 -in live.pem -outform DER) \
                       <(openssl x509 -in trust/notme-root.pem -outform DER); then
             echo "::error::trust/notme-root.pem is not the served root. Run 'task trust:refresh', commit, and re-tag."

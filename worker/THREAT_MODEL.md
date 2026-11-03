@@ -129,6 +129,7 @@ An invite is a bearer way in: whoever holds the token gets the scopes it names, 
 | path traversal      | access internal files (.env, wrangler.toml) | blockedPaths + dotfile check in worker.ts         | `routing.blocked-paths`       |
 | subdomain confusion | auth.notme.bot serves main site content     | run_worker_first=true, explicit subdomain routing | `routing.subdomain.isolation` |
 | cache poisoning     | CF cache serves wrong content for subdomain | Vary header on content-negotiated responses       | `routing.cache.vary`          |
+| cache bypass        | `/.well-known/jwks.json?x=<random>` misses the Cache API every time, so each request is an unauthenticated call on the singleton authority | `/.well-known/*` cache keys drop the query string — no route there reads one (`src/cache-key.ts`, notme-ed6114) | `routing.cache.query-ignored` |
 
 ### 9. credential vault — RETIRED, not a notme surface
 

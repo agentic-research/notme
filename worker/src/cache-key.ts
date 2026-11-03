@@ -37,6 +37,16 @@ export function wantsJson(request: Request): boolean {
 
 export function cacheKey(request: Request, vary?: string): Request {
   const url = new URL(request.url);
+  // /.well-known/* ignores the caller's query (notme-ed6114). No route under
+  // it reads one, so the query never changes the response — but it was part
+  // of the key, so `jwks.json?x=<random>` always missed and paid an
+  // unauthenticated call on the singleton SigningAuthority. A route there
+  // that starts reading a parameter must add it back here, by name.
+  //
+  // What the query used to buy deliberately — an operator's cache bypass —
+  // the build in the key now provides across deploys; within one build an
+  // operator sees what clients see.
+  if (url.pathname.startsWith("/.well-known/")) url.search = "";
   url.searchParams.set("_build", currentBuild);
   // For content-negotiated routes, include Accept in the cache key so JSON
   // and HTML responses are cached separately. `_cache=v2` invalidates the v1

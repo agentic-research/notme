@@ -14,13 +14,17 @@ describe("post-deploy verification contract", () => {
     expect(taskfile).toContain('while [ "$attempt" -le "$MAX_ATTEMPTS" ]');
   });
 
-  it("bypasses Cache API entries that can survive deployments", () => {
-    expect(taskfile).toMatch(
-      /ca-bundle\.pem\?verify=\$VERIFY_NONCE[\s\S]+BEGIN CERTIFICATE/,
-    );
-    expect(taskfile).toMatch(
-      /jwks\.json\?verify=\$VERIFY_NONCE[\s\S]+"crv":"Ed25519"/,
-    );
+  it("checks the DO-backed /.well-known documents", () => {
+    expect(taskfile).toMatch(/ca-bundle\.pem"[\s\S]+BEGIN CERTIFICATE/);
+    expect(taskfile).toMatch(/jwks\.json"[\s\S]+"crv":"Ed25519"/);
+  });
+
+  it("does not claim a query bypasses the /.well-known cache", () => {
+    // It used to (notme-382e63). /.well-known/* keys now ignore the query
+    // (notme-ed6114), so a nonce there would read as a bypass it is not;
+    // what makes a post-deploy read fresh is the build in every key
+    // (cache-build-key.test.ts).
+    expect(taskfile).not.toMatch(/\.well-known\/[\w.-]+\?/);
   });
 
   it("checks the unauthenticated passkey status contract", () => {
