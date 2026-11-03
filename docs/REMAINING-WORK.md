@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 79 in notme (`rsry status --json` →
+**Updated:** 2026-11-02 · **Open beads:** 77 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -44,9 +44,9 @@ feel finished rather than merely argued.
 In order. Items marked **owner** need the operator, and an agent can't do
 them.
 
-1. **notme-c0c9a2:** if the log pin is misconfigured, write the cert to the
-   CT backlog so it drains once the pin is fixed. Must land before step 2.
-   (notme-b52d7c, the CT-bound mint key and epoch race, is fixed: 1a91149.)
+1. **Done:** notme-c0c9a2 (a bad CT pin now backlogs) and notme-b52d7c (the
+   mint key and epoch race), merged in 668e52f and 17df8e2. Before step 2,
+   decide the CT log's cost settings, which are on notme-1b46a8.
 2. **notme-1b46a8 / notme-907299:** provision the CT log from upstream azul
    `d9402ec` (owner), fill the pin, bind `CT_LOG`, deploy. Closes when a
    production mint's SCT verifies against the live log.
@@ -78,6 +78,10 @@ them.
    new `task-cert verify` (and later signet and LLO) refuses them with `tier
    carries criteria; the task names none`. Nothing breaks at deploy; recovery
    is `git pull` (mint reads `tier.pem` by default, no re-enrolment).
+   **Deploy note (binding v3):** leave `RENEWAL_BINDING_V3` off through canary
+   and promote, and turn it on after 100%. Never roll back past this release
+   with it on. A rollback is recoverable only within about 58 minutes; after
+   that, renewing machines must re-enroll.
 10. **notme-bed754** closes when 1–9 are closed.
 
 Waiting on someone else: **notme-bc4cd2** (adopt LLO v0.21.0) waits for LLO
@@ -95,8 +99,6 @@ to publish the tag.
   4). Parts 2 and 4/5 are merged.
 - notme-a2e75d: the first-user and claim marks are bound to the userId only,
   not to the browser like invite reservations are.
-- notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
-  there's a binding-version oracle.
 - notme-1629fe: the canonical fixture gate has no integrity anchor.
 
 **H2, a trustworthy release pipeline and gates.** This gates the release tag.
@@ -188,7 +190,8 @@ Listed so the count doesn't creep up unnoticed:
   notme-8e6863, notme-a040c1, notme-be5691, notme-c006aa, notme-c07956,
   notme-c72e03, notme-c16e0d, notme-c7819f, notme-ae3130.
 - **Closed by work (2026-11-02):** notme-bad2e5, notme-159805, notme-ad2a7a,
-  notme-bdc850, notme-1a5465, notme-2131e8, notme-b51777, notme-b52d7c.
+  notme-bdc850, notme-1a5465, notme-2131e8, notme-b51777, notme-b52d7c,
+  notme-c9fc8c, notme-c0c9a2.
 - **Filed from the doc-drift batch (2026-11-02):**
   - notme-bad2e5 and notme-baea8c (proxy gaps);
   - a gen/go scope-check note, added to notme-ea5c65 rather than filed as a
