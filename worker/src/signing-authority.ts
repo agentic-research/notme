@@ -316,7 +316,8 @@ export interface CtHealth {
   /**
    * Why CT_LOG_ID / CT_LOG_KEY cannot be trusted; null when bound and valid,
    * or unbound. While set, mints are backlogged and the drain submits
-   * nothing; lastError is left as the last real submission error.
+   * nothing. A drain fire skipped for it does not touch lastError; each mint
+   * under it overwrites lastError with "config: …; chains backlogged".
    */
   configError: string | null;
 }
