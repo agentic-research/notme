@@ -61,6 +61,8 @@
 !schema/fixtures/*.json
 !schema/fixtures/*.expected.hex
 !schema/fixtures/*.bin
+# Digest manifest pinning every fixture file (notme-1629fe).
+!schema/fixtures/SHA256SUMS
 
 # Committed root trust anchor — the out-of-band copy of the signet root CA a
 # third party pins against, instead of re-establishing trust on every fetch of

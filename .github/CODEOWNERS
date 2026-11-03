@@ -1,0 +1,9 @@
+# The ADR-010 canonical-encoding fixtures are the CABundle signing-input
+# contract that other implementations vendor. A change to them, to their
+# digest manifest, or to the gate that checks them must be visible to a
+# named reviewer, not just green CI (notme-1629fe). Takes effect as a merge
+# gate only where branch protection requires code-owner review.
+/schema/fixtures/                          @jamestexas
+/scripts/fixture-manifest.ts               @jamestexas
+/worker/src/__tests__/bundle-canonical.test.ts @jamestexas
+/worker/src/revocation.ts                  @jamestexas
