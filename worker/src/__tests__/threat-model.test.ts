@@ -50,6 +50,7 @@ import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
 import { AuthService } from "../../worker";
 import { validateRedirectUri } from "../auth/redirect-uri";
 import { verifyOIDC } from "../auth/verify-proof";
+import { fakeIssuer } from "./helpers/oidc-issuer";
 import { validateDpopProof } from "../auth/dpop";
 import {
   type CABundle,
@@ -222,18 +223,15 @@ describe("contract.oidc.audience-identity", () => {
   });
 
   it("accepts the audience check (and proceeds past it) when aud matches", async () => {
-    const body = ENC({
-      iss: "https://auth.notme.bot",
-      sub: "test",
-      aud: "notme.bot",
-      exp: FUTURE_EXP,
-    });
-    // Audience check passes; verifier proceeds to JWKS fetch (which will fail
-    // in vitest). We only care that the failure reason is NOT a wrong-audience
-    // error — that proves the audience check was satisfied.
-    await expect(
-      verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot"),
-    ).rejects.not.toThrow(/wrong audience/);
+    // "Proceeds past it" used to mean fetching live JWKS from
+    // auth.notme.bot and passing on any error that was not the audience one
+    // (notme-3fc74b). The issuer is now a local fixture, so passing the
+    // audience check is shown by the token VERIFYING, with the keys fetched
+    // from the fixture.
+    const issuer = await fakeIssuer("https://auth.notme.bot");
+    const token = await issuer.token({ sub: "test", aud: "notme.bot" });
+    await expect(verifyOIDC(token, "notme.bot")).resolves.toMatchObject({ subject: "test" });
+    expect(issuer.requests).toContain("https://auth.notme.bot/.well-known/jwks");
   });
 });
 
@@ -262,28 +260,22 @@ describe("contract.oidc.trusted-issuers", () => {
     );
   });
 
+  // Both issuers are local fixtures (notme-3fc74b): trusted means the token
+  // verifies, not that the failure was some error other than the trust one.
   it("accepts a known issuer (GHA) past the trust check", async () => {
-    const body = ENC({
-      iss: "https://token.actions.githubusercontent.com",
-      sub: "repo:agentic-research/notme",
-      aud: "notme.bot",
-      exp: FUTURE_EXP,
+    const issuer = await fakeIssuer("https://token.actions.githubusercontent.com");
+    const token = await issuer.token({ sub: "repo:agentic-research/notme", aud: "notme.bot" });
+    await expect(verifyOIDC(token, "notme.bot")).resolves.toMatchObject({
+      issuer: "https://token.actions.githubusercontent.com",
     });
-    await expect(
-      verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot"),
-    ).rejects.not.toThrow(/untrusted issuer/);
+    expect(issuer.requests).toContain("https://token.actions.githubusercontent.com/.well-known/jwks");
   });
 
   it("accepts auth.notme.bot as a trusted self-issuer", async () => {
-    const body = ENC({
-      iss: "https://auth.notme.bot",
-      sub: "test",
-      aud: "notme.bot",
-      exp: FUTURE_EXP,
-    });
-    await expect(
-      verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot"),
-    ).rejects.not.toThrow(/untrusted issuer/);
+    const issuer = await fakeIssuer("https://auth.notme.bot");
+    const token = await issuer.token({ sub: "test", aud: "notme.bot" });
+    await expect(verifyOIDC(token, "notme.bot")).resolves.toMatchObject({ issuer: "https://auth.notme.bot" });
+    expect(issuer.requests).toContain("https://auth.notme.bot/.well-known/jwks");
   });
 
   // Cross-repo: @notme/contract is the single source of truth — both the
