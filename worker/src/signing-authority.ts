@@ -2928,7 +2928,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // still holds that request: its resend of the same bytes then lands on
     // the retry path. The client guarantees this by clearing a refused first
     // attempt ONLY for a reason this authority could never reverse for the
-    // same bytes (invalid_key, invalid_proof, binding_v2_required,
+    // same bytes (invalid_key, invalid_proof for a v1/v2 request — a v3
+    // request refused invalid_proof is KEPT, since a rolled-back authority
+    // may not know v3 — binding_v2_required,
     // binding_v3_required, revoked, fork_detected, horizon_passed,
     // epoch_changed, unknown_key, a malformed body). stale_proof (judged
     // against a clock that moves) and approval_withdrawn (judged against LIVE
