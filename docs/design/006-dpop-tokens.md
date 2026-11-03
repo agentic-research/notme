@@ -85,7 +85,8 @@ Response: `{ "access_token": "<jwt>", "token_type": "DPoP", "expires_in": 300 }`
 >
 > **Order (2026-11-03, `notme-ed6114`).** Every check runs before the DO
 > call it guards. A request carrying a session cookie is first charged to
-> `token-ip:${cf-connecting-ip}` on the same binding (same 20/60 s), because
+> `token-ip:<source>` on the same binding (same 20/60 s; source is the IPv4
+> address, the IPv6 /64, or `none`, see THREAT_MODEL §4), because
 > the principal is unknown until the DO's session secret verifies the
 > cookie; the `token:${principalId}` check then runs before the live scopes
 > are read. A token exchange is keyed `token:${sub}` from the GitHub-signed

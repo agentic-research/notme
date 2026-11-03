@@ -58,6 +58,7 @@ import { principalIdentity } from "./src/cert-authority";
 import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
 import { buildInfo } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
+import { clientIpBucket } from "./src/client-ip-key";
 import { isDeniedDestination } from "./src/destination-policy";
 
 /**
@@ -4058,7 +4059,9 @@ export default {
                   // Any string is a cookie until the secret says otherwise,
                   // so this one is keyed on where it came from, not on what
                   // it claims. No cookie, no DO call — and no budget spent.
-                  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+                  // IPv6 by its /64; no address is its own bucket (review F4,
+                  // src/client-ip-key.ts).
+                  const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
                   if (await rateLimited(`token-ip:${ip}`)) return tooMany();
                   const { verifySessionCookie, liveScopes } =
                     await import("./src/auth/session");

@@ -103,6 +103,31 @@ describe("POST /token is limited before any SigningAuthority RPC", () => {
     expect(spy.calls).toEqual([]);
   });
 
+  it("the pre-DO bucket is the IPv6 /64, and a request with no address gets its own", async () => {
+    // Review F4: per-/128 keying gave one IPv6 subscriber 2^64 buckets.
+    const rl = limiter(() => false);
+    const forged = (ip?: string) =>
+      new Request(`${ORIGIN}/token`, {
+        method: "POST",
+        headers: {
+          DPoP: "placeholder",
+          "content-type": "application/json",
+          cookie: "notme_session=forged.value",
+          ...(ip ? { "cf-connecting-ip": ip } : {}),
+        },
+        body: JSON.stringify({ audience: "https://notme.bot" }),
+      });
+    for (const ip of ["2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ffff", "203.0.113.9", undefined]) {
+      await call(forged(ip), { SIGNING_AUTHORITY: spiedAuthority().binding, TOKEN_LIMITER: rl.binding });
+    }
+    expect(rl.keys).toEqual([
+      "token-ip:2001:db8:1:2::/64",
+      "token-ip:2001:db8:1:2::/64",
+      "token-ip:203.0.113.9",
+      "token-ip:none",
+    ]);
+  });
+
   it("a principal over its budget is refused before its live scopes are read", async () => {
     const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
     const cookie = await createSessionCookie(

@@ -283,8 +283,9 @@ describe("dpop.rate-limit", () => {
     // Each cookie is first charged to its source address, BEFORE the DO
     // reads the secret that verifies it (notme-ed6114,
     // pre-do-limits.do.test.ts). Without a cf-connecting-ip they share the
-    // "unknown" bucket; behind Cloudflare the header is always present.
-    expect(rl.keys).toEqual(["token-ip:unknown", "token:alice", "token-ip:unknown", "token:bob"]);
+    // "none" bucket (src/client-ip-key.ts); behind Cloudflare the header is
+    // always present.
+    expect(rl.keys).toEqual(["token-ip:none", "token:alice", "token-ip:none", "token:bob"]);
   });
 
   it("an unauthenticated caller never reaches the limiter", async () => {
