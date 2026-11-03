@@ -86,3 +86,47 @@ describe("routing.cache.query-ignored", () => {
     });
   }
 });
+
+// THREAT_MODEL §8 `routing.cache.method-gate`. The Cache API serves GET
+// only, so before this any other method missed the cache every time — the
+// same free DO call the query string used to buy (review F1).
+describe("routing.cache.method-gate", () => {
+  const send = (url: string, method: string, extra: Record<string, unknown>) =>
+    worker.fetch(new Request(url, { method, headers: { host: new URL(url).host } }), {
+      ...env,
+      ...DEPLOYED_ENV,
+      ...extra,
+    } as never);
+
+  for (const [path, rpc] of [
+    ["/.well-known/jwks.json", "getPublicKeyJwk"],
+    ["/.well-known/epochs.json", "listEpochKeys"],
+    ["/.well-known/ca-bundle.pem", "getCACertificatePem"],
+  ] as const) {
+    it(`${path}: after one GET, HEAD is served from the cache and POST is 405, with no further DO call`, async () => {
+      const spy = spiedAuthority();
+      const extra = { SIGNING_AUTHORITY: spy.binding, BUILD_SHA: randomCommit() };
+      const warm = await send(`${AUTH}${path}`, "GET", extra);
+      expect(warm.status).toBe(200);
+      const head = await send(`${AUTH}${path}`, "HEAD", extra);
+      expect(head.status).toBe(200);
+      expect(head.headers.get("cache-control")).toBe(warm.headers.get("cache-control"));
+      expect(await head.text()).toBe("");
+      for (const method of ["POST", "PUT", "DELETE"]) {
+        const res = await send(`${AUTH}${path}`, method, extra);
+        expect(res.status, method).toBe(405);
+        expect(res.headers.get("allow")).toBe("GET, HEAD");
+      }
+      expect(spy.calls.filter((c) => c === rpc)).toEqual([rpc]);
+    });
+
+    it(`${path}: a cold HEAD warms the GET entry`, async () => {
+      const spy = spiedAuthority();
+      const extra = { SIGNING_AUTHORITY: spy.binding, BUILD_SHA: randomCommit() };
+      expect((await send(`${AUTH}${path}`, "HEAD", extra)).status).toBe(200);
+      expect((await send(`${AUTH}${path}`, "HEAD", extra)).status).toBe(200);
+      expect((await send(`${AUTH}${path}`, "GET", extra)).status).toBe(200);
+      expect(spy.calls.filter((c) => c === rpc)).toEqual([rpc]);
+    });
+  }
+});

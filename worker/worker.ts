@@ -1897,6 +1897,34 @@ async function cacheMatch(
   }
 }
 
+/**
+ * Serve a DO-backed public document through the Cache API (notme-ed6114,
+ * review F1). The Cache API stores and matches GET only, so a HEAD or POST
+ * used to miss every time and pay a call on the singleton authority — the
+ * same flood the query string bought before the key ignored it.
+ *
+ * GET and HEAD share the GET entry (HEAD gets its headers, no body; a cold
+ * HEAD warms it). Anything else is 405 before any DO work. `build` returns
+ * null to fall through to the caller's next handler.
+ */
+async function serveCachedPublic(
+  request: Request,
+  build: () => Promise<Response | null>,
+): Promise<Response | null> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return Response.json({ error: "method not allowed" }, { status: 405, headers: { Allow: "GET, HEAD" } });
+  }
+  const asGet =
+    request.method === "GET" ? request : new Request(request.url, { method: "GET", headers: request.headers });
+  let resp = (await cacheMatch(asGet)) ?? null;
+  if (!resp) {
+    const built = await build();
+    if (!built) return null;
+    resp = await cachePut(asGet, built);
+  }
+  return request.method === "HEAD" ? new Response(null, { status: resp.status, headers: resp.headers }) : resp;
+}
+
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
     // Every cache key carries the build, so a deploy is never answered from
@@ -4187,45 +4215,45 @@ export default {
       // this is public key material, and an auditor is not a principal.
       // Requiring a credential to verify history would defeat the point.
       if (pathname === "/.well-known/epochs.json") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-        const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const epochs = await authority.listEpochKeys();
-        const resp = Response.json(
-          { epochs },
-          {
-            headers: {
-              // Short max-age: a rotation adds an entry, and an auditor
-              // fetching just after one should not be told the epoch is
-              // unknown. The set only ever grows, so a stale copy is
-              // incomplete rather than wrong.
-              "Cache-Control": "public, max-age=60",
-              "Access-Control-Allow-Origin": "*",
+        const served = await serveCachedPublic(request, async () => {
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const epochs = await authority.listEpochKeys();
+          return Response.json(
+            { epochs },
+            {
+              headers: {
+                // Short max-age: a rotation adds an entry, and an auditor
+                // fetching just after one should not be told the epoch is
+                // unknown. The set only ever grows, so a stale copy is
+                // incomplete rather than wrong.
+                "Cache-Control": "public, max-age=60",
+                "Access-Control-Allow-Origin": "*",
+              },
             },
-          },
-        );
-        return cachePut(request, resp);
+          );
+        });
+        if (served) return served;
       }
 
       if (pathname === "/.well-known/jwks.json") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        try {
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const jwk = await authority.getPublicKeyJwk();
-          const { buildJwksResponse } = await import("./src/auth/dpop-handler");
-          const resp = Response.json(buildJwksResponse(jwk), {
-            headers: {
-              "Cache-Control": "public, max-age=3600",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
-          return cachePut(request, resp);
-        } catch {
-          return jsonErr("authority unavailable", 503);
-        }
+        const served = await serveCachedPublic(request, async () => {
+          try {
+            const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+            const authority = env.SIGNING_AUTHORITY.get(authorityId);
+            const jwk = await authority.getPublicKeyJwk();
+            const { buildJwksResponse } = await import("./src/auth/dpop-handler");
+            return Response.json(buildJwksResponse(jwk), {
+              headers: {
+                "Cache-Control": "public, max-age=3600",
+                "Access-Control-Allow-Origin": "*",
+              },
+            });
+          } catch {
+            return jsonErr("authority unavailable", 503);
+          }
+        });
+        if (served) return served;
       }
 
       // Authority discovery — signet equivalent of openid-configuration.
@@ -4316,22 +4344,22 @@ export default {
       // CA certificate — self-signed X.509 from SigningAuthority DO.
       // CF mTLS trust store requires X.509 PEM, not raw public keys.
       if (pathname === "/.well-known/ca-bundle.pem") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        try {
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const pem: string = await authority.getCACertificatePem();
-          const resp = new Response(pem, {
-            headers: {
-              "Content-Type": "application/x-pem-file",
-              "Cache-Control": "public, max-age=3600",
-            },
-          });
-          return cachePut(request, resp);
-        } catch {
-          // DO not available — fall through to VPC proxy
-        }
+        const served = await serveCachedPublic(request, async () => {
+          try {
+            const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+            const authority = env.SIGNING_AUTHORITY.get(authorityId);
+            const pem: string = await authority.getCACertificatePem();
+            return new Response(pem, {
+              headers: {
+                "Content-Type": "application/x-pem-file",
+                "Cache-Control": "public, max-age=3600",
+              },
+            });
+          } catch {
+            return null; // DO not available — fall through to VPC proxy
+          }
+        });
+        if (served) return served;
       }
 
       // Content-negotiated landing at /
