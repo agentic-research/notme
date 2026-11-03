@@ -69,7 +69,10 @@ them.
      no hard cap.
 8. **The stage 2 gate:** the release tag waits on the remaining live-path
    security fixes and the release-pipeline fixes (stage 2 groups H1 and H2).
-9. **notme-cf288e → tag → notme-8e8836:** promote staging → canary →
+9. **notme-34e933 (owner, P1):** turn on branch protection for `main` (PR,
+   required CI, code-owner review, no force-push, admins included) and block
+   force-push on `goalzero`. Neither is protected today.
+10. **notme-cf288e → tag → notme-8e8836:** promote staging → canary →
    production (`task ship-prod`, **owner**), then cut the tag. The signed
    trust anchor (8e8836) closes when the release job signs it from that tag.
    **Deploy note (phase 2):** upgrade every `task-cert` checkout to 2a5dd9b
@@ -82,7 +85,7 @@ them.
    and promote, and turn it on after 100%. Never roll back past this release
    with it on. A rollback is recoverable only within about 58 minutes; after
    that, renewing machines must re-enroll.
-10. **notme-bed754** closes when 1–9 are closed.
+11. **notme-bed754** closes when 1–10 are closed.
 
 Waiting on someone else: **notme-bc4cd2** (adopt LLO v0.21.0) waits for LLO
 to publish the tag.
@@ -99,7 +102,6 @@ to publish the tag.
   4). Parts 2 and 4/5 are merged.
 - notme-a2e75d: the first-user and claim marks are bound to the userId only,
   not to the browser like invite reservations are.
-- notme-1629fe: the canonical fixture gate has no integrity anchor.
 
 **H2, a trustworthy release pipeline and gates.** This gates the release tag.
 - notme-16b2d5: `worker:promote` has no gate.
@@ -191,7 +193,7 @@ Listed so the count doesn't creep up unnoticed:
   notme-c72e03, notme-c16e0d, notme-c7819f, notme-ae3130.
 - **Closed by work (2026-11-02):** notme-bad2e5, notme-159805, notme-ad2a7a,
   notme-bdc850, notme-1a5465, notme-2131e8, notme-b51777, notme-b52d7c,
-  notme-c9fc8c, notme-c0c9a2, notme-729801 (the P0).
+  notme-c9fc8c, notme-c0c9a2, notme-729801 (the P0), notme-1629fe.
 - **Filed from the doc-drift batch (2026-11-02):**
   - notme-bad2e5 and notme-baea8c (proxy gaps);
   - a gen/go scope-check note, added to notme-ea5c65 rather than filed as a
@@ -217,6 +219,8 @@ Listed so the count doesn't creep up unnoticed:
 - **From the /join single-use reviews (2026-11-03):** notme-f850f2 (the
   binding RPC spends no jti). The cross-deployment audience, a DO-only jti
   store and DPoP jti prefixing went onto notme-e3dede.
+- **From merging notme-1629fe (2026-11-03):** notme-34e933 (no branch
+  protection on main or goalzero; owner action, gates the tag).
 - **Not filed:** the signet enforcement bead already existed
   (signet-be49b9). It now has the final encoding and a testable close
   condition, and notme-bdffc7 depends on it.
