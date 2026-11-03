@@ -8,7 +8,8 @@
 //   keys  — singleton authority keypair (Ed25519)
 //   state — epoch, seqno, keyId for bundle generation
 //   dpop_jtis — atomically consumed single-use proof identifiers (DPoP proof
-//               jtis, and /join's OIDC proof jtis under a `join-oidc:` prefix)
+//               jtis, and OIDC proof jtis spent at /join or /auth/oidc/login,
+//               both under the one `oidc:<issuer>#<jti>` key)
 //
 // The DO owns the full lifecycle: key generation, bundle signing, rotation.
 // The Worker writes signed bundles to KV for the revocation verifier.
@@ -1120,8 +1121,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * on purpose: SQLite's PRIMARY KEY, not a read-then-write, decides the
    * winner, and a caller can put it inside the same block as the write the
    * identifier licenses. Shared by DPoP proofs (`mintDPoPTokenOnce`) and
-   * /join's OIDC proofs (`joinInviteWithFederated`); callers namespace keys
-   * that are not DPoP jtis (`#oidcJoinJtiKey`).
+   * OIDC proofs (`joinInviteWithFederated`, `loginWithFederated`), which
+   * both spend the one `oidc:<issuer>#<jti>` key from `#oidcJtiKey`.
    */
   #consumeJti(key: string, expiresAt: number): boolean {
     const sql = this.ctx.storage.sql;
@@ -3570,7 +3571,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return { ok: false, reason: "already_linked" };
     }
     const principalId = crypto.randomUUID();
-    const jtiKey = SigningAuthority.#oidcJoinJtiKey(provider, proof.jti);
+    const jtiKey = SigningAuthority.#oidcJtiKey(provider, proof.jti);
     return this.ctx.storage.transactionSync(() => {
       // Consumed in the same synchronous block as the invite and the link:
       // a replay cannot interleave with the first use, and a refused join
@@ -3595,14 +3596,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   /**
-   * The `dpop_jtis` key for an OIDC proof spent at /join. Namespaced so it
-   * cannot collide with a DPoP proof jti, and by issuer because a jti is
-   * unique only within its issuer. A DPoP client could choose a jti of this
-   * shape, but only to pre-spend an OIDC token whose jti it already knows,
-   * i.e. one it has already seen — which is the token's replay, refused.
+   * The ONE `dpop_jtis` key for an OIDC proof spent in this DO, whichever
+   * route spends it: /join (joinInviteWithFederated) and /auth/oidc/login
+   * (loginWithFederated). One key, not one per route (re-review N1): with
+   * per-route keys the only guard between the two legs was KV `jti:<jti>`,
+   * written after the DO commit and eventually consistent, so a token just
+   * spent at /join could still become a session. Namespaced so it cannot
+   * collide with a DPoP proof jti, and by issuer because a jti is unique
+   * only within its issuer. A DPoP client could choose a jti of this shape,
+   * but only to pre-spend an OIDC token whose jti it already knows — one it
+   * has already seen, whose replay is refused anyway.
    */
-  static #oidcJoinJtiKey(issuer: string, jti: string): string {
-    return `join-oidc:${issuer}#${jti}`;
+  static #oidcJtiKey(issuer: string, jti: string): string {
+    return `oidc:${issuer}#${jti}`;
   }
 
   /**
@@ -3613,7 +3619,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * from a log — logged in, as often as it was presented.
    *
    * One synchronous block, as joinInviteWithFederated: the principal lookup,
-   * the jti consume (`oidc-login:<issuer>#<jti>`, kept past exp per F2) and
+   * the jti consume (the shared `oidc:<issuer>#<jti>`, kept past exp per F2) and
    * the scope read cannot interleave with a concurrent login. A refusal
    * spends nothing: an unknown identity returns before the consume, so the
    * same token still works once its holder joins. `spentElsewhere` is the
@@ -3633,7 +3639,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     if (proof.spentElsewhere) return { ok: false, reason: "proof_reused" };
     const principalId = findPrincipalByFederated(sql, provider, providerSub);
     if (!principalId) return { ok: false, reason: "unknown_identity" };
-    if (!this.#consumeJti(`oidc-login:${provider}#${proof.jti}`, proof.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS)) {
+    if (!this.#consumeJti(SigningAuthority.#oidcJtiKey(provider, proof.jti), proof.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS)) {
       return { ok: false, reason: "proof_reused" };
     }
     return { ok: true, principalId, scopes: getCapabilities(sql, principalId) };

@@ -19,7 +19,7 @@
  * successful login writes `jti:<jti>`; a refused login (unknown identity)
  * spends nothing; the rejection body is constant.
  */
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { GHA_ISSUER, type GhaSigner, ghaPopBody, installGhaSigner } from "./__tests__/helpers/gha-token";
@@ -152,5 +152,44 @@ describe("an OIDC token is single-use at /auth/oidc/login (review F1)", () => {
       ok: false,
       reason: "proof_reused",
     });
+  });
+});
+
+describe("/join and /auth/oidc/login spend ONE key in the DO (re-review N1)", () => {
+  // The two legs consumed different dpop_jtis keys (`join-oidc:` and
+  // `oidc-login:`), so the only guard BETWEEN them was KV `jti:<jti>`, which
+  // /join writes after its DO commit. Until that write propagates (KV is
+  // eventually consistent, ~60s) a token just spent at /join became a 24h
+  // session at login. Deleting the KV key stands in for non-propagation.
+  const jtiOf = (token: string) =>
+    (JSON.parse(atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"))) as { jti: string }).jti;
+  const forgetKv = (token: string) =>
+    (env as unknown as { CA_BUNDLE_CACHE: KVNamespace }).CA_BUNDLE_CACHE.delete(`jti:${jtiOf(token)}`);
+
+  it("login.oidc-jti.cross-leg — a token spent at /join cannot log in, even before KV has it", async () => {
+    const s = sub("join-then-login");
+    const token = await signer.token({ sub: s });
+    const inv = await authority().createInviteToken("inviter", ["bridgeCert"], 3600);
+    expect((await postJson("/join", { token: inv.token, proof: { type: "oidc", token } })).status).toBe(200);
+    await forgetKv(token);
+    const res = await login(token);
+    expect(res.status).toBe(401);
+    expect(hasSession(res)).toBe(false);
+  });
+
+  it("login.oidc-jti.cross-leg — a token spent at login cannot join, even before KV has it", async () => {
+    const s = sub("login-then-join");
+    await linked(s);
+    const token = await signer.token({ sub: s });
+    expect((await login(token)).status).toBe(200);
+    await forgetKv(token);
+    // Unlink, so the already-linked 409 cannot stand in for the jti guard.
+    await runInDurableObject(authority(), async (_a, state) => {
+      state.storage.sql.exec("DELETE FROM federated_identities WHERE provider_sub = ?", s);
+    });
+    const inv = await authority().createInviteToken("inviter", ["bridgeCert"], 3600);
+    const res = await postJson("/join", { token: inv.token, proof: { type: "oidc", token } });
+    expect(res.status).toBe(401);
+    expect(hasSession(res)).toBe(false);
   });
 });
