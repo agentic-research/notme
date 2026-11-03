@@ -1927,6 +1927,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     if ("error" in logPin) {
       console.error({ event: "ct.config_invalid", error: logPin.error });
       this.#ctRecord("error", `config: ${logPin.error}; chains backlogged`);
+      // #ctLogPin awaited (import + digest on a pin not seen before): the
+      // same re-check as the log path before signing (review I3).
+      this.#refuseIfMintStateMoved(p.captured);
       return this.#mintUnloggedAndBacklog(p, rootB64);
     }
 
