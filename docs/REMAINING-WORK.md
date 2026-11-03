@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 76 in notme (`rsry status --json` →
+**Updated:** 2026-11-02 · **Open beads:** 77 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -78,9 +78,10 @@ to publish the tag.
 
 **H1, live-path security.** This gates the release tag.
 - notme-3dfe15, **part 1 only:** `/join` has no server-issued OIDC nonce.
-  GitHub Actions tokens take no nonce, so this needs the owner's choice:
-  (A) single-use jti on `/join`, or (B) change the shared audience setting.
-  Parts 2 and 4/5 are merged.
+  The owner decided (2026-11-03): A now, a single-use jti on `/join`, as
+  `/cert/gha` already has. B is for the long run: a server nonce bound into
+  the proof, designed so automated callers keep working (notme-e3dede, stage
+  4). Parts 2 and 4/5 are merged.
 - notme-a2e75d: the first-user and claim marks are bound to the userId only,
   not to the browser like invite reservations are.
 - notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
@@ -194,6 +195,8 @@ Listed so the count doesn't creep up unnoticed:
   docs/audits/2026-11-03-durable-objects.md.
 - **From fixing notme-b52d7c (2026-11-03):** notme-d06b7b (a stranded
   enrolment after a failed collect; pre-existing).
+- **From the /join nonce decision (2026-11-03):** notme-e3dede, the long-term
+  design (B), in stage 4.
 - **Not filed:** the signet enforcement bead already existed
   (signet-be49b9). It now has the final encoding and a testable close
   condition, and notme-bdffc7 depends on it.
