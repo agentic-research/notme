@@ -5,7 +5,12 @@ import { describe, expect, it } from "vitest";
 
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
+// worker:verify's checks moved out of the Taskfile into a script so they can
+// run against a stub and a local Worker (notme-325916, notme-6ae724). The
+// Taskfile must still delegate to it, or the contract below is about a file
+// nothing runs.
 const taskfile = read("Taskfile.yml");
+const verifyScript = read("scripts/worker-verify.sh");
 
 /** Every file under `dir` (relative to the repo root), recursively. */
 function filesUnder(dir: string): string[] {
@@ -20,15 +25,19 @@ function filesUnder(dir: string): string[] {
 }
 
 describe("post-deploy verification contract", () => {
+  it("worker:verify runs scripts/worker-verify.sh", () => {
+    expect(taskfile).toMatch(/worker:verify:[\s\S]*?cmds:\s*\n\s*- bash scripts\/worker-verify\.sh/);
+  });
+
   it("retries while a new Worker deployment converges", () => {
-    expect(taskfile).toContain("MAX_ATTEMPTS=5");
-    expect(taskfile).toContain("RETRY_DELAY_SECONDS=2");
-    expect(taskfile).toContain('while [ "$attempt" -le "$MAX_ATTEMPTS" ]');
+    expect(verifyScript).toContain('MAX_ATTEMPTS="${VERIFY_MAX_ATTEMPTS:-5}"');
+    expect(verifyScript).toContain('RETRY_DELAY_SECONDS="${VERIFY_RETRY_DELAY_SECONDS:-2}"');
+    expect(verifyScript).toContain('while [ "$attempt" -le "$MAX_ATTEMPTS" ]');
   });
 
   it("checks the DO-backed /.well-known documents", () => {
-    expect(taskfile).toMatch(/ca-bundle\.pem"[\s\S]+BEGIN CERTIFICATE/);
-    expect(taskfile).toMatch(/jwks\.json"[\s\S]+"crv":"Ed25519"/);
+    expect(verifyScript).toMatch(/ca-bundle\.pem"[\s\S]+BEGIN CERTIFICATE/);
+    expect(verifyScript).toMatch(/jwks\.json"[\s\S]+"crv":"Ed25519"/);
   });
 
   it("no operator tool claims a query bypasses the /.well-known cache", () => {
@@ -57,7 +66,7 @@ describe("post-deploy verification contract", () => {
   });
 
   it("checks the unauthenticated passkey status contract", () => {
-    expect(taskfile).toMatch(
+    expect(verifyScript).toMatch(
       /passkey-status[\s\S]+auth\/passkey\/status[\s\S]+401[\s\S]+unauthorized/,
     );
   });

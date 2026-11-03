@@ -151,6 +151,13 @@ describe("worker:promote gate (notme-16b2d5)", () => {
     expect(deployed(r.calls, NEW)).toBe(false);
   });
 
+  it("refuses a pass recorded against a different host (a stub or a local Worker)", () => {
+    writeEvidence("production", NEW, { ...goodEvidence("production"), auth_base: "http://127.0.0.1:8787" });
+    const r = promote({ NEW, ENV: "production" });
+    expect(r.code).not.toBe(0);
+    expect(deployed(r.calls, NEW)).toBe(false);
+  });
+
   it("refuses an unpinned (sampled) or failed verify record", () => {
     writeEvidence("production", NEW, { ...goodEvidence("production"), pinned: false });
     expect(deployed(promote({ NEW, ENV: "production" }).calls, NEW)).toBe(false);

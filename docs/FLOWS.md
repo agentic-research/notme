@@ -347,6 +347,10 @@ Confirm with `curl -s https://auth.notme.bot/.well-known/version`.
 same convergence caveat on the way back, which is exactly when nobody wants to
 wait. After a `ship-prod`, use `task worker:rollback`.
 
-**Version-override targeting does not work here** (`notme-9f2f79`): probing a
-specific version returns the *old* one, measured 5/5. Verify after promoting,
-not before.
+**Version-override targeting only works on a version in the deployment.**
+Probing a version that is uploaded but not deployed returns the *old* one,
+measured 5/5 (`notme-9f2f79`) — Cloudflare ignores the header silently. So
+`worker:verify VERSION=<id>` runs after `worker:canary`, and brackets every
+check with a pinned `/.well-known/version` probe: if the pin is ignored, the
+run fails instead of passing on the old build (`notme-325916`). A sampled,
+unpinned verify during a soak is a health check, not evidence about the canary.

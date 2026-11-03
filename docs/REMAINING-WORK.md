@@ -109,8 +109,12 @@ to publish the tag.
   ENV is mandatory, promote needs a pinned-verify record for that exact version
   (or a logged `ALLOW_UNVERIFIED` reason), and rolls back on a failed
   post-promote verify. ship-prod no longer claims a rollback it never did.
-- notme-325916: the canary soak samples traffic instead of targeting the new
-  version.
+- notme-325916: the canary soak sampled traffic instead of targeting the new
+  version. Fixed on fix/release-pipeline-gates: `worker:verify VERSION=<id>
+  ENV=<env>` pins every probe with the version-override header and brackets
+  each check with a pinned `/.well-known/version`; a pass writes the record
+  promote needs. Owner: run the first pinned soak on staging against a real
+  split before relying on it for production.
 - notme-6ae724: no runtime contract tests in CI.
 - The alarm epic **notme-5c2511**, with notme-e992ad and notme-5d358a.
 

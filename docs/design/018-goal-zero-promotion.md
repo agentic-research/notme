@@ -129,6 +129,35 @@ disposable by design (its CA is not trusted by anything).
 > demonstrating, by measurement against `/.well-known/version`, that traffic
 > splitting on this Worker routes as configured.
 
+> **CORRECTION (2026-11-03, `notme-325916`) — the canary returns as a PINNED
+> soak, and the measurement is built into every run.** The deletion's
+> condition is met by construction rather than by a one-off demonstration:
+> `task worker:verify VERSION=<id> ENV=<env>` sends
+> `Cloudflare-Workers-Version-Overrides: <worker>="<id>"` on every probe AND
+> brackets every check with a pinned `/.well-known/version` probe that must
+> report the build `<id>` was uploaded from. Both documented failure modes
+> now fail the run instead of reporting the old version's behaviour:
+>
+> - the override is ignored because `<id>` is not in the current deployment
+>   (the pre-promotion probe of `91b54069`) → the opening bracket reports the
+>   old build and the run stops;
+> - unpinned sampling never reaches the canary (the 85/85) → irrelevant:
+>   nothing in a pinned run is sampled.
+>
+> So the soak is run **after** `worker:canary` puts the version in the
+> deployment, never before. A sampled `worker:verify` during a soak is a
+> service-health check and is never evidence about the new version; it writes
+> no record. Proven against a stub of Cloudflare's documented routing in
+> `worker-verify-pinning.test.ts` (a broken canary fails the pinned soak under
+> every routing of unpinned traffic; an ignored override fails closed).
+>
+> **Not yet measured against Cloudflare.** The pinned path has not run against
+> a real split since this change. The first run should be a staging
+> rehearsal — `task worker:canary NEW=<id> OLD=<cur> ENV=staging`, then
+> `task worker:verify VERSION=<id> ENV=staging`, then `task worker:promote
+> NEW=<id> ENV=staging` — and until it is green, `ship-prod` remains the
+> default production path.
+
 **Entry:** Phase 1 green at the SHA being released.
 **Command:** two paths, and only one of them is gated per version.
 
@@ -146,6 +175,14 @@ task worker:canary NEW=<id> OLD=<cur> ENV=production       # NEW enters the depl
 task worker:verify VERSION=<id> ENV=production             # pinned soak; writes evidence
 task worker:promote NEW=<id> ENV=production                # refuses without that evidence
 ```
+
+**Gated-path exit criteria.** A green `worker:verify VERSION=<id>` run —
+pinned, every check bracketed by `/.well-known/version` reporting the build
+`<id>` was uploaded from — taken while `<id>` is in the deployment. Its record
+(`.release-evidence/production/<id>.json`) goes in the release evidence bundle.
+An unpinned verify during the soak does not count. Run it from the checkout
+that uploaded `<id>` (EXPECT defaults to `git rev-parse HEAD`), or pass
+`EXPECT=<sha>`.
 
 **The promotion gate (`notme-16b2d5`).** `worker:promote` used to be
 `wrangler versions deploy NEW@100%` behind one precondition — that `NEW` was a
@@ -235,7 +272,7 @@ Recorded on the release bead (and linked from the PR) at each cut:
 
 1. Git SHA + tag; PR URL; CI run URL (Phase 0).
 2. `ship-staging` transcript tail + staging verify output (Phase 1).
-3. Version id uploaded; promote command + convergence proof (consecutive `/.well-known/version` samples at the released SHA)
+3. Version id uploaded; the pinned-verify evidence record (`.release-evidence/<env>/<id>.json`) when the gated path was used; promote command + convergence proof (consecutive `/.well-known/version` samples at the released SHA)
    transcript (Phase 2–3).
 4. Release workflow run URL; `cosign verify` / `verify-attestation` output
    (in-job); npm provenance attestation URL when dpop shipped.

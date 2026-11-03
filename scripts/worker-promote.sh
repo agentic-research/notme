@@ -100,7 +100,7 @@ else
   # Every field is checked, not just existence: a renamed file, a sampled run,
   # or a failed run must not read as a pass.
   EXPECT="$(node -e '
-    const [file, version, env] = process.argv.slice(1);
+    const [file, version, env, authBase] = process.argv.slice(1);
     const r = JSON.parse(require("fs").readFileSync(file, "utf8"));
     const bad = [];
     if (r.schema !== "notme.release-evidence/v1") bad.push("schema");
@@ -108,11 +108,13 @@ else
     if (r.pinned !== true) bad.push("not pinned (a sampled verify is not evidence about one version)");
     if (r.version !== version) bad.push("version=" + r.version);
     if (r.env !== env) bad.push("env=" + r.env);
+    // A pass against a stub or a local Worker is not a pass against this env.
+    if (r.auth_base !== authBase) bad.push("auth_base=" + r.auth_base);
     if (!/^[0-9a-f]{40}$/.test(r.commit || "")) bad.push("commit");
     if (bad.length) { console.error("evidence record rejected: " + bad.join(", ")); process.exit(1); }
     console.error("evidence: pinned verify passed for " + version + " (" + env + ", build " + r.commit.slice(0, 12) + ") at " + r.checked_at);
     process.stdout.write(r.commit);
-  ' "$RECORD" "$NEW" "$ENV_NAME")" || die "evidence record for $NEW is not a pinned pass ($RECORD)"
+  ' "$RECORD" "$NEW" "$ENV_NAME" "$AUTH_BASE")" || die "evidence record for $NEW is not a pinned pass ($RECORD)"
 fi
 
 # ── who holds traffic now: the rollback target ──

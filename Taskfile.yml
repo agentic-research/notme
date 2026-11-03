@@ -132,135 +132,32 @@ tasks:
       - pnpm exec wrangler rollback
 
   worker:verify:
-    desc: Smoke test live endpoints with bounded deployment-convergence retries
-    # AUTH_BASE / SITE_BASE default to production; `worker:verify-staging`
-    # passes the staging hosts so both environments share ONE definition of
-    # "the service works" instead of a staging copy that drifts.
+    desc: "Smoke test live endpoints ([ENV=staging] [VERSION=<id> — pin every probe to that version and record evidence])"
+    # The checks live in scripts/worker-verify.sh so they can be run against a
+    # stub (worker-verify-pinning.test.ts) and a local Worker (ci.yml) — the
+    # same definition everywhere instead of copies that drift.
+    #
+    # AUTH_BASE / SITE_BASE default from ENV (production unless ENV=staging);
+    # `worker:verify-staging` passes the staging hosts so both environments
+    # share ONE definition of "the service works".
+    #
+    # VERSION=<version-id> (notme-325916): every probe carries Cloudflare's
+    # version-override header, and each check is bracketed by a pinned
+    # /.well-known/version probe that must report EXPECT (default: git HEAD).
+    # Cloudflare ignores the header SILENTLY when the version is not in the
+    # current deployment, so the bracket is what turns "pinned" from a request
+    # into a proof. A pinned pass writes the evidence worker:promote requires.
     vars:
-      AUTH_BASE: '{{.AUTH_BASE | default "https://auth.notme.bot"}}'
-      SITE_BASE: '{{.SITE_BASE | default "https://notme.bot"}}'
+      AUTH_BASE: '{{.AUTH_BASE | default (eq .ENV "staging" | ternary "https://auth-staging.notme.bot" "https://auth.notme.bot")}}'
+      SITE_BASE: '{{.SITE_BASE | default (eq .ENV "staging" | ternary "https://staging.notme.bot" "https://notme.bot")}}'
+    env:
+      AUTH_BASE: "{{.AUTH_BASE}}"
+      SITE_BASE: "{{.SITE_BASE}}"
+      VERSION: "{{.VERSION}}"
+      EXPECT: "{{.EXPECT}}"
+      ENV: "{{.ENV}}"
     cmds:
-      - |
-        FAIL=0
-        AUTH_BASE="{{.AUTH_BASE}}"
-        SITE_BASE="{{.SITE_BASE}}"
-        AUTH_HOST="${AUTH_BASE#https://}"
-        VERIFY_NONCE="$(date +%s)"
-        MAX_ATTEMPTS=5
-        RETRY_DELAY_SECONDS=2
-        BODY_FILE="$(mktemp)"
-        trap 'rm -f "$BODY_FILE"' EXIT
-
-        check_request() {
-          label="$1"
-          method="$2"
-          url="$3"
-          expected_status="$4"
-          expected_pattern="$5"
-          data="${6:-}"
-          accept="${7:-}"
-          attempt=1
-
-          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
-            if [ "$method" = "POST" ]; then
-              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
-                -X POST "$url" -H "Content-Type: application/json" -d "$data")
-            elif [ -n "$accept" ]; then
-              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
-                -H "Accept: $accept" "$url")
-            else
-              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" "$url")
-            fi
-
-            if [ "$status" = "$expected_status" ] && grep -Fq "$expected_pattern" "$BODY_FILE"; then
-              echo "✓ $label"
-              return 0
-            fi
-
-            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-              sleep "$RETRY_DELAY_SECONDS"
-            fi
-            attempt=$((attempt + 1))
-          done
-
-          detail=$(head -c 160 "$BODY_FILE" | tr '\n' ' ')
-          echo "✗ $label (got $status; body: $detail)"
-          FAIL=1
-        }
-
-        echo "=== ${AUTH_HOST} ==="
-        check_request "landing" "GET" "${AUTH_BASE}/" "200" "identity authority"
-        check_request "login" "GET" "${AUTH_BASE}/login" "200" "passkey"
-        check_request "discovery" "GET" "${AUTH_BASE}/.well-known/signet-authority.json" "200" '"issuer"'
-        # Cache API entries survive Worker deployments, but every key carries
-        # the build (src/cache-key.ts), so this reads the NEW build's entry.
-        # No query: /.well-known/* keys ignore it (notme-ed6114) — a bypass
-        # that worked for the verifier worked for any flood too.
-        check_request "ca-bundle" "GET" "${AUTH_BASE}/.well-known/ca-bundle.pem" "200" "BEGIN CERTIFICATE"
-        # The SERVED root must carry the budget the code mints. Production
-        # served pathlen:0 for five months after the code moved to pathlen=1,
-        # because the DO's cache check asked only whether BasicConstraints
-        # existed (notme-1b1db4). Every Issuing CA tier minted under that root
-        # was unverifiable by any stock validator, and every test passed —
-        # against a fresh test root. This reads the LIVE root, not a fixture.
-        ROOT_PATHLEN=$(curl -s "${AUTH_BASE}/.well-known/ca-bundle.pem" \
-          | openssl x509 -noout -text 2>/dev/null | grep -o 'pathlen:[0-9]*' | cut -d: -f2)
-        if [ "$ROOT_PATHLEN" = "1" ]; then
-          echo "✓ root-pathlen (served root admits one intermediate tier)"
-        else
-          echo "✗ root-pathlen: served root has pathlen '${ROOT_PATHLEN:-none}', code mints 1 — Issuing CA tiers cannot verify"
-          FAIL=1
-        fi
-        # The committed trust anchor must still be what production serves.
-        # It went stale twice (2026-08-28 pathlen heal, 2026-10-28 notBefore
-        # re-issue) while trust-anchor.test.ts passed, because that test
-        # compares trust/ only to itself (notme-8e8836). Production only:
-        # trust/ pins the production authority.
-        if [ "$AUTH_BASE" = "https://auth.notme.bot" ]; then
-          if pnpm exec tsx scripts/refresh-trust-anchor.ts --check; then
-            echo "✓ trust-anchor (trust/ matches the served root)"
-          else
-            echo "✗ trust-anchor: trust/ disagrees with the served root (see above)"
-            FAIL=1
-          fi
-        fi
-        check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json" "200" '"crv":"Ed25519"'
-        # The deployed build must be able to NAME ITSELF. Asserting
-        # "stamped":true rather than merely a 200: an endpoint that always
-        # answered "unknown" would pass a liveness check while telling a
-        # consumer nothing, which is the state that made signet's "no positive
-        # evidence" objection correct (notme-9f2f79). No nonce — it is
-        # no-store, so there is no cache entry to bypass.
-        check_request "build-version" "GET" "${AUTH_BASE}/.well-known/version" "200" '"stamped":true'
-        # Expect the environment's own authority host in the docs page — a
-        # staging deploy that renders production URLs is a config leak, not
-        # a pass. Nonce for the same reason as ca-bundle: Cache API entries
-        # survive deployments, and this handler cachePuts with max-age=3600.
-        check_request "api-docs" "GET" "${AUTH_BASE}/api/docs?verify=$VERIFY_NONCE" "200" "${AUTH_HOST}"
-        check_request "passkey-status" "GET" "${AUTH_BASE}/auth/passkey/status" "401" '"error":"unauthorized"'
-        check_request "authorize" "GET" "${AUTH_BASE}/authorize" "400" '"error":"redirect_uri required"'
-        check_request "token" "POST" "${AUTH_BASE}/token" "400" '"error":"dpop_proof_required"' '{"audience":"https://test"}'
-        # Every check above names a route that exists. Nothing covered the
-        # fallthrough, which is where notme-cb0354 lived: unmatched paths came
-        # back as error 1101 in production for as long as the VPC tunnel was
-        # unhealthy, and the gate stayed green throughout.
-        #
-        # The body pattern is the Worker's own constant 404, which it returns
-        # when the VPC fetch fails. A HEALTHY tunnel would instead hand back
-        # whatever signet answers for an unknown path, so if this check ever
-        # fails on the pattern rather than the status, read it as "the tunnel
-        # came up" and decide there whether signet's 404 shape is acceptable
-        # to expose — do not just relax the assertion. The status is the part
-        # that must never regress: 1101 surfaces as 500.
-        check_request "unmatched-path" "GET" "${AUTH_BASE}/.well-known/not-a-route-$VERIFY_NONCE" "404" '"error":"not_found"'
-
-        echo "=== ${SITE_BASE#https://} ==="
-        check_request "homepage" "GET" "${SITE_BASE}/" "200" "notme"
-        check_request "apas" "GET" "${SITE_BASE}/apas?verify=$VERIFY_NONCE" "200" "0.2.1-draft"
-        check_request "apas-schema" "GET" "${SITE_BASE}/provenance/dispatch/v1?verify=$VERIFY_NONCE" "200" '"workItemRef"' "" "application/schema+json"
-
-        echo "---"
-        [ $FAIL -eq 0 ] && echo "All checks passed." || { echo "SOME CHECKS FAILED"; exit 1; }
+      - bash scripts/worker-verify.sh
 
   node:preflight:
     desc: Fail fast, with remediation, when local Node can't run the release path
