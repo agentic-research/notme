@@ -1085,6 +1085,38 @@ describe("ct.health — what the operator sees", () => {
     });
   });
 
+  it("an unparseable root under a bad pin is unloggable, not backlogged into gaveUp forever (review L3)", async () => {
+    const name = `ct-badroot-${++seq}-${crypto.randomUUID()}`;
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+    const mtls = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const sign = (await crypto.subtle.generateKey(
+      { name: "Ed25519" }, true, ["sign", "verify"],
+    )) as CryptoKeyPair;
+    await setMode("ok");
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as DrainAuth;
+      const e = { ...a.env };
+      delete e.CT_LOG_KEY;
+      a.env = e;
+      a.getCACertificatePem = async () => "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+      const pair = (await a.mintBridgeCertPair({
+        subject: SUBJECT,
+        identity: `wimse://notme.bot/principal/${name}`,
+        mtlsPublicKeyPem: await spkiPem(mtls.publicKey),
+        signingPublicKeyPem: await spkiPem(sign.publicKey),
+        scopes: ["bridgeCert"],
+        authMethod: "gha-oidc",
+      })) as { certificates: { mtls: string } };
+      expect(pair.certificates.mtls).toContain("BEGIN CERTIFICATE");
+      const h = await a.getAlarmHealth();
+      expect(h.ct.backlog, "a chain ending in an unparseable root can never be logged").toBe(0);
+      expect(h.ct.unloggable.count).toBe(1);
+      expect(h.ct.unloggable.reason).toMatch(/^root unparseable/);
+    });
+  });
+
   it("a healthy, empty authority reports zeros", async () => {
     await withBacklog(0, async (a) => {
       const h = await a.getAlarmHealth();

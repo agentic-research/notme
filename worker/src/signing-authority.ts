@@ -1913,17 +1913,20 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // (notme-c0c9a2). health.configError is the alert.
     const logPin = await this.#ctLogPin();
     const rootB64 = pemToB64(p.issuerPem);
-    if ("error" in logPin) {
-      console.error({ event: "ct.config_invalid", error: logPin.error });
-      this.#ctRecord("error", `config: ${logPin.error}; chains backlogged`);
-      return this.#mintUnloggedAndBacklog(p, rootB64);
-    }
+    // The root is parsed BEFORE the pin branch (review L3): a chain ending in
+    // a root that cannot be parsed can never be logged, so it is counted
+    // unloggable here rather than backlogged into gaveUp for good.
     let issuerSpki: Uint8Array;
     try {
       issuerSpki = spkiOf(b64ToBytes(rootB64));
     } catch (err) {
       this.#ctRecord("unloggable", `root unparseable: ${String(err)}`);
       return p.mint(p.pin, () => []);
+    }
+    if ("error" in logPin) {
+      console.error({ event: "ct.config_invalid", error: logPin.error });
+      this.#ctRecord("error", `config: ${logPin.error}; chains backlogged`);
+      return this.#mintUnloggedAndBacklog(p, rootB64);
     }
 
     const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
