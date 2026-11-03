@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,7 +27,7 @@ function filesUnder(dir: string): string[] {
 
 describe("post-deploy verification contract", () => {
   it("worker:verify runs scripts/worker-verify.sh", () => {
-    expect(taskfile).toMatch(/worker:verify:[\s\S]*?cmds:\s*\n\s*- bash scripts\/worker-verify\.sh/);
+    expect(taskfile).toMatch(/worker:verify:[\s\S]*?cmds:[\s\S]*?- >-\s*\n\s*bash scripts\/worker-verify\.sh/);
   });
 
   it("retries while a new Worker deployment converges", () => {
@@ -69,5 +70,29 @@ describe("post-deploy verification contract", () => {
     expect(verifyScript).toMatch(
       /passkey-status[\s\S]+auth\/passkey\/status[\s\S]+401[\s\S]+unauthorized/,
     );
+  });
+});
+
+describe("ship-prod checks PRODUCTION whatever the shell exports (review M6)", () => {
+  it("with ENV/AUTH_BASE/SITE_BASE/VERSION/EXPECT exported for staging, converge + verify still target production", () => {
+    // --dry renders every command without running it — nothing is deployed.
+    const r = spawnSync("task", ["-d", ROOT, "--dry", "ship-prod"], {
+      env: {
+        ...process.env,
+        ENV: "staging",
+        AUTH_BASE: "https://auth-staging.notme.bot",
+        SITE_BASE: "https://staging.notme.bot",
+        VERSION: "01d00000-0000-4000-8000-000000000000",
+        EXPECT: "f".repeat(40),
+      },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const out = `${r.stdout}\n${r.stderr}`;
+    const verify = out.split("\n").find((l) => l.includes("[worker:verify]")) ?? "";
+    const converge = out.split("\n").find((l) => l.includes("[worker:await-convergence]")) ?? "";
+    expect(verify, out).toContain("--env production --auth-base https://auth.notme.bot --site-base https://notme.bot --version '' --expect ''");
+    expect(converge, out).toContain("--auth-base https://auth.notme.bot");
+    expect(out).not.toContain("staging.notme.bot");
   });
 });

@@ -29,8 +29,27 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 FAIL=0
-AUTH_BASE="${AUTH_BASE:-https://auth.notme.bot}"
-SITE_BASE="${SITE_BASE:-https://notme.bot}"
+# Targets are ARGUMENTS (`task worker:verify` passes them), never read from
+# the environment: an exported AUTH_BASE/ENV/VERSION/EXPECT in the operator's
+# shell must not redirect a caller that stated its target — ship-prod's
+# verify of production stayed production with ENV=staging exported only
+# because of this (review M6).
+AUTH_BASE="https://auth.notme.bot"
+SITE_BASE="https://notme.bot"
+VERSION=""
+ENV_NAME=""
+EXPECT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --auth-base) AUTH_BASE="${2:-}"; shift 2 ;;
+    --site-base) SITE_BASE="${2:-}"; shift 2 ;;
+    --env) ENV_NAME="${2:-}"; shift 2 ;;
+    --version) VERSION="${2:-}"; shift 2 ;;
+    --expect) EXPECT="${2:-}"; shift 2 ;;
+    *) echo "✗ worker-verify: unknown argument '$1'"; exit 2 ;;
+  esac
+done
+[ -n "$AUTH_BASE" ] && [ -n "$SITE_BASE" ] || { echo "✗ worker-verify: empty --auth-base/--site-base"; exit 2; }
 # http:// as well, for a local Worker; the api-docs check wants a bare host.
 AUTH_HOST="${AUTH_BASE#http*://}"
 VERIFY_NONCE="$(date +%s)"
@@ -39,9 +58,6 @@ RETRY_DELAY_SECONDS="${VERIFY_RETRY_DELAY_SECONDS:-2}"
 BODY_FILE="$(mktemp)"
 trap 'rm -f "$BODY_FILE"' EXIT
 
-VERSION="${VERSION:-}"
-ENV_NAME="${ENV:-}"
-EXPECT="${EXPECT:-}"
 EVIDENCE_DIR="${NOTME_EVIDENCE_DIR:-$PWD/.release-evidence}"
 PIN=()
 CHECKS=0

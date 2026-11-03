@@ -116,9 +116,8 @@ if [ "$up" -ne 1 ]; then
 fi
 
 status=0
-AUTH_BASE="$AUTH_BASE" SITE_BASE="$SITE_BASE" VERIFY_MAX_ATTEMPTS="${VERIFY_MAX_ATTEMPTS:-3}" \
-  VERIFY_RETRY_DELAY_SECONDS="${VERIFY_RETRY_DELAY_SECONDS:-1}" \
-  bash "$ROOT/scripts/worker-verify.sh" || status=$?
+VERIFY_MAX_ATTEMPTS="${VERIFY_MAX_ATTEMPTS:-3}" VERIFY_RETRY_DELAY_SECONDS="${VERIFY_RETRY_DELAY_SECONDS:-1}" \
+  bash "$ROOT/scripts/worker-verify.sh" --auth-base "$AUTH_BASE" --site-base "$SITE_BASE" || status=$?
 
 if [ "$status" -ne 0 ]; then
   echo "--- wrangler log (tail) ---"

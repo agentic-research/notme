@@ -203,14 +203,25 @@ non-empty string — so any version in the account's upload history reached 100%
 of production in one command, and an omitted `ENV` meant production. Now
 (`scripts/worker-promote.sh`, pinned by `promote-gate.test.ts`):
 
-- `ENV=production|staging` is mandatory on canary and promote; neither
-  environment is reachable by omission.
+- `ENV=production|staging` is mandatory on canary and promote, and must be
+  typed on the task command line: Task fills `{{.ENV}}` from the environment,
+  so a value equal to an exported shell variable of the same name is refused
+  (`ENV`, `NEW`, `EXPECT`, `ALLOW_UNVERIFIED`; `scripts/lib/selectors.sh`).
+  Neither environment is reachable by omission or by a stale `export`.
 - promote refuses unless `.release-evidence/<env>/<version-id>.json` records a
   **pinned** verify pass for exactly that version in exactly that environment.
   Only `worker:verify VERSION=<id>` writes one; a sampled verify never does.
+  The record **expires after 24 h**: a soak is evidence against that day's DO
+  state, secrets and dependencies, any of which can move, so it is re-earned
+  rather than trusted indefinitely.
+- before deploying it resolves the rollback target — the highest-percentage
+  version in the current deployment that is not `NEW` — and **refuses to
+  deploy** if there is none or the deployment cannot be read.
 - after the deploy it awaits convergence on the recorded build, then verifies
-  pinned to `NEW`; if either fails it **promotes the prior version back** and
-  exits non-zero. That is the defined failure action.
+  pinned to `NEW`; if either fails, or the run is interrupted (INT/TERM), it
+  **promotes the prior version back**, deletes `NEW`'s pass record so the
+  same version cannot walk back through the gate on it, and exits non-zero.
+  That is the defined failure action.
 - the emergency override is `ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>`: a
   typed reason, an explicit build sha, a loud banner, and a line appended to
   `.release-evidence/overrides.log`.

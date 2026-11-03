@@ -150,14 +150,16 @@ tasks:
     vars:
       AUTH_BASE: '{{.AUTH_BASE | default (eq .ENV "staging" | ternary "https://auth-staging.notme.bot" "https://auth.notme.bot")}}'
       SITE_BASE: '{{.SITE_BASE | default (eq .ENV "staging" | ternary "https://staging.notme.bot" "https://notme.bot")}}'
-    env:
-      AUTH_BASE: "{{.AUTH_BASE}}"
-      SITE_BASE: "{{.SITE_BASE}}"
-      VERSION: "{{.VERSION}}"
-      EXPECT: "{{.EXPECT}}"
-      ENV: "{{.ENV}}"
+    # Arguments, not `env:` — an exported variable of the same name would
+    # override a Task env block (review M6; see scripts/lib/selectors.sh).
     cmds:
-      - bash scripts/worker-verify.sh
+      - >-
+        bash scripts/worker-verify.sh
+        --env {{shellQuote (.ENV | default "")}}
+        --auth-base {{shellQuote .AUTH_BASE}}
+        --site-base {{shellQuote .SITE_BASE}}
+        --version {{shellQuote (.VERSION | default "")}}
+        --expect {{shellQuote (.EXPECT | default "")}}
 
   node:preflight:
     desc: Fail fast, with remediation, when local Node can't run the release path
@@ -231,8 +233,11 @@ tasks:
     cmds:
       - task: worker:verify
         vars:
+          ENV: staging
           AUTH_BASE: "https://auth-staging.notme.bot"
           SITE_BASE: "https://staging.notme.bot"
+          VERSION: ""
+          EXPECT: ""
 
   ship-staging:
     desc: "Staging gate: preflight → install → check → docs → deploy staging → verify staging"
@@ -268,6 +273,10 @@ tasks:
     preconditions:
       - sh: '[ "{{.ENV}}" = production ] || [ "{{.ENV}}" = staging ]'
         msg: "ENV=production or ENV=staging is required — neither is reachable by omission"
+      # Task fills {{.ENV}} from the environment too: an `export ENV=…` left in
+      # the shell must not stand in for typing it (review M6).
+      - sh: '[ -z "${ENV:-}" ] || [ "${ENV}" != "{{.ENV}}" ]'
+        msg: "ENV is exported in your shell — unset ENV and pass ENV= on the task command line"
       - sh: test -n "{{.NEW}}"
         msg: "NEW=<version-id> is required (task worker:versions to list)"
       - sh: test -n "{{.OLD}}"
@@ -286,13 +295,18 @@ tasks:
     # The gate, the override (ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>), and
     # the post-promote converge → pinned verify → rollback live in the script
     # so they are testable without a Cloudflare account (promote-gate.test.ts).
-    env:
-      NEW: "{{.NEW}}"
-      ENV: "{{.ENV}}"
-      ALLOW_UNVERIFIED: "{{.ALLOW_UNVERIFIED}}"
-      EXPECT: "{{.EXPECT}}"
+    #
+    # Values go in as ARGUMENTS, shell-quoted. Not through `env:`: an exported
+    # variable of the same name overrides a Task env block, and Task also
+    # fills `{{.ENV}}` from the environment, so the script refuses any
+    # selector equal to an exported shell variable (scripts/lib/selectors.sh).
     cmds:
-      - bash scripts/worker-promote.sh
+      - >-
+        bash scripts/worker-promote.sh
+        --env {{shellQuote (.ENV | default "")}}
+        --new {{shellQuote (.NEW | default "")}}
+        --allow-unverified {{shellQuote (.ALLOW_UNVERIFIED | default "")}}
+        --expect {{shellQuote (.EXPECT | default "")}}
 
   docs:check:
     desc: Verify doc claims against code
@@ -363,7 +377,12 @@ tasks:
     # build. This closes that gap. See scripts/await-convergence.ts.
     deps: [deps:install]
     cmds:
-      - pnpm exec tsx scripts/await-convergence.ts
+      # Explicit flags override the script's AUTH_BASE/EXPECT environment
+      # fallbacks, so a caller like ship-prod pins the target (review M6).
+      - >-
+        pnpm exec tsx scripts/await-convergence.ts
+        {{if .AUTH_BASE}}--auth-base {{shellQuote .AUTH_BASE}}{{end}}
+        {{if .EXPECT}}--expect {{shellQuote .EXPECT}}{{end}}
 
   ship:
     desc: "Safe path: preflight → install → check → docs → preview → verify instructions"
@@ -379,7 +398,7 @@ tasks:
       - echo "  task worker:canary NEW=<id> OLD=<id> ENV=production  # 10% canary (PCT=n to change)"
       - echo "  task worker:verify VERSION=<id> ENV=production       # PINNED soak; records evidence"
       - echo "  task worker:promote NEW=<id> ENV=production          # refuses without that evidence"
-      - echo "  task worker:promote NEW=<old-id> ENV=production      # rollback = promote the old id"
+      - 'echo "  (a failed promote rolls itself back; emergency exit at any time: task worker:rollback)"'
       - echo ""
       - 'echo "Direct path (skips canary, no auto-rollback): task ship-prod"'
 
@@ -417,6 +436,10 @@ tasks:
     # emergency exit), then `task worker:verify`. The path that rolls back by
     # itself is ship → canary → pinned verify → worker:promote.
     desc: "Full send: preflight → install → check → docs → deploy → converge → verify. NO auto-rollback: on failure run task worker:rollback"
+    vars:
+      # The build worker:deploy stamps (BUILD_SHA = git HEAD).
+      HEAD_SHA:
+        sh: git rev-parse HEAD
     cmds:
       - task: node:preflight
       - task: worker:install
@@ -425,8 +448,20 @@ tasks:
       - task: worker:deploy
       # Between deploy and verify, because a verify that runs during
       # convergence can pass against the build being replaced (notme-9f2f79).
+      # Every target is stated, never inherited: an exported ENV=staging (or
+      # AUTH_BASE/VERSION/EXPECT) in the operator's shell must not turn the
+      # check of the production deploy into a check of staging (review M6).
       - task: worker:await-convergence
+        vars:
+          AUTH_BASE: https://auth.notme.bot
+          EXPECT: "{{.HEAD_SHA}}"
       - task: worker:verify
+        vars:
+          ENV: production
+          AUTH_BASE: https://auth.notme.bot
+          SITE_BASE: https://notme.bot
+          VERSION: ""
+          EXPECT: ""
 
   worker:build-local:
     desc: Bundle worker for local workerd

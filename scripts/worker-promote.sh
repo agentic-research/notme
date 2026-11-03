@@ -2,7 +2,10 @@
 # worker-promote.sh — route 100% of an environment's traffic to ONE version,
 # only if that exact version has passed a pinned verify (notme-16b2d5).
 #
-# Invoked by `task worker:promote NEW=<version-id> ENV=<production|staging>`.
+# Invoked by `task worker:promote NEW=<version-id> ENV=<production|staging>`,
+# which passes its values as ARGUMENTS:
+#   worker-promote.sh --env <production|staging> --new <id>
+#                     [--allow-unverified '<reason>' --expect <sha>]
 #
 # ── WHY IT IS A GATE AND NOT A ONE-LINER ──
 # It used to be `wrangler versions deploy NEW@100% --yes` behind a single
@@ -15,42 +18,66 @@
 # ── WHAT COUNTS AS EVIDENCE ──
 # A record at $NOTME_EVIDENCE_DIR/<env>/<version-id>.json, written ONLY by
 # scripts/worker-verify.sh when it ran PINNED to that version (Cloudflare's
-# version-override header) and every pinned check was answered by that
-# version's own build (identity-bracketed against /.well-known/version). A
-# sampled, unpinned verify never writes one: at a 10/90 split it is evidence
-# about whichever version answered, which was measured to be the OLD one 85
-# times out of 85 (notme-325916). The pinned run that produces the record is
-# `task worker:verify VERSION=<id> ENV=<env>` during the canary split.
-#
-# Every version promoted through this gate is re-verified pinned at 100%, which
-# refreshes its record — so rolling back to a version that was once promoted
-# here passes the gate without the override.
+# version-override header), every pinned check was answered by that version's
+# own build, and Cloudflare listed the version as serving (notme-325916). A
+# sampled, unpinned verify never writes one. The record must be:
+#   - for exactly this version, environment and host, result=pass, pinned;
+#   - younger than EVIDENCE_TTL_HOURS (24). A soak says the version worked
+#     against the DO state, secrets and dependencies of that day. After a day,
+#     any of those may have moved — a rotated key, a changed secret, a
+#     dependency's new behaviour — so the record is re-earned by a fresh pinned
+#     soak rather than trusted indefinitely (review M4). 24h fits the
+#     soak-then-promote day this is for; rollbacks to older versions use
+#     `task worker:rollback`.
+# A failed post-promote check deletes NEW's record, so the same broken version
+# cannot walk back through the gate on its old pass.
 #
 # TRUST MODEL, stated plainly: the record is a local file. This gate stops the
-# accident-shaped failures (wrong id, wrong env, never-verified artifact); it
-# does not stop an operator who forges a JSON file. It is a typed, deliberate
-# act either way — which is the property the bead asked for.
+# accident-shaped failures (wrong id, wrong env, never-verified or stale
+# artifact); it does not stop an operator who forges a JSON file.
 #
 # ── THE OVERRIDE ──
-# ALLOW_UNVERIFIED="<reason>" skips the evidence check for emergencies. It
-# requires a real reason (>= 12 chars), an explicit EXPECT=<40-hex build sha>
+# --allow-unverified '<reason>' skips the evidence check for emergencies. It
+# requires a real reason (>= 12 chars), an explicit --expect <40-hex build sha>
 # (there is no record to read it from, and the post-promote verify needs to
 # know which build should answer), and appends to $NOTME_EVIDENCE_DIR/overrides.log.
 #
+# ── SELECTORS COME FROM THE COMMAND LINE ──
+# A value equal to an exported shell variable of the same name (ENV, NEW,
+# EXPECT, ALLOW_UNVERIFIED) is refused: Task fills template variables from the
+# environment, so a stale `export ENV=production` would otherwise satisfy
+# "ENV is required" (review M6). See scripts/lib/selectors.sh.
+#
 # ── FAILURE ACTION ──
-# After the deploy: await convergence on the expected build, then verify pinned
-# to NEW. If either fails, the version that held traffic BEFORE the promote is
-# promoted back (same mechanism — ADR-018's rollback), and the script exits 1.
+# The rollback target (PREV) is resolved BEFORE deploying, as the highest-
+# percentage version that is not NEW. If it cannot be resolved, nothing is
+# deployed (review M2, M3). After the deploy: await convergence on the expected
+# build, then verify pinned to NEW. If either fails — or the run is interrupted
+# (INT/TERM, review L3) — PREV is promoted back and the script exits non-zero.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/selectors.sh
+. "$ROOT/scripts/lib/selectors.sh"
 EVIDENCE_DIR="${NOTME_EVIDENCE_DIR:-$ROOT/.release-evidence}"
-NEW="${NEW:-}"
-ENV_NAME="${ENV:-}"
-ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-}"
-EXPECT="${EXPECT:-}"
+EVIDENCE_TTL_HOURS=24
 
 die() { echo "✗ worker:promote: $*" >&2; exit 1; }
+
+NEW="" ENV_NAME="" ALLOW_UNVERIFIED="" EXPECT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env) ENV_NAME="${2:-}"; shift 2 ;;
+    --new) NEW="${2:-}"; shift 2 ;;
+    --allow-unverified) ALLOW_UNVERIFIED="${2:-}"; shift 2 ;;
+    --expect) EXPECT="${2:-}"; shift 2 ;;
+    *) die "unknown argument '$1'" ;;
+  esac
+done
+refuse_exported ENV "$ENV_NAME"
+refuse_exported NEW "$NEW"
+refuse_exported EXPECT "$EXPECT"
+refuse_exported ALLOW_UNVERIFIED "$ALLOW_UNVERIFIED"
 
 # Test seams. Loud when set, because each one replaces a safety step.
 VERIFY_CMD="${NOTME_PROMOTE_VERIFY_CMD:-bash $ROOT/scripts/worker-verify.sh}"
@@ -70,7 +97,7 @@ case "$ENV_NAME" in
     AUTH_BASE="https://auth-staging.notme.bot"
     SITE_BASE="https://staging.notme.bot"
     ;;
-  "") die "ENV=production or ENV=staging is required — neither environment is reachable by omission" ;;
+  "") die "ENV=production or ENV=staging is required on the task command line — neither environment is reachable by omission" ;;
   *) die "ENV must be 'production' or 'staging' (got '$ENV_NAME')" ;;
 esac
 
@@ -98,9 +125,9 @@ else
     task worker:verify VERSION=$NEW ENV=$ENV_NAME
   Emergency only: ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>"
   # Every field is checked, not just existence: a renamed file, a sampled run,
-  # or a failed run must not read as a pass.
+  # a failed run or a stale one must not read as a pass.
   EXPECT="$(node -e '
-    const [file, version, env, authBase] = process.argv.slice(1);
+    const [file, version, env, authBase, ttlH] = process.argv.slice(1);
     const r = JSON.parse(require("fs").readFileSync(file, "utf8"));
     const bad = [];
     if (r.schema !== "notme.release-evidence/v1") bad.push("schema");
@@ -111,41 +138,73 @@ else
     // A pass against a stub or a local Worker is not a pass against this env.
     if (r.auth_base !== authBase) bad.push("auth_base=" + r.auth_base);
     if (!/^[0-9a-f]{40}$/.test(r.commit || "")) bad.push("commit");
+    const age = Date.now() - Date.parse(r.checked_at);
+    if (!(age >= 0 && age <= Number(ttlH) * 3600_000)) bad.push("checked_at " + r.checked_at + " is older than " + ttlH + "h (or unreadable) — re-run the pinned soak");
     if (bad.length) { console.error("evidence record rejected: " + bad.join(", ")); process.exit(1); }
     console.error("evidence: pinned verify passed for " + version + " (" + env + ", build " + r.commit.slice(0, 12) + ") at " + r.checked_at);
     process.stdout.write(r.commit);
-  ' "$RECORD" "$NEW" "$ENV_NAME" "$AUTH_BASE")" || die "evidence record for $NEW is not a pinned pass ($RECORD)"
+  ' "$RECORD" "$NEW" "$ENV_NAME" "$AUTH_BASE" "$EVIDENCE_TTL_HOURS")" || die "evidence record for $NEW is not a fresh pinned pass ($RECORD)"
 fi
 
-# ── who holds traffic now: the rollback target ──
-PREV="$(wrangler deployments status --json ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} 2>/dev/null | node -e '
+# ── the rollback target, resolved BEFORE anything changes ──
+STATUS="$(wrangler deployments status --json ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} 2>/dev/null)" \
+  || die "cannot read the current deployment (wrangler deployments status failed) — no rollback target, so nothing was deployed"
+PREV="$(printf '%s' "$STATUS" | node -e '
+  const newId = process.argv[1];
   let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
     try {
-      const v = (JSON.parse(s).versions || []).slice().sort((a, b) => b.percentage - a.percentage);
+      const v = (JSON.parse(s).versions || [])
+        .filter((x) => x.version_id && x.version_id !== newId)
+        .sort((a, b) => b.percentage - a.percentage);
       process.stdout.write(v.length ? v[0].version_id : "");
-    } catch { /* unknown — reported below */ }
+    } catch { /* unparseable — empty, refused below */ }
   });
-')" || PREV=""
+' "$NEW")"
+[[ "$PREV" =~ $UUID_RE ]] || die "no rollback target: the current $ENV_NAME deployment lists no version other than $NEW — nothing was deployed"
 
-echo "▸ promoting $NEW to 100% of $ENV_NAME (expected build ${EXPECT:0:12}; prior: ${PREV:-unknown})"
+rollback() {
+  echo "▸ rolling back: promoting prior version $PREV to 100%" >&2
+  wrangler versions deploy "$PREV@100%" ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} --yes
+  # The version just failed in production; its old pass must not open the gate again.
+  rm -f "$RECORD"
+  echo "✗ rolled back to $PREV; removed $RECORD. Confirm with: task worker:verify ENV=$ENV_NAME" >&2
+}
+
+echo "▸ promoting $NEW to 100% of $ENV_NAME (expected build ${EXPECT:0:12}; rollback target: $PREV)"
+# From here until the verdict, an interrupt must not leave NEW at 100% unchecked.
+# shellcheck disable=SC2317,SC2329  # invoked by the trap
+on_interrupt() {
+  trap - INT TERM
+  echo "✗ interrupted after the deploy" >&2
+  # Async children ignore SIGINT in a non-interactive shell; stop the checks
+  # explicitly so nothing keeps probing after the rollback.
+  if [ -n "${CHECK_PID:-}" ]; then
+    pkill -TERM -P "$CHECK_PID" 2>/dev/null || true
+    kill "$CHECK_PID" 2>/dev/null || true
+  fi
+  rollback
+  exit 130
+}
+trap on_interrupt INT TERM
 wrangler versions deploy "$NEW@100%" ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} --yes
 
 post_check() {
-  AUTH_BASE="$AUTH_BASE" EXPECT="$EXPECT" VERSION="$NEW" $CONVERGE_CMD &&
-    AUTH_BASE="$AUTH_BASE" SITE_BASE="$SITE_BASE" ENV="$ENV_NAME" VERSION="$NEW" EXPECT="$EXPECT" $VERIFY_CMD
+  $CONVERGE_CMD --auth-base "$AUTH_BASE" --expect "$EXPECT" &&
+    $VERIFY_CMD --env "$ENV_NAME" --auth-base "$AUTH_BASE" --site-base "$SITE_BASE" --version "$NEW" --expect "$EXPECT"
 }
 
-if post_check; then
+# Run the checks in the background and wait: bash defers a trap until the
+# foreground child exits, so a Ctrl-C during the multi-minute convergence
+# would otherwise do nothing until convergence gave up.
+post_check &
+CHECK_PID=$!
+if wait "$CHECK_PID"; then
+  trap - INT TERM
   echo "✓ $NEW is serving 100% of $ENV_NAME and passed pinned verify"
   exit 0
 fi
+trap - INT TERM
 
 echo "✗ post-promote convergence/verify FAILED for $NEW in $ENV_NAME" >&2
-if [ -n "$PREV" ] && [ "$PREV" != "$NEW" ]; then
-  echo "▸ rolling back: promoting prior version $PREV to 100%" >&2
-  wrangler versions deploy "$PREV@100%" ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} --yes
-  echo "✗ rolled back to $PREV. Confirm with: task worker:verify ENV=$ENV_NAME" >&2
-else
-  echo "✗ NOT rolled back — prior version unknown. Run: task worker:versions ENV=$ENV_NAME, then promote the old id" >&2
-fi
+rollback
 exit 1
