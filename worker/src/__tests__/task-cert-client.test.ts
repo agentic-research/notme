@@ -1198,7 +1198,10 @@ describe("the legacy cutoff never silently turns off (flag vs env)", () => {
     // a valid value gets past the cutoff check (then fails on the missing dir, not exit 2)
     expect(run("--legacy-cutoff=2026-12-01").status).not.toBe(2);
     expect(run("--legacy-cutoff", "2026-12-01").status).not.toBe(2);
-  });
+    // Five real `pnpm exec tsx` spawns in sequence: each costs seconds on a
+    // loaded machine, so the 5 s default timed this test out with nothing
+    // wrong in the code. The budget is for process start-up, not for the CLI.
+  }, 60_000);
 });
 
 describe("tier.json records the criteria the authority granted", () => {
