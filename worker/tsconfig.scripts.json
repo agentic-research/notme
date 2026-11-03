@@ -19,6 +19,7 @@
     "src/__tests__/criteria.test.ts",
     "src/__tests__/destination-policy.test.ts",
     "src/__tests__/authority-host.test.ts",
+    "src/__tests__/invite-link-pages.test.ts",
     "../scripts/verify-ct-log.ts"
   ],
   "exclude": ["node_modules"]

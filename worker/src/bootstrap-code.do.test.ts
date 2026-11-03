@@ -464,3 +464,53 @@ describe("a bootstrap code is valid ONLY while nobody can authenticate (notme-ad
     expect(await stub.consumeBootstrapCode(code)).toBe(true);
   });
 });
+
+describe("invites are inside the reset, and inside a ceiling (notme-2131e8)", () => {
+  // An invite is a way in: redeeming one creates a principal with whatever
+  // scopes it names, authorityManage included. #hasAuthenticator does not
+  // count invites, so "reset left nobody able to authenticate" was only true
+  // if no invite survived the reset. Redemption checked redeemed_at
+  // and expires_at and nothing else — so one did.
+  it("invite.reset.revokes — an invite minted before resetPasskeyData cannot be redeemed after it", async () => {
+    const stub = authority("bs-reset-revokes-invites");
+    // A real granter, so the invite is live on its own terms before the reset
+    // (an invite whose inviter cannot grant it is dead anyway — review M2 —
+    // which would make this test pass for the wrong reason).
+    await stub.createPrincipalWithCapabilities("pre-reset-admin", ["bridgeCert", "authorityManage"]);
+    const invite = await stub.createInviteToken(
+      "pre-reset-admin",
+      ["bridgeCert", "authorityManage"],
+      3600,
+    );
+    expect(await stub.reserveInviteToken(invite.token, "pre-reset-probe")).not.toBeNull();
+    await stub.resetPasskeyData();
+    expect(await stub.reserveInviteToken(invite.token, "post-reset-stranger")).toBeNull();
+  });
+
+  // The TTL was caller-supplied and unclamped: `body.ttl ?? 3600` went
+  // straight into expires_at, so an authorityManage invite could be minted
+  // to live for a decade. The ceiling is the one the invite form already
+  // states (max="168" hours) — the API simply did not enforce it.
+  it("invite.ttl.ceiling — clamps an invite's lifetime to INVITE_MAX_TTL_SECONDS (7 days)", async () => {
+    const stub = authority("bs-invite-ttl-ceiling");
+    const tenYears = 10 * 365 * 24 * 3600;
+    const before = Date.now();
+    const invite = await stub.createInviteToken("admin", ["authorityManage"], tenYears);
+    const lifetimeS = (Date.parse(invite.expiresAt) - before) / 1000;
+    expect(lifetimeS).toBeLessThanOrEqual(7 * 24 * 3600 + 5);
+    expect(lifetimeS).toBeGreaterThan(7 * 24 * 3600 - 60);
+  });
+
+  it("invite.ttl.finite — refuses a non-finite TTL rather than minting an invite with no usable expiry", async () => {
+    // Inside the DO rather than over RPC: a rejected RPC promise surfaces as
+    // an unhandled rejection in this pool even when the test awaits it.
+    const { createInvite } = await import("./auth/principals");
+    await runInDurableObject(authority("bs-invite-ttl-nonfinite"), async (_auth, state) => {
+      for (const ttl of [Number.POSITIVE_INFINITY, Number.NaN]) {
+        expect(() => createInvite(state.storage.sql, "admin", ["bridgeCert"], ttl)).toThrow(
+          /finite/,
+        );
+      }
+    });
+  });
+});

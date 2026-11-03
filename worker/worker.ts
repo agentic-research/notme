@@ -913,7 +913,11 @@ async function handlePasskey(
       }
       // First user requires bootstrap code (proves deployer ownership)
       // Everyone else can register freely — gets bridgeCert scope only
-      if (result.isFirstUser && !body.bootstrapCode) {
+      // First-user standing is the authority's answer, not passkey.ts's
+      // "passkey_users is empty" (review L2): an authority whose admin signs
+      // in by OIDC has no passkey user, and that sent every invitee here.
+      const firstUser = await authority.registrationIsFirstUser();
+      if (firstUser && !body.bootstrapCode) {
         // A READ, not a mint (notme-addef9). This route is unauthenticated,
         // so calling getOrCreateBootstrapCode() here meant any stranger's
         // first request caused an admin credential to be minted and logged —
@@ -970,8 +974,10 @@ async function handlePasskey(
             );
         }
       }
-      if (result.isFirstUser) {
-        const valid = await authority.consumeBootstrapCode(body.bootstrapCode!);
+      if (firstUser) {
+        // Consumes the code AND marks this userId, so verify admits it as the
+        // admin — the mark, not a passkey count, is what verify trusts.
+        const valid = await authority.beginFirstUserRegistration(body.bootstrapCode!, userId);
         if (!valid) {
           return jsonErr("invalid or already-used bootstrap code", 403);
         }
@@ -992,29 +998,46 @@ async function handlePasskey(
       // Scopes come from the INVITE, never from the request: a caller that
       // could name its own scopes would make the gate decorative.
       let invitedScopes: string[] | null = null;
-      if (!result.isFirstUser) {
+      let reservationSecret: string | null = null;
+      if (!firstUser) {
         if (!body.inviteToken) {
           return jsonErr(
             "registration is invite-only — ask an administrator for an invite link",
             403,
           );
         }
-        const redeemed = await authority.redeemInviteToken(
+        // RESERVE, do not redeem (notme-3dfe15). Redeeming here burned the
+        // invite before the ceremony had happened, so a cancelled prompt
+        // spent it. The invite is consumed when THIS userId's credential
+        // verifies, and the principal is created with its scopes then.
+        const reserved = await authority.reserveInviteToken(
           body.inviteToken,
           userId,
         );
-        if (!redeemed) {
+        if (!reserved) {
           return jsonErr("invalid, expired or already-used invite", 403);
         }
-        invitedScopes = redeemed.scopes;
+        invitedScopes = reserved.scopes;
+        reservationSecret = reserved.secret;
       }
 
       // Deployer gets all; an invited user gets exactly what the invite says.
-      const scopes = result.isFirstUser
+      const scopes = firstUser
         ? [...(await import("./src/auth/admin-scopes")).ADMIN_SCOPES]
         : (invitedScopes ?? ["bridgeCert"]);
 
-      return Response.json({ ...result, userId, scopes });
+      const res = Response.json({ ...result, isFirstUser: firstUser, userId, scopes });
+      if (reservationSecret) {
+        // The reservation belongs to THIS browser (review M1): verify must
+        // present the secret, and HttpOnly keeps it out of page script, so
+        // learning the userId and challenge is no longer enough to finish
+        // someone else's ceremony.
+        res.headers.append(
+          "Set-Cookie",
+          `${INVITE_RESERVATION_COOKIE}=${reservationSecret}; Path=/auth/passkey/register; HttpOnly; Secure; SameSite=Strict; Max-Age=300`,
+        );
+      }
+      return res;
     }
 
     if (pathname === "/auth/passkey/register/verify") {
@@ -1032,7 +1055,14 @@ async function handlePasskey(
         body.response,
         host,
         origin,
+        parseCookie(request.headers.get("cookie") || "", INVITE_RESERVATION_COOKIE) ?? undefined,
       );
+      if (result.refused) {
+        // Verified, but not authorized: no live invite reservation (another
+        // registration consumed the invite first, or the window passed), no
+        // claim, not the first credential. Nothing was stored (notme-3dfe15).
+        return jsonErr("invalid, expired or already-used invite", 403);
+      }
       if (!result.verified) {
         return jsonErr("registration verification failed", 400);
       }
@@ -1064,7 +1094,11 @@ async function handlePasskey(
       // Scopes come from the GRANT STORE — never from the client body (scope
       // escalation vector) and no longer from the is_admin bit alone. The
       // passkey user becomes a principal with grants here, so its authority
-      // has one source and one revoke path (notme-77a024 finding b).
+      // has one source and one revoke path (notme-77a024 finding b). An
+      // invited registration's principal already exists by now, created
+      // with the INVITE's scopes when verification consumed the reservation
+      // (notme-3dfe15), so this returns those rather than enrolling it with
+      // bridgeCert.
       const scopes = await authority.ensurePasskeyPrincipal(
         body.userId,
         result.isAdmin,
@@ -1102,8 +1136,10 @@ async function handlePasskey(
           origin,
         );
       } catch (verifyErr: any) {
+        // Logged, not returned: verifier messages can carry the expected
+        // challenge (review M1).
         console.error("[passkey] verify error:", verifyErr.message);
-        return jsonErr("verification error: " + verifyErr.message, 400);
+        return jsonErr("verification error", 400);
       }
       if (!result.verified || !result.userId) {
         return jsonErr(
@@ -1143,9 +1179,16 @@ async function handlePasskey(
 
     return jsonErr("not found", 404);
   } catch (e: any) {
-    return jsonErr(e.message || "passkey error", 500);
+    // A constant body (review M1). @simplewebauthn's challenge-mismatch error
+    // names the EXPECTED challenge, so returning e.message handed the secret
+    // half of an in-flight ceremony to anyone who sent a wrong one.
+    console.error("[passkey] error:", e?.message);
+    return jsonErr("passkey error", 500);
   }
 }
+
+/** HttpOnly cookie binding an invite reservation to the reserving browser (review M1). */
+const INVITE_RESERVATION_COOKIE = "notme_invite_reservation";
 
 function parseCookie(cookieHeader: string, name: string): string | null {
   const match = cookieHeader
@@ -2443,6 +2486,11 @@ export default {
           ttl?: number;
         };
         const scopes = body.scopes ?? ["bridgeCert"];
+        // The DO clamps the lifetime to INVITE_MAX_TTL_SECONDS (notme-2131e8);
+        // a ttl that is not a finite number is a caller error, not a 500.
+        if (body.ttl !== undefined && (typeof body.ttl !== "number" || !Number.isFinite(body.ttl))) {
+          return jsonErr("ttl must be a finite number of seconds", 400);
+        }
         // Delegated authorization — granter must hold authorityManage AND
         // the specific scope being granted. canGrant() is the single source
         // of truth for the predicate (was duplicated inline pre-rosary-8119d0).
@@ -2461,7 +2509,10 @@ export default {
         const host = request.headers.get("host") || "auth.notme.bot";
         return Response.json({
           token: invite.token,
-          url: `https://${host}/join?t=${invite.token}`,
+          // The token rides in the FRAGMENT, which a browser never sends to
+          // the server (notme-3dfe15). As ?t= it was written into the
+          // invocation log of every request that opened the link.
+          url: `https://${host}/join#t=${invite.token}`,
           expiresAt: invite.expiresAt,
           scopes,
         });
@@ -2528,75 +2579,95 @@ export default {
         }
       }
 
-      // GET /join?t=<token> — redeem an invite (shows registration page)
+      // GET /join#t=<token> — the invite landing page. The token is in the
+      // fragment, so this request does not carry it (and must not require
+      // it); the page reads it from location.hash and POSTs it to /join.
       if (pathname === "/join" && request.method === "GET") {
-        const token = new URL(request.url).searchParams.get("t");
-        if (!token) return jsonErr("missing invite token", 400);
-        // Serve the login page — it will handle the invite token
         const baseUrl = env.SITE_URL || "https://notme.bot";
         return env.ASSETS.fetch(new Request(`${baseUrl}/_login`));
       }
 
-      // POST /join — redeem invite + register (passkey or OIDC)
+      // POST /join — start joining by invite (notme-3dfe15).
+      //
+      // WITHOUT a proof: reserve the invite and start a passkey registration
+      // — exactly /auth/passkey/register/options with this invite. Returns
+      // { options, userId, scopes } and NO session. The invite is consumed,
+      // and the principal created with its scopes, only when that passkey
+      // verifies at /auth/passkey/register/verify. This route used to redeem
+      // the invite and hand out a session immediately, for a principal with
+      // no authenticator at all: invisible to #hasAuthenticator, and the
+      // reason a failed passkey ceremony after it burned the invite.
+      //
+      // WITH an OIDC proof: the proof is verified FIRST — a bad one is 403
+      // (ERROR_STATUS.OIDC_PROOF_REJECTED) and spends nothing — and then the
+      // invite is redeemed, the principal created and the identity linked in
+      // one synchronous DO call. The link failure used to be swallowed, so a
+      // bad proof still burned the invite and returned a session.
       if (pathname === "/join" && request.method === "POST") {
         const body = (await request.json()) as {
           token: string;
           proof?: { type: string; token?: string };
         };
-        if (!body.token) return jsonErr("invite token required", 400);
+        if (!body.token || typeof body.token !== "string") {
+          return jsonErr("invite token required", 400);
+        }
+
+        if (!body.proof) {
+          // Forward ONLY what the delegate reads (review L3): the body is
+          // rebuilt and differs in length, so copying the original headers
+          // carried a stale Content-Length; cf-connecting-ip keys the
+          // registration rate limit.
+          const forwarded = new Headers({ "content-type": "application/json" });
+          const ip = request.headers.get("cf-connecting-ip");
+          if (ip) forwarded.set("cf-connecting-ip", ip);
+          return handlePasskey(
+            "/auth/passkey/register/options",
+            new Request(new URL("/auth/passkey/register/options", request.url), {
+              method: "POST",
+              headers: forwarded,
+              body: JSON.stringify({ inviteToken: body.token }),
+            }),
+            env,
+          );
+        }
+        if (body.proof.type !== "oidc" || !body.proof.token) {
+          return jsonErr("unsupported proof — omit it to join with a passkey, or send an oidc token", 400);
+        }
+
+        const { verifyOIDC } = await import("./src/auth/verify-proof");
+        let identity;
+        try {
+          identity = await verifyOIDC(body.proof.token, "notme.bot");
+        } catch (e: any) {
+          // Logged, not returned (review L4): verifier messages describe
+          // what the server expected (audience, issuer, key id).
+          console.error("[join] oidc proof rejected:", e?.message);
+          return jsonErr("invalid oidc proof", 403);
+        }
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-
-        // Create principal
-        const principalId = crypto.randomUUID();
-        const result = await authority.redeemInviteToken(
+        const joined = await authority.joinInviteWithFederated(
           body.token,
-          principalId,
+          identity.issuer,
+          identity.subject,
         );
-        if (!result) return jsonErr("invalid or expired invite", 403);
-
-        // Create principal with the invite's scopes
-        await authority.createPrincipalWithCapabilities(
-          principalId,
-          result.scopes,
-        );
-
-        // If OIDC proof provided, link it
-        if (body.proof?.type === "oidc" && body.proof.token) {
-          const { verifyOIDC } = await import("./src/auth/verify-proof");
-          try {
-            const identity = await verifyOIDC(body.proof.token, "notme.bot");
-            await authority.linkFederatedId(
-              principalId,
-              identity.issuer,
-              identity.subject,
-            );
-          } catch {
-            // OIDC link is optional — principal is created regardless
-          }
+        if (!joined.ok) {
+          return joined.reason === "already_linked"
+            ? jsonErr("this identity already belongs to a principal — sign in with it at /auth/oidc/login", 409)
+            : jsonErr("invalid or expired invite", 403);
         }
 
-        // Issue session
         const { createSessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
         const cookie = await createSessionCookie(
-          { principalId, scopes: result.scopes, authMethod: "invite" },
-          sessionSecret,
+          { principalId: joined.principalId, scopes: joined.scopes, authMethod: "invite" },
+          await authority.getSessionSecret(),
         );
-
         return new Response(
-          JSON.stringify({
-            joined: true,
-            principalId,
-            scopes: result.scopes,
-          }),
+          JSON.stringify({ joined: true, principalId: joined.principalId, scopes: joined.scopes }),
           {
             status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              "Set-Cookie": cookie,
-            },
+            headers: { "Content-Type": "application/json", "Set-Cookie": cookie },
           },
         );
       }

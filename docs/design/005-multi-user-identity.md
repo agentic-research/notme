@@ -278,20 +278,33 @@ The deployer's principal gets all three capability grants:
 ```
 1. Existing user (with authorityManage scope) creates an invite:
    POST /invites { scopes: ["bridgeCert"], ttl: 3600 }
-   -> returns { token: "a1b2c3d4...", url: "https://auth.example.com/join?t=a1b2c3d4" }
+   -> returns { token: "a1b2c3d4...", url: "https://auth.example.com/join#t=a1b2c3d4" }
+      (token in the fragment, never the query: a fragment is not sent to the
+      server, so it stays out of request logs -- notme-3dfe15)
 
 2. Inviter shares the URL (text message, email, QR code -- out of band)
 
 3. New user opens the URL
 4. System validates invite token (not expired, not redeemed)
-5. System creates a new principal with the scopes specified in the invite
-6. User is presented with authentication options:
+5. User is presented with authentication options:
    a. Register a passkey (preferred)
    b. Sign in with OIDC (if any provider tokens are available)
-7. Chosen credential is linked to the new principal
-8. Invite marked as redeemed
-9. Session cookie issued
+6. Chosen credential is verified
+7. Only then: invite marked as redeemed, principal created with the invite's
+   scopes, credential linked to it -- one atomic step in the DO
+8. Session cookie issued
 ```
+
+> **As built (notme-3dfe15).** The first version redeemed the invite and
+> created the principal at step 4, before any credential existed: a failed
+> passkey ceremony burned the invite, a successful one enrolled the principal
+> with `bridgeCert` whatever the invite said, and `POST /join` with no proof
+> issued a session to a principal with no authenticator. Now `POST /join`
+> without a proof (or `register/options` with `inviteToken`) only *reserves*
+> the invite for one WebAuthn user id and returns registration options;
+> `register/verify` consumes the reservation. `POST /join` with an OIDC proof
+> verifies the proof first (bad proof: 403, invite untouched) and refuses an
+> identity already linked to a principal (409).
 
 The invite token is the authorization to create an account. It replaces the
 "admin must be present" requirement. The invite is time-limited (default 1 hour),
@@ -299,7 +312,8 @@ single-use, and scoped (the inviter chooses what capabilities the invitee gets).
 
 **Security properties:**
 - The invite URL is a bearer token -- anyone who has it can use it
-- Time-limited (configurable, default 1 hour)
+- Time-limited (configurable, default 1 hour, clamped to a 7-day ceiling —
+  `INVITE_MAX_TTL_SECONDS`, notme-2131e8)
 - Single-use (redeemed_at is set on first use)
 - Scoped (invitee cannot escalate beyond what the invite grants)
 - Auditable (created_by, redeemed_by tracked)
@@ -521,11 +535,12 @@ But delegation is always bounded by the grantor's own capabilities.
 
 An invite URL is a bearer token. If leaked, anyone can create an account with the
 granted scopes. Mitigations:
-- Short TTL (default 1 hour, configurable)
+- Short TTL (default 1 hour, configurable up to a 7-day ceiling)
 - Single-use
 - Scoped (invitee gets only what the invite specifies)
 - Auditable (created_by is recorded)
-- Revocable (delete the invite before it is redeemed)
+- Revoked wholesale by `/auth/passkey/reset`, which deletes every unredeemed
+  invite (notme-2131e8). There is no per-invite revoke route.
 
 ### Threat: OIDC issuer compromise
 

@@ -327,7 +327,17 @@ const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
 import { keyIdFromSpki } from "./key-id";
 import { ADMIN_SCOPES, PRIOR_ADMIN_SCOPES, SIGNING_SCOPES } from "./auth/admin-scopes";
-import { ensurePrincipalSchema, grantCapability } from "./auth/principals";
+import {
+  consumeInviteReservation,
+  createPrincipal,
+  ensurePrincipalSchema,
+  findPrincipalByFederated,
+  grantCapability,
+  linkFederatedIdentity,
+  liveInvite,
+  redeemInvite,
+  reserveInvite,
+} from "./auth/principals";
 import type { CommitmentErrorCode } from "./receipts/commitment";
 import type { DelegatedJwtErrorCode } from "./jwt/delegated-claims";
 
@@ -410,6 +420,13 @@ function pemToB64(pem: string): string {
 
 function b64ToBytes(b64: string): Uint8Array {
   return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+/** A first-user mark lives as long as the registration challenge (passkey.ts, 5 min). */
+const FIRST_USER_REGISTRATION_TTL_S = 300;
+
+async function sha256Hex(s: string): Promise<string> {
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s))));
 }
 
 function hex(b: Uint8Array): string {
@@ -3236,16 +3253,152 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     response: any,
     rpId: string,
     origin: string,
-  ): Promise<{ verified: boolean; isAdmin: boolean }> {
+    /** The reservation secret from the browser's HttpOnly cookie (review M1). */
+    reservationSecret?: string,
+  ): Promise<{ verified: boolean; isAdmin: boolean; refused?: true }> {
     const { verifyRegistration } = await import("./auth/passkey");
-    return verifyRegistration(
+    // Hashed BEFORE the ceremony, so the admit block below stays synchronous.
+    const secretHash = reservationSecret ? await sha256Hex(reservationSecret) : "";
+    try {
+      return await verifyRegistration(
+        userId,
+        displayName,
+        response,
+        rpId,
+        origin,
+        this.ctx.storage.sql,
+        () => this.#admitRegistration(userId, secretHash),
+        // ONE transaction around admit AND the credential stores (review
+        // L1): the redeem, the principal, its grants, the passkey user and
+        // the credential commit together or not at all.
+        (fn) => this.ctx.storage.transactionSync(fn),
+      );
+    } catch (e: any) {
+      // A failed ceremony is an answer, not an exception to ship across RPC
+      // (review M1): verifier messages can name the expected challenge, and
+      // a thrown message is what the route used to hand back to the caller.
+      console.error("[passkey] registration verify failed:", e?.message);
+      // Burn the challenge here too: a store that threw rolled back with the
+      // transaction, challenge deletion included.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
+        userId,
+      );
+      return { verified: false, isAdmin: false };
+    }
+  }
+
+  /**
+   * Is this verified registration authorized? Runs synchronously inside
+   * verifyRegistration, after the attestation checks out and before the
+   * credential is stored (notme-3dfe15).
+   *
+   * Exactly three registrations are admitted, mirroring the gates on
+   * /auth/passkey/register/options:
+   *   - a FIRST-USER registration, marked by beginFirstUserRegistration once
+   *     options consumed the bootstrap code (review L2). The mark, not
+   *     "passkey_users is empty", is what makes the registrant the admin:
+   *     the count is empty on any authority whose admin has no passkey, and
+   *     trusting it handed the admin scopes to whatever reached verify;
+   *   - a claim registration, marked at options and finalized by the route;
+   *   - one holding a live invite reservation, which is CONSUMED here — the
+   *     invite is redeemed and the principal created with the invite's
+   *     scopes in the same block that stores the credential.
+   * Anything else — a reservation superseded by a registration that verified
+   * first, one past its window, none at all — stores nothing. Before this the
+   * gate lived only at options, so the bridgeCert fallback in
+   * ensurePasskeyPrincipal admitted any verified registration that slipped it.
+   */
+  #admitRegistration(userId: string, secretHash: string): false | { isAdmin: boolean } {
+    const sql = this.ctx.storage.sql;
+    const now = Math.floor(Date.now() / 1000);
+    this.#ensureFirstUserSchema();
+    sql.exec(
+      "DELETE FROM first_user_registrations WHERE user_id = ? AND expires_at > ?",
       userId,
-      displayName,
-      response,
-      rpId,
-      origin,
-      this.ctx.storage.sql,
+      now,
     );
+    const [first] = [...sql.exec<{ n: number }>("SELECT changes() AS n")];
+    if (first!.n === 1) return { isAdmin: true };
+    this.#ensureClaimSchema();
+    const [{ n }] = [
+      ...sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM bootstrap_claim_registrations WHERE user_id = ? AND expires_at > ?",
+        userId,
+        Math.floor(Date.now() / 1000),
+      ),
+    ];
+    if (n > 0) return { isAdmin: false };
+    const invite = consumeInviteReservation(sql, userId, secretHash);
+    if (!invite) return false;
+    createPrincipal(sql, userId, undefined, invite.createdBy);
+    for (const scope of invite.scopes) {
+      grantCapability(sql, userId, scope, invite.createdBy);
+    }
+    return { isAdmin: false };
+  }
+
+  // ── First-user registration (review L2) ──────────────────────────────
+
+  #ensureFirstUserSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS first_user_registrations (
+        user_id    TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+  }
+
+  /**
+   * Is a new registration a FIRST-USER (deployer) registration? True when no
+   * passkey user exists AND no administrator can sign in another way — a
+   * live authorityManage grant on a principal with a linked identity.
+   *
+   * Not "passkey_users is empty" alone (review L2): on an authority whose
+   * admin authenticates by OIDC, that sent every invitee to the bootstrap
+   * gate. Not "no administrator" alone either: a bare principal holding
+   * authorityManage (POST /cert bootstrap) or an admin whose passkeys a reset
+   * wiped cannot sign in, and the bootstrap gate is exactly how that
+   * authority is recovered (notme-976385, notme-4838ae).
+   */
+  #isFirstUserRegistration(ensurePasskeySchema: (sql: any) => void): boolean {
+    const sql = this.ctx.storage.sql;
+    ensurePasskeySchema(sql);
+    const [{ users }] = [...sql.exec<{ users: number }>("SELECT COUNT(*) AS users FROM passkey_users")];
+    if (users > 0) return false;
+    ensurePrincipalSchema(sql);
+    const [{ admins }] = [
+      ...sql.exec<{ admins: number }>(
+        "SELECT COUNT(*) AS admins FROM capability_grants g JOIN federated_identities f ON f.principal_id = g.principal_id WHERE g.scope = 'authorityManage' AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > datetime('now'))",
+      ),
+    ];
+    return admins === 0;
+  }
+
+  /** Would a registration starting now be a first-user registration? A read. */
+  async registrationIsFirstUser(): Promise<boolean> {
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    return this.#isFirstUserRegistration(ensurePasskeySchema);
+  }
+
+  /**
+   * Start a first-user registration for `userId`: still first-user, and the
+   * bootstrap code is valid (consumed). Marks the registration so verify
+   * admits it as the admin — and nothing else does.
+   */
+  async beginFirstUserRegistration(code: string, userId: string): Promise<boolean> {
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    if (!this.#isFirstUserRegistration(ensurePasskeySchema)) return false;
+    if (typeof code !== "string" || !(await this.consumeBootstrapCode(code))) return false;
+    this.#ensureFirstUserSchema();
+    const now = Math.floor(Date.now() / 1000);
+    this.ctx.storage.sql.exec("DELETE FROM first_user_registrations WHERE expires_at <= ?", now);
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO first_user_registrations (user_id, expires_at) VALUES (?, ?)",
+      userId,
+      now + FIRST_USER_REGISTRATION_TTL_S,
+    );
+    return true;
   }
 
   async passkeyAuthenticationOptions(rpId: string): Promise<any> {
@@ -3304,12 +3457,61 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return { token: invite.token, expiresAt: invite.expiresAt };
   }
 
-  async redeemInviteToken(
+  /**
+   * Reserve an invite for the passkey registration `userId` is starting
+   * (notme-3dfe15). Spends nothing: the invite is consumed only when that
+   * registration's credential verifies (#admitRegistration). Returns the
+   * scopes the invite will grant, or null when it is not live.
+   */
+  async reserveInviteToken(
     token: string,
-    redeemedBy: string,
-  ): Promise<{ scopes: string[] } | null> {
-    const { redeemInvite } = await import("./auth/principals");
-    return redeemInvite(this.ctx.storage.sql, token, redeemedBy);
+    userId: string,
+  ): Promise<{ scopes: string[]; secret: string } | null> {
+    // The secret goes to the reserving browser in an HttpOnly cookie and is
+    // required at verify (review M1); only its hash is stored here.
+    const secret = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const invite = reserveInvite(this.ctx.storage.sql, token, userId, await sha256Hex(secret));
+    return invite ? { scopes: invite.scopes, secret } : null;
+  }
+
+  /**
+   * Join by invite with an OIDC identity the caller has ALREADY VERIFIED
+   * (notme-3dfe15). One synchronous block: the invite is redeemed, the
+   * principal created with its scopes, and the identity linked — or nothing
+   * happens. Refuses an identity already linked to a principal: the link
+   * table's INSERT OR REPLACE would otherwise move someone's existing
+   * identity onto the new principal.
+   *
+   * The INVITE is checked first (review L4): answering "already linked" for
+   * a garbage invite told any holder of an id_token whether that identity
+   * had joined. Synchronous throughout, so the two reads and the writes
+   * cannot interleave with another join.
+   */
+  async joinInviteWithFederated(
+    token: string,
+    provider: string,
+    providerSub: string,
+  ): Promise<
+    | { ok: true; principalId: string; scopes: string[] }
+    | { ok: false; reason: "invalid_invite" | "already_linked" }
+  > {
+    const sql = this.ctx.storage.sql;
+    ensurePrincipalSchema(sql);
+    if (!liveInvite(sql, token)) return { ok: false, reason: "invalid_invite" };
+    if (findPrincipalByFederated(sql, provider, providerSub)) {
+      return { ok: false, reason: "already_linked" };
+    }
+    const principalId = crypto.randomUUID();
+    return this.ctx.storage.transactionSync(() => {
+      const invite = redeemInvite(sql, token, principalId);
+      if (!invite) return { ok: false as const, reason: "invalid_invite" as const };
+      createPrincipal(sql, principalId, undefined, invite.createdBy);
+      for (const scope of invite.scopes) {
+        grantCapability(sql, principalId, scope, invite.createdBy);
+      }
+      linkFederatedIdentity(sql, principalId, provider, providerSub);
+      return { ok: true as const, principalId, scopes: invite.scopes };
+    });
   }
 
   // ── Principal management ──
@@ -3490,12 +3692,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // deletes from passkey_credentials, federated_identities, principals, or
   // invites. Two invariants currently rest on that being true:
   //
-  //   1. The known gap in #hasAuthenticator — that it does not count
-  //      outstanding invites — is UNREACHABLE, because reaching "no
+  //   1. #hasAuthenticator does not count outstanding invites. That is safe
+  //      because this method now REVOKES them (notme-2131e8): "reset" is
+  //      total, so it cannot leave a live authorityManage invite behind. It
+  //      was already unreachable before that, and still is: reaching "no
   //      authenticator but a live authorityManage invite" requires losing a
   //      credential, which requires this method, which requires consuming a
   //      bootstrap code, which requires already having no authenticator. The
-  //      transition is circular (notme-2131e8). That last step is now
+  //      transition is circular. The revocation is what keeps that from
+  //      mattering when the circularity breaks. That last step is now
   //      ENFORCED rather than emergent: consumeBootstrapCode refuses once
   //      anyone can authenticate. The circularity used to hold only because
   //      a consumed code stayed consumed, which is a weaker reason.
@@ -3525,6 +3730,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec("DELETE FROM passkey_credentials");
     this.ctx.storage.sql.exec("DELETE FROM passkey_users");
     this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
+
+    // Revoke every outstanding invite (notme-2131e8). An invite is a way in
+    // that #hasAuthenticator does not count, so a reset that left one live
+    // left a way in the predicate cannot see — an authorityManage invite
+    // outliving the wipe it was supposed to be inside. Redeemed rows stay:
+    // they are the audit trail of who joined by whom, not a way in.
+    ensurePrincipalSchema(this.ctx.storage.sql);
+    this.ctx.storage.sql.exec("DELETE FROM invites WHERE redeemed_at IS NULL");
+    this.ctx.storage.sql.exec("DELETE FROM invite_reservations");
 
     // Rotate the session secret, invalidating every cookie issued before
     // this reset. Without it a reset revoked NOTHING: the secret was minted

@@ -343,7 +343,40 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //   revoke  — only ever STOPS renewal (narrows). A leaked stub could
       //             revoke machines: a denial of service strictly weaker than
       //             revokeEpoch.
-    ).toBe(62);
+      //
+      // 62 → 63: redeemInviteToken REMOVED; reserveInviteToken and
+      // joinInviteWithFederated added (notme-3dfe15). Reviewed:
+      //   redeemInviteToken — burned an invite without creating anything, so
+      //             the route that called it had to create the principal in a
+      //             second call; the gap between the two is the defect. Off
+      //             the surface.
+      //   reserve — writes a reservation row and grants nothing. The invite
+      //             is consumed only inside passkeyVerifyRegistration, by a
+      //             credential that verified. A stub holder needs the invite
+      //             token to reserve, and with it could already register.
+      //             It returns a fresh reservation secret (review M1) — the
+      //             caller's own, binding only the reservation it just made.
+      //   joinInviteWithFederated — redeems an invite and links an identity
+      //             the caller claims to have verified. A stub holder could
+      //             already do both (createPrincipalWithCapabilities,
+      //             linkFederatedId), so no new capability class; it also
+      //             refuses an identity that is already linked, which
+      //             linkFederatedId did not until review I1 (it now throws
+      //             on an existing link instead of moving it).
+      //
+      // 63 → 65: registrationIsFirstUser, beginFirstUserRegistration
+      // (review L2). Reviewed:
+      //   registrationIsFirstUser — a boolean read: "no passkey user and no
+      //             administrator with a linked identity". Strictly less than
+      //             getBootstrapState already tells an anonymous caller.
+      //   beginFirstUserRegistration — marks a userId as the deployer's
+      //             registration, but only after consumeBootstrapCode accepts
+      //             the code, which a stub holder could already call (and
+      //             with the code could already register as admin through
+      //             the route). It moves the admin decision OFF the
+      //             passkey_users count, which any stub-issued challenge on
+      //             an authority with no passkey user used to satisfy.
+    ).toBe(65);
   });
 });
 

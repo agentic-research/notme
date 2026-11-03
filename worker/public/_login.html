@@ -215,8 +215,16 @@ var returnTo = urlParams.get('return_to') || '/me';
 // Safety: only allow same-origin paths (no open redirect)
 if (returnTo.indexOf('/') !== 0 || returnTo.indexOf('//') === 0) returnTo = '/me';
 
-// Check for invite token in URL
-var inviteToken = urlParams.get('t');
+// Invite token: from the URL FRAGMENT (/join#t=…), which the browser never
+// sends to the server, so it stays out of request logs (notme-3dfe15). A
+// legacy ?t= link is NOT honoured: its token already reached a log, so the
+// page will not treat it as an invitation (review M3). The fragment is
+// scrubbed from the address bar and history once read.
+var hashParams = new URLSearchParams(window.location.hash.slice(1));
+var inviteToken = hashParams.get('t');
+if (inviteToken && window.history && window.history.replaceState) {
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+}
 if (inviteToken) {
   addLine('invite token detected.', 'info');
   addLine('register a passkey or paste an oidc token to join.', 'dim');
@@ -283,12 +291,20 @@ async function registerPasskey() {
   var bootstrapCode = document.getElementById('bootstrapInput').value.trim();
   setStatus('requesting registration...', 'info');
   try {
-    var body = inviteToken ? {} : (bootstrapCode ? { bootstrapCode: bootstrapCode } : {});
-    var optRes = await fetch('/auth/passkey/register/options', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
+    // An invite RESERVES at /join and is consumed only when the passkey
+    // below verifies (notme-3dfe15): a cancelled prompt does not spend it,
+    // and the new principal gets the invite's scopes.
+    var optRes = inviteToken
+      ? await fetch('/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: inviteToken })
+        })
+      : await fetch('/auth/passkey/register/options', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(bootstrapCode ? { bootstrapCode: bootstrapCode } : {})
+        });
 
     if (!optRes.ok) {
       var err = (await optRes.json()).error || 'failed';
@@ -319,22 +335,11 @@ async function registerPasskey() {
 
     setStatus('verifying...', 'info');
 
-    // If invite token, redeem via /join
-    if (inviteToken) {
-      var joinRes = await fetch('/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: inviteToken })
-      });
-      if (!joinRes.ok) throw new Error((await joinRes.json()).error || 'join failed');
-    }
-
     var verifyRes = await fetch('/auth/passkey/register/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         userId: data.userId,
-        scopes: data.scopes,
         response: {
           id: cred.id,
           rawId: bufToB64url(cred.rawId),
@@ -383,20 +388,11 @@ async function submitToken() {
 
   setStatus('verifying token...', 'info');
 
-  // Try as invite token first (short, UUID-like)
+  // An invite token (short, UUID-like) is not a login: it admits you to
+  // REGISTER a passkey, and is spent only when that passkey verifies.
   if (token.length < 40 && !token.includes('.')) {
-    try {
-      var joinRes = await fetch('/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: token })
-      });
-      if (joinRes.ok) {
-        setStatus('joined — redirecting...', 'ok');
-        setTimeout(function() { window.location.href = returnTo; }, 800);
-        return;
-      }
-    } catch(e) {}
+    inviteToken = token;
+    return registerPasskey();
   }
 
   // Try as OIDC JWT

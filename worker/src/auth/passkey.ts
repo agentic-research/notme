@@ -114,7 +114,28 @@ export async function verifyRegistration(
   rpId: string,
   origin: string,
   sql: any,
-): Promise<{ verified: boolean; isAdmin: boolean }> {
+  /**
+   * Runs after the attestation verifies and BEFORE anything is stored, in the
+   * same synchronous block as the inserts below (no await between them).
+   * Returning false refuses the registration and stores nothing. This is
+   * where the caller decides whether this registration was authorized — an
+   * invite reservation consumed, a claim marked — so the decision and the
+   * credential it admits cannot be separated (notme-3dfe15). It also decides
+   * whether the registrant is the ADMIN (review L2): `isFirstUser` is only
+   * "passkey_users is empty", which is not the same as "nobody administers
+   * this authority". The default keeps the old count-based answer for
+   * callers with no gate of their own.
+   */
+  admit: (isFirstUser: boolean) => false | { isAdmin: boolean } = (f) => ({ isAdmin: f }),
+  /**
+   * Wraps admit AND the stores in one transaction (review L1). In a Durable
+   * Object pass `fn => ctx.storage.transactionSync(fn)`: a throwing insert
+   * (e.g. a colliding credential_id) then rolls back the consumed invite and
+   * the principal admit created, instead of committing them with no
+   * credential. The default runs it bare, for callers with no transaction.
+   */
+  transact: <T>(fn: () => T) => T = (fn) => fn(),
+): Promise<{ verified: boolean; isAdmin: boolean; refused?: true }> {
   ensurePasskeySchema(sql);
 
   // Get stored challenge
@@ -140,53 +161,76 @@ export async function verifyRegistration(
 
   const expectedChallenge = challenges[0]!.challenge;
 
-  const verification = await verifyRegistrationResponse({
-    response,
-    expectedChallenge,
-    expectedOrigin: origin,
-    expectedRPID: rpId,
-  });
+  // A FAILED ceremony burns its challenge (review M1). Left in place, a
+  // challenge outlived every wrong guess at it for the full window; combined
+  // with an error body that named the expected value, one probe was enough
+  // to learn it and a second to use it.
+  const burnChallenge = () =>
+    sql.exec(
+      "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
+      userId,
+    );
+  let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
+  try {
+    verification = await verifyRegistrationResponse({
+      response,
+      expectedChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpId,
+    });
+  } catch (e) {
+    burnChallenge();
+    throw e;
+  }
 
   if (!verification.verified || !verification.registrationInfo) {
+    burnChallenge();
     return { verified: false, isAdmin: false };
   }
 
   const { credential } = verification.registrationInfo;
 
-  // Check if first user (auto-admin)
-  const users = sql
-    .exec("SELECT COUNT(*) as count FROM passkey_users")
-    .toArray() as Array<{ count: number }>;
-  const isFirstUser = (users[0]?.count ?? 0) === 0;
+  return transact(() => {
+    // Check if first user (auto-admin)
+    const users = sql
+      .exec("SELECT COUNT(*) as count FROM passkey_users")
+      .toArray() as Array<{ count: number }>;
+    const isFirstUser = (users[0]?.count ?? 0) === 0;
 
-  // Store user
-  sql.exec(
-    "INSERT OR IGNORE INTO passkey_users (user_id, display_name, is_admin) VALUES (?, ?, ?)",
-    userId,
-    displayName,
-    isFirstUser ? 1 : 0,
-  );
+    const decision = admit(isFirstUser);
+    if (!decision) {
+      return { verified: false, isAdmin: false, refused: true as const };
+    }
 
-  // Store credential — base64 encode public key for SQLite TEXT column
-  const pubKeyB64 = btoa(
-    String.fromCharCode(...new Uint8Array(credential.publicKey)),
-  );
-  sql.exec(
-    "INSERT INTO passkey_credentials (credential_id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)",
-    credential.id,
-    userId,
-    pubKeyB64,
-    credential.counter,
-    JSON.stringify(response.response.transports ?? []),
-  );
+    // Store user
+    sql.exec(
+      "INSERT OR IGNORE INTO passkey_users (user_id, display_name, is_admin) VALUES (?, ?, ?)",
+      userId,
+      displayName,
+      decision.isAdmin ? 1 : 0,
+    );
 
-  // Clean up challenge
-  sql.exec(
-    "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
-    userId,
-  );
+    // Store credential — base64 encode public key for SQLite TEXT column
+    const pubKeyB64 = btoa(
+      String.fromCharCode(...new Uint8Array(credential.publicKey)),
+    );
+    sql.exec(
+      "INSERT INTO passkey_credentials (credential_id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)",
+      credential.id,
+      userId,
+      pubKeyB64,
+      credential.counter,
+      JSON.stringify(response.response.transports ?? []),
+    );
 
-  return { verified: true, isAdmin: isFirstUser };
+    // Clean up challenge
+    sql.exec(
+      "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
+      userId,
+    );
+
+    return { verified: true, isAdmin: decision.isAdmin };
+  });
 }
 
 // ── Authentication ──

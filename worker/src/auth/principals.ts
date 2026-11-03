@@ -145,6 +145,26 @@ export function ensurePrincipalSchema(sql: any): void {
       redeemed_at TEXT
     )
   `);
+  // notme-3dfe15: one row per in-flight passkey registration started under an
+  // invite. Never a grant by itself — see reserveInvite.
+  //
+  // secret_hash: SHA-256 (hex) of the reservation secret held ONLY in the
+  // reserving browser's HttpOnly cookie. Consumption requires it, so knowing
+  // the userId and challenge is not enough to finish someone else's
+  // ceremony. A row without one ('' — a pre-column row) can never be consumed.
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS invite_reservations (
+      user_id     TEXT PRIMARY KEY,
+      token       TEXT NOT NULL,
+      expires_at  INTEGER NOT NULL,
+      secret_hash TEXT NOT NULL DEFAULT ''
+    )
+  `);
+  try {
+    sql.exec("ALTER TABLE invite_reservations ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''");
+  } catch {
+    /* column exists */
+  }
 }
 
 // ── Principal CRUD ──
@@ -305,7 +325,11 @@ export function linkFederatedIdentity(
   ensurePrincipalSchema(sql);
   const id = crypto.randomUUID();
   sql.exec(
-    "INSERT OR REPLACE INTO federated_identities (id, principal_id, provider, provider_sub, provider_email) VALUES (?, ?, ?, ?, ?)",
+    // Plain INSERT, not OR REPLACE (review I1): UNIQUE(provider, provider_sub)
+    // made "replace" MOVE an identity that already belonged to someone onto
+    // this principal. An existing link now throws; no caller relied on
+    // re-pointing.
+    "INSERT INTO federated_identities (id, principal_id, provider, provider_sub, provider_email) VALUES (?, ?, ?, ?, ?)",
     id, principalId, provider, providerSub, providerEmail ?? null,
   );
 }
@@ -342,14 +366,30 @@ export function getFederatedIdentities(sql: any, principalId: string): Federated
 
 // ── Invites ──
 
-const INVITE_DEFAULT_TTL_SECONDS = 3600;
+export const INVITE_DEFAULT_TTL_SECONDS = 3600;
+
+/**
+ * The longest an invite may live: 7 days (notme-2131e8).
+ *
+ * An invite is a bearer way in — whoever holds the link gets the scopes it
+ * names, authorityManage included — so its lifetime is exposure. The TTL is
+ * caller-supplied and was unclamped. 168 hours is not a new number: it is
+ * the ceiling the invite form (public/_invite.html, max="168") has always
+ * stated; the API simply did not enforce it. Enforced HERE, in the one
+ * function that writes expires_at, so no route can forget it.
+ */
+export const INVITE_MAX_TTL_SECONDS = 7 * 24 * 3600;
 
 export function createInvite(
   sql: any, createdBy: string, scopes: string[], ttlSeconds = INVITE_DEFAULT_TTL_SECONDS,
 ): Invite {
   ensurePrincipalSchema(sql);
+  if (typeof ttlSeconds !== "number" || !Number.isFinite(ttlSeconds)) {
+    throw new Error("invite ttl must be a finite number of seconds");
+  }
+  const ttl = Math.min(ttlSeconds, INVITE_MAX_TTL_SECONDS);
   const token = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
   sql.exec(
     "INSERT INTO invites (token, created_by, scopes, expires_at) VALUES (?, ?, ?, ?)",
     token, createdBy, JSON.stringify(scopes), expiresAt,
@@ -357,20 +397,111 @@ export function createInvite(
   return { token, createdBy, scopes, expiresAt };
 }
 
-export function redeemInvite(sql: any, token: string, redeemedBy: string): { scopes: string[] } | null {
+/** What a live invite grants, and who granted it. */
+export interface InviteGrant {
+  scopes: string[];
+  createdBy: string;
+}
+
+/** An invite that exists, is unredeemed and unexpired. A read — never a write. */
+export function liveInvite(sql: any, token: string): InviteGrant | null {
   ensurePrincipalSchema(sql);
+  if (typeof token !== "string" || token === "") return null;
   const rows = sql.exec(
-    "SELECT scopes, expires_at, redeemed_at FROM invites WHERE token = ?", token,
-  ).toArray() as Array<{ scopes: string; expires_at: string; redeemed_at: string | null }>;
+    "SELECT scopes, created_by, created_at, expires_at, redeemed_at FROM invites WHERE token = ?", token,
+  ).toArray() as Array<{ scopes: string; created_by: string; created_at: string; expires_at: string; redeemed_at: string | null }>;
 
   if (rows.length === 0) return null;
   const invite = rows[0];
   if (invite.redeemed_at) return null;
   if (new Date(invite.expires_at) < new Date()) return null;
+  // The ceiling applies to EXISTING rows too (review M3). The clamp is in
+  // createInvite, so an invite minted before it with a years-long TTL — the
+  // population whose ?t= links sit in invocation logs — would otherwise stay
+  // live. created_at is SQLite's "YYYY-MM-DD HH:MM:SS" (UTC, whole seconds),
+  // hence the slack; an unparsable row fails closed.
+  const createdMs = Date.parse(invite.created_at.replace(" ", "T") + "Z");
+  const lifetimeMs = Date.parse(invite.expires_at) - createdMs;
+  if (!Number.isFinite(lifetimeMs) || lifetimeMs > (INVITE_MAX_TTL_SECONDS + 60) * 1000) return null;
+  const scopes = JSON.parse(invite.scopes) as string[];
+  // The inviter's CURRENT grants must still allow every scope (review M2).
+  // canGrant ran only at mint, so revoking an admin left their outstanding
+  // invites able to hand out what was just taken away. All-or-nothing: an
+  // invite is refused rather than silently narrowed.
+  const granter = getCapabilities(sql, invite.created_by);
+  if (!scopes.every((s) => canGrant(granter, s))) return null;
+  return { scopes, createdBy: invite.created_by };
+}
 
+/**
+ * Mark an invite redeemed by `redeemedBy`. Synchronous, so a caller in a
+ * Durable Object can check, redeem and create the principal with no await in
+ * between — the single-use property is that block, not this UPDATE alone.
+ */
+export function redeemInvite(sql: any, token: string, redeemedBy: string): InviteGrant | null {
+  const invite = liveInvite(sql, token);
+  if (!invite) return null;
   sql.exec(
-    "UPDATE invites SET redeemed_by = ?, redeemed_at = datetime('now') WHERE token = ?",
+    "UPDATE invites SET redeemed_by = ?, redeemed_at = datetime('now') WHERE token = ? AND redeemed_at IS NULL",
     redeemedBy, token,
   );
-  return { scopes: JSON.parse(invite.scopes) };
+  return invite;
+}
+
+// ── Invite reservations: reserve at registration start, consume at verify ──
+//
+// notme-3dfe15 (parts 4/5). Redeeming an invite when the passkey ceremony
+// STARTS meant a cancelled or failed ceremony burned it, and enrolling the
+// principal separately at verify meant the invite's scopes were never applied
+// at all. A reservation records "WebAuthn user id U is registering under
+// invite T" without spending T; consumption happens when U's credential
+// verifies, together with creating U as a principal holding T's scopes.
+//
+// Several reservations may name one invite (a retry after a failed ceremony
+// starts a new one). The first to verify consumes the invite; every other one
+// then finds it redeemed and is refused. A reservation is not a lock, because
+// the token is the bearer credential — anyone able to reserve could equally
+// have redeemed.
+
+/** Same window as a registration challenge (passkey.ts, 5 minutes). */
+export const INVITE_RESERVATION_TTL_SECONDS = 300;
+
+/**
+ * Reserve `token` for registration `userId`, bound to the browser holding the
+ * secret whose SHA-256 is `secretHash` (review M1). null when the invite is
+ * not live.
+ */
+export function reserveInvite(
+  sql: any, token: string, userId: string, secretHash: string,
+): InviteGrant | null {
+  const invite = liveInvite(sql, token);
+  const now = Math.floor(Date.now() / 1000);
+  sql.exec("DELETE FROM invite_reservations WHERE expires_at <= ?", now);
+  if (!invite || !secretHash) return null;
+  sql.exec(
+    "INSERT OR REPLACE INTO invite_reservations (user_id, token, expires_at, secret_hash) VALUES (?, ?, ?, ?)",
+    userId, token, now + INVITE_RESERVATION_TTL_SECONDS, secretHash,
+  );
+  return invite;
+}
+
+/**
+ * Consume `userId`'s reservation: redeem the invite it names, for `userId`.
+ * Requires the reserving browser's secret (as its SHA-256): without it the
+ * reservation is left alone — so a caller who merely knows the userId can
+ * neither use it nor cancel it — and null is returned. With it, the
+ * reservation is deleted whether or not the invite is still live.
+ */
+export function consumeInviteReservation(
+  sql: any, userId: string, secretHash: string,
+): InviteGrant | null {
+  ensurePrincipalSchema(sql);
+  const rows = sql.exec(
+    "SELECT token, expires_at, secret_hash FROM invite_reservations WHERE user_id = ?", userId,
+  ).toArray() as Array<{ token: string; expires_at: number; secret_hash: string }>;
+  if (rows.length === 0) return null;
+  if (!secretHash || rows[0].secret_hash === "" || rows[0].secret_hash !== secretHash) return null;
+  sql.exec("DELETE FROM invite_reservations WHERE user_id = ?", userId);
+  if (rows[0].expires_at <= Math.floor(Date.now() / 1000)) return null;
+  return redeemInvite(sql, rows[0].token, userId);
 }

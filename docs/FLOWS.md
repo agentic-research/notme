@@ -59,7 +59,10 @@ sequenceDiagram
 ```
 
 **Registration is invite-only** after the first user (ADR-021). Scopes come
-from the invite, never from the request. The eventual gate is signet's trust
+from the invite, never from the request. An invite is *reserved* when the
+registration starts (`POST /join`, or `register/options` with `inviteToken`)
+and *consumed* only when the passkey verifies — a cancelled ceremony does not
+spend it (`notme-3dfe15`). The eventual gate is signet's trust
 policy bundle (`sigpol`); the invite is the interim mechanism, and the
 decision — that registration is a policy question about a subject notme does
 not own the registry for — is the same either way.

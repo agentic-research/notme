@@ -24,9 +24,10 @@ feel finished rather than merely argued.
 
 ## Stage 0: in flight now
 
-- **notme-2131e8 and notme-3dfe15** (invites and `/join`, H1) are being
-  worked in a side branch.
-- **Done today:**
+- **Done:**
+  - invites and `/join` (H1), merged from `fix/h1-invites-join` after two
+    security reviews. notme-2131e8 closed; notme-3dfe15 stays open for part 1
+    only (the OIDC nonce, which is the owner's decision);
   - phase 2, notme-bdc850 (see stage 3);
   - the P1 proxy IPv6 fix, notme-bad2e5 (daa3ab2);
   - notme-159805 and notme-ad2a7a: the code was already fixed; the missing
@@ -75,9 +76,12 @@ to publish the tag.
 ## Stage 2: hardening
 
 **H1, live-path security.** This gates the release tag.
-- notme-3dfe15: `/join` — no server-issued OIDC nonce; the invite token is in
-  the URL; the invite is consumed before the passkey verifies.
-- notme-2131e8: invites survive a passkey reset and have no TTL ceiling.
+- notme-3dfe15, **part 1 only:** `/join` has no server-issued OIDC nonce.
+  GitHub Actions tokens take no nonce, so this needs the owner's choice:
+  (A) single-use jti on `/join`, or (B) change the shared audience setting.
+  Parts 2 and 4/5 are merged.
+- notme-a2e75d: the first-user and claim marks are bound to the userId only,
+  not to the browser like invite reservations are.
 - notme-c9fc8c: renewal binding v2 doesn't commit to the enrollment, and
   there's a binding-version oracle.
 - notme-1629fe: the canonical fixture gate has no integrity anchor.
@@ -177,6 +181,8 @@ Listed so the count doesn't creep up unnoticed:
   notme-2098f4. The other deferred items became comments on beads that
   already own the area: notme-bdffc7, notme-bdeeb5, notme-070a8f,
   notme-229dc3.
+- **From the invite/`/join` security reviews (2026-11-02):** one new bead,
+  notme-a2e75d (first-user and claim marks not bound to the browser).
 - **Not filed:** the signet enforcement bead already existed
   (signet-be49b9). It now has the final encoding and a testable close
   condition, and notme-bdffc7 depends on it.
