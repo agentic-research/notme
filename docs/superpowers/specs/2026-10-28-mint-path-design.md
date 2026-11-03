@@ -213,9 +213,18 @@ Which binding a row accepts (`binding_version`):
   counted in `/admin/alarm-health` under `renewal.belowBinding` (review L1).
 - A key collected for the first time starts at 2, so a client that predates
   v3 keeps renewing; a key that was enrolled before (re-enrollment) starts
-  at 3, which is the only case v2 left open. The first v3 renewal raises a
-  row to 3. The task-cert client always generates a fresh key at enroll, so
-  it never meets the re-enrollment case.
+  at 3 (while the rollout gate below is on), which is the only case v2 left
+  open. The first v3 renewal raises a row to 3. The task-cert client always
+  generates a fresh key at enroll, so it never meets the re-enrollment case.
+- **What stays open** (review L2). A re-enrollment collected before deploy,
+  or while the gate is off, stays at 2, and nothing migrates it: forcing it
+  to 3 would strand a client that cannot sign v3. For such a row M4 stays
+  open until its client signs v3. Against it, a holder of the earlier
+  enrollment's key and tier.json can keep claiming or forking it with v2,
+  indefinitely; only holders of the same key can. A no-key attacker
+  replaying captured bytes is bounded by the request's age: 1 h to claim,
+  120 s to fork. Such rows are the active ones at binding 2 with a
+  superseded row for the same key.
 
 **Rollout gate** (review M1). Ids are handed out only while the worker var
 `RENEWAL_BINDING_V3` is `"on"` (default off). Off, no id goes out and a
