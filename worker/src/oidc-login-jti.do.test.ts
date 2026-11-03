@@ -14,10 +14,11 @@
  *
  * The rule now, /join's: no jti is 400; a jti spent in the shared
  * `jti:<jti>` keyspace is refused; the authority DO consumes
- * `oidc-login:<issuer>#<jti>` in the same synchronous block that resolves
+ * `oidc:<issuer>#<jti>` (the key /join spends too) in the same synchronous block that resolves
  * the principal and reads its scopes, kept past `exp` (review F2); a
  * successful login writes `jti:<jti>`; a refused login (unknown identity)
- * spends nothing; the rejection body is constant.
+ * spends nothing; no refusal carries verifier text (a rejected token is
+ * the constant `invalid oidc proof`).
  */
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
