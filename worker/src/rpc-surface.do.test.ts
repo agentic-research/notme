@@ -376,7 +376,14 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //             the route). It moves the admin decision OFF the
       //             passkey_users count, which any stub-issued challenge on
       //             an authority with no passkey user used to satisfy.
-    ).toBe(65);
+      //
+      // 65 → 66: loginWithFederated (review F1, notme-3dfe15 part 1).
+      // Reviewed: it returns the principal and scopes for an identity the
+      // caller claims to have verified, and spends a jti. A stub holder could
+      // already read both (findPrincipalByOIDC, getPrincipalScopes) and mint
+      // a session with getSessionSecret; the only write is a dpop_jtis row,
+      // which at worst pre-spends a token whose jti the holder already knows.
+    ).toBe(66);
   });
 });
 

@@ -2704,21 +2704,40 @@ export default {
         try {
           identity = await verifyOIDC(body.token, "notme.bot");
         } catch (e: any) {
-          return jsonErr("invalid token: " + e.message, 401);
+          // Logged, not returned (review F1, as /join's L4): verifier
+          // messages describe what the server expected.
+          console.error("[oidc-login] token rejected:", e?.message);
+          return jsonErr("invalid oidc proof", 401);
         }
+
+        // Single-use, exactly as /join (review F1): this mints a 24h
+        // session, so an unspent-jti check is the only thing stopping a
+        // spent or logged token from becoming one, again and again.
+        const jti = identity.claims?.jti;
+        if (typeof jti !== "string" || !jti) {
+          return jsonErr("jti claim required for replay protection", 400);
+        }
+        const exp = Number(identity.claims?.exp) || 0;
+        const jtiKey = `jti:${jti}`;
+        const spentElsewhere = Boolean(await platform.cache.get(jtiKey));
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
 
-        const principalId = await authority.findPrincipalByOIDC(
+        const loggedIn = await authority.loginWithFederated(
           identity.issuer,
           identity.subject,
+          { jti, exp, spentElsewhere },
         );
-        if (!principalId) {
-          return jsonErr("unknown identity — get an invite first", 403);
+        if (!loggedIn.ok) {
+          return loggedIn.reason === "proof_reused"
+            ? jsonErr("token already used", 401)
+            : jsonErr("unknown identity — get an invite first", 403);
         }
-
-        const scopes = await authority.getPrincipalScopes(principalId);
+        const { principalId, scopes } = loggedIn;
+        await platform.cache.put(jtiKey, "1", {
+          expirationTtl: Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
+        });
         const { createSessionCookie } = await import("./src/auth/session");
         const sessionSecret = await authority.getSessionSecret();
         const cookie = await createSessionCookie(

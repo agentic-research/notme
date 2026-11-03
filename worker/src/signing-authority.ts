@@ -333,6 +333,7 @@ import {
   createPrincipal,
   ensurePrincipalSchema,
   findPrincipalByFederated,
+  getCapabilities,
   grantCapability,
   linkFederatedIdentity,
   liveInvite,
@@ -3602,6 +3603,40 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    */
   static #oidcJoinJtiKey(issuer: string, jti: string): string {
     return `join-oidc:${issuer}#${jti}`;
+  }
+
+  /**
+   * Sign in with an OIDC identity the caller has ALREADY VERIFIED, spending
+   * the proof (review F1 of notme-3dfe15 part 1). The 24h session the route
+   * mints used to cost nothing but an unexpired token: any token for a
+   * linked identity — spent at /cert/gha, /cert, /token or /join, or read
+   * from a log — logged in, as often as it was presented.
+   *
+   * One synchronous block, as joinInviteWithFederated: the principal lookup,
+   * the jti consume (`oidc-login:<issuer>#<jti>`, kept past exp per F2) and
+   * the scope read cannot interleave with a concurrent login. A refusal
+   * spends nothing: an unknown identity returns before the consume, so the
+   * same token still works once its holder joins. `spentElsewhere` is the
+   * worker's read of the shared `jti:<jti>` KV keyspace.
+   */
+  async loginWithFederated(
+    provider: string,
+    providerSub: string,
+    proof: { jti: string; exp: number; spentElsewhere: boolean },
+  ): Promise<
+    | { ok: true; principalId: string; scopes: string[] }
+    | { ok: false; reason: "unknown_identity" | "proof_reused" }
+  > {
+    const sql = this.ctx.storage.sql;
+    this.#ensureSchema();
+    ensurePrincipalSchema(sql);
+    if (proof.spentElsewhere) return { ok: false, reason: "proof_reused" };
+    const principalId = findPrincipalByFederated(sql, provider, providerSub);
+    if (!principalId) return { ok: false, reason: "unknown_identity" };
+    if (!this.#consumeJti(`oidc-login:${provider}#${proof.jti}`, proof.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS)) {
+      return { ok: false, reason: "proof_reused" };
+    }
+    return { ok: true, principalId, scopes: getCapabilities(sql, principalId) };
   }
 
   // ── Principal management ──
