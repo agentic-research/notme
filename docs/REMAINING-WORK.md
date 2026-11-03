@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 77 in notme (`rsry status --json` →
+**Updated:** 2026-11-02 · **Open beads:** 78 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -58,9 +58,18 @@ them.
 6. **notme-229dc3:** apply for the IANA PEN (**owner**, then days to weeks at
    IANA), then swap `1.3.6.1.4.1.99999` for the assigned arc. This also
    removes the shared-arc collisions.
-7. **The stage 2 gate:** the release tag waits on the remaining live-path
+7. **Before deploy: cost guard** (docs/audits/2026-11-03-cost-estimate.md).
+   At current usage the bill is the $5/month Workers Paid base fee.
+   - **rig-ed460e:** the notme.bot rate-limit ruleset was never applied (it
+     isn't in tofu state), and as written it exceeds the Free plan's limits.
+     notme.bot has no edge spend guard today.
+   - **notme-ed6114:** /token and /.well-known reach the Durable Object before
+     any limit.
+   - **Owner:** set billing alerts, around $10 and $25, since Workers Paid has
+     no hard cap.
+8. **The stage 2 gate:** the release tag waits on the remaining live-path
    security fixes and the release-pipeline fixes (stage 2 groups H1 and H2).
-8. **notme-cf288e → tag → notme-8e8836:** promote staging → canary →
+9. **notme-cf288e → tag → notme-8e8836:** promote staging → canary →
    production (`task ship-prod`, **owner**), then cut the tag. The signed
    trust anchor (8e8836) closes when the release job signs it from that tag.
    **Deploy note (phase 2):** upgrade every `task-cert` checkout to 2a5dd9b
@@ -69,7 +78,7 @@ them.
    new `task-cert verify` (and later signet and LLO) refuses them with `tier
    carries criteria; the task names none`. Nothing breaks at deploy; recovery
    is `git pull` (mint reads `tier.pem` by default, no re-enrolment).
-9. **notme-bed754** closes when 1–8 are closed.
+10. **notme-bed754** closes when 1–9 are closed.
 
 Waiting on someone else: **notme-bc4cd2** (adopt LLO v0.21.0) waits for LLO
 to publish the tag.
@@ -197,6 +206,9 @@ Listed so the count doesn't creep up unnoticed:
   enrolment after a failed collect; pre-existing).
 - **From the /join nonce decision (2026-11-03):** notme-e3dede, the long-term
   design (B), in stage 4.
+- **From the pre-deploy cost estimate (2026-11-03):** rig-ed460e and
+  notme-ed6114, both deploy gates. The CT-log cost decisions went on
+  notme-1b46a8 as a comment.
 - **Not filed:** the signet enforcement bead already existed
   (signet-be49b9). It now has the final encoding and a testable close
   condition, and notme-bdffc7 depends on it.
