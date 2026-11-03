@@ -72,8 +72,9 @@ GHA_ALLOWED_OWNERS = "your-org"
 # backlog row marked logged, only if it carries this id and its signature
 # verifies under this key — so a wrong CT_LOG_PATH, shard or service cannot
 # put a stranger's SCTs in notme's certificates. Missing or malformed while
-# bound: nothing is submitted, every mint goes out unlogged (never refused),
-# and /admin/alarm-health reports `ct.configError` and counts `ct.unloggable`.
+# bound: nothing is submitted, every mint goes out unlogged (never refused)
+# with its final chains backlogged, and /admin/alarm-health reports
+# `ct.configError`; once the pin is fixed the backlog drains (notme-c0c9a2).
 # CT_LOG_ID = "<base64 log_id from trust/notme-ct-log.json>"
 # CT_LOG_KEY = "<base64 key from trust/notme-ct-log.json>"
 

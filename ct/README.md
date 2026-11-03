@@ -347,7 +347,12 @@ shard, or some other Worker behind the binding therefore shows up as
 `lastError` "wrong log" or "bad signature" and a growing backlog, not as
 certificates carrying SCTs that no verifier trusts. With either variable
 missing or malformed, nothing is submitted: every mint goes out unlogged
-(never refused) and health reports `configError` and counts `unloggable`.
+(never refused), its final chains are backlogged, and health reports
+`configError` (and `lastError` "config: ..."). The drain submits nothing
+while the pin is invalid; once `CT_LOG_ID` / `CT_LOG_KEY` are fixed, the next
+fires log those rows, each SCT verified under the pin, so a forgotten secret
+costs the embedded SCTs of that window but not the log entries
+(notme-c0c9a2).
 
 The log never causes a refusal. The authority can, and only in one case.
 The final certificate is signed after the `add-pre-chain` round-trip, and
@@ -375,15 +380,16 @@ up means the timeout, not the log, is the problem.
 | `backlog` | unlogged rows still being retried |
 | `oldestUnloggedAgeS` | age of the oldest such row, `null` when none |
 | `gaveUp` | unlogged rows that hit 24 attempts; still retried, at most once per 24 h per row, and counted here until logged |
-| `lastError` / `lastErrorAt` | last submission failure, with the reason: `HTTP <status>`, `timeout`, `invalid SCT`, `network error`, `wrong log` (SCT id is not `CT_LOG_ID`), `bad signature` (does not verify under `CT_LOG_KEY`) |
-| `unloggable` | `{count, lastAt, reason}`: mints that went out with no SCT and **no backlog row**: the root could not be read, `CT_LOG_ID` / `CT_LOG_KEY` are missing or malformed (`config: ...`), or the backlog INSERT failed |
+| `lastError` / `lastErrorAt` | last submission failure, with the reason: `HTTP <status>`, `timeout`, `invalid SCT`, `network error`, `wrong log` (SCT id is not `CT_LOG_ID`), `bad signature` (does not verify under `CT_LOG_KEY`); or `config: ...` from a mint that found the pin invalid and backlogged its chains. A drain fire skipped for an invalid pin does not overwrite it |
+| `unloggable` | `{count, lastAt, reason}`: mints that went out with no SCT and **no backlog row**: the root could not be read or parsed, or the backlog INSERT failed. (An invalid pin is not counted here: those mints are backlogged.) |
 | `embedFailed` | `{count, lastAt}`: mints whose SCTs verified but could not be embedded; they were backlogged instead |
 | `configError` | why `CT_LOG_ID` / `CT_LOG_KEY` cannot be trusted; `null` when they are valid (or `CT_LOG` is unbound) |
 
 Alert on:
 
 - **`configError` not `null`.** The binding is up but nothing is being
-  logged. Fix `CT_LOG_ID` / `CT_LOG_KEY` (runbook step 3).
+  logged; every mint is backlogged and `backlog` grows. Fix `CT_LOG_ID` /
+  `CT_LOG_KEY` (runbook step 3) and the backlog drains on the next fires.
 - **`lastError` reading `wrong log` or `bad signature`.** The binding reaches
   something that is not the pinned log: check `CT_LOG_PATH`, the `service`
   name, and that the pin is the shard's current key.
@@ -442,7 +448,7 @@ switch time loses nothing:
 
 Switching at the close is therefore the lesser loss: the last hour's
 certificates lose their embedded SCT but are still recorded. The real fix is
-choosing the shard per certificate by its `notAfter`; see the bead for
+choosing the shard per certificate by its `notAfter`; see notme-afa9d8 for
 per-cert shard selection. Until it lands:
 
 1. Add the next shard to `config.notme.json`, e.g. `notme2027h2` with
@@ -477,5 +483,5 @@ per-cert shard selection. Until it lands:
 - The log is not provisioned and nothing is pinned or bound.
 - Shard rollover (step 6) is a manual runbook step: nothing alerts ahead of
   `notme`'s 2027-07-01 close, and the authority logs to one shard at a time,
-  so the switch costs the last hour's embedded SCTs. See the bead for
+  so the switch costs the last hour's embedded SCTs. See notme-afa9d8 for
   per-cert shard selection.

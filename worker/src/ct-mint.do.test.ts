@@ -434,7 +434,7 @@ describe("ct.pin — only the pinned log's verified SCT is embedded", () => {
     ["CT_LOG_ID is not SHA-256(CT_LOG_KEY)", { CT_LOG_ID: OTHER_ID }, /CT_LOG_ID is not SHA-256\(CT_LOG_KEY\)/],
     ["CT_LOG_KEY not a P-256 key", { CT_LOG_KEY: btoa("not a key") }, /CT_LOG_KEY is not a P-256 SPKI/],
   ] as const) {
-    it(`${label} while bound: nothing submitted, minted unlogged, counted in health`, async () => {
+    it(`${label} while bound: nothing submitted, minted unlogged, BOTH final chains backlogged (notme-c0c9a2)`, async () => {
       await setMode("ok");
       const r = await mint({ envPatch: patch });
       expect(await received(), "an unpinned authority must not submit").toEqual([]);
@@ -442,11 +442,15 @@ describe("ct.pin — only the pinned log's verified SCT is embedded", () => {
         expect(oids(pem)).not.toContain(CT_SCT_LIST_OID);
         expect(oids(pem)).not.toContain(CT_POISON_OID);
       }
-      expect(r.backlog).toEqual([]);
+      // A fixable deploy mistake must not leave these certs unlogged for
+      // good: the final chains wait in the backlog for the pin to be fixed.
+      expectBacklogged(r);
       await expectWorkingPair(r);
-      expect(r.health.unloggable.count).toBe(1);
-      expect(r.health.unloggable.reason).toMatch(/^config: /);
-      expect(r.health.unloggable.reason).toMatch(reason);
+      expect(r.health.backlog).toBe(2);
+      // Recorded as an error, not as unloggable: the rows are recoverable.
+      expect(r.health.unloggable.count).toBe(0);
+      expect(r.health.lastError).toMatch(/^config: /);
+      expect(r.health.lastError).toMatch(reason);
       expect(r.health.configError).toMatch(reason);
     });
   }
@@ -860,16 +864,88 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
     });
   }
 
-  it("I1: the drain submits nothing while CT_LOG_KEY is missing; rows untouched, reason recorded", async () => {
+  it("I1: the drain submits nothing while CT_LOG_KEY is missing; rows untouched, configError is the signal", async () => {
     await withBacklog(2, async (a) => {
+      // A real submission error from before the pin broke.
+      a.ctx.storage.sql.exec(
+        "UPDATE ct_health SET last_error = 'add-chain failed for backlog row 1: HTTP 503', last_error_at = 7 WHERE id = 'ct'",
+      );
+      await a.alarm();
       await a.alarm();
       expect(rowsOf(a).every((r) => r.attempts === 0 && r.logged_at === null)).toBe(true);
       const h = await a.getAlarmHealth();
-      expect(h.ct.lastError).toMatch(/drain skipped: config: CT_LOG_KEY missing/);
       expect(h.ct.configError).toBe("CT_LOG_KEY missing");
+      // The skip is reported by configError; it does not clobber the last
+      // real submission error on every fire (notme-c0c9a2).
+      expect(h.ct.lastError).toBe("add-chain failed for backlog row 1: HTTP 503");
+      expect(h.ct.lastErrorAt).toBe(7);
       expect(h.failureCount).toBe(0);
     }, { envPatch: { CT_LOG_KEY: undefined } });
     expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(0);
+  });
+
+  it("notme-c0c9a2: certs minted while the pin is misconfigured wait in the backlog, then drain — verified — once it is fixed", async () => {
+    const name = `ct-pinfix-${++seq}-${crypto.randomUUID()}`;
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+    const mtls = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const sign = (await crypto.subtle.generateKey(
+      { name: "Ed25519" }, true, ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const stubKey = await control("ok");
+    const chains = await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as DrainAuth;
+      const good = { ...a.env };
+      const broken = { ...a.env };
+      delete broken.CT_LOG_KEY; // the forgotten secret
+      a.env = broken;
+      await a.mintBridgeCertPair({
+        subject: SUBJECT,
+        identity: `wimse://notme.bot/principal/${name}`,
+        mtlsPublicKeyPem: await spkiPem(mtls.publicKey),
+        signingPublicKeyPem: await spkiPem(sign.publicKey),
+        scopes: ["bridgeCert"],
+        authMethod: "gha-oidc",
+      });
+      expect(rowsOf(a)).toHaveLength(2);
+
+      // Misconfigured: the alarm fires, nothing is submitted, nothing moves.
+      await a.alarm();
+      expect(rowsOf(a).every((r) => r.attempts === 0 && r.logged_at === null)).toBe(true);
+      let h = await a.getAlarmHealth();
+      expect(h.ct.configError).toBe("CT_LOG_KEY missing");
+      expect(h.ct.backlog).toBe(2);
+
+      // The operator sets CT_LOG_KEY; the next fire logs both rows.
+      a.env = good;
+      await a.alarm();
+      expect(rowsOf(a).every((r) => r.logged_at !== null)).toBe(true);
+      h = await a.getAlarmHealth();
+      expect(h.ct.configError).toBeNull();
+      expect(h.ct.backlog).toBe(0);
+      return (
+        a.ctx.storage.sql.exec("SELECT chain_json FROM ct_backlog ORDER BY id").toArray() as Array<{
+          chain_json: string;
+        }>
+      ).map((r) => JSON.parse(r.chain_json) as string[]);
+    });
+    // Exactly those two final chains reached add-chain, and only after the fix.
+    const adds = (await received()).filter((r) => r.path.endsWith("/add-chain"));
+    expect(adds.map((r) => r.chain[0]).sort()).toEqual(chains.map((c) => c[0]).sort());
+    expect((await received()).filter((r) => r.path.endsWith("/add-pre-chain"))).toEqual([]);
+    // And the log's answer for each chain verifies, under the pin, over that
+    // final certificate's bytes (the same check the drain made before marking).
+    for (const chain of chains) {
+      const res = await ctLog().fetch("https://ct-log/ct/v1/add-chain", {
+        method: "POST",
+        body: JSON.stringify({ chain }),
+      });
+      const sct = (await res.json()) as SctResponse;
+      expect(
+        await verifySct(sct, { kind: "x509", certDer: fromB64(chain[0]!) }, await stubPin(stubKey)),
+      ).toBe("ok");
+    }
   });
 
   it("absent binding: the drain does nothing — no log call, rows untouched", async () => {

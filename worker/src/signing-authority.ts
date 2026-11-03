@@ -114,7 +114,8 @@ interface SigningAuthorityEnv {
    * its P-256 key. REQUIRED when CT_LOG is bound — an SCT is embedded, or a
    * backlog row marked logged, only if it carries this id and its signature
    * verifies under this key. Missing or malformed: nothing is submitted, the
-   * mint goes out unlogged, and health reports `configError`.
+   * mint goes out unlogged with its final chains backlogged (they drain
+   * once the pin is fixed), and health reports `configError`.
    */
   CT_LOG_ID?: string;
   CT_LOG_KEY?: string;
@@ -304,13 +305,19 @@ export interface CtHealth {
   lastErrorAt: number;
   /**
    * Mints that went out unlogged with NO backlog row, and the last reason:
-   * the root could not be read, CT_LOG_ID / CT_LOG_KEY are missing or
-   * malformed, or the backlog INSERT failed. The drain cannot recover these.
+   * the root could not be read or parsed, or the backlog INSERT failed. The
+   * drain cannot recover these. (CT_LOG_ID / CT_LOG_KEY missing or malformed
+   * is NOT counted here: those mints are backlogged and drain once the pin
+   * is fixed — see configError, notme-c0c9a2.)
    */
   unloggable: { count: number; lastAt: number; reason: string };
   /** Mints whose SCTs verified but could not be embedded; backlogged instead. */
   embedFailed: { count: number; lastAt: number };
-  /** Why CT_LOG_ID / CT_LOG_KEY cannot be trusted; null when bound and valid, or unbound. */
+  /**
+   * Why CT_LOG_ID / CT_LOG_KEY cannot be trusted; null when bound and valid,
+   * or unbound. While set, mints are backlogged and the drain submits
+   * nothing; lastError is left as the last real submission error.
+   */
   configError: string | null;
 }
 
@@ -685,7 +692,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Each row is a FINAL chain — [leaf, issuer], base64 DER — that carries
     // no SCT and still has to be recorded by the log via add-chain. Created
     // unconditionally (an empty table is free); rows are written only when
-    // CT_LOG is bound and a submission failed.
+    // CT_LOG is bound and a submission failed, or the pin is invalid.
     this.#ensureCtBacklogSchema();
     this.#initialized = true;
     // Once per DO start: existing deployers get the signing scopes the admin
@@ -1894,14 +1901,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return p.mint(p.pin, () => []);
     }
     // Bound but unpinned: an SCT could not be checked, so nothing is
-    // submitted. The mint goes out unlogged and is counted — never refused.
+    // submitted. The mint goes out unlogged — never refused — and its final
+    // chains are backlogged: the drain skips while the pin is invalid and
+    // logs them, verified, once CT_LOG_ID / CT_LOG_KEY are fixed, so a
+    // fixable deploy mistake does not leave them unlogged for good
+    // (notme-c0c9a2). health.configError is the alert.
     const logPin = await this.#ctLogPin();
+    const rootB64 = pemToB64(p.issuerPem);
     if ("error" in logPin) {
       console.error({ event: "ct.config_invalid", error: logPin.error });
-      this.#ctRecord("unloggable", `config: ${logPin.error}`);
-      return p.mint(p.pin, () => []);
+      this.#ctRecord("error", `config: ${logPin.error}; chains backlogged`);
+      return this.#mintUnloggedAndBacklog(p, rootB64);
     }
-    const rootB64 = pemToB64(p.issuerPem);
     let issuerSpki: Uint8Array;
     try {
       issuerSpki = spkiOf(b64ToBytes(rootB64));
@@ -1953,6 +1964,21 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     // Again: a failed embed above awaited, so check once more before signing.
     this.#refuseIfMintStateMoved(p.captured);
+    return this.#mintUnloggedAndBacklog(p, rootB64);
+  }
+
+  /**
+   * Mint with no CT extension and write every final chain to ct_backlog for
+   * the drain. A failed INSERT is counted as unloggable; the mint stands.
+   */
+  async #mintUnloggedAndBacklog<P, R>(
+    p: {
+      pin: P;
+      mint: (pin: P | undefined, ct: (i: number) => Extension[]) => Promise<R>;
+      pems: (r: R) => string[];
+    },
+    rootB64: string,
+  ): Promise<R> {
     const fin = await p.mint(p.pin, () => []);
     try {
       const now = Math.floor(Date.now() / 1000);
@@ -2049,7 +2075,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Each row is a FINAL chain — [leaf, issuer], base64 DER — that carries
     // no SCT and still has to be recorded by the log via add-chain. Created
     // unconditionally (an empty table is free); rows are written only when
-    // CT_LOG is bound and a submission failed.
+    // CT_LOG is bound and a submission failed, or the pin is invalid.
     sql.exec(`
       CREATE TABLE IF NOT EXISTS ct_backlog (
         id              INTEGER PRIMARY KEY,
@@ -2150,7 +2176,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * Anything else increments attempts and records lastError with the reason.
    * A row that cannot even be parsed counts as a failed attempt, so it ages
    * out instead of poisoning the batch. With CT_LOG_ID / CT_LOG_KEY invalid
-   * nothing is submitted and no row is touched. Callers wrap this in
+   * nothing is submitted, no row is touched and lastError is left alone
+   * (configError reports it). Callers wrap this in
    * try/catch: a drain error is never an alarm failure.
    */
   async #drainCtBacklog(): Promise<void> {
@@ -2159,7 +2186,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.#ensureCtSchema();
     const logPin = await this.#ctLogPin();
     if ("error" in logPin) {
-      this.#ctRecord("error", `drain skipped: config: ${logPin.error}`);
+      // health.configError already reports this on every read. Writing it to
+      // lastError on every fire would overwrite the last real submission
+      // error with the same config message (notme-c0c9a2).
+      console.warn({ event: "ct.drain_skipped", error: logPin.error });
       return;
     }
     const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
