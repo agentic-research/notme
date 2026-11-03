@@ -199,9 +199,21 @@ jobs:
       # the parsed DER, never file bytes (their framing differs by a newline).
       - name: Confirm trust/ is what production serves
         run: |
-          # No cache-busting query: /.well-known/* cache keys ignore it
-          # (notme-ed6114). This reads what clients are served.
+          # The PEM is edge-cached (a query no longer bypasses it, notme-ed6114)
+          # and nothing purges it on rotate(), so for up to its max-age it can
+          # be the PREVIOUS root — and a trust/ refreshed from that same stale
+          # copy would match it. So the served root must first carry the key
+          # the no-store KV CABundle names as current (/internal/ca-bundle,
+          # scripts/trust-anchor-freshness.ts); only then is "trust/ matches
+          # the served root" evidence about production.
           curl -fsS "https://auth.notme.bot/.well-known/ca-bundle.pem" -o live.pem
+          curl -fsS "https://auth.notme.bot/internal/ca-bundle" -o bundle.json
+          served=$(openssl x509 -in live.pem -noout -pubkey | openssl pkey -pubin -outform DER | tee spki.der | tail -c 32 | base64 -w0)
+          current=$(jq -r '.keys[.keyId] // empty' bundle.json)
+          if [ "$(stat -c %s spki.der)" != 44 ] || [ -z "$current" ] || [ "$served" != "$current" ]; then
+            echo "::error::the served root's key is not the authority's current key (keyId $(jq -r .keyId bundle.json)): the edge copy predates a rotate. Wait out its max-age, re-run 'task trust:refresh', and re-tag."
+            exit 1
+          fi
           if ! cmp -s <(openssl x509 -in live.pem -outform DER) \
                       <(openssl x509 -in trust/notme-root.pem -outform DER); then
             echo "::error::trust/notme-root.pem is not the served root. Run 'task trust:refresh', commit, and re-tag."

@@ -24,9 +24,12 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as x509 from "@peculiar/x509";
+import { rootKeyIsCurrent } from "./trust-anchor-freshness";
 
 const AUTHORITY = "https://auth.notme.bot";
 const BUNDLE = `${AUTHORITY}/.well-known/ca-bundle.pem`;
+/** The signed KV CABundle: no-store, names the live key (src/internal-ca-bundle.ts). */
+const LIVE_BUNDLE = `${AUTHORITY}/internal/ca-bundle`;
 const DIR = join(__dirname, "..", "trust");
 const check = process.argv.includes("--check");
 
@@ -36,9 +39,25 @@ const sha256Hex = async (b: ArrayBuffer) =>
     .join("");
 
 async function main() {
-  const res = await fetch(`${BUNDLE}?r=${Date.now()}`); // past the Cache API
+  // Edge-cached: a query no longer gets past the Cache API (/.well-known/*
+  // keys ignore it, notme-ed6114), and nothing purges it on rotate(). So the
+  // PEM is only trusted once the no-store CABundle confirms its key is the
+  // live one — otherwise this could write, or --check could bless, the root
+  // of a key the authority stopped using (review F2).
+  const res = await fetch(BUNDLE);
   if (!res.ok) throw new Error(`${BUNDLE} answered ${res.status}`);
   const live = new x509.X509Certificate(await res.text());
+  const cab = await fetch(LIVE_BUNDLE, { headers: { accept: "application/json" } });
+  if (!cab.ok) throw new Error(`${LIVE_BUNDLE} answered ${cab.status}`);
+  const bundle = (await cab.json()) as { keyId: string; keys: Record<string, string> };
+  if (!rootKeyIsCurrent(new Uint8Array(live.publicKey.rawData), bundle)) {
+    console.error(
+      `STALE EDGE COPY: ${BUNDLE} serves a root whose key is not the authority's current key ` +
+        `(${LIVE_BUNDLE} keyId ${bundle.keyId}). A rotate() is still inside the PEM's max-age ` +
+        "at this colo. Not writing or judging anything — re-run once it has expired.",
+    );
+    process.exit(3);
+  }
   const pin = JSON.parse(readFileSync(join(DIR, "notme-root.json"), "utf8"));
 
   const spki = await sha256Hex(live.publicKey.rawData);

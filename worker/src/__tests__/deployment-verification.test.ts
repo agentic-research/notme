@@ -1,11 +1,23 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const taskfile = readFileSync(
-  fileURLToPath(new URL("../../../Taskfile.yml", import.meta.url)),
-  "utf8",
-);
+const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
+const taskfile = read("Taskfile.yml");
+
+/** Every file under `dir` (relative to the repo root), recursively. */
+function filesUnder(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(join(ROOT, dir))) {
+    if (name === "node_modules") continue;
+    const rel = join(dir, name);
+    if (statSync(join(ROOT, rel)).isDirectory()) out.push(...filesUnder(rel));
+    else out.push(rel);
+  }
+  return out;
+}
 
 describe("post-deploy verification contract", () => {
   it("retries while a new Worker deployment converges", () => {
@@ -19,12 +31,29 @@ describe("post-deploy verification contract", () => {
     expect(taskfile).toMatch(/jwks\.json"[\s\S]+"crv":"Ed25519"/);
   });
 
-  it("does not claim a query bypasses the /.well-known cache", () => {
-    // It used to (notme-382e63). /.well-known/* keys now ignore the query
-    // (notme-ed6114), so a nonce there would read as a bypass it is not;
-    // what makes a post-deploy read fresh is the build in every key
-    // (cache-build-key.test.ts).
-    expect(taskfile).not.toMatch(/\.well-known\/[\w.-]+\?/);
+  it("no operator tool claims a query bypasses the /.well-known cache", () => {
+    // It used to work (notme-382e63). /.well-known/* keys ignore the query
+    // now (notme-ed6114), so a nonce there is a bypass that is not one — and
+    // refresh-trust-anchor.ts hid its nonce behind a variable
+    // (`${BUNDLE}?r=…`), which a literal-path grep missed (review F2). So:
+    // every operator surface, the literal form AND the appended form.
+    const files = ["Taskfile.yml", ...filesUnder("scripts"), ...filesUnder(".github/workflows")];
+    const literal = /\.well-known\/[\w.-]+\?/;
+    const appended = /\$\{[^}]*(BUNDLE|JWKS|EPOCHS|WELL_KNOWN)[^}]*\}\?/i;
+    const offenders = files.filter((f) => {
+      const s = read(f);
+      return literal.test(s) || appended.test(s);
+    });
+    expect(offenders).toEqual([]);
+  });
+
+  it("trust-anchor checks compare against the no-store CABundle, not only the edge-cached PEM", () => {
+    // After rotate() the edge keeps serving the old root for up to its
+    // max-age, and nothing purges it. A check that compares trust/ with that
+    // copy can agree with it and sign a stale anchor (review F2). The KV
+    // CABundle at /internal/ca-bundle is no-store and names the live key.
+    expect(read("scripts/refresh-trust-anchor.ts")).toContain("/internal/ca-bundle");
+    expect(read(".github/workflows/release.yml")).toContain("/internal/ca-bundle");
   });
 
   it("checks the unauthenticated passkey status contract", () => {
