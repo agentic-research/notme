@@ -53,7 +53,12 @@ now() { date +%s; }
 PROBE=$(mktemp)
 SETTLE_S=65 # epochs.json max-age (60s) plus margin
 probe() { curl -s -o "$PROBE" -w '%{http_code}' "$BASE/.well-known/epochs.json"; }
-kid() { python3 -c 'import json,sys;print([e for e in json.load(open(sys.argv[1]))["epochs"] if e["untilEpoch"] is None][0]["keyId"])' "$PROBE"; }
+# The live key's identity is its id AND its public bytes. listEpochKeys reads
+# the id before it loads the key, so a cold load that regenerated the key (the
+# bug this hunts) would show the OLD id beside the NEW key; comparing ids
+# alone would read "same key" (review F5, notme-ed6114). Comparing the bytes
+# is what "same key" means.
+kid() { python3 -c 'import json,sys;e=[e for e in json.load(open(sys.argv[1]))["epochs"] if e["untilEpoch"] is None][0];print(e["keyId"]+"/"+e["publicRawB64"])' "$PROBE"; }
 trap 'rm -f "$PROBE"' EXIT
 
 # Settle, then wait (up to 90s more) for the probe to return the wanted
@@ -93,9 +98,13 @@ else
   # Still 200: either the DO stayed warm (key in memory) or the row is NOT
   # sealed. Do not guess which.
   c=$(probe); k=$(kid 2>/dev/null || echo "?")
-  echo "INCONCLUSIVE: still serving ($c, key $k) $((SETTLE_S + 90))s after withdrawal." >&2
-  echo "  Same key and a warm DO is the likely reason; re-run after an eviction." >&2
-  echo "  A DIFFERENT key here means regeneration — a bug: report it on notme-41d0d3." >&2
+  if [[ $k != "$KID0" && $k != "?" ]]; then
+    echo "FAIL: still serving $((SETTLE_S + 90))s after withdrawal, with a DIFFERENT key ($KID0 → $k)." >&2
+    echo "  That is regeneration — a bug: report it on notme-41d0d3." >&2
+  else
+    echo "INCONCLUSIVE: still serving ($c, key $k) $((SETTLE_S + 90))s after withdrawal." >&2
+    echo "  Same key bytes and a warm DO is the likely reason; re-run after an eviction." >&2
+  fi
   tr -d '\n' < "$KEK_FILE" | wr secret put NOTME_KEK_SECRET >/dev/null
   exit 1
 fi
