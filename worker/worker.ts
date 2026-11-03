@@ -1898,6 +1898,18 @@ async function cacheMatch(
 }
 
 /**
+ * Cache lifetime for documents a verifier reads a KEY from (jwks.json,
+ * ca-bundle.pem). Nothing purges the Cache API or a client's copy on
+ * rotate(), so a rotation reaches such a verifier only once the edge entry
+ * AND its own copy expire — up to twice this. 300 s matches
+ * BUNDLE_MAX_AGE_MS, the bound ADR-019 D7 sets for the CABundle; at 3600 s a
+ * compromised key stayed trusted for about two hours (review F3,
+ * notme-ed6114). With the method gate and query-free keys this costs at most
+ * one DO call per document per colo per 5 minutes.
+ */
+const ROTATION_BOUND_CACHE_CONTROL = "public, max-age=300";
+
+/**
  * Serve a DO-backed public document through the Cache API (notme-ed6114,
  * review F1). The Cache API stores and matches GET only, so a HEAD or POST
  * used to miss every time and pay a call on the singleton authority — the
@@ -4245,7 +4257,7 @@ export default {
             const { buildJwksResponse } = await import("./src/auth/dpop-handler");
             return Response.json(buildJwksResponse(jwk), {
               headers: {
-                "Cache-Control": "public, max-age=3600",
+                "Cache-Control": ROTATION_BOUND_CACHE_CONTROL,
                 "Access-Control-Allow-Origin": "*",
               },
             });
@@ -4352,7 +4364,7 @@ export default {
             return new Response(pem, {
               headers: {
                 "Content-Type": "application/x-pem-file",
-                "Cache-Control": "public, max-age=3600",
+                "Cache-Control": ROTATION_BOUND_CACHE_CONTROL,
               },
             });
           } catch {

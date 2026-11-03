@@ -87,6 +87,20 @@ describe("routing.cache.query-ignored", () => {
   }
 });
 
+// A rotate() reaches a verifier of these documents only when both the edge
+// entry and the verifier's own copy expire: nothing purges either. 300 s
+// matches BUNDLE_MAX_AGE_MS, the bound ADR-019 D7 sets for the CABundle
+// (review F3). At 3600 s, a compromised key stayed trusted ~2 h.
+describe("routing.cache.rotation-bound", () => {
+  for (const path of ["/.well-known/jwks.json", "/.well-known/ca-bundle.pem"]) {
+    it(`${path} is cached for at most 300 s, at the edge and by the client`, async () => {
+      const res = await get(`${AUTH}${path}`, { BUILD_SHA: randomCommit() });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("public, max-age=300");
+    });
+  }
+});
+
 // THREAT_MODEL §8 `routing.cache.method-gate`. The Cache API serves GET
 // only, so before this any other method missed the cache every time — the
 // same free DO call the query string used to buy (review F1).

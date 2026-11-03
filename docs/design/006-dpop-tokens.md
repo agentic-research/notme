@@ -98,7 +98,16 @@ If no session: redirects to /login. Otherwise: browser JS generates keypair, min
 
 ### GET /.well-known/jwks.json (auth.notme.bot)
 
-Ed25519 public key in JWK format. Cached 1hr. Updates on key rotation (epoch change).
+Ed25519 public key in JWK format.
+
+> **CORRECTION (2026-11-03, `notme-ed6114`).** This said "Cached 1hr.
+> Updates on key rotation (epoch change)." Nothing updates it: `rotate()`
+> purges neither the Cache API nor a client's copy, so a rotation reaches a
+> verifier only when both expire. It is now `Cache-Control: public,
+> max-age=300` (edge and client), so a verifier that reads only this
+> document sees a rotation within about 10 minutes (edge 300 s + client
+> 300 s), not about 2 hours. The CABundle at `/internal/ca-bundle` is the
+> 5-minute path (ADR-019 D7).
 
 ```json
 { "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": "<b64url>", "kid": "<keyId>", "use": "sig", "alg": "EdDSA" }] }

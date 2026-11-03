@@ -48,7 +48,7 @@ now() { date +%s; }
 # now ignore the query (notme-ed6114: that bypass was free to anyone), and
 # `wrangler secret put` keeps the build, so the key stays the same too. So
 # the probe is epochs.json — it loads the live key like jwks.json does, but
-# is cached for 60s rather than an hour — and every wait first lets any entry
+# is cached for 60s rather than 300s — and every wait first lets any entry
 # written before the change expire. Timings below include that settle.
 PROBE=$(mktemp)
 SETTLE_S=65 # epochs.json max-age (60s) plus margin
