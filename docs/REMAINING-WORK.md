@@ -106,21 +106,58 @@ to publish the tag.
 
 **H2, a trustworthy release pipeline and gates.** This gates the release tag.
 - notme-16b2d5: `worker:promote` had no gate. Fixed on fix/release-pipeline-gates:
-  ENV is mandatory, promote needs a pinned-verify record for that exact version
-  (or a logged `ALLOW_UNVERIFIED` reason), and rolls back on a failed
-  post-promote verify. ship-prod no longer claims a rollback it never did.
+  ENV is mandatory and must be typed on the command line (a value equal to an
+  exported shell variable is refused). Promote needs a fresh (24 h) pinned-verify
+  record for that exact version, or a logged `ALLOW_UNVERIFIED` reason. It
+  resolves the rollback target before deploying and refuses if there is none,
+  and it rolls back on a failed post-promote check or an interrupt. ship-prod no
+  longer claims a rollback it never did, and it verifies production whatever the
+  shell exports.
 - notme-325916: the canary soak sampled traffic instead of targeting the new
   version. Fixed on fix/release-pipeline-gates: `worker:verify VERSION=<id>
-  ENV=<env>` pins every probe with the version-override header and brackets
-  each check with a pinned `/.well-known/version`; a pass writes the record
-  promote needs. Owner: run the first pinned soak on staging against a real
-  split before relying on it for production.
+  ENV=<env>` pins every probe with the version-override header and brackets each
+  check with a pinned `/.well-known/version` (commit, plus `version_id` once the
+  binding is live). It also requires `wrangler deployments status` to list the
+  version as serving. A pass writes the record promote needs.
 - notme-6ae724: CI had no runtime contract tests. Fixed on
-  fix/release-pipeline-gates: ci.yml `contract` boots the real Worker locally and
-  runs `worker:verify`'s checks on every PR (DO RPC was already covered by the
-  pool suite). The deployed half, `staging-smoke.yml`, is written but **does not
-  run until the owner adds `CLOUDFLARE_STAGING_API_TOKEN`** + two vars to the
-  `staging` environment.
+  fix/release-pipeline-gates: ci.yml `contract` boots the real Worker locally
+  and runs `worker:verify`'s checks on every PR (DO RPC was already covered by
+  the pool suite). The deployed half, `staging-smoke.yml`, is written but is
+  **skipped until the owner configures the `staging` environment** (below).
+- **Owner actions for H2** (none of these can be done from the repo):
+  1. GitHub, Settings, Environments, `staging`: set the deployment-branch
+     policy to **`main` only. This is MANDATORY before adding the secret.** The
+     token can deploy production too. Cloudflare API tokens can be scoped only to
+     an account or zone, not to one Worker script (Cloudflare docs, "Create
+     tokens via API": policies support User, Account and Zone resources only).
+     The only real isolation is a separate Cloudflare account for staging.
+     Without this policy, any branch can add a workflow that names
+     `environment: staging` and read the secret.
+  2. On that environment, add secret `CLOUDFLARE_STAGING_API_TOKEN`: Workers
+     Scripts:Edit and Workers KV Storage:Edit, this account only, with an expiry.
+     Add vars `CLOUDFLARE_ACCOUNT_ID` and `STAGING_KV_NAMESPACE_ID`, plus one
+     var per staging setting: `STAGING_SITE_URL`, `STAGING_SIGNET_AUTHORITY_URL`,
+     `STAGING_GHA_ALLOWED_OWNERS` (staging's own allowlist, never production's),
+     `STAGING_ALLOWED_AUDIENCES` and `STAGING_RENEWAL_BINDING_V3`. These become
+     staging's vars on every merge. Until they are set, the staging smoke job
+     shows as skipped.
+  3. Add `[version_metadata]` / `binding = "CF_VERSION_METADATA"`, at top level
+     and under `[env.staging.version_metadata]`, to the live, gitignored
+     `worker/wrangler.toml`, as in the template. Until then, pinned soaks identify
+     the version by commit plus the deployment listing, and promote warns.
+  4. Run the first pinned soak against a real staging split:
+     `task worker:canary NEW=<id> OLD=<cur> ENV=staging`, then
+     `task worker:verify VERSION=<id> ENV=staging`, then
+     `task worker:promote NEW=<id> ENV=staging`. `ship-prod` stays the default
+     production path until this passes.
+  5. Habits: type `ENV=` on every canary and promote command, and `unset` any
+     exported `ENV`/`NEW`/`EXPECT`/`ALLOW_UNVERIFIED`. Evidence expires after
+     24 h. To roll back to an older version, use `task worker:rollback`.
+- Left open from the pipeline security review (not blocking): the gate does
+  not match `site_base` (L1); a check retry after its bracket is not re-bracketed
+  (L2); there is no staging `deploy-preview` and no staging `worker:rollback`, so
+  owner action 4 needs one raw `wrangler versions upload --env staging` (L5); the
+  override log is local only (L7).
 - The alarm epic **notme-5c2511**, with notme-e992ad and notme-5d358a.
 
 **H3, correctness and hygiene.** Doesn't gate the tag.
