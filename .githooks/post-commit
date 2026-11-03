@@ -4,7 +4,7 @@
 # regenerate only the marked block and preserve everything else.
 
 # >>> rsry-managed (do not edit between these markers; `rsry hooks install` regenerates) >>>
-# rsry-hook post-commit v0.10.0 sha256:21e406da22968241f7d1272273121308530dacaf06b204340813eabc96fa4718
+# rsry-hook post-commit v0.10.1 sha256:21e406da22968241f7d1272273121308530dacaf06b204340813eabc96fa4718
 # Fold the commit-scoped bead record into the commit that named it
 # (rosary-e5bfd3, ADR-0024 amendment A).
 #

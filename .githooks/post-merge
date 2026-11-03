@@ -4,7 +4,7 @@
 # regenerate only the marked block and preserve everything else.
 
 # >>> rsry-managed (do not edit between these markers; `rsry hooks install` regenerates) >>>
-# rsry-hook post-merge v0.10.0 sha256:33416e9e336a45395b91cb52cac2c86850686b1b763771fe69bf96629019066c
+# rsry-hook post-merge v0.10.1 sha256:ec67905fe9973b71088023eadd9fc77fc3190387ad1cdb65a1191deb9efe1fb9
 REPO=$(basename "$PWD")
 BEADS_DIR=".beads/dolt/$REPO"
 if [ -d "$BEADS_DIR" ]; then
@@ -15,7 +15,7 @@ fi
 # hook: it may live in an ephemeral build/worktree path. RSRY_BIN is an
 # explicit override; PATH is the portable default; ~/.local/bin covers
 # PATH-restricted Git GUIs and launchd jobs.
-RSRY_HOOK_VERSION="0.10.0"
+RSRY_HOOK_VERSION="0.10.1"
 RSRY="${RSRY_BIN:-}"
 if [ -z "$RSRY" ]; then
     RSRY=$(command -v rsry 2>/dev/null || true)
@@ -45,6 +45,13 @@ else
     # `git pull` landed on the trunk (`[bead-id] … (#N)`) — no gh / webhook / tunnel.
     # Best-effort: never block or fail the merge.
     "$RSRY" close-merged --local --repo "$REPO" >/dev/null 2>&1 || true
+
+    # Trunk refresh (ADR-0024 amendment A, rosary-e5c0a0): on the trunk, after
+    # the merge, re-render every published bead from the store and commit the
+    # projection, then push. A refused push (PR-only trunk) parks the commit
+    # on rsry/trunk-refresh and resets the trunk — the tree stays clean.
+    # Best-effort; the primitive decides whether this checkout qualifies.
+    "$RSRY" bead trunk-refresh --push 2>&1 | grep -v '^\[rsry trunk-refresh\] skipped' >&2 || true
 
     # rsry version-drift nudge (rosary-d09889): in the rosary source repo, if this
     # pull moved the crate version past the installed binary, say so — the release

@@ -4,7 +4,7 @@
 # regenerate only the marked block and preserve everything else.
 
 # >>> rsry-managed (do not edit between these markers; `rsry hooks install` regenerates) >>>
-# rsry-hook pre-push v0.10.0 sha256:2fa8040cf4648c62ba85683b5fd8df08b415f797d3a0480de1483d51460b77d0
+# rsry-hook pre-push v0.10.1 sha256:2fa8040cf4648c62ba85683b5fd8df08b415f797d3a0480de1483d51460b77d0
 # Refuse to push when the PUSHED ref's tracked bead export is stale for the
 # beads the pushed commits name (rosary-e5c037). This gates the ARTIFACT, not
 # the checkout: the rosary-9c0e6c gate it replaces re-exported the whole store

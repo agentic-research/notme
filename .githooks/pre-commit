@@ -1,6 +1,6 @@
 #!/bin/sh
 # >>> rsry-managed (do not edit between these markers; `rsry hooks install` regenerates) >>>
-# rsry-hook pre-commit v0.10.0 sha256:65f22158c403eae846485aa828702c35539b3c720a7ee9e29a9aade884a728b2
+# rsry-hook pre-commit v0.10.1 sha256:65f22158c403eae846485aa828702c35539b3c720a7ee9e29a9aade884a728b2
 REPO=$(basename "$PWD")
 # The tracked bead projection is written by the COMMIT-MSG hook, scoped to the
 # beads the commit subject names (rosary-e5bfd3, ADR-0024 amendment A). It used
