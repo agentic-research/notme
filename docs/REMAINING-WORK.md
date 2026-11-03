@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 75 in notme (`rsry status --json` →
+**Updated:** 2026-11-02 · **Open beads:** 74 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -109,9 +109,6 @@ to publish the tag.
 - notme-325916: the canary soak samples traffic instead of targeting the new
   version.
 - notme-6ae724: no runtime contract tests in CI.
-- notme-070a8f: an alarm-health flake cascades across 8 files and can hide
-  real failures.
-- notme-3fc74b: plain-suite tests reach the live `auth.notme.bot`.
 - The alarm epic **notme-5c2511**, with notme-e992ad and notme-5d358a.
 
 **H3, correctness and hygiene.** Doesn't gate the tag.
@@ -195,7 +192,7 @@ Listed so the count doesn't creep up unnoticed:
 - **Closed by work (2026-11-02):** notme-bad2e5, notme-159805, notme-ad2a7a,
   notme-bdc850, notme-1a5465, notme-2131e8, notme-b51777, notme-b52d7c,
   notme-c9fc8c, notme-c0c9a2, notme-729801 (the P0), notme-1629fe,
-  notme-ed6114.
+  notme-ed6114, notme-070a8f, notme-3fc74b.
 - **Filed from the doc-drift batch (2026-11-02):**
   - notme-bad2e5 and notme-baea8c (proxy gaps);
   - a gen/go scope-check note, added to notme-ea5c65 rather than filed as a
@@ -223,6 +220,8 @@ Listed so the count doesn't creep up unnoticed:
   store and DPoP jti prefixing went onto notme-e3dede.
 - **From merging notme-1629fe (2026-11-03):** notme-34e933 (no branch
   protection on main or goalzero; owner action, gates the tag).
+- **From fixing notme-3fc74b (2026-11-03):** notme-73202e (the Durable Object
+  test suite has no network guard yet).
 - **Not filed:** the signet enforcement bead already existed
   (signet-be49b9). It now has the final encoding and a testable close
   condition, and notme-bdffc7 depends on it.
