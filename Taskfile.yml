@@ -192,16 +192,18 @@ tasks:
         check_request "landing" "GET" "${AUTH_BASE}/" "200" "identity authority"
         check_request "login" "GET" "${AUTH_BASE}/login" "200" "passkey"
         check_request "discovery" "GET" "${AUTH_BASE}/.well-known/signet-authority.json" "200" '"issuer"'
-        # Cache API entries survive Worker deployments. A unique query checks
-        # the newly deployed handler instead of the previous version's cache.
-        check_request "ca-bundle" "GET" "${AUTH_BASE}/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE" "200" "BEGIN CERTIFICATE"
+        # Cache API entries survive Worker deployments, but every key carries
+        # the build (src/cache-key.ts), so this reads the NEW build's entry.
+        # No query: /.well-known/* keys ignore it (notme-ed6114) — a bypass
+        # that worked for the verifier worked for any flood too.
+        check_request "ca-bundle" "GET" "${AUTH_BASE}/.well-known/ca-bundle.pem" "200" "BEGIN CERTIFICATE"
         # The SERVED root must carry the budget the code mints. Production
         # served pathlen:0 for five months after the code moved to pathlen=1,
         # because the DO's cache check asked only whether BasicConstraints
         # existed (notme-1b1db4). Every Issuing CA tier minted under that root
         # was unverifiable by any stock validator, and every test passed —
         # against a fresh test root. This reads the LIVE root, not a fixture.
-        ROOT_PATHLEN=$(curl -s "${AUTH_BASE}/.well-known/ca-bundle.pem?verify=$VERIFY_NONCE-pl" \
+        ROOT_PATHLEN=$(curl -s "${AUTH_BASE}/.well-known/ca-bundle.pem" \
           | openssl x509 -noout -text 2>/dev/null | grep -o 'pathlen:[0-9]*' | cut -d: -f2)
         if [ "$ROOT_PATHLEN" = "1" ]; then
           echo "✓ root-pathlen (served root admits one intermediate tier)"
@@ -222,7 +224,7 @@ tasks:
             FAIL=1
           fi
         fi
-        check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json?verify=$VERIFY_NONCE" "200" '"crv":"Ed25519"'
+        check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json" "200" '"crv":"Ed25519"'
         # The deployed build must be able to NAME ITSELF. Asserting
         # "stamped":true rather than merely a 200: an endpoint that always
         # answered "unknown" would pass a liveness check while telling a

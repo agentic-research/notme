@@ -43,3 +43,27 @@ describe("the cache key carries the build", () => {
     expect(json).not.toBe(html);
   });
 });
+
+describe("/.well-known/* keys ignore the query string (notme-ed6114)", () => {
+  it("a random query does not buy a fresh entry", () => {
+    setCacheBuild({ BUILD_SHA: "e".repeat(40) });
+    const bare = cacheKey(req("https://auth.notme.bot/.well-known/jwks.json")).url;
+    const busted = cacheKey(req("https://auth.notme.bot/.well-known/jwks.json?x=1&_build=forged")).url;
+    expect(busted).toBe(bare);
+  });
+
+  it("a caller cannot name the build either", () => {
+    // `_build` is the one parameter the key itself sets; a caller-supplied
+    // one must not survive alongside it.
+    setCacheBuild({ BUILD_SHA: "f".repeat(40) });
+    const u = new URL(cacheKey(req("https://auth.notme.bot/.well-known/epochs.json?_build=x")).url);
+    expect(u.searchParams.getAll("_build")).toEqual(["f".repeat(40)]);
+  });
+
+  it("other paths keep their query: it is not known to be irrelevant there", () => {
+    setCacheBuild({ BUILD_SHA: "1".repeat(40) });
+    const a = cacheKey(req("https://notme.bot/x?a=1")).url;
+    const b = cacheKey(req("https://notme.bot/x?a=2")).url;
+    expect(a).not.toBe(b);
+  });
+});

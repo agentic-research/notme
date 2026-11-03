@@ -82,6 +82,15 @@ Response: `{ "access_token": "<jwt>", "token_type": "DPoP", "expires_in": 300 }`
 > rate-limit `period` accepts only 10 or 60 seconds, so no hourly figure can
 > describe this binding. The effective ceiling is up to 1200 tokens per
 > principal per hour. The check runs only when the binding is present.
+>
+> **Order (2026-11-03, `notme-ed6114`).** Every check runs before the DO
+> call it guards. A request carrying a session cookie is first charged to
+> `token-ip:<source>` on the same binding (same 20/60 s; source is the IPv4
+> address, the IPv6 /64, or `none`, see THREAT_MODEL §4), because
+> the principal is unknown until the DO's session secret verifies the
+> cookie; the `token:${principalId}` check then runs before the live scopes
+> are read. A token exchange is keyed `token:${sub}` from the GitHub-signed
+> subject, before any DO call.
 
 ### GET /authorize (auth.notme.bot)
 
@@ -90,7 +99,16 @@ If no session: redirects to /login. Otherwise: browser JS generates keypair, min
 
 ### GET /.well-known/jwks.json (auth.notme.bot)
 
-Ed25519 public key in JWK format. Cached 1hr. Updates on key rotation (epoch change).
+Ed25519 public key in JWK format.
+
+> **CORRECTION (2026-11-03, `notme-ed6114`).** This said "Cached 1hr.
+> Updates on key rotation (epoch change)." Nothing updates it: `rotate()`
+> purges neither the Cache API nor a client's copy, so a rotation reaches a
+> verifier only when both expire. It is now `Cache-Control: public,
+> max-age=300` (edge and client), so a verifier that reads only this
+> document sees a rotation within about 10 minutes (edge 300 s + client
+> 300 s), not about 2 hours. The CABundle at `/internal/ca-bundle` is the
+> 5-minute path (ADR-019 D7).
 
 ```json
 { "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": "<b64url>", "kid": "<keyId>", "use": "sig", "alg": "EdDSA" }] }

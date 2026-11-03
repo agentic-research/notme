@@ -57,6 +57,17 @@ compares to production instead:
 **A changed SPKI is not a refresh.** It is a different authority and needs its
 own review. That is why the script stops there, not because of a bug.
 
+**The served PEM is edge-cached** (`notme-ed6114`). A query string no longer
+gets past the cache, and nothing purges it on `rotate()`, so for up to its
+`max-age` a colo can serve the previous root. Both the script and the release
+gate therefore first require the served root's key to be the one the no-store
+CABundle at `/internal/ca-bundle` names as current. If it is not (exit 3, or
+the release step's "edge copy predates a rotate"), wait out the `max-age` and
+run again. `rotate()` republishes the bundle to KV as it finishes, so what
+remains is KV's own edge caching: a colo can read the previous bundle for
+about 60 s after a rotation. Right after a rotation, wait a minute or two
+before refreshing or tagging.
+
 ## Why this exists
 
 Verification of a notme credential bottoms out in the root CA. Until now the

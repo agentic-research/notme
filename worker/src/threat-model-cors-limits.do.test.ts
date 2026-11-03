@@ -205,17 +205,32 @@ describe("passkey.register.rate-limit", () => {
   });
 
   it("an absent IP header does not silently share one bucket with everyone", async () => {
-    // It does fall back to a single "unknown" bucket — recorded here as the
-    // measured behaviour rather than asserted as a defence, because behind CF
-    // the header is always present and a test that pretended otherwise would
-    // be describing a deployment that does not exist.
+    // It does fall back to a single bucket of its own, "none"
+    // (src/client-ip-key.ts) — recorded here as the measured behaviour rather
+    // than asserted as a defence, because behind CF the header is always
+    // present and a test that pretended otherwise would be describing a
+    // deployment that does not exist.
     const rl = limiter(10);
     await call(
       "/auth/passkey/register/options",
       { method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
       { PASSKEY_LIMITER: rl.binding },
     );
-    expect(rl.keys).toEqual(["passkey:unknown"]);
+    expect(rl.keys).toEqual(["passkey:none"]);
+  });
+
+  it("buckets an IPv6 caller by its /64, as /token does (notme-ed6114)", async () => {
+    // One subscriber is routinely handed a whole /64; per-address keying gave
+    // it about 2^64 registration budgets (re-review NEW-2).
+    const rl = limiter(10);
+    for (const ip of ["2001:db8:5:6::1", "2001:db8:5:6:dead:beef:0:1"]) {
+      await call(
+        "/auth/passkey/register/options",
+        { method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": ip }, body: "{}" },
+        { PASSKEY_LIMITER: rl.binding },
+      );
+    }
+    expect(rl.keys).toEqual(["passkey:2001:db8:5:6::/64", "passkey:2001:db8:5:6::/64"]);
   });
 
   it("is checked BEFORE any authority work, so a flood costs no DO time", async () => {
@@ -279,13 +294,20 @@ describe("dpop.rate-limit", () => {
         TOKEN_LIMITER: rl.binding,
       });
     }
-    expect(rl.keys).toEqual(["token:alice", "token:bob"]);
+    expect(rl.keys.filter((k) => k.startsWith("token:"))).toEqual(["token:alice", "token:bob"]);
+    // Each cookie is first charged to its source address, BEFORE the DO
+    // reads the secret that verifies it (notme-ed6114,
+    // pre-do-limits.do.test.ts). Without a cf-connecting-ip they share the
+    // "none" bucket (src/client-ip-key.ts); behind Cloudflare the header is
+    // always present.
+    expect(rl.keys).toEqual(["token-ip:none", "token:alice", "token-ip:none", "token:bob"]);
   });
 
   it("an unauthenticated caller never reaches the limiter", async () => {
-    // The limiter runs AFTER session resolution, deliberately: keying on a
-    // principal requires knowing one. A stranger gets 401 and consumes no
-    // budget, which is the property that makes per-principal keying safe.
+    // A caller with NO cookie is refused 401 before any limiter or DO call,
+    // and consumes no budget. One WITH a cookie is charged to its address
+    // first (above): the principal is not known until the DO's secret
+    // verifies the cookie, and that read must not be free (notme-ed6114).
     const rl = limiter(0);
     const res = await call("/token", tokenReq(), { TOKEN_LIMITER: rl.binding });
     expect(res.status).toBe(401);

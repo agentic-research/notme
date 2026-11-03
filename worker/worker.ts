@@ -58,6 +58,7 @@ import { principalIdentity } from "./src/cert-authority";
 import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
 import { buildInfo } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
+import { clientIpBucket } from "./src/client-ip-key";
 import { isDeniedDestination } from "./src/destination-policy";
 
 /**
@@ -671,13 +672,6 @@ async function handleCertGHA(
 
   const cfg = getConfig(env);
 
-  try {
-    // Ensure CA bundle is published to KV (lazy init — first request bootstraps)
-    await ensureCurrentCABundle(env, platform);
-  } catch (e: any) {
-    return jsonErr("authority unavailable: " + e.message, 503);
-  }
-
   // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC)
   const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
   const authority = env.SIGNING_AUTHORITY.get(authorityId);
@@ -725,6 +719,17 @@ async function handleCertGHA(
     if (!allowed) {
       return jsonErr("rate limit exceeded", 429);
     }
+  }
+
+  try {
+    // Ensure CA bundle is published to KV (lazy init — first request
+    // bootstraps). AFTER the token, allowlist, jti and limiter checks
+    // (notme-ed6114): on a KV miss this is a generateBundle() on the
+    // singleton authority, and it used to run before the bearer token was
+    // read, so an anonymous or rate-limited request paid for it.
+    await ensureCurrentCABundle(env, platform);
+  } catch (e: any) {
+    return jsonErr("authority unavailable: " + e.message, 503);
   }
 
   // ── Bridge cert pair via PoP exchange (008) ──
@@ -864,7 +869,9 @@ async function handlePasskey(
   }
 
   if (env.PASSKEY_LIMITER) {
-    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    // IPv6 by its /64, no address its own bucket — as /token (notme-ed6114,
+    // src/client-ip-key.ts).
+    const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
     const { success } = await env.PASSKEY_LIMITER.limit({
       key: `passkey:${ip}`,
     });
@@ -1891,6 +1898,46 @@ async function cacheMatch(
     cacheEnabled = false;
     return undefined;
   }
+}
+
+/**
+ * Cache lifetime for documents a verifier reads a KEY from (jwks.json,
+ * ca-bundle.pem). Nothing purges the Cache API or a client's copy on
+ * rotate(), so a rotation reaches such a verifier only once the edge entry
+ * AND its own copy expire — up to twice this. 300 s matches
+ * BUNDLE_MAX_AGE_MS, the bound ADR-019 D7 sets for the CABundle; at 3600 s a
+ * compromised key stayed trusted for about two hours (review F3,
+ * notme-ed6114). With the method gate and query-free keys this costs at most
+ * one DO call per document per colo per 5 minutes.
+ */
+const ROTATION_BOUND_CACHE_CONTROL = "public, max-age=300";
+
+/**
+ * Serve a DO-backed public document through the Cache API (notme-ed6114,
+ * review F1). The Cache API stores and matches GET only, so a HEAD or POST
+ * used to miss every time and pay a call on the singleton authority — the
+ * same flood the query string bought before the key ignored it.
+ *
+ * GET and HEAD share the GET entry (HEAD gets its headers, no body; a cold
+ * HEAD warms it). Anything else is 405 before any DO work. `build` returns
+ * null to fall through to the caller's next handler.
+ */
+async function serveCachedPublic(
+  request: Request,
+  build: () => Promise<Response | null>,
+): Promise<Response | null> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return Response.json({ error: "method not allowed" }, { status: 405, headers: { Allow: "GET, HEAD" } });
+  }
+  const asGet =
+    request.method === "GET" ? request : new Request(request.url, { method: "GET", headers: request.headers });
+  let resp = (await cacheMatch(asGet)) ?? null;
+  if (!resp) {
+    const built = await build();
+    if (!built) return null;
+    resp = await cachePut(asGet, built);
+  }
+  return request.method === "HEAD" ? new Response(null, { status: resp.status, headers: resp.headers }) : resp;
 }
 
 export default {
@@ -3287,8 +3334,7 @@ export default {
         } catch {
           /* empty body */
         }
-        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const r = await authority.renewTier({
+        const params = {
           publicKeyPem: typeof body.public_key === "string" ? body.public_key : "",
           iat: typeof body.iat === "number" ? body.iat : NaN,
           proof: typeof body.proof === "string" ? body.proof : "",
@@ -3300,13 +3346,22 @@ export default {
           ...(body.enrollment_id !== undefined
             ? { enrollmentId: typeof body.enrollment_id === "string" ? body.enrollment_id : "" }
             : {}),
-        });
+        };
+        const refusalStatus = (reason: string) =>
+          reason === "unknown_key" ? 404
+          : reason === "invalid_key" || reason === "binding_v2_required" || reason === "binding_v3_required" ? 400
+          : reason === "stale_proof" || reason === "invalid_proof" ? 401
+          : 403;
+        // The bindings are request-only, so a forged proof is refused here,
+        // before it costs the singleton anything (notme-ed6114). The DO runs
+        // the same checks again; src/auth/renewal-precheck.ts mirrors them.
+        const { precheckRenewalProof } = await import("./src/auth/renewal-precheck");
+        const pre = await precheckRenewalProof(params);
+        if (!pre.ok) return Response.json({ error: pre.reason }, { status: refusalStatus(pre.reason) });
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.renewTier(params);
         if (!r.ok) {
-          const status =
-            r.reason === "unknown_key" ? 404
-            : r.reason === "invalid_key" || r.reason === "binding_v2_required" || r.reason === "binding_v3_required" ? 400
-            : r.reason === "stale_proof" || r.reason === "invalid_proof" ? 401
-            : 403;
+          const status = refusalStatus(r.reason);
           // revoked / horizon_passed / epoch_changed / approval_withdrawn /
           // fork_detected all mean "a human must approve again" — named, so
           // the machine can say which. binding_v2_required and
@@ -3926,6 +3981,23 @@ export default {
               const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
               const authority = env.SIGNING_AUTHORITY.get(authorityId);
 
+              // Rate limit — atomic, edge-fast (replaces the KV-based,
+              // TOCTOU-vulnerable limiter). EVERY check runs before the DO
+              // call it guards (notme-ed6114): the limiter used to run after
+              // getSessionSecret(), so any value in notme_session bought a
+              // billed RPC on the singleton authority before anything could
+              // refuse it. Two keys, because the principal is not known
+              // until the secret is in hand:
+              //   token-ip:<ip>  — before the secret is read for a cookie;
+              //   token:<sub>    — once the caller is known, before any
+              //                    further DO work on its behalf.
+              const rateLimited = async (key: string): Promise<boolean> => {
+                if (!env.TOKEN_LIMITER) return false;
+                const { success } = await env.TOKEN_LIMITER.limit({ key });
+                return !success;
+              };
+              const tooMany = () => Response.json({ error: "rate_limited" }, { status: 429 });
+
               // ── Resolve identity: session cookie OR client cert ──
               let principalId: string | null = null;
               let scopes: string[] = [];
@@ -3975,6 +4047,9 @@ export default {
                 principalId = claims.sub;
                 scopes = ["bridgeCert"];
                 exchanged = { jti: claims.jti, exp: Number(claims.exp) || 0 };
+                // GitHub-signed, so the subject is known (and not the
+                // caller's to vary) without asking the DO.
+                if (await rateLimited(`token:${principalId}`)) return tooMany();
                 sessionSecret = await authority.getSessionSecret();
               } else {
                 // Session cookie (browser/passkey users)
@@ -3983,6 +4058,13 @@ export default {
                   "notme_session",
                 );
                 if (cookie) {
+                  // Any string is a cookie until the secret says otherwise,
+                  // so this one is keyed on where it came from, not on what
+                  // it claims. No cookie, no DO call — and no budget spent.
+                  // IPv6 by its /64; no address is its own bucket (review F4,
+                  // src/client-ip-key.ts).
+                  const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+                  if (await rateLimited(`token-ip:${ip}`)) return tooMany();
                   const { verifySessionCookie, liveScopes } =
                     await import("./src/auth/session");
                   const secret: string = await authority.getSessionSecret();
@@ -3990,6 +4072,7 @@ export default {
                   const session = await verifySessionCookie(cookie, secret);
                   if (session) {
                     principalId = session.principalId;
+                    if (await rateLimited(`token:${principalId}`)) return tooMany();
                     // LIVE grants, not the cookie's copy (notme-486e8a): a
                     // revoked scope must not keep appearing in fresh tokens.
                     scopes = await liveScopes(session, authority);
@@ -4004,19 +4087,6 @@ export default {
                   return Response.json(
                     { error: "session_required" },
                     { status: 401 },
-                  );
-                }
-              }
-
-              // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
-              if (env.TOKEN_LIMITER) {
-                const { success } = await env.TOKEN_LIMITER.limit({
-                  key: `token:${principalId}`,
-                });
-                if (!success) {
-                  return Response.json(
-                    { error: "rate_limited" },
-                    { status: 429 },
                   );
                 }
               }
@@ -4162,45 +4232,45 @@ export default {
       // this is public key material, and an auditor is not a principal.
       // Requiring a credential to verify history would defeat the point.
       if (pathname === "/.well-known/epochs.json") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-        const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const epochs = await authority.listEpochKeys();
-        const resp = Response.json(
-          { epochs },
-          {
-            headers: {
-              // Short max-age: a rotation adds an entry, and an auditor
-              // fetching just after one should not be told the epoch is
-              // unknown. The set only ever grows, so a stale copy is
-              // incomplete rather than wrong.
-              "Cache-Control": "public, max-age=60",
-              "Access-Control-Allow-Origin": "*",
+        const served = await serveCachedPublic(request, async () => {
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const epochs = await authority.listEpochKeys();
+          return Response.json(
+            { epochs },
+            {
+              headers: {
+                // Short max-age: a rotation adds an entry, and an auditor
+                // fetching just after one should not be told the epoch is
+                // unknown. The set only ever grows, so a stale copy is
+                // incomplete rather than wrong.
+                "Cache-Control": "public, max-age=60",
+                "Access-Control-Allow-Origin": "*",
+              },
             },
-          },
-        );
-        return cachePut(request, resp);
+          );
+        });
+        if (served) return served;
       }
 
       if (pathname === "/.well-known/jwks.json") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        try {
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const jwk = await authority.getPublicKeyJwk();
-          const { buildJwksResponse } = await import("./src/auth/dpop-handler");
-          const resp = Response.json(buildJwksResponse(jwk), {
-            headers: {
-              "Cache-Control": "public, max-age=3600",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
-          return cachePut(request, resp);
-        } catch {
-          return jsonErr("authority unavailable", 503);
-        }
+        const served = await serveCachedPublic(request, async () => {
+          try {
+            const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+            const authority = env.SIGNING_AUTHORITY.get(authorityId);
+            const jwk = await authority.getPublicKeyJwk();
+            const { buildJwksResponse } = await import("./src/auth/dpop-handler");
+            return Response.json(buildJwksResponse(jwk), {
+              headers: {
+                "Cache-Control": ROTATION_BOUND_CACHE_CONTROL,
+                "Access-Control-Allow-Origin": "*",
+              },
+            });
+          } catch {
+            return jsonErr("authority unavailable", 503);
+          }
+        });
+        if (served) return served;
       }
 
       // Authority discovery — signet equivalent of openid-configuration.
@@ -4291,22 +4361,22 @@ export default {
       // CA certificate — self-signed X.509 from SigningAuthority DO.
       // CF mTLS trust store requires X.509 PEM, not raw public keys.
       if (pathname === "/.well-known/ca-bundle.pem") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        try {
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const pem: string = await authority.getCACertificatePem();
-          const resp = new Response(pem, {
-            headers: {
-              "Content-Type": "application/x-pem-file",
-              "Cache-Control": "public, max-age=3600",
-            },
-          });
-          return cachePut(request, resp);
-        } catch {
-          // DO not available — fall through to VPC proxy
-        }
+        const served = await serveCachedPublic(request, async () => {
+          try {
+            const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+            const authority = env.SIGNING_AUTHORITY.get(authorityId);
+            const pem: string = await authority.getCACertificatePem();
+            return new Response(pem, {
+              headers: {
+                "Content-Type": "application/x-pem-file",
+                "Cache-Control": ROTATION_BOUND_CACHE_CONTROL,
+              },
+            });
+          } catch {
+            return null; // DO not available — fall through to VPC proxy
+          }
+        });
+        if (served) return served;
       }
 
       // Content-negotiated landing at /

@@ -43,15 +43,28 @@ cd "$(dirname "$0")/../worker"
 wr() { pnpm exec wrangler "$@" "${WENV[@]}"; }
 now() { date +%s; }
 
-# A random query string defeats the Cache API (the key includes the query),
-# so every probe reaches the Durable Object and its key load.
+# The probe must reach the Durable Object's key load, not an edge copy. A
+# random query string used to defeat the Cache API, but /.well-known/* keys
+# now ignore the query (notme-ed6114: that bypass was free to anyone), and
+# `wrangler secret put` keeps the build, so the key stays the same too. So
+# the probe is epochs.json — it loads the live key like jwks.json does, but
+# is cached for 60s rather than 300s — and every wait first lets any entry
+# written before the change expire. Timings below include that settle.
 PROBE=$(mktemp)
-probe() { curl -s -o "$PROBE" -w '%{http_code}' "$BASE/.well-known/jwks.json?r=$RANDOM$RANDOM"; }
-kid() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["keys"][0]["kid"])' "$PROBE"; }
+SETTLE_S=65 # epochs.json max-age (60s) plus margin
+probe() { curl -s -o "$PROBE" -w '%{http_code}' "$BASE/.well-known/epochs.json"; }
+# The live key's identity is its id AND its public bytes. listEpochKeys reads
+# the id before it loads the key, so a cold load that regenerated the key (the
+# bug this hunts) would show the OLD id beside the NEW key; comparing ids
+# alone would read "same key" (review F5, notme-ed6114). Comparing the bytes
+# is what "same key" means.
+kid() { python3 -c 'import json,sys;e=[e for e in json.load(open(sys.argv[1]))["epochs"] if e["untilEpoch"] is None][0];print(e["keyId"]+"/"+e["publicRawB64"])' "$PROBE"; }
 trap 'rm -f "$PROBE"' EXIT
 
-# Wait (up to 90s) for the probe to return the wanted status class.
+# Settle, then wait (up to 90s more) for the probe to return the wanted
+# status class.
 await() { # $1 = ok|fail
+  sleep "$SETTLE_S"
   for _ in $(seq 1 45); do
     c=$(probe)
     if [[ $1 == ok && $c == 200 ]] || [[ $1 == fail && $c != 200 ]]; then echo "$c"; return 0; fi
@@ -85,9 +98,13 @@ else
   # Still 200: either the DO stayed warm (key in memory) or the row is NOT
   # sealed. Do not guess which.
   c=$(probe); k=$(kid 2>/dev/null || echo "?")
-  echo "INCONCLUSIVE: still serving ($c, key $k) 90s after withdrawal." >&2
-  echo "  Same key and a warm DO is the likely reason; re-run after an eviction." >&2
-  echo "  A DIFFERENT key here means regeneration — a bug: report it on notme-41d0d3." >&2
+  if [[ $k != "$KID0" && $k != "?" ]]; then
+    echo "FAIL: still serving $((SETTLE_S + 90))s after withdrawal, with a DIFFERENT key ($KID0 → $k)." >&2
+    echo "  That is regeneration — a bug: report it on notme-41d0d3." >&2
+  else
+    echo "INCONCLUSIVE: still serving ($c, key $k) $((SETTLE_S + 90))s after withdrawal." >&2
+    echo "  Same key bytes and a warm DO is the likely reason; re-run after an eviction." >&2
+  fi
   tr -d '\n' < "$KEK_FILE" | wr secret put NOTME_KEK_SECRET >/dev/null
   exit 1
 fi
@@ -95,7 +112,7 @@ fi
 # Recover: restore the SAME secret, measure time to serve again.
 t=$(now)
 tr -d '\n' < "$KEK_FILE" | wr secret put NOTME_KEK_SECRET >/dev/null
-await ok >/dev/null || { echo "FAIL: did not recover within 90s of restoring the secret" >&2; exit 1; }
+await ok >/dev/null || { echo "FAIL: did not recover within $((SETTLE_S + 90))s of restoring the secret" >&2; exit 1; }
 KID2=$(kid)
 [[ $KID2 == "$KID0" ]] || { echo "FAIL: recovered with a different key ($KID2)" >&2; exit 1; }
 echo "recovered       key $KID2 (same), time to recover $(( $(now) - t ))s"
