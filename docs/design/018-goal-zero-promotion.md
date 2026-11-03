@@ -54,7 +54,7 @@ that name the command to run.
   `AUTH_BASE`/`SITE_BASE`; `worker:verify-staging` runs the *same* checks
   against staging. One definition of "the service works," two targets.
 - **Canary/promote tasks**: `worker:versions`, `worker:canary NEW= OLD=
-  [PCT=10]`, `worker:promote NEW=` wrap Cloudflare gradual deployments so
+  ENV= [PCT=10]`, `worker:promote NEW= ENV=` wrap Cloudflare gradual deployments so
   the promotion unit is an explicit version id, and rollback is the same
   command pointed at the old id.
 
@@ -130,15 +130,45 @@ disposable by design (its CA is not trusted by anything).
 > splitting on this Worker routes as configured.
 
 **Entry:** Phase 1 green at the SHA being released.
-**Command:** `task ship-prod` — preflight → install → check → docs → deploy →
-**await-convergence** → verify, with the promotion steps runnable individually:
+**Command:** two paths, and only one of them is gated per version.
+
+*Direct path* — `task ship-prod`: preflight → install → check → docs → deploy →
+**await-convergence** → verify. The composite task is the gate. It does **not**
+roll back by itself (its description used to say it did, and nothing
+implemented it — `notme-16b2d5` Finding B); on a failed verify the new build is
+still serving 100%, and the exit is `task worker:rollback`.
+
+*Gated path* — promotion by version id:
 
 ```
-task worker:deploy-preview               # upload; stamps BUILD_SHA; prints id
-task worker:promote NEW=<id>             # 100% — atomic, no partial exposure
-task worker:await-convergence            # EXPECT=<sha>: N CONSECUTIVE samples
-task worker:verify                       # behavioural checks, only after that
+task worker:deploy-preview                                 # upload; stamps BUILD_SHA; prints id
+task worker:canary NEW=<id> OLD=<cur> ENV=production       # NEW enters the deployment
+task worker:verify VERSION=<id> ENV=production             # pinned soak; writes evidence
+task worker:promote NEW=<id> ENV=production                # refuses without that evidence
 ```
+
+**The promotion gate (`notme-16b2d5`).** `worker:promote` used to be
+`wrangler versions deploy NEW@100%` behind one precondition — that `NEW` was a
+non-empty string — so any version in the account's upload history reached 100%
+of production in one command, and an omitted `ENV` meant production. Now
+(`scripts/worker-promote.sh`, pinned by `promote-gate.test.ts`):
+
+- `ENV=production|staging` is mandatory on canary and promote; neither
+  environment is reachable by omission.
+- promote refuses unless `.release-evidence/<env>/<version-id>.json` records a
+  **pinned** verify pass for exactly that version in exactly that environment.
+  Only `worker:verify VERSION=<id>` writes one; a sampled verify never does.
+- after the deploy it awaits convergence on the recorded build, then verifies
+  pinned to `NEW`; if either fails it **promotes the prior version back** and
+  exits non-zero. That is the defined failure action.
+- the emergency override is `ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>`: a
+  typed reason, an explicit build sha, a loud banner, and a line appended to
+  `.release-evidence/overrides.log`.
+
+The record is a local file (the directory is gitignored). The gate stops the
+accident-shaped failures — wrong id, wrong environment, never-verified
+artifact — not an operator who forges JSON. Paste the record into the release
+bead as part of the evidence bundle.
 
 **The ordering is the design.** Identity first, behaviour second: the
 convergence gate polls `/.well-known/version` (stamped with `BUILD_SHA` at
@@ -156,10 +186,13 @@ rollback that is the same mechanism as promotion. Identity-critical changes
 (auth/, signing-authority, cert-exchange, DPoP) take their soak on staging,
 where a broken version costs nothing.
 
-**Rollback:** `task worker:promote NEW=<old-id>`, then
-`worker:await-convergence` against the OLD sha, then `worker:verify` — the
-convergence caveat applies on the way back too, which is exactly when nobody
-wants to wait for it.
+**Rollback:** `task worker:promote NEW=<old-id> ENV=production`, which runs
+convergence against the OLD sha and a pinned verify itself — the convergence
+caveat applies on the way back too, which is exactly when nobody wants to wait
+for it. A version that was once promoted through the gate has a record (the
+post-promote pinned verify refreshes it), so rolling back to it needs no
+override. A version that reached traffic by `ship-prod` has none: use
+`task worker:rollback`, or the override with its sha.
 
 **Hard constraint (unchanged):** a version carrying a new `[[migrations]]`
 entry promotes atomically anyway — Durable Object migrations do not split —
@@ -189,7 +222,7 @@ provenance/signature verification steps green (they are part of the
 workflows, not manual).
 
 **Rollback:**
-- Service: `task worker:promote NEW=<old-id>` (or `task worker:rollback`).
+- Service: `task worker:promote NEW=<old-id> ENV=production` (or `task worker:rollback`).
 - Images: previous tags remain; consumers pin digests (cloister fail-closed
   pinning refuses an unresolvable digest — ADR-0041), so a bad image is
   fixed by cutting `v<X.Y.Z+1>`, never by moving a tag.

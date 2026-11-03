@@ -105,7 +105,10 @@ to publish the tag.
   not to the browser like invite reservations are.
 
 **H2, a trustworthy release pipeline and gates.** This gates the release tag.
-- notme-16b2d5: `worker:promote` has no gate.
+- notme-16b2d5: `worker:promote` had no gate. Fixed on fix/release-pipeline-gates:
+  ENV is mandatory, promote needs a pinned-verify record for that exact version
+  (or a logged `ALLOW_UNVERIFIED` reason), and rolls back on a failed
+  post-promote verify. ship-prod no longer claims a rollback it never did.
 - notme-325916: the canary soak samples traffic instead of targeting the new
   version.
 - notme-6ae724: no runtime contract tests in CI.

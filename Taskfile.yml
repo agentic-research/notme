@@ -339,43 +339,55 @@ tasks:
       - task: worker:deploy-staging
       - task: worker:verify-staging
 
-  # ENV selects the wrangler environment: unset = production, ENV=staging =
-  # the staging Worker. The SAME three tasks drive both, so the canary path
-  # rehearsed on staging is literally the one that promotes production —
-  # rather than a staging rehearsal of a different command (same reasoning as
-  # worker:verify's AUTH_BASE/SITE_BASE).
+  # ENV selects the wrangler environment and is REQUIRED on every task that
+  # moves traffic: ENV=production or ENV=staging, never a default. An omitted
+  # ENV used to mean production, so a staging rehearsal with a dropped
+  # `ENV=staging` promoted production (notme-16b2d5, Finding D). The SAME
+  # tasks drive both, so the canary path rehearsed on staging is literally the
+  # one that promotes production — rather than a staging rehearsal of a
+  # different command (same reasoning as worker:verify's AUTH_BASE/SITE_BASE).
   worker:versions:
     desc: "List uploaded versions — ids for canary/promote/rollback ([ENV=staging])"
     dir: worker
     vars:
-      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
+      ENV_FLAG: '{{if eq .ENV "staging"}}--env staging{{end}}'
     cmds:
       - pnpm exec wrangler versions list {{.ENV_FLAG}}
 
   worker:canary:
-    desc: "Split traffic: NEW=<version-id> OLD=<version-id> [PCT=10] [ENV=staging]"
+    desc: "Split traffic: NEW=<version-id> OLD=<version-id> ENV=<production|staging> [PCT=10]"
     dir: worker
     vars:
       PCT: '{{.PCT | default "10"}}'
-      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
+      ENV_FLAG: '{{if eq .ENV "staging"}}--env staging{{end}}'
     preconditions:
+      - sh: '[ "{{.ENV}}" = production ] || [ "{{.ENV}}" = staging ]'
+        msg: "ENV=production or ENV=staging is required — neither is reachable by omission"
       - sh: test -n "{{.NEW}}"
         msg: "NEW=<version-id> is required (task worker:versions to list)"
       - sh: test -n "{{.OLD}}"
         msg: "OLD=<version-id> is required — the id traffic falls back to"
+      # atoi("abc") is 0 and 100-110 is -10: validate before the arithmetic.
+      - sh: 'echo "{{.PCT}}" | grep -Eq "^[1-9][0-9]?$"'
+        msg: "PCT must be an integer 1-99"
     cmds:
+      - echo "▸ canary on {{.ENV}} — {{.NEW}} @ {{.PCT}}%, {{.OLD}} @ {{sub 100 (atoi .PCT)}}%"
       - pnpm exec wrangler versions deploy "{{.NEW}}@{{.PCT}}%" "{{.OLD}}@{{sub 100 (atoi .PCT)}}%" {{.ENV_FLAG}} --yes
+      - echo "Next — soak PINNED to the new version (a sampled verify is not evidence about it)"
+      - echo "  task worker:verify VERSION={{.NEW}} ENV={{.ENV}}"
 
   worker:promote:
-    desc: "Route 100% of traffic to NEW=<version-id> ([ENV=staging])"
-    dir: worker
-    vars:
-      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
-    preconditions:
-      - sh: test -n "{{.NEW}}"
-        msg: "NEW=<version-id> is required (task worker:versions to list)"
+    desc: "Route 100% to NEW=<version-id> ENV=<production|staging> — gated on a pinned verify of THAT version; rolls back on failure"
+    # The gate, the override (ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>), and
+    # the post-promote converge → pinned verify → rollback live in the script
+    # so they are testable without a Cloudflare account (promote-gate.test.ts).
+    env:
+      NEW: "{{.NEW}}"
+      ENV: "{{.ENV}}"
+      ALLOW_UNVERIFIED: "{{.ALLOW_UNVERIFIED}}"
+      EXPECT: "{{.EXPECT}}"
     cmds:
-      - pnpm exec wrangler versions deploy "{{.NEW}}@100%" {{.ENV_FLAG}} --yes
+      - bash scripts/worker-promote.sh
 
   docs:check:
     desc: Verify doc claims against code
@@ -458,13 +470,13 @@ tasks:
       - task: worker:deploy-preview
       - echo ""
       - echo "Preview version uploaded. To go live (canary path):"
-      - echo "  task worker:versions                   # find NEW/OLD version ids"
-      - echo "  task worker:canary NEW=<id> OLD=<id>   # 10% canary (PCT=n to change)"
-      - echo "  task worker:verify                     # smoke test during soak"
-      - echo "  task worker:promote NEW=<id>           # 100% after soak"
-      - echo "  task worker:promote NEW=<old-id>       # rollback = promote the old id"
+      - echo "  task worker:versions ENV=production                  # find NEW/OLD version ids"
+      - echo "  task worker:canary NEW=<id> OLD=<id> ENV=production  # 10% canary (PCT=n to change)"
+      - echo "  task worker:verify VERSION=<id> ENV=production       # PINNED soak; records evidence"
+      - echo "  task worker:promote NEW=<id> ENV=production          # refuses without that evidence"
+      - echo "  task worker:promote NEW=<old-id> ENV=production      # rollback = promote the old id"
       - echo ""
-      - 'echo "Direct path (skips canary): task worker:deploy && task worker:verify"'
+      - 'echo "Direct path (skips canary, no auto-rollback): task ship-prod"'
 
   trust:refresh:
     desc: "Refresh trust/ from the live root; refuses if the KEY changed. `-- --check` only compares (notme-8e8836)"
@@ -492,7 +504,14 @@ tasks:
       - pnpm exec tsx scripts/task-cert/cli.ts {{.CLI_ARGS}}
 
   ship-prod:
-    desc: "Full send: preflight → install → check → docs → deploy → verify (rollback on failure)"
+    # NO automatic rollback. This description used to end "(rollback on
+    # failure)" and nothing implemented it, so an operator who trusted it would
+    # not roll back a broken deploy by hand (notme-16b2d5, Finding B). If
+    # verify fails here the new build is STILL serving 100%: roll back with
+    # `task worker:rollback` (wrangler's previous deployment, ungated — the
+    # emergency exit), then `task worker:verify`. The path that rolls back by
+    # itself is ship → canary → pinned verify → worker:promote.
+    desc: "Full send: preflight → install → check → docs → deploy → converge → verify. NO auto-rollback: on failure run task worker:rollback"
     cmds:
       - task: node:preflight
       - task: worker:install
