@@ -1944,6 +1944,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       issuerSpki = spkiOf(b64ToBytes(rootB64));
     } catch (err) {
       this.#ctRecord("unloggable", `root unparseable: ${String(err)}`);
+      // Also past the #ctLogPin await: re-check before signing.
+      this.#refuseIfMintStateMoved(p.captured);
       return p.mint(p.pin, () => []);
     }
     if ("error" in logPin) {

@@ -1290,4 +1290,49 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
     expect(r.ok ? r.v.authority : null, "minted under the captured (stale) epoch").toBeNull();
     expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
   });
+
+  // The unparseable-root path also signs after `await #ctLogPin()`. Same
+  // deterministic technique; the pin itself is valid here (the getter
+  // returns the real key), only the root is broken.
+  it("unparseable root: an epoch that moved during the pin check refuses the unlogged mint", async () => {
+    const name = `ct-rootrace-${++seq}-${crypto.randomUUID()}`;
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+    const { ED25519 } = await import("./platform");
+    const mtls = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+    )) as CryptoKeyPair;
+    const sign = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
+    const mtlsPem = await spkiPem(mtls.publicKey);
+    const signPem = await spkiPem(sign.publicKey);
+    await setMode("ok");
+    const r = await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as RaceAuth & AuthLike;
+      await a.getAuthorityState(); // initialise before the traps are armed
+      a.getCACertificatePem = async () => "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+      let fired = false;
+      const sql = a.ctx.storage.sql as unknown as { exec(q: string): unknown };
+      const realKey = a.env.CT_LOG_KEY;
+      const e: Record<string, unknown> = { ...a.env };
+      delete e.CT_LOG_KEY;
+      Object.defineProperty(e, "CT_LOG_KEY", {
+        get() {
+          if (!fired) {
+            fired = true;
+            sql.exec("UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'");
+          }
+          return realKey;
+        },
+      });
+      a.env = e;
+      return a
+        .mintBridgeCertPair({
+          subject: SUBJECT, identity: `wimse://notme.bot/principal/${name}`,
+          mtlsPublicKeyPem: mtlsPem, signingPublicKeyPem: signPem,
+          scopes: ["bridgeCert"], authMethod: "gha-oidc",
+        })
+        .then((v) => ({ ok: true as const, v }), (err) => ({ ok: false as const, e: String(err) }));
+    });
+    expect(r.ok ? r.v.authority : null, "minted under the captured (stale) epoch").toBeNull();
+    expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+  });
 });
