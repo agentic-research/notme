@@ -555,24 +555,27 @@
   "public_key": "&lt;Ed25519 SPKI PEM&gt;",
   "iat": 1711670400,
   "generation": 3,
+  "enrollment_id": "&lt;64 hex&gt;",
   "proof": "&lt;sig&gt;"
 }</div>
-          <div class="ep-note"><code>generation</code> is the generation returned by the machine's last successful renewal (or its collect response). With it, <code>proof</code> is an Ed25519 signature over <code>"notme/tier-renew/v2\0" || SPKI || uint64be(iat) || uint64be(generation)</code>. Without it the request is the legacy v1 form, <code>"notme/tier-renew/v1\0" || SPKI || uint64be(iat)</code>, which only enrollments made before v2 may still use; new enrollments refuse v1 with <code>binding_v2_required</code>.</div>
+          <div class="ep-note"><code>generation</code> is the generation returned by the machine's last successful renewal (or its collect response), and <code>enrollment_id</code> the id returned with it. With both, <code>proof</code> is an Ed25519 signature over binding v3, <code>"notme/tier-renew/v3\0" || SPKI || uint64be(iat) || uint64be(generation) || enrollment_id</code> (the id's 32 raw bytes), so a request for one enrollment of a key never counts for another. With <code>generation</code> only it is binding v2, <code>"notme/tier-renew/v2\0" || SPKI || uint64be(iat) || uint64be(generation)</code>, accepted until the enrollment's first v3 renewal, and never on a re-enrolled key (<code>binding_v3_required</code>). Without either the request is the legacy v1 form, <code>"notme/tier-renew/v1\0" || SPKI || uint64be(iat)</code>, which only enrollments made before v2 may still use; newer enrollments refuse v1 with <code>binding_v2_required</code>.</div>
           <div class="ep-note"><code>iat</code> is the machine's clock when it signed. At the enrollment's current generation (and for a legacy v1 request) a valid proof is accepted with <code>iat</code> from one hour (3600 s) in the past to 120 s in the future, so a request that never reached the authority can be resent unchanged. A request already accepted is a retry only within one hour of its <code>iat</code>; a newly signed request at an older generation is judged a fork only if its <code>iat</code> is within 120 s of the authority's clock, and is otherwise <code>stale_proof</code>.</div>
           <div class="ep-label">response</div>
           <div class="ep-response">{
   "...": "the renewed tier certificate material",
   "renew_until": 1712275200,
   "generation": 4,
+  "enrollment_id": "&lt;64 hex&gt;",
   "criteria": ["agent-session/1"]
 }</div>
-          <div class="ep-note"><code>generation</code> is the value to sign into the next renewal.</div>
+          <div class="ep-note"><code>generation</code> and <code>enrollment_id</code> are the values to sign into the next renewal.</div>
           <div class="ep-label">errors</div>
-          <div class="ep-response">// 404 unknown_key   400 invalid_key   400 binding_v2_required
+          <div class="ep-response">// 404 unknown_key   400 invalid_key   400 binding_v2_required   400 binding_v3_required
 // 401 stale_proof   401 invalid_proof
 // 403 revoked | horizon_passed | epoch_changed | approval_withdrawn | fork_detected</div>
           <div class="ep-note"><code>fork_detected</code> (403): a copy of this machine renewed, so the enrollment (one shared key) is shut off; the human runs <code>enroll</code> again. An exact resend of a request that was already accepted (within a one-hour window) is treated as a retry, not a fork; a replay of an accepted request is <code>stale_proof</code> and revokes nothing.</div>
-          <div class="ep-note"><code>binding_v2_required</code> (400): a v1 request (no <code>generation</code>) for an enrollment that speaks v2. The approval has not ended: the client is older than the authority and must be updated.</div>
+          <div class="ep-note"><code>binding_v2_required</code> (400): a v1 request (no <code>generation</code>) for an enrollment that speaks v2. <code>binding_v3_required</code> (400): a v1 or v2 request (no <code>enrollment_id</code>) for an enrollment that speaks v3. In both the approval has not ended: the client is older than the authority and must be updated.</div>
+          <div class="ep-note">The proof is checked before the enrollment is looked up, so a request whose proof does not verify gets <code>invalid_proof</code> (401) whether or not the key is enrolled: <code>unknown_key</code> and the <code>binding_*_required</code> reasons reach only a holder of the key. A v3 request naming an enrollment that is not this key's active one (an earlier enrollment of a re-enrolled key) is <code>unknown_key</code>.</div>
         </div>
       </div>
 

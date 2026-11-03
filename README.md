@@ -159,6 +159,8 @@ the machine's tier key is the approval: whoever holds it can renew until you rev
 
 **deploy order.** deploy the worker before using the updated `task-cert` client: the new client relies on the worker's renewal generations and its one-hour resend window. a legacy machine (a `tier.json` with no generation) keeps renewing either way.
 
+**renewal binding v3.** a renewal also signs the enrollment's id (`enrollment_id` in `tier.json`, returned at collect and on every renewal), so a request signed for one enrollment of a key never counts for a later enrollment of the same key (notme-c9fc8c). a machine collected before v3 renews once with v2, learns its id from that response, and signs v3 from then on; after its first v3 renewal the authority refuses v2 for it (`binding_v3_required`: update `task-cert`). an older `task-cert` keeps renewing with v2 indefinitely within the horizon, unless the key was enrolled before (re-enrolling one key through the API), which needs v3 from the start. the authority checks the proof before it looks the enrollment up, so a request without the key gets `invalid_proof` and learns nothing about the enrollment.
+
 ### try it
 
 ```bash

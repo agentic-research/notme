@@ -39,7 +39,14 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 type Key = { privateKey: CryptoKey; spki: Uint8Array; pem: string };
 
 /** What a machine holds on disk: its key and the generation of its last tier. */
-type Client = { key: Key; generation: number | undefined; pending: PendingRenewal | null; human: { cookie: string; pid: string } };
+type Client = {
+  key: Key;
+  generation: number | undefined;
+  /** tier.json's enrollment_id (notme-c9fc8c): with it the client signs v3. */
+  enrollmentId?: string;
+  pending: PendingRenewal | null;
+  human: { cookie: string; pid: string };
+};
 
 async function enroll(): Promise<Client> {
   const kp = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
@@ -55,8 +62,14 @@ async function enroll(): Promise<Client> {
   const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, kp.privateKey, tierEnrolmentBinding(spki, await deviceCodeHash(start.device_code)))));
   const tok = await post("/cert/issuing-ca/device/token", { device_code: start.device_code, proof });
   expect(tok.status, await tok.clone().text()).toBe(200);
-  const tier = (await tok.json()) as { generation?: number };
-  return { key: { privateKey: kp.privateKey, spki, pem }, generation: tier.generation, pending: null, human: { cookie, pid } };
+  const tier = (await tok.json()) as { generation?: number; enrollment_id?: string };
+  return {
+    key: { privateKey: kp.privateKey, spki, pem },
+    generation: tier.generation,
+    enrollmentId: tier.enrollment_id,
+    pending: null,
+    human: { cookie, pid },
+  };
 }
 
 /** Copy the machine's disk: same key, same generation, its own pending slot. */
@@ -72,10 +85,11 @@ async function runClient(c: Client, fetchFn: Fetch = direct, force?: { v1: boole
     c.key,
     {
       generation: force?.v1 ? undefined : c.generation,
+      enrollmentId: force?.v1 ? undefined : c.enrollmentId,
       pending: c.pending,
       savePending: (p) => { c.pending = p; },
       clearPending: (body) => { if (c.pending?.body === body) c.pending = null; },
-      persist: (r) => { c.generation = r.generation; },
+      persist: (r) => { c.generation = r.generation; c.enrollmentId = r.enrollment_id ?? c.enrollmentId; },
       currentGeneration: async () => (force?.v1 ? undefined : c.generation),
     },
     fetchFn as typeof fetch,
@@ -293,8 +307,9 @@ describe("mint path phase 1, end to end with the real client", () => {
     }
   });
 
-  it("a legacy machine keeps working until its first v2 renewal", async () => {
+  it("a legacy machine keeps working until its first generation renewal", async () => {
     const c = await enroll();
+    c.enrollmentId = undefined; // a tier.json from before binding v3 too
     const fpHex = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", c.key.spki))).map((b) => b.toString(16).padStart(2, "0")).join("");
     await runInDurableObject(authority(), (a) => {
       (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", fpHex);
@@ -302,10 +317,46 @@ describe("mint path phase 1, end to end with the real client", () => {
     // A tier.json from before generations: no generation field, v1 proof.
     const v1 = await runClient(c, direct, { v1: true });
     expect(v1.certificate.length).toBeGreaterThan(0);
-    const v2 = await runClient(c);
+    // The v1 response carried the enrollment id, so this client's first
+    // generation renewal signs v3 (notme-c9fc8c).
+    expect(c.enrollmentId).toMatch(/^[0-9a-f]{64}$/);
+    const v3 = await runClient(c);
+    expect(v3.generation).toBe(1);
+    // v1 is retired for this machine now (and v2 with it).
+    const refused = await refusal(runClient(copyOf({ ...c, generation: undefined }), direct, { v1: true }));
+    expect(refused?.reason).toBe("binding_v3_required");
+  });
+
+  it("a legacy machine on a client without v3 still locks v1 out at its first v2 renewal", async () => {
+    const c = await enroll();
+    const fpHex = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", c.key.spki))).map((b) => b.toString(16).padStart(2, "0")).join("");
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", fpHex);
+    });
+    expect((await runClient(c, direct, { v1: true })).certificate.length).toBeGreaterThan(0);
+    const v2 = await runClient({ ...c, enrollmentId: undefined, pending: null });
     expect(v2.generation).toBe(1);
-    // v1 is retired for this machine now.
     const refused = await refusal(runClient(copyOf({ ...c, generation: undefined }), direct, { v1: true }));
     expect(refused?.reason).toBe("binding_v2_required");
+  });
+
+  it("a machine collected before binding v3 upgrades itself: v2 once, then v3, and v2 is retired (notme-c9fc8c)", async () => {
+    const c = await enroll();
+    c.enrollmentId = undefined; // tier.json written by an authority that predates v3
+    const bodies: string[] = [];
+    const watching: Fetch = (url, init) => {
+      bodies.push(String(init?.body));
+      return direct(url, init);
+    };
+    expect((await runClient(c, watching)).generation).toBe(1);
+    expect("enrollment_id" in JSON.parse(bodies[0]!), "first renewal is v2").toBe(false);
+    expect(c.enrollmentId, "the renewal response taught it the id").toMatch(/^[0-9a-f]{64}$/);
+    expect((await runClient(c, watching)).generation).toBe(2);
+    expect(JSON.parse(bodies[1]!).enrollment_id).toBe(c.enrollmentId);
+    // A copy still on the old client (v2 only) is refused by name, nothing revoked.
+    const refused = await refusal(runClient({ ...copyOf(c), enrollmentId: undefined }));
+    expect(refused?.reason).toBe("binding_v3_required");
+    expect((await enrollmentsOf(c))[0].revoked_at).toBeNull();
+    expect((await runClient(c)).generation).toBe(3);
   });
 });

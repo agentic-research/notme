@@ -3213,13 +3213,15 @@ export default {
             { status: r.reason === "invalid_proof" ? 401 : 400 },
           );
         }
-        const { ok: _ok, principalId, authMethod, renewUntil, generation, ...tier } = r;
+        const { ok: _ok, principalId, authMethod, renewUntil, generation, enrollmentId, ...tier } = r;
         return Response.json({
           ...tier,
           principal_id: principalId,
           auth_method: authMethod,
           renew_until: renewUntil,
           generation,
+          // What a v3 renewal signs (notme-c9fc8c).
+          enrollment_id: enrollmentId,
         });
       }
 
@@ -3230,11 +3232,15 @@ export default {
       // `generation` and signs "notme/tier-renew/v2\0" || SPKI ||
       // uint64be(iat) || uint64be(generation); success returns the
       // generation to sign next, and a copied key renewing is a 403
-      // fork_detected (notme-747cc7). Unauthenticated BY
+      // fork_detected (notme-747cc7). v3 adds `enrollment_id` (returned at
+      // collect and by every renewal) and signs "notme/tier-renew/v3\0" ||
+      // SPKI || uint64be(iat) || uint64be(generation) || enrollment_id, so a
+      // request for one enrollment of a key never counts for a re-enrollment
+      // of it (notme-c9fc8c). Unauthenticated BY
       // DESIGN: the proof of possession is the authentication, and the result
       // is a public certificate for a key only the renewer holds.
       if (pathname === "/cert/issuing-ca/renew" && request.method === "POST") {
-        let body: { public_key?: unknown; iat?: unknown; proof?: unknown; generation?: unknown } = {};
+        let body: { public_key?: unknown; iat?: unknown; proof?: unknown; generation?: unknown; enrollment_id?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
         } catch {
@@ -3248,21 +3254,27 @@ export default {
           // v2 (notme-747cc7): a generation in the body selects the v2
           // binding; without one the request is v1.
           ...(typeof body.generation === "number" ? { generation: body.generation } : {}),
+          // v3 (notme-c9fc8c): an enrollment_id selects the v3 binding. A
+          // non-string one still selects it, and fails as invalid_proof.
+          ...(body.enrollment_id !== undefined
+            ? { enrollmentId: typeof body.enrollment_id === "string" ? body.enrollment_id : "" }
+            : {}),
         });
         if (!r.ok) {
           const status =
             r.reason === "unknown_key" ? 404
-            : r.reason === "invalid_key" || r.reason === "binding_v2_required" ? 400
+            : r.reason === "invalid_key" || r.reason === "binding_v2_required" || r.reason === "binding_v3_required" ? 400
             : r.reason === "stale_proof" || r.reason === "invalid_proof" ? 401
             : 403;
           // revoked / horizon_passed / epoch_changed / approval_withdrawn /
           // fork_detected all mean "a human must approve again" — named, so
-          // the machine can say which. binding_v2_required (400) is not one:
-          // a v1 request to an enrollment that speaks v2 — update the client.
+          // the machine can say which. binding_v2_required and
+          // binding_v3_required (400) are not: a request below the binding
+          // the enrollment speaks — update the client.
           return Response.json({ error: r.reason }, { status });
         }
-        const { ok: _ok, renewUntil, generation, ...tier } = r;
-        return Response.json({ ...tier, renew_until: renewUntil, generation });
+        const { ok: _ok, renewUntil, generation, enrollmentId, ...tier } = r;
+        return Response.json({ ...tier, renew_until: renewUntil, generation, enrollment_id: enrollmentId });
       }
 
       // GET /cert/issuing-ca/enrollments — the signed-in human's machines.

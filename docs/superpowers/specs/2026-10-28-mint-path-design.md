@@ -188,6 +188,36 @@ alarm.
 
 So within one maximum horizon of deploy, no copy can sidestep the counter.
 
+**Binding v3: naming the enrollment** (notme-c9fc8c). v2 does not commit to
+*which* enrollment a request is for. If the same key is enrolled twice
+through the API, a recent request signed for the first enrollment (≤ 1 h
+old) could claim the second one's generation, or (≤ 120 s old, at a spent
+generation) fork it. v3 adds the enrollment:
+
+    "notme/tier-renew/v3\0" || SPKI || uint64be(iat) || uint64be(generation) || enrollment_id
+
+`enrollment_id` is SHA-256(`"notme/tier-enrolment-id/v1\0"` ||
+SHA-256(device_code)), 32 bytes; the authority returns it as 64 lowercase hex
+at collect and on every renewal, and the request carries it as
+`enrollment_id`. A v3 request whose id is not the active enrollment's is
+answered `unknown_key` and changes nothing. Generations, retries and forks
+work exactly as in v2.
+
+Which binding a row accepts (`binding_version`):
+- NULL (legacy): v1, v2, v3. The first v2 or v3 renewal raises it.
+- 2: v2 and v3. A v1 request is `binding_v2_required`.
+- 3: v3 only. A v1 or v2 request is `binding_v3_required`.
+- A key collected for the first time starts at 2, so a client that predates
+  v3 keeps renewing; a key that was enrolled before (re-enrollment) starts
+  at 3, which is the only case v2 left open. The first v3 renewal raises a
+  row to 3. The task-cert client always generates a fresh key at enroll, so
+  it never meets the re-enrollment case.
+
+**The proof is verified before the row is read** (notme-c9fc8c). Every
+binding is computed from the request alone, so a caller without the key
+gets `invalid_proof` whatever the row says: it cannot learn whether a key is
+enrolled (`unknown_key`) or which binding it speaks.
+
 ### 5.2 Clone policy on the enrollment
 
 `/enroll` gains a clone-policy control beside the renewal horizon:
@@ -447,7 +477,7 @@ Acceptance:
 | Existing piece | What changes | What keeps working untouched |
 |---|---|---|
 | `tier_enrolments` (signing-authority.ts) | adds `generation`, `last_renewal_digest`, `clone_policy`, `log_key`, `last_checkpoint`; branch rows | existing rows default to generation 0, `singleton`, no log (legacy) |
-| `/cert/issuing-ca/renew` | binding v2 with generation; fork handling | v1 binding accepted for enrollments with no log key, until they re-enroll |
+| `/cert/issuing-ca/renew` | binding v2 with generation; fork handling; binding v3 names the enrollment (§5.1) | v1 binding accepted for enrollments with no log key, until they re-enroll; v2 accepted on any enrollment that has not renewed with v3 and is not a re-enrollment |
 | `/enroll` page | clone-policy control; `replicas` gated on `authorityManage` | renewal horizon, fingerprint compare |
 | `mintTaskCertPair` (cert-authority.ts) | optional SCT embedding (existing `opts.pin` + `ct/sct.ts`); `.1.10` | `.1.9` task scope, narrowing, parent/subtask rules |
 | `task-cert` CLI | `serve`; local log; checkpoint at renew | `enroll`, `mint`, `renew`, `revoke`, `verify`, `status` |

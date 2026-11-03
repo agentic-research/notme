@@ -24,7 +24,9 @@ import {
   tierEnrolmentBinding,
   deviceCodeHash,
   tierRenewalBindingV2,
+  tierRenewalBindingV3,
   tierRenewalBinding,
+  tierEnrolmentId,
   renewalRequestDigest,
 } from "./auth/tier-enrolment-binding";
 import { ED25519 } from "./platform";
@@ -65,7 +67,12 @@ async function enrolled(m?: Machine, renewDays?: number) {
   const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, m.kp.privateKey, tierEnrolmentBinding(m.spki, await deviceCodeHash(start.device_code)))));
   const tok = await post("/cert/issuing-ca/device/token", { device_code: start.device_code, proof });
   expect(tok.status, await tok.clone().text()).toBe(200);
-  return { m, h, tier: (await tok.json()) as { certificate: string; renew_until: number; generation?: number } };
+  return {
+    m,
+    h,
+    deviceCode: start.device_code,
+    tier: (await tok.json()) as { certificate: string; renew_until: number; generation?: number; enrollment_id: string },
+  };
 }
 
 const nowS = () => Math.floor(Date.now() / 1000);
@@ -80,6 +87,19 @@ const send = (body: unknown) => post("/cert/issuing-ca/renew", body);
 
 async function renew(m: Machine, generation: number, iat = nowS(), key = m.kp.privateKey) {
   return send(await renewalBody(m, generation, iat, key));
+}
+
+const unhex = (s: string) => Uint8Array.from(s.match(/../g)!, (h) => parseInt(h, 16));
+
+/** A v3 renewal request body (notme-c9fc8c): v2 plus the enrollment id. */
+async function renewalBodyV3(m: Machine, enrollmentId: string, generation: number, iat = nowS(), key = m.kp.privateKey) {
+  const binding = tierRenewalBindingV3(m.spki, iat, generation, unhex(enrollmentId));
+  const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, key, binding)));
+  return { public_key: m.pem, iat, generation, enrollment_id: enrollmentId, proof };
+}
+
+async function renewV3(m: Machine, enrollmentId: string, generation: number, iat = nowS(), key = m.kp.privateKey) {
+  return send(await renewalBodyV3(m, enrollmentId, generation, iat, key));
 }
 
 const fp = async (spki: Uint8Array) =>
@@ -321,7 +341,8 @@ describe("re-enrolling a key", () => {
     await expectOk(await renew(m, 1), 2);
     const again = await enrolled(m, 1);
     expect(again.tier.generation).toBe(0);
-    await expectOk(await renew(m, 0), 1);
+    // A re-enrolled key speaks v3 only (notme-c9fc8c).
+    await expectOk(await renewV3(m, again.tier.enrollment_id, 0), 1);
     const rows = await rowsOf(m);
     expect(rows.map((r) => r.status)).toEqual(["superseded", "active"]);
     expect(rows[0].revoked_at).toBeNull();
@@ -335,8 +356,8 @@ describe("re-enrolling a key", () => {
     const t = nowS();
     await expectOk(await renew(m, 0, t), 1);
     await expectErr(await renew(m, 0, t + 1), 403, "fork_detected");
-    await enrolled(m, 1);
-    await expectOk(await renew(m, 0), 1);
+    const again = await enrolled(m, 1);
+    await expectOk(await renewV3(m, again.tier.enrollment_id, 0), 1);
     expect((await rowsOf(m)).map((r) => r.status)).toEqual(["superseded", "active"]);
   });
 
@@ -469,5 +490,191 @@ describe("clone policy", () => {
     const html = await res.text();
     expect(html).toContain('id="clone"');
     expect(html).toContain('<option value="singleton" selected');
+  });
+});
+
+// ── notme-c9fc8c ────────────────────────────────────────────────────────────
+
+describe("a request from an earlier enrollment of the same key (notme-c9fc8c M4)", () => {
+  /** Set the active row's generation, standing in for the new enrollment's honest renewals. */
+  const setGeneration = async (m: Machine, g: number) => {
+    const f = await fp(m.spki);
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec(
+        "UPDATE tier_enrolments SET generation = ? WHERE key_fingerprint = ? AND status = 'active'",
+        g,
+        f,
+      );
+    });
+  };
+
+  it("cannot claim the re-enrollment's generation", async () => {
+    const { m } = await enrolled();
+    // Signed for the FIRST enrollment and captured (never sent, or sent and lost).
+    const captured = await renewalBody(m, 0);
+    const again = await enrolled(m); // the same key is enrolled again
+    const res = await send(captured);
+    expect(res.status, await res.clone().text()).not.toBe(200);
+    // A re-enrolled key speaks v3 only: the v2 request is refused by name.
+    expect(await res.json()).toMatchObject({ error: "binding_v3_required" });
+    const row = await rowOf(m);
+    expect(row.generation).toBe(0);
+    expect(row.revoked_at).toBeNull();
+    await expectOk(await renewV3(m, again.tier.enrollment_id, 0), 1);
+  });
+
+  it("cannot fork the re-enrollment", async () => {
+    const { m } = await enrolled();
+    const captured = await renewalBody(m, 0); // fresh: inside the 120 s fork window
+    await enrolled(m);
+    await setGeneration(m, 1); // the new enrollment's machine has renewed once
+    const res = await send(captured);
+    expect(res.status, await res.clone().text()).not.toBe(200);
+    expect(await res.json()).toMatchObject({ error: "binding_v3_required" });
+    const row = await rowOf(m);
+    expect(row.revoked_at, "a request for another enrollment revoked this one").toBeNull();
+    expect(row.generation).toBe(1);
+  });
+
+  it("a v3 request names its enrollment: one for the earlier enrollment changes nothing in the new one", async () => {
+    const first = await enrolled();
+    const { m } = first;
+    await expectOk(await renewV3(m, first.tier.enrollment_id, 0), 1);
+    const captured = await renewalBodyV3(m, first.tier.enrollment_id, 1); // never answered
+    const again = await enrolled(m);
+    expect(again.tier.enrollment_id).not.toBe(first.tier.enrollment_id);
+    await setGeneration(m, 1);
+    // Not this enrollment's request: as if the key had none. No claim, no fork.
+    await expectErr(await send(captured), 404, "unknown_key");
+    const row = await rowOf(m);
+    expect(row.generation).toBe(1);
+    expect(row.revoked_at).toBeNull();
+    await expectOk(await renewV3(m, again.tier.enrollment_id, 1), 2);
+  });
+});
+
+describe("binding v3 (notme-c9fc8c)", () => {
+  /** binding_version as the authority holds it. */
+  async function bindingOf(m: Machine) {
+    const f = await fp(m.spki);
+    return runInDurableObject(authority(), (a) =>
+      ((a as SigningAuthority)["ctx"].storage.sql
+        .exec("SELECT binding_version FROM tier_enrolments WHERE key_fingerprint = ? AND status = 'active'", f)
+        .toArray()[0] as { binding_version: number | null }).binding_version,
+    );
+  }
+
+  it("collect returns the enrollment id; it is derived from the device code and every renewal repeats it", async () => {
+    const { m, tier, deviceCode } = await enrolled();
+    const want = Array.from(await tierEnrolmentId(await deviceCodeHash(deviceCode)), (b) => b.toString(16).padStart(2, "0")).join("");
+    expect(tier.enrollment_id).toBe(want);
+    const r = await renew(m, 0); // v2: still accepted on a first-time key
+    expect(r.status).toBe(200);
+    expect(((await r.json()) as { enrollment_id: string }).enrollment_id).toBe(want);
+  });
+
+  it("a first-time key collects at v2, so a client that predates v3 keeps renewing", async () => {
+    const { m } = await enrolled();
+    expect(await bindingOf(m)).toBe(2);
+    await expectOk(await renew(m, 0), 1);
+    await expectOk(await renew(m, 1), 2);
+    expect(await bindingOf(m)).toBe(2);
+  });
+
+  it("a re-enrolled key collects at v3", async () => {
+    const { m } = await enrolled();
+    await enrolled(m);
+    expect(await bindingOf(m)).toBe(3);
+  });
+
+  it("v3 renews 0 -> 1 -> 2, and the first v3 renewal retires v2 and v1 for that enrollment", async () => {
+    const { m, tier } = await enrolled();
+    await expectOk(await renewV3(m, tier.enrollment_id, 0), 1);
+    expect(await bindingOf(m)).toBe(3);
+    await expectOk(await renewV3(m, tier.enrollment_id, 1), 2);
+    await expectErr(await renew(m, 2), 400, "binding_v3_required");
+    await expectErr(await renewV1(m), 400, "binding_v3_required");
+    expect((await rowOf(m)).generation).toBe(2);
+  });
+
+  it("a legacy enrollment can move straight from v1 to v3", async () => {
+    const { m } = await enrolled();
+    const f = await fp(m.spki);
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", f);
+    });
+    const r = await renewV1(m);
+    expect(r.status).toBe(200);
+    const id = ((await r.json()) as { enrollment_id: string }).enrollment_id;
+    await expectOk(await renewV3(m, id, 0), 1);
+    expect(await bindingOf(m)).toBe(3);
+  });
+
+  it("a v3 lost response is a retry; a v3 copy is a fork: generations work as in v2", async () => {
+    const { m, tier } = await enrolled();
+    const body = await renewalBodyV3(m, tier.enrollment_id, 0);
+    expect((await send(body)).status).toBe(200);
+    await expectOk(await send(body), 1); // the same bytes: a retry
+    const t = nowS();
+    await expectOk(await renewV3(m, tier.enrollment_id, 1, t), 2);
+    await expectErr(await renewV3(m, tier.enrollment_id, 1, t + 1), 403, "fork_detected");
+  });
+
+  it("a v3 proof never verifies as v2, nor with a malformed id", async () => {
+    const { m, tier } = await enrolled();
+    const v3 = await renewalBodyV3(m, tier.enrollment_id, 0);
+    const { enrollment_id: _id, ...asV2 } = v3;
+    await expectErr(await send(asV2), 401, "invalid_proof");
+    for (const bad of ["", "zz", tier.enrollment_id.toUpperCase(), tier.enrollment_id.slice(2), 7]) {
+      await expectErr(await send({ ...v3, enrollment_id: bad }), 401, "invalid_proof");
+    }
+    expect((await rowOf(m)).generation).toBe(0);
+  });
+});
+
+describe("without the key, a refusal says nothing about the enrollment (notme-c9fc8c M3)", () => {
+  /** A refusal's status and reason. */
+  const refusalOf = async (res: Response) => ({ status: res.status, error: ((await res.json()) as { error: string }).error });
+
+  async function legacy(m: Machine) {
+    const f = await fp(m.spki);
+    await runInDurableObject(authority(), (a) => {
+      (a as SigningAuthority)["ctx"].storage.sql.exec("UPDATE tier_enrolments SET binding_version = NULL WHERE key_fingerprint = ?", f);
+    });
+  }
+
+  /** A v1 body for m's public key with a proof m did not sign. */
+  async function forgedV1(m: Machine, iat: number) {
+    const thief = await machine();
+    const proof = b64u(new Uint8Array(await crypto.subtle.sign(ED25519, thief.kp.privateKey, tierRenewalBinding(m.spki, iat))));
+    return { public_key: m.pem, iat, proof };
+  }
+
+  for (const [label, iat] of [["a stale iat", () => nowS() - 7200], ["a fresh iat", () => nowS()]] as const) {
+    it(`a forged v1 request with ${label} reads the same on a v2 enrollment, a legacy one, and none`, async () => {
+      const v2 = (await enrolled()).m;
+      const old = (await enrolled()).m;
+      await legacy(old);
+      const none = await machine();
+      const seen = [];
+      for (const m of [v2, old, none]) seen.push(await refusalOf(await send(await forgedV1(m, iat()))));
+      expect(seen).toEqual([
+        { status: 401, error: "invalid_proof" },
+        { status: 401, error: "invalid_proof" },
+        { status: 401, error: "invalid_proof" },
+      ]);
+    });
+  }
+
+  it("a forged v2 request reads the same for an enrolled key and an unknown one", async () => {
+    const { m } = await enrolled();
+    const none = await machine();
+    const thief = await machine();
+    const seen = [];
+    for (const k of [m, none]) seen.push(await refusalOf(await renew(k, 0, nowS(), thief.kp.privateKey)));
+    expect(seen).toEqual([
+      { status: 401, error: "invalid_proof" },
+      { status: 401, error: "invalid_proof" },
+    ]);
   });
 });

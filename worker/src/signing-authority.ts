@@ -440,6 +440,11 @@ function hex(b: Uint8Array): string {
   return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+/** Even-length lowercase hex back to bytes (callers validate the shape). */
+function unhex(s: string): Uint8Array {
+  return Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
+}
+
 /** A row's granted criteria (notme-bdc850); null for a pre-phase-2 enrollment. */
 function storedCriteria(json: string | null): import("./criteria").Criteria[] | null {
   return json === null ? null : (JSON.parse(json) as import("./criteria").Criteria[]);
@@ -2643,6 +2648,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         authMethod: string;
         renewUntil: number;
         generation: number;
+        /** The enrollment's id, hex: what a v3 renewal signs (notme-c9fc8c). */
+        enrollmentId: string;
         clone_policy: string;
         /** Criteria ids ("agent-session/1"); null for a pre-phase-2 enrollment. */
         criteria: string[] | null;
@@ -2698,15 +2705,35 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return { ok: false, reason: "invalid_proof" };
     }
 
+    const { tierEnrolmentId } = await import("./auth/tier-enrolment-binding");
+    const enrollmentId = hex(await tierEnrolmentId(codeHashBytes));
+
     // Consume first, atomically: of two concurrent collects with a valid
     // proof, exactly one sees changes() = 1.
+    //
+    // Binding version (notme-c9fc8c). A key collected for the first time
+    // speaks v2 or v3: the v2 binding does not name the enrollment, but no
+    // other enrollment of this key ever existed, so no request signed for one
+    // can be replayed here — and a v2-only client mid-flight keeps working.
+    // A RE-enrolled key (an earlier enrollment of it was ever collected)
+    // speaks v3 only: a v2 request signed for the earlier enrollment could
+    // otherwise claim, or fork, this one. Same synchronous block as the
+    // activation, so no collect interleaves between the check and the write.
+    const reEnrolled =
+      this.ctx.storage.sql
+        .exec(
+          "SELECT 1 FROM tier_enrolments WHERE key_fingerprint = ? AND device_code_hash != ? AND status IN ('active', 'superseded') LIMIT 1",
+          row.key_fingerprint,
+          deviceCodeHash,
+        )
+        .toArray().length > 0;
     this.ctx.storage.sql.exec(
       // 'active', not 'consumed': the enrollment lives on as the record a
       // machine renews against (notme-337d82). Single use still holds — a
       // second collect finds status 'active' and is refused.
-      // A collected enrollment starts at generation 0 and speaks renewal
-      // binding v2 (notme-747cc7).
-      "UPDATE tier_enrolments SET status = 'active', generation = 0, binding_version = 2 WHERE device_code_hash = ? AND status = 'approved'",
+      // A collected enrollment starts at generation 0 (notme-747cc7).
+      "UPDATE tier_enrolments SET status = 'active', generation = 0, binding_version = ? WHERE device_code_hash = ? AND status = 'approved'",
+      reEnrolled ? 3 : 2,
       deviceCodeHash,
     );
     const [change] = [
@@ -2748,6 +2775,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       authMethod: row.auth_method,
       renewUntil: row.renew_until ?? 0,
       generation: 0,
+      enrollmentId,
       clone_policy: row.clone_policy,
       criteria: criteria?.map(criteriaId) ?? null,
       ...result,
@@ -2787,9 +2815,28 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // request that never arrived.
   // Nothing is written before the proof verifies, so a stranger posting a
   // stale generation for someone's public key cannot shut it off.
+  //
+  // The proof is verified BEFORE the enrollment row is read (notme-c9fc8c
+  // M3). Every binding is computed from the request alone, so a caller
+  // without the key learns only invalid_proof: not whether the key is
+  // enrolled (unknown_key), nor which binding its enrollment speaks
+  // (binding_v2_required / binding_v3_required).
+  //
+  // Binding v3 (notme-c9fc8c M4) adds the enrollment id, so a request signed
+  // for one enrollment of a key never counts for a re-enrollment of the same
+  // key. A row that has accepted v3 (or was collected as a re-enrollment)
+  // refuses v1 and v2; a row at v2 still accepts v2, so a client that
+  // predates v3 keeps renewing.
 
-  async renewTier(params: { publicKeyPem: string; iat: number; proof: string; generation?: number }): Promise<
-    | ({ ok: true; renewUntil: number; generation: number; criteria: string[] | null } & import("./cert-authority").IssuingCaCertResult & {
+  async renewTier(params: {
+    publicKeyPem: string;
+    iat: number;
+    proof: string;
+    generation?: number;
+    /** Hex enrollment id: selects binding v3 (with `generation`). */
+    enrollmentId?: string;
+  }): Promise<
+    | ({ ok: true; renewUntil: number; generation: number; enrollmentId: string; criteria: string[] | null } & import("./cert-authority").IssuingCaCertResult & {
         authority: { epoch: number; key_id: string };
       })
     | {
@@ -2804,7 +2851,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           | "epoch_changed"
           | "approval_withdrawn"
           | "fork_detected"
-          | "binding_v2_required";
+          | "binding_v2_required"
+          | "binding_v3_required";
       }
   > {
     this.#ensureTierEnrolmentSchema();
@@ -2818,6 +2866,71 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     if (key.algorithm.name !== "Ed25519") return { ok: false, reason: "invalid_key" };
     const spki = new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
     const fingerprint = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", spki)));
+
+    const now = Math.floor(Date.now() / 1000);
+    const {
+      RENEWAL_SKEW_S,
+      RENEWAL_RETRY_WINDOW_S,
+      ENROLMENT_ID_HEX,
+      tierEnrolmentId,
+      tierRenewalBinding,
+      tierRenewalBindingV2,
+      tierRenewalBindingV3,
+      renewalRequestDigest,
+    } = await import("./auth/tier-enrolment-binding");
+    const { verifyEd25519PopProof } = await import("./auth/pop");
+    // The binding the request claims: v3 names the enrollment, v2 a
+    // generation, v1 neither.
+    const version: 1 | 2 | 3 =
+      params.enrollmentId !== undefined ? 3 : params.generation !== undefined ? 2 : 1;
+    const v2 = version >= 2; // generations: v2 and v3 alike
+    const fresh = Number.isSafeInteger(params.iat) && Math.abs(now - params.iat) <= RENEWAL_SKEW_S;
+    // At the CURRENT generation a valid proof may be up to the retry window
+    // old: a request that never reached the authority (offline on resume, a
+    // 5xx, a 429) is resent byte for byte, with its original iat. Accepting
+    // it is safe — a key holder can sign any iat, and a captured request
+    // nobody accepted only advances the counter, PROVIDED the honest client
+    // still holds that request: its resend of the same bytes then lands on
+    // the retry path. The client guarantees this by clearing a refused first
+    // attempt ONLY for a reason this authority could never reverse for the
+    // same bytes (invalid_key, invalid_proof, binding_v2_required,
+    // binding_v3_required, revoked, fork_detected, horizon_passed,
+    // epoch_changed, unknown_key, a malformed body). stale_proof (judged
+    // against a clock that moves) and approval_withdrawn (judged against LIVE
+    // scopes, so a restored grant reverses it) are kept; were the client to
+    // clear either and re-sign at this generation, a replay of the cleared
+    // request would make that new request a fork.
+    const inRetryWindow =
+      Number.isSafeInteger(params.iat) &&
+      params.iat >= now - RENEWAL_RETRY_WINDOW_S &&
+      params.iat <= now + RENEWAL_SKEW_S;
+    let digest = "";
+    if (v2) {
+      // v2/v3: verify FIRST — a retry carries its original (older) iat, so
+      // freshness is decided per branch below, never before the proof.
+      const g = params.generation;
+      if (!Number.isSafeInteger(params.iat) || params.iat < 0) return { ok: false, reason: "stale_proof" };
+      if (g === undefined || !Number.isSafeInteger(g) || g < 0) return { ok: false, reason: "invalid_proof" };
+      let binding: Uint8Array;
+      if (version === 3) {
+        const id = params.enrollmentId as string;
+        if (!ENROLMENT_ID_HEX.test(id)) return { ok: false, reason: "invalid_proof" };
+        binding = tierRenewalBindingV3(spki, params.iat, g, unhex(id));
+      } else {
+        binding = tierRenewalBindingV2(spki, params.iat, g);
+      }
+      if (!(await verifyEd25519PopProof(binding, key, params.proof))) {
+        return { ok: false, reason: "invalid_proof" };
+      }
+      digest = await renewalRequestDigest(binding);
+    } else {
+      if (!Number.isSafeInteger(params.iat) || params.iat < 0) return { ok: false, reason: "stale_proof" };
+      if (!(await verifyEd25519PopProof(tierRenewalBinding(spki, params.iat), key, params.proof))) {
+        return { ok: false, reason: "invalid_proof" };
+      }
+    }
+
+    // ── Only a holder of the key gets past this line. ──
     type Row = {
       device_code_hash: string;
       principal_id: string;
@@ -2842,61 +2955,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         .toArray()[0] as Row | undefined;
     const row = readRow();
     if (!row) return { ok: false, reason: "unknown_key" };
-
-    const now = Math.floor(Date.now() / 1000);
-    const {
-      RENEWAL_SKEW_S,
-      RENEWAL_RETRY_WINDOW_S,
-      tierRenewalBinding,
-      tierRenewalBindingV2,
-      renewalRequestDigest,
-    } = await import("./auth/tier-enrolment-binding");
-    const { verifyEd25519PopProof } = await import("./auth/pop");
-    const v2 = params.generation !== undefined;
-    const fresh = Number.isSafeInteger(params.iat) && Math.abs(now - params.iat) <= RENEWAL_SKEW_S;
-    // At the CURRENT generation a valid proof may be up to the retry window
-    // old: a request that never reached the authority (offline on resume, a
-    // 5xx, a 429) is resent byte for byte, with its original iat. Accepting
-    // it is safe — a key holder can sign any iat, and a captured request
-    // nobody accepted only advances the counter, PROVIDED the honest client
-    // still holds that request: its resend of the same bytes then lands on
-    // the retry path. The client guarantees this by clearing a refused first
-    // attempt ONLY for a reason this authority could never reverse for the
-    // same bytes (invalid_key, invalid_proof, binding_v2_required, revoked,
-    // fork_detected, horizon_passed, epoch_changed, unknown_key, a malformed
-    // body). stale_proof (judged against a clock that moves) and
-    // approval_withdrawn (judged against LIVE scopes, so a restored grant
-    // reverses it) are kept; were the client to clear either and re-sign at
-    // this generation, a replay of the cleared request would make that new
-    // request a fork.
-    const inRetryWindow =
-      Number.isSafeInteger(params.iat) &&
-      params.iat >= now - RENEWAL_RETRY_WINDOW_S &&
-      params.iat <= now + RENEWAL_SKEW_S;
-    let digest = "";
-    if (v2) {
-      // v2: verify FIRST — a retry carries its original (older) iat, so
-      // freshness is decided per branch below, never before the proof.
-      const g = params.generation as number;
-      if (!Number.isSafeInteger(params.iat) || params.iat < 0) return { ok: false, reason: "stale_proof" };
-      if (!Number.isSafeInteger(g) || g < 0) return { ok: false, reason: "invalid_proof" };
-      const binding = tierRenewalBindingV2(spki, params.iat, g);
-      if (!(await verifyEd25519PopProof(binding, key, params.proof))) {
-        return { ok: false, reason: "invalid_proof" };
-      }
-      digest = await renewalRequestDigest(binding);
-    } else {
-      // v1 (no generation) neither checks nor advances the generation, so a
-      // copied key could use it to renew around the fork check: refused once
-      // the enrollment speaks v2. NULL (a legacy row) still accepts v1 until
-      // its first v2 renewal sets binding_version = 2.
-      // A distinct reason, so the machine says "update task-cert", not "approval ended".
-      if (row.binding_version === 2) return { ok: false, reason: "binding_v2_required" };
-      if (!inRetryWindow) return { ok: false, reason: "stale_proof" };
-      if (!(await verifyEd25519PopProof(tierRenewalBinding(spki, params.iat), key, params.proof))) {
-        return { ok: false, reason: "invalid_proof" };
-      }
-    }
+    const enrollmentId = hex(await tierEnrolmentId(unhex(row.device_code_hash)));
+    // A v3 request signed for ANOTHER enrollment of this key (one since
+    // superseded) is not a request for this one: answered as if the key had
+    // no enrollment, and nothing about this one changes.
+    if (version === 3 && params.enrollmentId !== enrollmentId) return { ok: false, reason: "unknown_key" };
+    // A request below the row's binding is refused by name, so the machine
+    // says "update task-cert", not "approval ended". v1 neither checks nor
+    // advances the generation, so a copied key could renew around the fork
+    // check with it; v2 does not name the enrollment. NULL (a legacy row)
+    // accepts all three; the first v2 or v3 renewal raises it.
+    if (row.binding_version === 3 && version < 3) return { ok: false, reason: "binding_v3_required" };
+    if (row.binding_version === 2 && version < 2) return { ok: false, reason: "binding_v2_required" };
+    if (!v2 && !inRetryWindow) return { ok: false, reason: "stale_proof" };
 
     const revokedReason = (r: Row) =>
       (r.revoke_reason === "fork_detected" ? "fork_detected" : "revoked") as "fork_detected" | "revoked";
@@ -2918,6 +2989,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         readRow,
         fingerprint,
         generation: params.generation as number,
+        version: version as 2 | 3,
         iat: params.iat,
         digest,
         fresh,
@@ -2944,7 +3016,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ttlMs,
       ...(criteria ? { criteria } : {}),
     });
-    return { ok: true, renewUntil: row.renew_until, generation, criteria: criteria?.map(criteriaId) ?? null, ...result };
+    // enrollmentId on every renewal, v1 and v2 included: a machine collected
+    // before v3 learns it here, and its next renewal signs v3.
+    return {
+      ok: true,
+      renewUntil: row.renew_until,
+      generation,
+      enrollmentId,
+      criteria: criteria?.map(criteriaId) ?? null,
+      ...result,
+    };
   }
 
   /**
@@ -2958,6 +3039,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     readRow: () => { generation: number; revoked_at: number | null; revoke_reason: string | null } | undefined;
     fingerprint: string;
     generation: number;
+    /** The request's binding, 2 or 3: what the claim raises binding_version to. */
+    version: 2 | 3;
     iat: number;
     digest: string;
     fresh: boolean;
@@ -2974,13 +3057,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // The row was read before this request's awaits, so another renewal
       // may have claimed g since: the generation guard is what makes exactly
       // one of two concurrent claims win.
+      // The binding guard does the same for the version: a v2 claim never
+      // lands on a row a concurrent v3 renewal raised to 3 meanwhile.
       sql.exec(
-        `UPDATE tier_enrolments SET generation = generation + 1, binding_version = 2
+        `UPDATE tier_enrolments SET generation = generation + 1, binding_version = ?
           WHERE device_code_hash = ? AND key_fingerprint = ? AND status = 'active'
-            AND revoked_at IS NULL AND generation = ?`,
+            AND revoked_at IS NULL AND generation = ?
+            AND (binding_version IS NULL OR binding_version <= ?)`,
+        p.version,
         p.row.device_code_hash,
         p.fingerprint,
         g,
+        p.version,
       );
       const [c] = [...sql.exec<{ n: number }>("SELECT changes() AS n")];
       if (c.n === 1) {
