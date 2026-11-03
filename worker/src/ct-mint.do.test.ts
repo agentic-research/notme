@@ -35,7 +35,8 @@ type Mode =
   | "fail-second"
   | "fail-signing"
   | "wrong-id"
-  | "bad-sig";
+  | "bad-sig"
+  | "hold";
 interface Received {
   path: string;
   chain: string[];
@@ -1016,5 +1017,125 @@ describe("ct.health — what the operator sees", () => {
       expect(h.ct.oldestUnloggedAgeS).toBeNull();
       expect(h.ct.unloggable.count).toBe(0);
     });
+  });
+});
+
+// ── notme-b52d7c: the key and epoch cannot change under an in-flight mint ──
+//
+// With CT_LOG bound, a mint captures the signing key and the epoch, awaits
+// add-pre-chain over the service binding (up to 2 s), then signs the final
+// certificate. Cloudflare's rules of Durable Objects: non-storage I/O lets
+// other requests interleave, so rotate() or revokeEpoch() can run to
+// completion inside that await. Pre-fix the final cert was then signed with
+// the just-retired key, or carried the pre-revocation epoch. The stub's
+// `hold` mode keeps add-pre-chain open while the test runs the operation
+// INSIDE the same DO, then releases it.
+
+type Minted = { authority: { epoch: number; key_id: string } };
+type RaceAuth = {
+  rotate(): Promise<{ newKeyId: string; epoch: number }>;
+  revokeEpoch(): Promise<{ epoch: number; seqno: number }>;
+  getAuthorityState(): Promise<{ epoch: number; keyId: string }>;
+  mintBridgeCertPair(p: Parameters<AuthLike["mintBridgeCertPair"]>[0]): Promise<Minted>;
+  mintIssuingCa(p: Parameters<TierAuthLike["mintIssuingCa"]>[0]): Promise<Minted>;
+};
+const HOLD_MS = 600;
+
+async function raceMint(
+  kind: "pair" | "tier",
+  op: "rotate" | "revokeEpoch",
+  holdMs: number = HOLD_MS,
+) {
+  const name = `ct-race-${++seq}-${crypto.randomUUID()}`;
+  const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+  const { ED25519 } = await import("./platform");
+  const mtls = (await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const sign = (await crypto.subtle.generateKey(ED25519, true, ["sign", "verify"])) as CryptoKeyPair;
+  const mtlsPem = await spkiPem(mtls.publicKey);
+  const signPem = await spkiPem(sign.publicKey);
+  const identity = `wimse://notme.bot/principal/${name}`;
+  const expected = kind === "pair" ? 2 : 1;
+
+  return runInDurableObject(stub, async (auth) => {
+    const a = auth as unknown as RaceAuth;
+    const before = await a.getAuthorityState();
+    const doMint = (): Promise<Minted> =>
+      kind === "pair"
+        ? a.mintBridgeCertPair({
+            subject: SUBJECT, identity, mtlsPublicKeyPem: mtlsPem,
+            signingPublicKeyPem: signPem, scopes: ["bridgeCert"], authMethod: "gha-oidc",
+          })
+        : a.mintIssuingCa({
+            subject: name, identity, publicKeyPem: signPem,
+            scopes: ["bridgeCert"], authMethod: "passkey",
+          });
+
+    // Held for HOLD_MS: long enough to run the operation to completion,
+    // well inside the authority's 2 s submission bound, so the mint takes
+    // the SCT-embedding path rather than timing out into the backlog one.
+    await ctLog().fetch("https://ct-log/__control", {
+      method: "POST",
+      body: JSON.stringify({ mode: "hold", holdMs }),
+    });
+    // Settled, not awaited: a rejection must not escape before we look at it.
+    const settled = doMint().then(
+      (v) => ({ ok: true as const, v }),
+      (e: unknown) => ({ ok: false as const, e: String(e) }),
+    );
+    // Wait until every add-pre-chain has reached the log and is being held.
+    const deadline = Date.now() + 1500;
+    while ((await received()).length < expected) {
+      if (Date.now() > deadline) throw new Error("mint never reached the log");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const arrivedAt = Date.now();
+    if (op === "rotate") await a.rotate();
+    else await a.revokeEpoch();
+    const after = await a.getAuthorityState();
+    // The operation finished while the log still held the submission; were
+    // it otherwise, this test would not be exercising the race.
+    const opInsideHold = Date.now() - arrivedAt < Math.min(holdMs, CT_TIMEOUT_MS);
+    const r = await settled;
+
+    // And the authority is not wedged: the next mint goes out under the
+    // CURRENT key and epoch.
+    await setMode("ok");
+    const retry = await doMint();
+    return { before, after, r, retry, opInsideHold };
+  });
+}
+
+describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)", () => {
+  for (const kind of ["pair", "tier"] as const) {
+    for (const op of ["rotate", "revokeEpoch"] as const) {
+      it(`${kind} + ${op}: a mint whose key or epoch changed under add-pre-chain is refused, not signed with the captured key`, async () => {
+        const { before, after, r, retry, opInsideHold } = await raceMint(kind, op);
+        expect(opInsideHold, "the operation did not finish inside the hold").toBe(true);
+        // The race really happened: the operation changed what it changes.
+        if (op === "rotate") expect(after.keyId).not.toBe(before.keyId);
+        else expect(after.epoch).toBe(before.epoch + 1);
+
+        expect(
+          r.ok ? r.v.authority : null,
+          "minted under the captured (stale) key/epoch instead of refusing",
+        ).toBeNull();
+        expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+
+        expect(retry.authority).toEqual({ epoch: after.epoch, key_id: after.keyId });
+      });
+    }
+  }
+
+  // The other post-await signing point: the log outlasts the 2 s bound, the
+  // mint falls back to an unlogged cert plus a backlog row — and that cert
+  // too must not be signed under the captured key.
+  it("pair + rotate, log times out: the unlogged fallback mint is refused too", async () => {
+    const { before, after, r, opInsideHold } = await raceMint("pair", "rotate", CT_TIMEOUT_MS + 500);
+    expect(opInsideHold, "the operation did not finish inside the hold").toBe(true);
+    expect(after.keyId).not.toBe(before.keyId);
+    expect(r.ok ? r.v.authority : null, "fallback minted under the retired key").toBeNull();
+    expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
   });
 });

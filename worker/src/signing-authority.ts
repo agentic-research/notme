@@ -1800,7 +1800,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       authority: { epoch: number; key_id: string };
     }
   > {
-    const { signingKey } = await this.#getOrCreateSigningKey();
+    const { signingKey, keyId: signingKeyId } = await this.#getOrCreateSigningKey();
     // Bridge pairs are root-issued: the default issuer, no issuerName. The
     // CT chain's issuer is read HERE, right after the key that signs the
     // pair, and handed to #mintLogged — so the chain names the root of the
@@ -1838,6 +1838,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         ),
       pems: (r) => [r.certificates.mtls, r.certificates.signing],
       issuerPem,
+      captured: { keyId: signingKeyId, epoch: state.epoch },
     });
     return {
       ...result,
@@ -1863,6 +1864,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    *      chain. A partially logged set is never issued, and the mint is never
    *      refused because of the log.
    *
+   * Steps 3 and 4 sign AFTER the add-pre-chain await, which is non-storage
+   * I/O: per Cloudflare's rules of Durable Objects other requests interleave
+   * there, so rotate() or revokeEpoch() can complete inside it. `captured` is
+   * the key id and epoch `mint` closes over; immediately before each final
+   * mint they are re-read and, if either moved, the mint is REFUSED (throws)
+   * rather than signed with a retired key or a revoked epoch (notme-b52d7c).
+   * That refusal is about the authority, not the log: the log never causes one.
+   *
    * With CT_LOG absent: one mint, no pin, no extension, no row — byte for
    * byte what minting did before CT.
    *
@@ -1874,6 +1883,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     pems: (r: R) => string[];
     /** The issuing CA's PEM, read alongside the signing key; null if unread. */
     issuerPem: string | null;
+    /** The key id and epoch `mint` signs with, re-checked after the log await. */
+    captured: { keyId: string; epoch: number };
   }): Promise<R> {
     const log = this.env.CT_LOG;
     if (!log) return p.mint(undefined, () => []);
@@ -1919,6 +1930,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       }),
     );
 
+    // ↑ The await above is where other requests interleave. Nothing captured
+    // before it — the key, the epoch — is trusted past it unchecked.
+    this.#refuseIfMintStateMoved(p.captured);
+
     if (results.every((r) => r.ok)) {
       const scts = results.map((r) => (r as { sct: SctResponse }).sct);
       try {
@@ -1936,6 +1951,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       );
     }
 
+    // Again: a failed embed above awaited, so check once more before signing.
+    this.#refuseIfMintStateMoved(p.captured);
     const fin = await p.mint(p.pin, () => []);
     try {
       const now = Math.floor(Date.now() / 1000);
@@ -1951,6 +1968,32 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       this.#ctRecord("unloggable", `backlog write failed: ${String(err)}`);
     }
     return fin;
+  }
+
+  /**
+   * Throw unless the authority's signing key id and epoch are still the ones
+   * a mint captured (notme-b52d7c). Synchronous storage reads only, so the
+   * answer is current at the instant the caller goes on to sign.
+   *
+   * Mid-rotate() the keys row is briefly absent and #getKeyId() returns
+   * "unknown", which also differs from any captured id, so that refuses too.
+   */
+  #refuseIfMintStateMoved(captured: { keyId: string; epoch: number }): void {
+    const keyId = this.#getKeyId();
+    const [row] = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    const epoch = row?.epoch;
+    if (keyId === captured.keyId && epoch === captured.epoch) return;
+    console.warn({
+      event: "ct.mint_refused_state_changed",
+      captured,
+      current: { keyId, epoch },
+    });
+    throw new Error(
+      `mint refused: the authority's signing key or epoch changed while the CT log was consulted ` +
+        `(key ${captured.keyId} -> ${keyId}, epoch ${captured.epoch} -> ${epoch}); retry the request`,
+    );
   }
 
   /**
@@ -2263,7 +2306,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         `issuing tier ttl capped at 24h, got ${params.ttlMs}ms`,
       );
     }
-    const { signingKey } = await this.#getOrCreateSigningKey();
+    const { signingKey, keyId: signingKeyId } = await this.#getOrCreateSigningKey();
     // Root PEM read right after the key that signs the tier — see
     // mintBridgeCertPair. Read only when a log is bound.
     const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
@@ -2295,6 +2338,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         ),
       pems: (r) => [r.certificate],
       issuerPem,
+      captured: { keyId: signingKeyId, epoch: state.epoch },
     });
     return {
       ...result,
