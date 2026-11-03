@@ -597,6 +597,25 @@ describe("binding v3 (notme-c9fc8c)", () => {
     expect((await rowOf(m)).generation).toBe(2);
   });
 
+  it("a VALID v1/v2 proof against a v3 row is refused, not revoked, and counted in health (review L1)", async () => {
+    // A copied key without tier.json, or an old binary: the authority has
+    // just verified a proof from the key that did not come from the current
+    // client. Revoking would also shut out a downgraded honest binary, so it
+    // is only made visible.
+    const { m, tier } = await enrolled();
+    await expectOk(await renewV3(m, tier.enrollment_id, 0), 1);
+    const before = (await authority().getAlarmHealth()).renewal.belowBinding;
+    await expectErr(await renew(m, 0), 400, "binding_v3_required"); // a spent generation: v2 would have forked
+    await expectErr(await renewV1(m), 400, "binding_v3_required");
+    // A forged proof is not counted: only a key holder reaches this check.
+    await expectErr(await renew(m, 1, nowS(), (await machine()).kp.privateKey), 401, "invalid_proof");
+    const after = (await authority().getAlarmHealth()).renewal.belowBinding;
+    expect(after.count).toBe(before.count + 2);
+    expect(after.lastAt).toBeGreaterThan(0);
+    expect(after.last).toMatch(/v1 against binding 3/);
+    expect((await rowOf(m)).revoked_at).toBeNull();
+  });
+
   it("a legacy enrollment can move straight from v1 to v3", async () => {
     const { m } = await enrolled();
     const f = await fp(m.spki);

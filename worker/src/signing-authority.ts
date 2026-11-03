@@ -299,6 +299,17 @@ export type BridgeCertRefusal =
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 
+/** Tier renewal health, reported under `renewal` by getAlarmHealth (notme-c9fc8c, review L1). */
+export interface RenewalHealth {
+  /**
+   * Renewals whose proof VERIFIED but whose binding is below what the
+   * enrollment speaks (v1/v2 against a v3 row): a copied key without
+   * tier.json, or an old binary. Refused (binding_v3_required), never
+   * revoked; `last` says which key, binding and generation.
+   */
+  belowBinding: { count: number; lastAt: number; last: string };
+}
+
 /** CT backlog health, reported under `ct` by getAlarmHealth (notme-1b46a8). */
 export interface CtHealth {
   /** Unlogged rows still being retried (attempts < 24). */
@@ -2987,7 +2998,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // advances the generation, so a copied key could renew around the fork
     // check with it; v2 does not name the enrollment. NULL (a legacy row)
     // accepts all three; the first v2 or v3 renewal raises it.
-    if (row.binding_version === 3 && version < 3) return { ok: false, reason: "binding_v3_required" };
+    if (row.binding_version === 3 && version < 3) {
+      // A VALID proof from this key that the current client would not sign
+      // (it speaks v3): a copied key without tier.json, or a downgraded
+      // binary. Not revoked, since the two look the same, but made visible
+      // (review L1).
+      this.#recordBelowBinding({ fingerprint, version, rowVersion: 3, generation: params.generation, current: row.generation });
+      return { ok: false, reason: "binding_v3_required" };
+    }
     if (row.binding_version === 2 && version < 2) return { ok: false, reason: "binding_v2_required" };
     if (!v2 && !inRetryWindow) return { ok: false, reason: "stale_proof" };
 
@@ -3048,6 +3066,58 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ...(this.env.RENEWAL_BINDING_V3 === "on" ? { enrollmentId } : {}),
       criteria: criteria?.map(criteriaId) ?? null,
       ...result,
+    };
+  }
+
+  /** Renewal health (review L1): verified proofs below the binding their enrollment speaks. */
+  #ensureRenewalHealth(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tier_renewal_health (
+        id                    TEXT PRIMARY KEY DEFAULT 'renewal',
+        below_binding_count   INTEGER NOT NULL DEFAULT 0,
+        below_binding_last_at INTEGER NOT NULL DEFAULT 0,
+        below_binding_last    TEXT    NOT NULL DEFAULT ''
+      )
+    `);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO tier_renewal_health (id) VALUES ('renewal')");
+  }
+
+  /** Log and count a verified renewal below its row's binding. Never throws. */
+  #recordBelowBinding(e: {
+    fingerprint: string;
+    version: number;
+    rowVersion: number;
+    generation: number | undefined;
+    current: number;
+  }): void {
+    console.warn({
+      event: "tier.renew_below_binding",
+      fingerprint: e.fingerprint,
+      version: e.version,
+      row_version: e.rowVersion,
+      generation: e.generation ?? null,
+      current: e.current,
+    });
+    try {
+      this.#ensureRenewalHealth();
+      const g = e.generation === undefined ? "none" : String(e.generation);
+      this.ctx.storage.sql.exec(
+        "UPDATE tier_renewal_health SET below_binding_count = below_binding_count + 1, below_binding_last_at = ?, below_binding_last = ? WHERE id = 'renewal'",
+        Math.floor(Date.now() / 1000),
+        `key ${e.fingerprint.slice(0, 16)}: v${e.version} against binding ${e.rowVersion} (generation ${g}, current ${e.current})`,
+      );
+    } catch (err) {
+      console.error({ event: "tier.renewal_health_write_failed", error: String(err) });
+    }
+  }
+
+  #readRenewalHealth(): RenewalHealth {
+    this.#ensureRenewalHealth();
+    const h = this.ctx.storage.sql
+      .exec("SELECT below_binding_count, below_binding_last_at, below_binding_last FROM tier_renewal_health WHERE id = 'renewal'")
+      .toArray()[0] as { below_binding_count: number; below_binding_last_at: number; below_binding_last: string };
+    return {
+      belowBinding: { count: h.below_binding_count, lastAt: h.below_binding_last_at, last: h.below_binding_last },
     };
   }
 
@@ -4746,6 +4816,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     warmupComplete: boolean;
     circuitBreakerOpen: boolean;
     ct: CtHealth;
+    renewal: RenewalHealth;
   }> {
     const health = this.#readAlarmHealthRow();
     const now = Date.now();
@@ -4772,6 +4843,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       circuitBreakerOpen:
         health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES,
       ct: await this.#readCtHealth(),
+      renewal: this.#readRenewalHealth(),
     };
   }
 }

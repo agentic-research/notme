@@ -206,7 +206,11 @@ work exactly as in v2.
 Which binding a row accepts (`binding_version`):
 - NULL (legacy): v1, v2, v3. The first v2 or v3 renewal raises it.
 - 2: v2 and v3. A v1 request is `binding_v2_required`.
-- 3: v3 only. A v1 or v2 request is `binding_v3_required`.
+- 3: v3 only. A v1 or v2 request is `binding_v3_required`. Its proof has
+  verified, so it came from the key but not from the current client (a
+  copied key without tier.json, or a downgraded binary): it is not revoked,
+  since the two look the same, but logged (`tier.renew_below_binding`) and
+  counted in `/admin/alarm-health` under `renewal.belowBinding` (review L1).
 - A key collected for the first time starts at 2, so a client that predates
   v3 keeps renewing; a key that was enrolled before (re-enrollment) starts
   at 3, which is the only case v2 left open. The first v3 renewal raises a
