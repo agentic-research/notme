@@ -514,3 +514,48 @@ describe("invites are inside the reset, and inside a ceiling (notme-2131e8)", ()
     });
   });
 });
+
+// ── notme-b51777: the consume is a compare-and-swap ──────────────────────────
+//
+// consumeBootstrapCode reads `used = 0`, then awaits timingSafeEqual (an HMAC
+// over crypto.subtle, a non-storage await), then marks the row used. Per
+// Cloudflare's rules of Durable Objects, input gates protect only storage
+// operations; any other await lets a second request interleave. Pre-fix the
+// write was an unconditional `UPDATE … SET used = 1`, so two concurrent
+// consumers that both passed the SELECT both returned true: two
+// administrators out of one single-use code.
+describe("passkey.admin.bootstrap-code — concurrent consume (notme-b51777)", () => {
+  it("passkey.admin.bootstrap-code.cas — two concurrent consumes of one code: exactly one succeeds", async () => {
+    const stub = authority("bs-concurrent-consume");
+    const code = await issuedCode(stub);
+    const results = await Promise.all([
+      stub.consumeBootstrapCode(code),
+      stub.consumeBootstrapCode(code),
+    ]);
+    expect(results.filter((r) => r === true)).toHaveLength(1);
+    // And the code stays spent.
+    expect(await stub.consumeBootstrapCode(code)).toBe(false);
+  });
+
+  // The test above went red over real RPC on the pre-fix code, but whether
+  // two RPC calls actually interleave at those awaits is up to workerd's
+  // scheduling and is not deterministic run to run, so on its own it cannot
+  // prove the CAS is what holds the line. The docs promise nothing about
+  // which awaits admit other events, so this one forces the interleave: two consumes
+  // started together inside ONE event, suspended at the same awaits, both
+  // past the SELECT before either UPDATE runs. Only the `AND used = 0`
+  // predicate keeps the second from returning true.
+  it("passkey.admin.bootstrap-code.cas-interleaved — consumes interleaved at the HMAC await: exactly one succeeds", async () => {
+    const stub = authority("bs-concurrent-consume-interleaved");
+    const code = await issuedCode(stub);
+    await runInDurableObject(stub, async (instance) => {
+      const auth = instance as SigningAuthority;
+      const results = await Promise.all([
+        auth.consumeBootstrapCode(code),
+        auth.consumeBootstrapCode(code),
+      ]);
+      expect(results.filter((r) => r === true)).toHaveLength(1);
+    });
+    expect(await stub.consumeBootstrapCode(code)).toBe(false);
+  });
+});

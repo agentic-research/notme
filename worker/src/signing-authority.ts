@@ -4148,8 +4148,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Mint-side gating cannot cover this: the code was legitimately issued at
     // a moment when it was valid. Only the consumer knows the authority has
     // since gained a way in.
+    // Imports hoisted to the top (notme-b51777): `await import(...)` is a
+    // yield point, so none may sit between the stored-code SELECT and its
+    // UPDATE below. timingSafeEqual itself still awaits crypto.subtle inside
+    // that window, which is why the UPDATE is a compare-and-swap.
     const { ensurePasskeySchema } = await import("./auth/passkey");
     const { ensurePrincipalSchema } = await import("./auth/principals");
+    const { timingSafeEqual } = await import("./auth/timing-safe");
     // ── OPERATOR SECRET OUTRANKS THE AUTHENTICATOR GATE (notme-4838ae) ──
     //
     // Checked BEFORE #hasAuthenticator, deliberately, and this is a security
@@ -4176,7 +4181,6 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // LOUD, because silent admin acquisition is the thing the gate guarded.
     const operatorSecret = bootstrapSecret(this.env);
     if (operatorSecret) {
-      const { timingSafeEqual } = await import("./auth/timing-safe");
       if (await timingSafeEqual(code, operatorSecret)) {
         console.warn(
           "[bootstrap] ADMIN RECOVERY: operator secret accepted while authenticators exist (notme-4838ae)",
@@ -4199,7 +4203,6 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // leaked position would let a caller recover it byte by byte.
     const secret = bootstrapSecret(this.env);
     if (secret) {
-      const { timingSafeEqual } = await import("./auth/timing-safe");
       if (await timingSafeEqual(code, secret)) return true;
       // Fall through rather than returning false. An authority can hold BOTH
       // an operator secret and a legacy stored code (armed deliberately via
@@ -4221,9 +4224,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       )
       .toArray() as Array<{ code: string; created_at: string }>;
 
-    const { timingSafeEqual } = await import("./auth/timing-safe");
     if (rows.length === 0 || !(await timingSafeEqual(rows[0]!.code, code)))
       return false;
+    // ↑ That await is a non-storage I/O point: a concurrent consume of the
+    // same code can run to completion while this one is suspended. Nothing
+    // read above may be trusted past it; the UPDATE below re-checks `used`
+    // itself.
 
     // Enforce 15-minute TTL here too (not just in getOrCreateBootstrapCode)
     const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
@@ -4233,10 +4239,22 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return false;
     }
 
+    // COMPARE-AND-SWAP (notme-b51777). Cloudflare's rules of Durable Objects:
+    // input gates protect only storage operations, and around other awaits
+    // "use optimistic locking (check-and-set) patterns". Pre-fix this was an
+    // unconditional `SET used = 1`, so two consumers that both passed the
+    // SELECT above both returned true: two administrators from one
+    // single-use code. Now the write itself carries the `used = 0` predicate,
+    // and the UPDATE plus its changes() read run with no await between them,
+    // so exactly one concurrent consumer sees changes() = 1. Same pattern as
+    // consumePopNonce and collectTierEnrolment.
     this.ctx.storage.sql.exec(
-      "UPDATE bootstrap SET used = 1 WHERE id = 'code'",
+      "UPDATE bootstrap SET used = 1 WHERE id = 'code' AND used = 0",
     );
-    return true;
+    const [c] = [
+      ...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n"),
+    ];
+    return c?.n === 1;
   }
 
   // Passkey stats — no PII, just counts for diagnostics
