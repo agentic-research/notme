@@ -2645,18 +2645,40 @@ export default {
           return jsonErr("invalid oidc proof", 403);
         }
 
+        // Single-use proof (notme-3dfe15 part 1, option A; the nonce-bound
+        // proof is notme-e3dede). Fail closed without a jti, as /cert/gha.
+        const jti = identity.claims?.jti;
+        if (typeof jti !== "string" || !jti) {
+          return jsonErr("jti claim required for replay protection", 400);
+        }
+        const exp = Number(identity.claims?.exp) || 0;
+        // One token, one spend, across routes: /join accepts the same
+        // aud-`notme.bot` tokens /cert/gha, /cert and /token spend into
+        // `jti:<jti>`. That keyspace is KV — eventually consistent — so it is
+        // READ here and passed in; the DO's own consume is what makes /join
+        // atomic, and it runs in the block that redeems the invite.
+        const jtiKey = `jti:${jti}`;
+        const spentElsewhere = Boolean(await platform.cache.get(jtiKey));
+
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
         const joined = await authority.joinInviteWithFederated(
           body.token,
           identity.issuer,
           identity.subject,
+          { jti, exp, spentElsewhere },
         );
         if (!joined.ok) {
+          if (joined.reason === "proof_reused") return jsonErr("token already used", 401);
           return joined.reason === "already_linked"
             ? jsonErr("this identity already belongs to a principal — sign in with it at /auth/oidc/login", 409)
             : jsonErr("invalid or expired invite", 403);
         }
+        // Spent in the shared keyspace only once the join succeeded, so the
+        // token cannot then buy a cert at /cert/gha, /cert or /token.
+        await platform.cache.put(jtiKey, "1", {
+          expirationTtl: Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
+        });
 
         const { createSessionCookie } = await import("./src/auth/session");
         const cookie = await createSessionCookie(
