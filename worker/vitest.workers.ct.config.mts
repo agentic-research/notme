@@ -47,6 +47,14 @@ import { baseMiniflare, CT_BOUND_SUITES, x509Dir } from "./vitest.workers.config
 //   fail-second   only the second-numbered call 500s
 //   fail-signing  500 for any chain whose leaf is NOT a P-256 key (the
 //                 Ed25519 signing cert) — the order-independent half-logged case
+//   hold          add-pre-chain is recorded, held open for `holdMs` (sent
+//                 with the mode, default 500), then answered as `ok`. Lets a
+//                 test run rotate() or revokeEpoch() to completion while a
+//                 mint is suspended on the log (notme-b52d7c). A timer and
+//                 not a /__release call: a promise created by one request and
+//                 resolved from another is not delivered across workerd
+//                 request contexts, so a release endpoint never released and
+//                 every held call ran into the authority's 2 s bound instead.
 
 /** TEST-ONLY log key. Not a secret and not any real log's key. */
 const STUB_LOG_JWK = {
@@ -157,6 +165,7 @@ function isEcLeaf(leafB64) {
 let mode = "ok";
 let n = 0;
 const received = [];
+let holdMs = 500;
 export default {
   async fetch(req) {
     const url = new URL(req.url);
@@ -165,6 +174,7 @@ export default {
       mode = b.mode;
       n = 0;
       received.length = 0;
+      holdMs = typeof b.holdMs === "number" ? b.holdMs : 500;
       const k = await logKeys();
       return Response.json({ id: b64(k.id), spki: k.spki });
     }
@@ -174,6 +184,9 @@ export default {
     const i = ++n;
     const body = JSON.parse(await req.text());
     received.push({ path: url.pathname, chain: body.chain });
+    if (mode === "hold" && url.pathname.endsWith("/add-pre-chain")) {
+      await new Promise((r) => setTimeout(r, holdMs));
+    }
     if (mode === "hang") {
       await new Promise((r) => setTimeout(r, 30000));
       return new Response("too late", { status: 500 });

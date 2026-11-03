@@ -349,6 +349,14 @@ certificates carrying SCTs that no verifier trusts. With either variable
 missing or malformed, nothing is submitted: every mint goes out unlogged
 (never refused) and health reports `configError` and counts `unloggable`.
 
+The log never causes a refusal. The authority can, and only in one case.
+The final certificate is signed after the `add-pre-chain` round-trip, and
+other requests can interleave during that wait. So if a `rotate()` or
+`revokeEpoch()` lands inside it, the mint is refused (the RPC throws "signing
+key or epoch changed while the CT log was consulted") instead of being signed
+with the retired key or the revoked epoch. The caller retries, and the retry
+mints under the current key (notme-b52d7c).
+
 **Deploy check: measure production `add-pre-chain` latency** against the
 mint's 2000 ms timeout (`DEFAULT_TIMEOUT_MS`, `worker/src/ct/log-client.ts`).
 Locally it was about 950 ms (about 400 to 950 ms over every run of the

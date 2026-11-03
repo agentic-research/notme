@@ -46,6 +46,8 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
 
 ### M1 (Medium): `consumeBootstrapCode` does not use compare-and-swap; one bootstrap code can admit two registrants
 
+**Fixed in f9f69af** (notme-b51777): the UPDATE carries `AND used = 0` and success requires `changes() = 1`.
+
 - **Location:** `worker/src/signing-authority.ts:4218-4239`
   - Reads `SELECT ... WHERE used = 0` (4218).
   - Then `await timingSafeEqual(...)` (4225). This is an HMAC over crypto.subtle, a non-storage await, preceded by `await import`.
@@ -64,6 +66,8 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
   - Add a two-concurrent-consumers DO test.
 
 ### M2 (Medium): a CT-bound mint can sign with a key or epoch that changed during its log round-trip
+
+**Fixed in 1a91149** (notme-b52d7c): after the add-pre-chain await the key id and epoch are re-read and the mint is refused if either moved.
 
 - **Location:**
   - `signing-authority.ts:1803-1810` (mintBridgeCertPair) and `2266-2270` (mintIssuingCa) capture `signingKey` and `state.epoch/keyId`.
