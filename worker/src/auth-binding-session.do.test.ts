@@ -22,7 +22,7 @@
  *    the real DO, once.
  */
 import { env, exports } from "cloudflare:workers";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AUTH_METHOD } from "./auth/session";
 import { popProofs } from "./__tests__/helpers/mint-creds";
 
@@ -54,15 +54,22 @@ async function realCreds(name = "binding-session", scopes = ["bridgeCert"]) {
     mtlsKey: mtls.privateKey,
     signingKey: signing.privateKey,
     signingPublicKey: signing.publicKey,
-    // What a binding caller CAN send: CryptoKey does not serialize over RPC
-    // (rpc.cryptokey.isolation), PKCS#8 bytes do.
-    signingKeyPkcs8: (await crypto.subtle.exportKey("pkcs8", signing.privateKey)) as ArrayBuffer,
   };
 }
 
 type Creds = Awaited<ReturnType<typeof realCreds>>;
 
-const auth = () => (exports as any).AuthService;
+/**
+ * The binding, specialised with `props` as an operator would set them per
+ * binding. Fresh props per test: authChallenge() is rate limited per binding
+ * props (notme-153f03), and this pool binds no CERT_LIMITER, so the
+ * per-isolate fallback counts — one shared bucket would throttle the file.
+ */
+let props: { test: string } = { test: "init" };
+beforeEach(() => {
+  props = { test: crypto.randomUUID() };
+});
+const auth = () => (exports as any).AuthService({ props });
 
 /** authChallenge + authenticate over the binding; returns the session STUB. */
 async function sessionOver(creds: Creds, extra: Record<string, unknown> = {}) {
@@ -146,27 +153,78 @@ describe("AuthService session over a real service binding (notme-153f03)", () =>
     session[Symbol.dispose]();
   });
 
-  it("auth.session.sign — authenticate with the signing key's PKCS#8 bytes, then session.sign() signs as the cert", async () => {
+  it("auth.session.sign — session.sign() calls back to the agent's signer over the binding; the key never leaves the agent", async () => {
+    const audit = captureAudit();
     const creds = await realCreds("binding-signer", ["bridgeCert", "sign:git"]);
-    const session = await sessionOver(creds, { signingKeyPkcs8: creds.signingKeyPkcs8 });
+    const session = await sessionOver(creds);
 
     const payload = new TextEncoder().encode("tree abc\n\ncommit");
-    const signed = await session.sign(payload.buffer, "git-commit");
+    const seen: Uint8Array[] = [];
+    // A function crosses the binding as a stub; calling it runs HERE, in the
+    // caller, with the caller's key (Workers RPC, "Send functions as
+    // parameters of RPC methods").
+    const signer = async (bytes: ArrayBuffer) => {
+      seen.push(new Uint8Array(bytes));
+      return crypto.subtle.sign({ name: "Ed25519" }, creds.signingKey, bytes);
+    };
+    const signed = await session.sign(payload.buffer, "git-commit", signer);
 
+    // The signer was asked to sign exactly the payload, once.
+    expect(seen).toHaveLength(1);
+    expect([...seen[0]!]).toEqual([...payload]);
     expect(signed.identity).toBe(creds.identity);
     expect(signed.certificate).toBe(creds.signingCert);
     expect(
       await crypto.subtle.verify({ name: "Ed25519" }, creds.signingPublicKey, signed.signature, payload),
     ).toBe(true);
+    expect(audit.filter((l) => l.type === "sign").at(-1)).toMatchObject({
+      allowed: true,
+      identity: creds.identity,
+      format: "git-commit",
+    });
     session[Symbol.dispose]();
   });
 
-  it("auth.session.sign.key-mismatch — a signing key that is not the signing cert's is refused at authenticate()", async () => {
+  it("auth.session.sign.wrong-key — a signer that signs with a key other than the cert's is refused and audited", async () => {
+    const audit = captureAudit();
     const creds = await realCreds("binding-mismatch");
     const other = await realCreds("binding-mismatch-other");
-    expect(await refusal(() => sessionOver(creds, { signingKeyPkcs8: other.signingKeyPkcs8 }))).toMatch(
-      /signing key does not match/,
+    const session = await sessionOver(creds);
+    const payload = new TextEncoder().encode("hello");
+
+    const message = await refusal(() =>
+      session.sign(payload.buffer, "raw", (bytes: ArrayBuffer) =>
+        crypto.subtle.sign({ name: "Ed25519" }, other.signingKey, bytes),
+      ),
     );
+
+    expect(message).toMatch(/signature does not verify/);
+    expect(audit.filter((l) => l.type === "sign").at(-1)).toMatchObject({
+      allowed: false,
+      reason: "signature_invalid",
+      identity: creds.identity,
+    });
+    session[Symbol.dispose]();
+  });
+
+  it("auth.session.sign.signer-throws — a signer that throws is refused and audited", async () => {
+    const audit = captureAudit();
+    const creds = await realCreds("binding-signer-throws");
+    const session = await sessionOver(creds);
+
+    const message = await refusal(() =>
+      session.sign(new TextEncoder().encode("x").buffer, "raw", () => {
+        throw new Error("hsm unplugged");
+      }),
+    );
+
+    expect(message).toMatch(/signer failed/);
+    expect(audit.filter((l) => l.type === "sign").at(-1)).toMatchObject({
+      allowed: false,
+      reason: "signer_failed",
+      identity: creds.identity,
+    });
+    session[Symbol.dispose]();
   });
 
   it("auth.session.disposed — a disposed session stub cannot be used", async () => {
@@ -187,8 +245,9 @@ describe("AuthService session over a real service binding (notme-153f03)", () =>
     const alice = await realCreds("binding-alice", ["bridgeCert"]);
     const bob = await realCreds("binding-bob", ["bridgeCert", "sign:git"]);
 
-    const a = await sessionOver(alice, { signingKeyPkcs8: alice.signingKeyPkcs8 });
-    const b = await sessionOver(bob, { signingKeyPkcs8: bob.signingKeyPkcs8 });
+    const a = await sessionOver(alice);
+    const b = await sessionOver(bob);
+    const signerFor = (key: CryptoKey) => (bytes: ArrayBuffer) => crypto.subtle.sign({ name: "Ed25519" }, key, bytes);
 
     // A, after B authenticated, is still A — in identity, audit and signature.
     expect((await a.identity()).identity).toBe(alice.identity);
@@ -199,14 +258,21 @@ describe("AuthService session over a real service binding (notme-153f03)", () =>
     expect(audit.filter((l) => l.type === "proxy").at(-1)).toMatchObject({ identity: alice.identity });
 
     const payload = new TextEncoder().encode("hello");
-    const signed = await a.sign(payload.buffer, "raw");
+    const signed = await a.sign(payload.buffer, "raw", signerFor(alice.signingKey));
     expect(signed.identity).toBe(alice.identity);
     expect(signed.certificate).toBe(alice.signingCert);
     expect(await crypto.subtle.verify({ name: "Ed25519" }, alice.signingPublicKey, signed.signature, payload)).toBe(true);
     expect(await crypto.subtle.verify({ name: "Ed25519" }, bob.signingPublicKey, signed.signature, payload)).toBe(false);
 
+    // A cannot be made to sign as B: B's key behind A's session does not verify
+    // under A's cert, so nothing is returned that a verifier would attribute to A.
+    expect(await refusal(() => a.sign(payload.buffer, "raw", signerFor(bob.signingKey)))).toMatch(
+      /signature does not verify/,
+    );
     // A cannot borrow B's scope: git-commit needs sign:git, which only B holds.
-    expect(await refusal(() => a.sign(payload.buffer, "git-commit"))).toMatch(/scope insufficient/);
+    expect(await refusal(() => a.sign(payload.buffer, "git-commit", signerFor(alice.signingKey)))).toMatch(
+      /scope insufficient/,
+    );
 
     a[Symbol.dispose]();
     b[Symbol.dispose]();
@@ -218,6 +284,22 @@ describe("AuthService session over a real service binding (notme-153f03)", () =>
       const message = await refusal(() => stub[name]({ url: PROXY_DEST }));
       expect(message, `${name} must not be callable on AuthService`).toMatch(/does not implement/);
     }
+  });
+
+  it("auth.session.challenge-throttled — over a binding with no CERT_LIMITER, authChallenge() is still bounded per binding props", async () => {
+    // This pool binds no rate limiter, as a self-hosted workerd config does
+    // not: the per-isolate fallback is what answers.
+    const granted: string[] = [];
+    let refused = "";
+    for (let i = 0; i < 20 && !refused; i++) {
+      const m = await refusal(async () => granted.push((await auth().authChallenge(`wimse://notme.bot/principal/flood-${i}`)).challenge));
+      if (m) refused = m;
+    }
+    expect(granted).toHaveLength(10);
+    expect(refused).toMatch(/rate limited/);
+    // A binding with other props has its own budget.
+    props = { test: crypto.randomUUID() };
+    expect(await refusal(() => auth().authChallenge("wimse://notme.bot/principal/other"))).toBe("");
   });
 });
 

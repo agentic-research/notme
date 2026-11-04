@@ -38,14 +38,14 @@ const IDENTITY = "wimse://notme.bot/test/pop-holder";
 
 // One env per test file section, so a challenge issued by one instance can
 // be presented to another — as two binding calls would be.
-function services() {
+function services(authorityEpoch = 1) {
   const env = {
     ...stubEnv(CA),
     PROXY_ALLOWED_DESTINATIONS: "api.github.com",
   };
-  // getAuthorityState for proxy()'s epoch gate.
+  // getAuthorityState for the epoch gate proxy() and sign() run.
   const authority = env.SIGNING_AUTHORITY.get() as Record<string, unknown>;
-  authority.getAuthorityState = async () => ({ epoch: 1, seqno: 1, keyId: "k" });
+  authority.getAuthorityState = async () => ({ epoch: authorityEpoch, seqno: 1, keyId: "k" });
   return () => new (AuthService as unknown as new (c: unknown, e: unknown) => AuthService)(null, env);
 }
 
@@ -138,32 +138,84 @@ describe("authenticate() requires proof of possession (notme-fbbfbc)", () => {
     expect(line).toMatchObject({ allowed: true, identity: IDENTITY });
   });
 
-  it("auth.pop.no-keys — over a binding (no CryptoKeys), PoP still authenticates; sign() then refuses cleanly", async () => {
+  it("auth.pop.no-keys — PoP authenticates with strings alone; no key is taken, and sign() without a signer refuses", async () => {
     const svc = services()();
     const creds = await mintCreds(CA, IDENTITY);
     const { challenge } = await svc.authChallenge(IDENTITY);
+    // A private key handed to authenticate() is ignored: the session holds
+    // none (notme-153f03). Signing goes through the caller's signer.
     const session = await svc.authenticate({
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
       challenge,
       proofs: await popProofs(creds, challenge),
+      signingKey: creds.signingKey,
     } as never);
     expect((await session.identity()).authenticated).toBe(true);
-    await expect(session.sign(new Uint8Array([1]).buffer)).rejects.toThrow(/signing key/);
+    await expect(session.sign(new Uint8Array([1]).buffer, "raw", undefined as never)).rejects.toThrow(/signer/);
+  });
+});
+
+describe("AuthSession.sign() — the gates run before the agent's signer is asked (notme-153f03)", () => {
+  const signerOf = (key: CryptoKey) => vi.fn(async (b: ArrayBuffer) => crypto.subtle.sign({ name: "Ed25519" }, key, b));
+  const signAudits = (logs: string[]) => logs.map((l) => JSON.parse(l)).filter((r) => r.type === "sign");
+
+  it("auth.sign.epoch — a revoked epoch refuses before the signer is called, and is audited", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((l: unknown) => void logs.push(String(l)));
+    const creds = await mintCreds(CA, IDENTITY, ["bridgeCert"], 1);
+    const session = await authenticateWithPop(services(2)(), creds);
+    const signer = signerOf(creds.signingKey);
+
+    await expect(session.sign(new Uint8Array([1]).buffer, "raw", signer)).rejects.toThrow(/revoked/);
+
+    expect(signer).not.toHaveBeenCalled();
+    expect(signAudits(logs).at(-1)).toMatchObject({ allowed: false, reason: "epoch_mismatch", identity: IDENTITY });
   });
 
-  it("auth.pop.key-mismatch — an in-isolate signingKey that is not the signing cert's is refused, and the challenge survives", async () => {
-    const svc = services()();
+  it("auth.sign.expired — expired certs refuse before the signer is called, and are audited", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((l: unknown) => void logs.push(String(l)));
+    const creds = await mintCreds(CA, IDENTITY);
+    const session = await authenticateWithPop(services()(), creds);
+    const signer = signerOf(creds.signingKey);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 24 * 3600 * 1000);
+
+    await expect(session.sign(new Uint8Array([1]).buffer, "raw", signer)).rejects.toThrow(/expired/);
+
+    expect(signer).not.toHaveBeenCalled();
+    expect(signAudits(logs).at(-1)).toMatchObject({ allowed: false, reason: "credentials_expired" });
+  });
+
+  it("auth.sign.scope — a missing scope refuses before the signer is called, and is audited", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((l: unknown) => void logs.push(String(l)));
+    const creds = await mintCreds(CA, IDENTITY, ["bridgeCert"]);
+    const session = await authenticateWithPop(services()(), creds);
+    const signer = signerOf(creds.signingKey);
+
+    await expect(session.sign(new Uint8Array([1]).buffer, "git-commit", signer)).rejects.toThrow(/scope insufficient/);
+
+    expect(signer).not.toHaveBeenCalled();
+    expect(signAudits(logs).at(-1)).toMatchObject({ allowed: false, reason: "scope_insufficient" });
+  });
+
+  it("auth.sign.verified — the signer's signature is returned only after it verifies under the signing cert", async () => {
     const creds = await mintCreds(CA, IDENTITY);
     const other = await mintCreds(CA, "wimse://notme.bot/test/other-key");
-    const { challenge } = await svc.authChallenge(IDENTITY);
-    const presented = { mtlsCert: creds.mtlsCert, signingCert: creds.signingCert, challenge, proofs: await popProofs(creds, challenge) };
-    await expect(svc.authenticate({ ...presented, signingKey: other.signingKey } as never)).rejects.toThrow(
-      /signing key does not match/,
+    const session = await authenticateWithPop(services()(), creds);
+    const payload = new TextEncoder().encode("payload");
+
+    const good = await session.sign(payload, "raw", signerOf(creds.signingKey));
+    expect(new Uint8Array(good.signature).length).toBe(64);
+    await expect(session.sign(payload, "raw", signerOf(other.signingKey))).rejects.toThrow(
+      /signature does not verify/,
     );
-    // Checked before the challenge is spent: the holder can still use it.
-    const session = await svc.authenticate({ ...presented, signingKey: creds.signingKey } as never);
-    expect((await session.identity()).identity).toBe(IDENTITY);
+    // A signer returning something that is not a signature at all.
+    await expect(session.sign(payload, "raw", async () => "nope" as never)).rejects.toThrow(
+      /signature does not verify|signer returned/,
+    );
   });
 });
 
@@ -182,7 +234,11 @@ describe("AuthSession disposal (notme-153f03)", () => {
 
     expect((await session.identity()).authenticated).toBe(false);
     await expect(session.proxy({ url: "https://api.github.com/zen" })).rejects.toThrow(/disposed/);
-    await expect(session.sign(new Uint8Array([1]).buffer, "raw")).rejects.toThrow(/disposed/);
+    await expect(
+      session.sign(new Uint8Array([1]).buffer, "raw", async (b: ArrayBuffer) =>
+        crypto.subtle.sign({ name: "Ed25519" }, creds.signingKey, b),
+      ),
+    ).rejects.toThrow(/disposed/);
     const records = logs.map((l) => JSON.parse(l));
     expect(records.find((r) => r.type === "session")).toMatchObject({ event: "disposed", identity: IDENTITY });
     expect(records.find((r) => r.type === "proxy")).toMatchObject({ allowed: false, reason: "not_authenticated" });
@@ -234,6 +290,32 @@ describe("authChallenge() is throttled (notme-153f03)", () => {
     expect(issued).toHaveLength(1);
     // The key is the binding's props, and nothing the caller chose.
     expect(new Set(rl.keys)).toEqual(new Set([`authchallenge:${JSON.stringify({ agent: "a" })}`]));
+  });
+
+  it("auth.challenge.fallback — with CERT_LIMITER unbound, a per-isolate limiter still bounds it", async () => {
+    // Self-hosted workerd (config.capnp) binds no rate limiter. Unique props
+    // per test run: the fallback is module state, shared by this isolate.
+    const props = { agent: `fallback-${crypto.randomUUID()}` };
+    const env = stubEnv(CA, { limiter: false });
+    const make = () =>
+      new (AuthService as unknown as new (c: unknown, e: unknown) => AuthService)({ props }, env);
+    let granted = 0;
+    let refused = "";
+    for (let i = 0; i < 50 && !refused; i++) {
+      try {
+        await make().authChallenge(IDENTITY);
+        granted++;
+      } catch (e) {
+        refused = (e as Error).message;
+      }
+    }
+    expect(refused).toMatch(/rate limited/);
+    expect(granted).toBe(10);
+    // Another binding's bucket is untouched.
+    const otherProps = { agent: `fallback-other-${crypto.randomUUID()}` };
+    await expect(
+      new (AuthService as unknown as new (c: unknown, e: unknown) => AuthService)({ props: otherProps }, env).authChallenge(IDENTITY),
+    ).resolves.toMatchObject({ expires_in: 60 });
   });
 
   it("auth.challenge.per-binding — one binding's flood does not spend another binding's budget", async () => {

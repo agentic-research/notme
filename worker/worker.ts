@@ -36,6 +36,7 @@ import { ED25519, type Platform } from "./src/platform";
 // AuthService: over a binding every top-level call is a fresh AuthService, so
 // `this` held nothing for the next call. See src/auth/auth-session.ts.
 import { AuthSession, type HeldCerts } from "./src/auth/auth-session";
+import { IsolateRateLimiter } from "./src/isolate-rate-limiter";
 
 // Audience allowlist — every endpoint that mints an access token must check
 // the requested audience against this set. Hoisted to module scope so /token
@@ -253,6 +254,13 @@ export class JwtSigner extends WorkerEntrypoint<any> {
 /** How long an authChallenge() challenge is good for (notme-fbbfbc). */
 const AUTH_CHALLENGE_TTL_S = 60;
 
+/**
+ * authChallenge()'s limiter when no CERT_LIMITER binding exists (notme-153f03):
+ * the binding's 10 / 60 s, counted in THIS isolate only. Module scope on
+ * purpose — a field on AuthService would reset with every binding call.
+ */
+const AUTH_CHALLENGE_FALLBACK_LIMITER = new IsolateRateLimiter({ limit: 10, periodSeconds: 60 });
+
 export class AuthService extends WorkerEntrypoint<any> {
   // NO credential state on this class (notme-153f03). Each top-level binding
   // call gets a fresh `this`, so a field here cannot carry anything from
@@ -400,15 +408,18 @@ export class AuthService extends WorkerEntrypoint<any> {
     // `token-ip:`: a key prefix is a separate counter, so this cannot spend a
     // repository's /cert/gha budget. One authenticate() needs one challenge,
     // and a bridge cert lives five minutes, so ten a minute is generous.
-    // Unbound (a self-hosted workerd config without it), it is not enforced —
-    // the same fail-open every limiter in this file has.
-    if (this.env.CERT_LIMITER) {
-      const { success } = await this.env.CERT_LIMITER.limit({
-        key: `authchallenge:${JSON.stringify(this.#props() ?? null)}`,
-      });
-      if (!success) {
-        throw new Error("rate limited — too many authChallenge() calls from this binding; retry in a minute");
-      }
+    //
+    // Unbound (self-hosted workerd: config.capnp binds no limiter), it does
+    // NOT fail open the way the HTTP routes' limiters do: the same 10 / 60 s
+    // is enforced by AUTH_CHALLENGE_FALLBACK_LIMITER, in this isolate's
+    // memory. That is per-isolate — each isolate counts on its own — which
+    // on one workerd process is the whole service.
+    const limiter = this.env.CERT_LIMITER ?? AUTH_CHALLENGE_FALLBACK_LIMITER;
+    const { success } = await limiter.limit({
+      key: `authchallenge:${JSON.stringify(this.#props() ?? null)}`,
+    });
+    if (!success) {
+      throw new Error("rate limited — too many authChallenge() calls from this binding; retry in a minute");
     }
     const issuedAt = Math.floor(Date.now() / 1000);
     const { nonce } = await this.#getAuthority().issuePopNonce(this.#challengeKey(identity, issuedAt));
@@ -450,29 +461,21 @@ export class AuthService extends WorkerEntrypoint<any> {
    * proofs here. They are checked with the same verifyPopProofs /cert uses,
    * against the public keys IN THE CERTS; the challenge is then spent.
    *
-   * Signing key: optional, and only needed for sign(). workerd cannot
-   * serialize a CryptoKey over RPC (`rpc.cryptokey.isolation`), so an
-   * in-isolate caller passes `signingKey` and a binding caller passes
-   * `signingKeyPkcs8`, the Ed25519 private key's PKCS#8 bytes, imported
-   * here as a non-extractable key. Either way the key must be the signing
-   * CERT's: a probe signature is checked against the cert's public key, so
-   * a session can never sign under one key while its audit line and
-   * returned certificate name another. Without a key, sign() refuses.
-   * `mtlsKey` is accepted in-isolate and unused (no mTLS on proxy()).
+   * No private key is taken, in any form (notme-153f03). Private keys are
+   * never exported, and a CryptoKey cannot cross a binding anyway
+   * (`rpc.cryptokey.isolation`). The session keeps the signing cert's
+   * PUBLIC key; `session.sign()` calls back to a signer the caller passes
+   * and returns its signature only if it verifies under that key.
    *
    * @throws on a CA, validity, pairing or epoch failure; on a missing,
-   *         malformed, expired, replayed or wrongly-bound challenge; on a
-   *         failed proof; or on a signing key that is not the cert's. On
-   *         throw no session exists.
+   *         malformed, expired, replayed or wrongly-bound challenge; or on a
+   *         failed proof. On throw no session exists.
    */
   async authenticate(creds: {
     mtlsCert: string;
     signingCert: string;
     challenge: string;
     proofs: { mtls: string; signing: string };
-    mtlsKey?: CryptoKey;
-    signingKey?: CryptoKey;
-    signingKeyPkcs8?: ArrayBuffer | ArrayBufferView;
   }): Promise<AuthSession> {
     const { deriveCredentialsFromCerts } =
       await import("./src/auth/derive-credentials");
@@ -519,10 +522,6 @@ export class AuthService extends WorkerEntrypoint<any> {
       throw new Error(`${pop.algorithm} proof-of-possession failed`);
     }
 
-    // The key sign() will use, if any: checked against the CERT before the
-    // challenge is spent, so a wrong key does not burn it.
-    const signingKey = await AuthService.#signingKeyFor(creds, signingPublicKey);
-
     // Spent only after the proofs verify (as /cert), so a forged attempt
     // cannot burn the holder's challenge. Bound to the DERIVED identity: a
     // challenge asked for one identity does not authenticate another.
@@ -533,14 +532,13 @@ export class AuthService extends WorkerEntrypoint<any> {
     const held: HeldCerts = {
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
-      mtlsKey: creds.mtlsKey ?? null,
-      signingKey,
+      signingPublicKey,
       identity: derived.identity,
       scopes: derived.scopes,
       expiresAt: derived.expiresAt,
       epoch: derived.epoch,
     };
-    // The epoch is read through env on each proxy() call rather than through
+    // The epoch is read through env on each proxy()/sign() call rather than through
     // this call's DO stub, so the session does not lean on an I/O object
     // belonging to the authenticate() call that created it.
     const env = this.env;
@@ -551,41 +549,6 @@ export class AuthService extends WorkerEntrypoint<any> {
     });
   }
 
-  /**
-   * The signing key a session will hold: the in-isolate CryptoKey, or the
-   * PKCS#8 bytes a binding caller sent, imported non-extractable, and in
-   * both cases only if it signs as the signing CERT's public key verifies.
-   * `static #`: not on the prototype, so not RPC-reachable.
-   */
-  static async #signingKeyFor(
-    creds: { signingKey?: CryptoKey; signingKeyPkcs8?: ArrayBuffer | ArrayBufferView },
-    certPublicKey: CryptoKey,
-  ): Promise<CryptoKey | null> {
-    if (creds.signingKey && creds.signingKeyPkcs8 != null) {
-      throw new Error("pass signingKey or signingKeyPkcs8, not both");
-    }
-    let key: CryptoKey | null = creds.signingKey ?? null;
-    if (creds.signingKeyPkcs8 != null) {
-      try {
-        key = await crypto.subtle.importKey("pkcs8", creds.signingKeyPkcs8, ED25519, false, ["sign"]);
-      } catch {
-        throw new Error("signingKeyPkcs8 is not an Ed25519 PKCS#8 private key");
-      }
-    }
-    if (!key) return null;
-    const probe = new TextEncoder().encode("notme/authsession-signing-key/v1\0");
-    let matches = false;
-    try {
-      const sig = await crypto.subtle.sign(ED25519, key, probe);
-      matches = await crypto.subtle.verify(ED25519, certPublicKey, sig, probe);
-    } catch {
-      matches = false;
-    }
-    if (!matches) {
-      throw new Error("signing key does not match the signing certificate");
-    }
-    return key;
-  }
 
   /*
    * proxy(), sign() AND identity() WERE HERE AND ARE NOW ON AuthSession

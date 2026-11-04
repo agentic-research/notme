@@ -28,21 +28,24 @@
 //   // worker/src/auth/cert-pair-binding.ts — with the P-256 and Ed25519 keys
 //   using session = await env.NOTME.authenticate({
 //     mtlsCert, signingCert, challenge, proofs: { mtls, signing },
-//     // Only for session.sign(): a CryptoKey cannot cross a binding, so the
-//     // Ed25519 key goes as PKCS#8 bytes. notme imports it non-extractable
-//     // and refuses it unless it is the signing cert's key.
-//     signingKeyPkcs8,
 //   });
 //
+// No private key is ever passed to notme. session.sign() takes a SIGNER, a
+// function this Worker supplies: it crosses the binding as a stub, notme
+// calls back to it here with the payload, and returns the signature only if
+// it verifies under the signing cert
+// (https://developers.cloudflare.com/workers/runtime-apis/rpc/#send-functions-as-parameters-of-rpc-methods).
+//
 // The challenge is single-use, good for 60 s, and authChallenge() is rate
-// limited per binding. `openSession` below stands for that sequence; where
-// the cert pair and keys come from (a launcher's /cert/gha exchange, say) is
-// the deployment's choice, not this example's.
+// limited per binding `props` (set props on this Worker's NOTME binding to
+// get a budget of its own). `openSession` below stands for that sequence;
+// where the cert pair and keys come from (a launcher's /cert/gha exchange,
+// say) is the deployment's choice, not this example's.
 
 /**
  * authChallenge -> prove -> authenticate, returning the session stub.
  * `env.BRIDGE_CREDENTIALS` is a placeholder for however this Worker is handed
- * its cert pair and the proofs over the challenge.
+ * its cert pair, the proofs over the challenge, and its signing function.
  */
 async function openSession(env) {
   const creds = env.BRIDGE_CREDENTIALS;
@@ -53,7 +56,6 @@ async function openSession(env) {
     signingCert: creds.signingCert,
     challenge,
     proofs,
-    signingKeyPkcs8: creds.signingKeyPkcs8,
   });
 }
 
@@ -85,13 +87,16 @@ export default {
       }
     }
 
-    // Sign data with the Ed25519 signing key the session holds
+    // Sign as the session's identity. This Worker's key signs (the signer
+    // runs here); notme gates, verifies against the cert, and audits.
     if (url.pathname === "/sign" && request.method === "POST") {
       const body = await request.json();
       try {
         const payload = Uint8Array.from(atob(body.payload), c => c.charCodeAt(0));
         using session = await openSession(env);
-        const result = await session.sign(payload.buffer, body.format || "raw");
+        const result = await session.sign(payload.buffer, body.format || "raw", (bytes) =>
+          env.BRIDGE_CREDENTIALS.sign(bytes),
+        );
         return Response.json({
           signature: btoa(String.fromCharCode(...new Uint8Array(result.signature))),
           certificate: result.certificate,

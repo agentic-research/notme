@@ -19,9 +19,13 @@
  * its public properties and getters ("Properties behave like RPC methods
  * that don't take any arguments"). So every field here is ECMAScript
  * `#private`, never TypeScript `private`, which is erased at compile time
- * and would leave the held certs, the signing key and the env readable on
- * the stub. The reachable surface is `proxy`, `sign`, `identity` and the
- * disposer, pinned by rpc-surface.do.test.ts.
+ * and would leave the held certs and the env readable on the stub. The
+ * reachable surface is `proxy`, `sign`, `identity` and the disposer, pinned
+ * by rpc-surface.do.test.ts.
+ *
+ * NO PRIVATE KEY. The session holds certs and the signing cert's PUBLIC key
+ * only. sign() calls back to a signer the caller passes and verifies what
+ * comes back, so no private key material crosses the binding either way.
  *
  * NO WAY TO CHANGE WHO IT IS. There is no method that re-authenticates or
  * swaps the held credentials: a session is one proven identity for its whole
@@ -44,10 +48,11 @@ import { ED25519 } from "../platform";
 export type HeldCerts = {
   mtlsCert: string;
   signingCert: string;
-  /** Held when authenticated in-isolate; CryptoKey does not serialize over RPC. */
-  mtlsKey: CryptoKey | null;
-  /** In-isolate CryptoKey, or imported (non-extractable) from PKCS#8 bytes. */
-  signingKey: CryptoKey | null;
+  /**
+   * The signing CERT's public key, which sign() verifies the caller's
+   * signature against. No private key is held: the caller signs.
+   */
+  signingPublicKey: CryptoKey;
   identity: string;
   scopes: string[];
   expiresAt: number;
@@ -59,7 +64,7 @@ export type HeldCerts = {
 export type AuthSessionDeps = {
   /** The Worker's env: PROXY_ALLOWED_DESTINATIONS, SIGNET_AUTHORITY_URL, SITE_URL. */
   env: Record<string, unknown>;
-  /** The authority's current epoch, read per proxy() call. */
+  /** The authority's current epoch, read per proxy() and sign() call. */
   authorityState: () => Promise<{ epoch: number }>;
 };
 
@@ -233,71 +238,128 @@ export class AuthSession extends RpcTarget {
   }
 
   /**
-   * Sign data with the held Ed25519 signing key.
-   * Returns the signature + the signing cert (public) + the WIMSE identity.
+   * Sign `payload` as this session's identity, with the CALLER's key.
    *
-   * Refuses once the certs have expired: a session can now outlive its certs
-   * (it lives as long as the caller's stub), and a signature shipped with an
-   * expired cert is one no verifier accepts.
+   * notme holds no private key for the session (notme-153f03): private keys
+   * are never exported, and a CryptoKey cannot cross a binding anyway. The
+   * caller passes `signer`, a function that signs bytes with its Ed25519
+   * key. Over a binding it arrives as a stub, and calling it "makes a new
+   * RPC back to the place where the function originated", so the key stays
+   * in the caller's isolate (Workers RPC, "Send functions as parameters of
+   * RPC methods"); the stub is disposed when this call returns ("Stubs
+   * received as parameters in an RPC call", Lifecycle). An agent whose
+   * signer is an RpcTarget passes `(bytes) => target.sign(bytes)`.
+   *
+   * Gates, in order, each refusing with an audit line naming it:
+   *   1. credentials held (not disposed) and unexpired;
+   *   2. scope: `raw` needs none, `dsse` / `git-commit` need sign:git or
+   *      sign:attestation;
+   *   3. a signer was given;
+   *   4. the held certs' epoch equals the authority's (the revocation lever,
+   *      as proxy()); an RPC failure refuses;
+   * then the signer is called over a private copy of the payload, and its
+   * output is returned ONLY if it verifies under the signing CERT's public
+   * key over that same payload (`signer_failed` / `signature_invalid`
+   * otherwise). So the returned signature, certificate and identity always
+   * agree, and the audit line records what was actually produced.
    */
   async sign(
-    payload: ArrayBuffer,
-    format: "raw" | "dsse" | "git-commit" = "raw",
+    payload: ArrayBuffer | ArrayBufferView,
+    format: "raw" | "dsse" | "git-commit",
+    signer: (payload: ArrayBuffer) => ArrayBuffer | ArrayBufferView | Promise<ArrayBuffer | ArrayBufferView>,
   ): Promise<{
     signature: ArrayBuffer;
     certificate: string;
     identity: string;
   }> {
     const held = this.#held;
+    const signingScopes = ["sign:git", "sign:attestation"];
+    const bytes = toBytes(payload);
+    const payloadHash = bytes
+      ? Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("")
+      : null;
+    const audit = (fields: Record<string, unknown>) =>
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          type: "sign",
+          identity: held?.identity ?? null,
+          format: String(format).slice(0, 16),
+          payload_hash: payloadHash ? `sha256:${payloadHash}` : null,
+          scope_checked:
+            format === "raw" ? "none" : (signingScopes.find((s) => held?.scopes.includes(s)) ?? null),
+          ...fields,
+        }),
+      );
+    const deny = (reason: string, message: string): never => {
+      audit({ allowed: false, reason });
+      throw new Error(message);
+    };
+
     if (!held) {
-      throw new Error("not authenticated — this session was disposed; call authenticate() again");
+      return deny("not_authenticated", "not authenticated — this session was disposed; call authenticate() again");
     }
     if (held.expiresAt <= Math.floor(Date.now() / 1000)) {
-      throw new Error("credentials expired — re-authenticate");
+      return deny("credentials_expired", "credentials expired — re-authenticate");
     }
-
-    // Scope check for signing
-    const signingScopes = ["sign:git", "sign:attestation"];
-    const hasSignScope =
-      format === "raw"
-        ? true // raw signing doesn't require a specific scope
-        : held.scopes.some((s) => signingScopes.includes(s));
+    if (!bytes) {
+      return deny("payload_invalid", "payload must be an ArrayBuffer or a typed array");
+    }
+    if (format !== "raw" && format !== "dsse" && format !== "git-commit") {
+      return deny("format_invalid", "format must be raw, dsse or git-commit");
+    }
+    const hasSignScope = format === "raw" || held.scopes.some((s) => signingScopes.includes(s));
     if (!hasSignScope) {
-      throw new Error(
-        `scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`,
+      return deny("scope_insufficient", `scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`);
+    }
+    if (typeof signer !== "function") {
+      return deny(
+        "no_signer",
+        "signer required — pass a function that signs the payload with the signing cert's Ed25519 key",
+      );
+    }
+    let epoch: number;
+    try {
+      ({ epoch } = await this.#deps.authorityState());
+    } catch {
+      return deny("authority_unavailable", "authority unavailable — cannot check the credentials' epoch");
+    }
+    if (held.epoch !== epoch) {
+      return deny(
+        "epoch_mismatch",
+        `credentials revoked — cert epoch ${held.epoch} is not the authority's epoch ${epoch}; re-authenticate`,
       );
     }
 
-    if (!held.signingKey) {
-      throw new Error(
-        "no signing key held — pass signingKey (in-isolate) or signingKeyPkcs8 (over a binding) to authenticate()",
+    // The signer gets its own copy: whatever it does to it, verification
+    // below is over the bytes this method was given.
+    let produced: unknown;
+    try {
+      produced = await signer(bytes.slice().buffer);
+    } catch {
+      return deny("signer_failed", "signer failed — the caller's signer threw");
+    }
+    const signature = toBytes(produced as ArrayBuffer | ArrayBufferView);
+    let verified = false;
+    if (signature) {
+      try {
+        verified = await crypto.subtle.verify(ED25519, held.signingPublicKey, signature, bytes);
+      } catch {
+        verified = false;
+      }
+    }
+    if (!verified) {
+      return deny(
+        "signature_invalid",
+        "signature does not verify under the signing certificate — the signer used another key or signed other bytes",
       );
     }
-    const signature = await crypto.subtle.sign(ED25519, held.signingKey, payload);
 
-    // Audit log
-    const payloadHash = Array.from(
-      new Uint8Array(await crypto.subtle.digest("SHA-256", payload)),
-    )
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        type: "sign",
-        identity: held.identity,
-        format,
-        payload_hash: `sha256:${payloadHash}`,
-        scope_checked:
-          format === "raw"
-            ? "none"
-            : signingScopes.find((s) => held.scopes.includes(s)),
-        allowed: true,
-      }),
-    );
-
+    audit({ allowed: true });
     return {
-      signature,
+      signature: signature!.slice().buffer,
       certificate: held.signingCert,
       identity: held.identity,
     };
@@ -329,4 +391,16 @@ export class AuthSession extends RpcTarget {
       authenticated: true,
     };
   }
+}
+
+/**
+ * A private copy of `v` as bytes, or null if it is not binary. Copies so a
+ * caller (or signer) holding the original cannot change what was checked.
+ */
+function toBytes(v: unknown): Uint8Array | null {
+  if (v instanceof ArrayBuffer) return new Uint8Array(v.slice(0));
+  if (ArrayBuffer.isView(v)) {
+    return new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) as ArrayBuffer);
+  }
+  return null;
 }

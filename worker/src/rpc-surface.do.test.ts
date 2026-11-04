@@ -463,15 +463,18 @@ describe("instance fields are private too, not merely TypeScript-private", () =>
   });
 
   it("AuthSession exposes no own state on an instance (notme-153f03)", async () => {
-    // The session holds the verified certs, the signing key and env. Its
+    // The session holds the verified certs, the signing cert's public key and env. Its
     // instance is what a stub points at, so a TS `private` field here would
     // be readable as a property over the binding.
+    const { publicKey } = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
     const session = new AuthSession(
       {
         mtlsCert: "m",
         signingCert: "s",
-        mtlsKey: null,
-        signingKey: null,
+        signingPublicKey: publicKey,
         identity: "wimse://notme.bot/test/fields",
         scopes: [],
         expiresAt: 0,

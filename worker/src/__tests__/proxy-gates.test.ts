@@ -16,7 +16,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { authenticateWithPop, makeCA, mintCreds, stubAuthority } from "./helpers/mint-creds";
+import { authenticateWithPop, makeCA, mintCreds, stubAuthority, UNLIMITED } from "./helpers/mint-creds";
 
 vi.mock("cloudflare:workers", () => ({
   // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
@@ -51,6 +51,7 @@ function service(vars: Record<string, unknown>, authorityEpoch: number | "throw"
     },
   });
   const env = {
+    CERT_LIMITER: UNLIMITED,
     ...vars,
     SIGNING_AUTHORITY: {
       idFromName: () => "default",

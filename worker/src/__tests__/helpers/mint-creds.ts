@@ -94,6 +94,8 @@ export function stubAuthority(ca: CryptoKeyPair, extra: Record<string, unknown> 
   const nonces = new Map<string, string>();
   return {
     getPublicKeyPem: async () => spkiToPem(ca.publicKey),
+    // The epoch proxy() and sign() check; mintCreds writes epoch 1 by default.
+    getAuthorityState: async () => ({ epoch: 1, seqno: 1, keyId: "k" }),
     issuePopNonce: async (principalId: string) => {
       const nonce = b64u(crypto.getRandomValues(new Uint8Array(32)));
       nonces.set(nonce, principalId);
@@ -108,14 +110,26 @@ export function stubAuthority(ca: CryptoKeyPair, extra: Record<string, unknown> 
   };
 }
 
-/** A stub env exposing just the SIGNING_AUTHORITY binding AuthService reaches. */
-export function stubEnv(ca: CryptoKeyPair) {
+/**
+ * A CERT_LIMITER stand-in that never refuses. authChallenge() is rate limited
+ * (notme-153f03) and, with no binding, falls back to a per-ISOLATE limiter
+ * whose count every suite in this isolate would share; suites that are not
+ * about the limit bind this so they do not throttle each other.
+ */
+export const UNLIMITED = { limit: async () => ({ success: true }) };
+
+/**
+ * A stub env exposing the SIGNING_AUTHORITY binding AuthService reaches, and
+ * an unlimited CERT_LIMITER unless `limiter: false` (to exercise the fallback).
+ */
+export function stubEnv(ca: CryptoKeyPair, opts: { limiter?: boolean } = {}) {
   const authority = stubAuthority(ca);
   return {
     SIGNING_AUTHORITY: {
       idFromName: () => "default",
       get: () => authority,
     },
+    ...(opts.limiter === false ? {} : { CERT_LIMITER: UNLIMITED }),
   };
 }
 

@@ -135,11 +135,15 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    const sessA = await authenticateWithPop(a, await makeCreds("wimse://notme.bot/gha/alice"));
+    const alice = await makeCreds("wimse://notme.bot/gha/alice");
+    const sessA = await authenticateWithPop(a, alice);
     await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
 
+    // The caller signs (notme-153f03); the session verifies and attributes.
     const payload = new TextEncoder().encode("hello").buffer as ArrayBuffer;
-    const signed = await sessA.sign(payload, "raw");
+    const signed = await sessA.sign(payload, "raw", (bytes: ArrayBuffer) =>
+      crypto.subtle.sign({ name: "Ed25519" }, alice.signingKey, bytes),
+    );
     expect(signed.identity).toBe("wimse://notme.bot/gha/alice");
   });
 });
