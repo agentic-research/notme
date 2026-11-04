@@ -57,9 +57,14 @@ class_name = "SigningAuthority"
 name = "REVOCATION"
 class_name = "RevocationAuthority"
 
+# SQLite-backed, like the template (notme-b556a4): this file runs under
+# `wrangler dev`, but a copy of it deployed to a fresh account must not ask
+# for a KV-backed namespace, which Cloudflare no longer creates there. See
+# wrangler.toml.example for why the tag names, not the backend, are what an
+# existing deployment depends on.
 [[migrations]]
 tag = "v1"
-new_classes = ["RevocationAuthority"]
+new_sqlite_classes = ["RevocationAuthority"]
 
 [[migrations]]
 tag = "v2"

@@ -26,6 +26,7 @@ import {
   RevocationAuthority,
   verifyBundleSignature,
 } from "./revocation";
+import type { SigningAuthority } from "./signing-authority";
 
 // ── Test key generation ───────────────────────────────────────────────────────
 
@@ -124,7 +125,40 @@ describe("bundle.signature.verification — verifyBundleSignature", () => {
 
 // ── RevocationAuthority DO ────────────────────────────────────────────────────
 
-describe("RevocationAuthority", () => {
+// Both storage backends (notme-b556a4). Production's namespace was created by
+// migration v1 as `new_classes` (KV-backed), and storage backends are
+// immutable once provisioned, so it stays that way. The committed templates
+// now create the class with `new_sqlite_classes`, because Cloudflare refuses
+// a new KV-backed namespace on an account that holds none. The class must
+// behave identically on both, so every case runs on each.
+//
+// Miniflare binds one class to one backend (a second, SQLite binding of the
+// same class fails with ERR_DIFFERENT_STORAGE_BACKEND), so the SQLite case
+// constructs RevocationAuthority over the state of a SQLite-backed DO
+// instance: the SigningAuthority namespace, under names no other test uses.
+// That is the same DurableObjectState API a SQLite-backed RevocationAuthority
+// namespace would hand the constructor, and the class touches nothing else.
+type Run = (name: string, fn: (instance: RevocationAuthority) => Promise<void>) => Promise<void>;
+const onKvBackend: Run = (name, fn) =>
+  runInDurableObject(env.REVOCATION.get(env.REVOCATION.idFromName(name)), (instance: RevocationAuthority) =>
+    fn(instance),
+  );
+const onSqliteBackend: Run = (name, fn) =>
+  runInDurableObject(
+    env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(`revocation-on-sqlite:${name}`)),
+    (sa) => {
+      const state = (sa as SigningAuthority)["ctx"] as DurableObjectState;
+      // Prove the premise rather than assume it: this storage IS SQLite.
+      expect(state.storage.sql.databaseSize).toBeGreaterThan(0);
+      return fn(new RevocationAuthority(state));
+    },
+  );
+const REVOCATION_BACKENDS = [
+  ["legacy-kv (production's namespace)", onKvBackend],
+  ["sqlite (the templates' fresh-account path)", onSqliteBackend],
+] as const;
+
+describe.each(REVOCATION_BACKENDS)("RevocationAuthority on %s", (_backend, inInstance) => {
   async function seqnoCheck(
     instance: RevocationAuthority,
     issuerId: string,
@@ -141,18 +175,14 @@ describe("RevocationAuthority", () => {
   }
 
   it("accepts first seqno", async () => {
-    const id = env.REVOCATION.idFromName("test-accept-first");
-    const stub = env.REVOCATION.get(id);
-    await runInDurableObject(stub, async (instance: RevocationAuthority) => {
+    await inInstance("test-accept-first", async (instance) => {
       const result = await seqnoCheck(instance, "test", 100);
       expect(result.ok).toBe(true);
     });
   });
 
   it("accepts same seqno (same bundle re-fetched)", async () => {
-    const id = env.REVOCATION.idFromName("test-accept-same");
-    const stub = env.REVOCATION.get(id);
-    await runInDurableObject(stub, async (instance: RevocationAuthority) => {
+    await inInstance("test-accept-same", async (instance) => {
       await seqnoCheck(instance, "test", 100);
       const result = await seqnoCheck(instance, "test", 100);
       expect(result.ok).toBe(true);
@@ -160,9 +190,7 @@ describe("RevocationAuthority", () => {
   });
 
   it("accepts higher seqno (bundle rotated)", async () => {
-    const id = env.REVOCATION.idFromName("test-accept-higher");
-    const stub = env.REVOCATION.get(id);
-    await runInDurableObject(stub, async (instance: RevocationAuthority) => {
+    await inInstance("test-accept-higher", async (instance) => {
       await seqnoCheck(instance, "test", 100);
       const result = await seqnoCheck(instance, "test", 101);
       expect(result.ok).toBe(true);
@@ -170,9 +198,7 @@ describe("RevocationAuthority", () => {
   });
 
   it("revocation.seqno.monotonic — rejects lower seqno (rollback attack)", async () => {
-    const id = env.REVOCATION.idFromName("test-reject-rollback");
-    const stub = env.REVOCATION.get(id);
-    await runInDurableObject(stub, async (instance: RevocationAuthority) => {
+    await inInstance("test-reject-rollback", async (instance) => {
       await seqnoCheck(instance, "test", 100);
       const result = await seqnoCheck(instance, "test", 99);
       expect(result.ok).toBe(false);
@@ -184,9 +210,7 @@ describe("RevocationAuthority", () => {
     // A null/undefined/NaN seqno compares false against everything, so without
     // this guard it would slip past the rollback check. JSON turns NaN and
     // Infinity into null, which is what a hostile caller can actually send.
-    const id = env.REVOCATION.idFromName("test-reject-invalid");
-    const stub = env.REVOCATION.get(id);
-    await runInDurableObject(stub, async (instance: RevocationAuthority) => {
+    await inInstance("test-reject-invalid", async (instance) => {
       await seqnoCheck(instance, "test", 100);
       for (const bad of [0, -1, null, "101", undefined] as unknown as number[]) {
         const result = await seqnoCheck(instance, "test", bad);
@@ -200,9 +224,7 @@ describe("RevocationAuthority", () => {
   });
 
   it("isolates seqno state per issuer", async () => {
-    const id = env.REVOCATION.idFromName("test-isolation");
-    const stub = env.REVOCATION.get(id);
-    await runInDurableObject(stub, async (instance: RevocationAuthority) => {
+    await inInstance("test-isolation", async (instance) => {
       await seqnoCheck(instance, "issuer-a", 200);
       // Different issuer starts at 0
       const result = await seqnoCheck(instance, "issuer-b", 1);
