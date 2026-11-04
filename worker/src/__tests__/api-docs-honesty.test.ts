@@ -18,6 +18,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { AUTHORITY_GRANT_TYPES } from "../as-metadata";
+import { AUTHORITY_HOST_TOKEN, renderApiDocs } from "../api-docs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url).href);
 const docs = readFileSync(`${root}public/_api-docs.html`, "utf8");
@@ -158,5 +159,42 @@ describe("api-docs.ca-bundle", () => {
     // waits forever for one.
     expect(docs).toContain("cRLSign");
     expect(docs).toMatch(/no CRL and no CRL distribution point/);
+  });
+});
+
+describe("api-docs.authority-host-is-a-template (notme-131c8e)", () => {
+  // The page used to hardcode the production authority host, and worker.ts
+  // rewrote that literal on any other environment: a domain change meant
+  // editing both, and neither side showed the coupling. The asset now names
+  // the host only through a placeholder, and the worker fills it for every
+  // environment, production included.
+  it("names no production authority host in the asset itself", () => {
+    expect(docs).not.toContain("auth.notme.bot");
+    expect(docs).toContain(AUTHORITY_HOST_TOKEN);
+  });
+
+  it("worker.ts no longer rewrites a literal production host", () => {
+    expect(workerSrc).not.toContain('replaceAll("auth.notme.bot"');
+  });
+
+  it("renders a complete page for the production host", () => {
+    const page = renderApiDocs(docs, "auth.notme.bot");
+    expect(page).not.toContain(AUTHORITY_HOST_TOKEN);
+    expect(page).toContain("<title>API — auth.notme.bot</title>");
+    expect(page).toContain('href="https://auth.notme.bot/api/docs"');
+    expect(page).toContain("curl -X POST https://auth.notme.bot/cert/gha");
+  });
+
+  it("renders a staging page with no production authority URL in it", () => {
+    const page = renderApiDocs(docs, "auth-staging.notme.bot");
+    expect(page).not.toContain(AUTHORITY_HOST_TOKEN);
+    expect(page).not.toContain("//auth.notme.bot");
+    expect(page).toContain("https://auth-staging.notme.bot/cert/gha");
+  });
+
+  it("escapes the host, so a hostile value cannot add markup", () => {
+    expect(renderApiDocs(`<b>${AUTHORITY_HOST_TOKEN}</b>`, `x"><script>`)).toBe(
+      "<b>x&quot;&gt;&lt;script&gt;</b>",
+    );
   });
 });

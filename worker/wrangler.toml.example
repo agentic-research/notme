@@ -178,9 +178,34 @@ class_name = "RevocationAuthority"
 # binding) — or CT_LOG_SHARDS in their place — are variables: see the
 # commented lines under [vars] above.
 
+# Durable Object migrations (notme-b556a4). Both classes are SQLite-backed.
+#
+# A FRESH account must use these exactly. Cloudflare no longer creates
+# KV-backed namespaces ("Creating new namespaces with the key-value storage
+# backend is no longer supported for accounts without an existing
+# key-value-backed namespace"), and `new_classes` selects that backend, so a
+# template that said `new_classes` had its first deploy refused.
+#
+# An EXISTING deployment whose v1 was applied as
+# `new_classes = ["RevocationAuthority"]` (notme.bot's production and
+# staging) keeps that history, and nothing here changes it:
+#   - wrangler matches the Worker's recorded tag against this list and
+#     applies only the entries after it ("Migration tags are treated like
+#     unique names and are used to determine which migrations have already
+#     been applied"; "Each migration can only be applied once per
+#     environment"). A deployment at v2 applies nothing from these lines.
+#   - Its RevocationAuthority namespace stays KV-backed: "Storage backends
+#     are immutable once provisioned."
+#   - So the TAG NAMES and their ORDER are what must not change. Do not
+#     rename v1/v2, and add new migrations as v3 onwards.
+#   - If such a deployment later moves to the `exports` field, declare
+#     RevocationAuthority there with `storage = "legacy-kv"`; `sqlite` would
+#     be refused with storage_type_mismatch.
+# Source: developers.cloudflare.com/durable-objects/reference/
+#   durable-objects-migrations/ and .../durable-object-class-migrations-legacy/
 [[migrations]]
 tag = "v1"
-new_classes = ["RevocationAuthority"]
+new_sqlite_classes = ["RevocationAuthority"]
 
 [[migrations]]
 tag = "v2"

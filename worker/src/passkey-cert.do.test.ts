@@ -316,11 +316,13 @@ describe("authMethod provenance (notme-ebc9af)", () => {
   });
 
   it("refuses a session with no authMethod rather than stamping a placeholder", async () => {
-    // verifySessionCookie JSON.parses the payload with no shape validation,
-    // so a future issuer that forgets authMethod would reach the mint with
-    // undefined. Defaulting to "passkey" would re-create the exact lie
-    // notme-ebc9af fixed; stamping String(undefined) puts the literal
-    // "undefined" in a certificate. Fail closed instead.
+    // A future issuer that forgets authMethod must not reach the mint:
+    // defaulting to "passkey" would re-create the exact lie notme-ebc9af
+    // fixed, and stamping String(undefined) puts the literal "undefined" in
+    // a certificate. The refusal now happens where the cookie becomes a
+    // session (notme-32003c), so such a cookie cannot even fetch the nonce
+    // the mint needs; auth-method-boundary.do.test.ts drives the mint routes
+    // themselves.
     const stub = env.SIGNING_AUTHORITY.get(
       env.SIGNING_AUTHORITY.idFromName("default"),
     );
@@ -329,10 +331,21 @@ describe("authMethod provenance (notme-ebc9af)", () => {
       { principalId: "principal-passkey-test", scopes: ["bridgeCert"] } as any,
       secret,
     );
-    const res = await post(await mintRequest(cookie), cookie);
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    const body = (await res.json()) as any;
-    expect(JSON.stringify(body)).not.toContain("undefined");
+    const nonce = await worker.fetch(
+      new Request(`${ORIGIN}/cert/nonce`, { method: "POST", headers: { cookie } }),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(nonce.status).toBe(401);
+    const res = await post(
+      {
+        nonce: "n",
+        public_keys: { mtls: "m", signing: "s" },
+        proofs: { mtls: "m", signing: "s" },
+      },
+      cookie,
+    );
+    expect(res.status).toBe(401);
+    expect(JSON.stringify(await res.json())).not.toContain("undefined");
   });
 
   it("an oidc session's cert carries the issuer-qualified method, URI-encoded", async () => {

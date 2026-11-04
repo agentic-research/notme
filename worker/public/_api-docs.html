@@ -8,7 +8,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>API — auth.notme.bot</title>
+    <title>API — {{AUTHORITY_HOST}}</title>
     <meta
       name="description"
       content="API reference for the notme.bot signet identity authority. Bridge certificates, GHA OIDC exchange, authority discovery."
@@ -18,7 +18,7 @@
       href="https://notme.bot/favicon.svg"
       type="image/svg+xml"
     />
-    <link rel="canonical" href="https://auth.notme.bot/api/docs" />
+    <link rel="canonical" href="https://{{AUTHORITY_HOST}}/api/docs" />
     <link rel="stylesheet" href="https://notme.bot/styles.css" />
     <style>
       @import url("https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300;1,400&display=swap");
@@ -330,7 +330,7 @@
 
       <div class="hero">
         <div class="hero-stamp">api reference</div>
-        <h1>auth.notme.bot</h1>
+        <h1>{{AUTHORITY_HOST}}</h1>
         <p class="lead">
           signet identity authority API. bridge certificates via OIDC token
           exchange, GHA automation, and agent registration.
@@ -339,7 +339,7 @@
 
       <div class="base-url">
         <span class="base-label">base</span>
-        <span class="base-value">https://auth.notme.bot</span>
+        <span class="base-value">https://{{AUTHORITY_HOST}}</span>
       </div>
 
       <h2>certificate exchange</h2>
@@ -389,7 +389,7 @@
   "scopes": ["bridgeCert"],
   "expires_at": 1711670400,
   "binding": "9f86d081...",
-  "authority": "https://auth.notme.bot",
+  "authority": "https://{{AUTHORITY_HOST}}",
   "principal_id": "a1b2c3d4-...",
   "auth_method": "passkey"
 }</div>
@@ -416,7 +416,7 @@
           </p>
           <div class="ep-label">request</div>
           <div class="ep-example">
-            curl -X POST https://auth.notme.bot/cert/gha \
+            curl -X POST https://{{AUTHORITY_HOST}}/cert/gha \
               -H "Authorization: Bearer ${ACTIONS_ID_TOKEN}" \
               -H "Content-Type: application/json" \
               -d '{"public_keys":{"mtls":"&lt;P-256 SPKI PEM&gt;","signing":"&lt;Ed25519 SPKI PEM&gt;"},
@@ -655,15 +655,15 @@
           </div>
           <div class="ep-label">response</div>
           <div class="ep-response">
-            { "issuer": "https://auth.notme.bot", "cert_endpoint":
-            "https://auth.notme.bot/cert", "cert_gha_endpoint":
-            "https://auth.notme.bot/cert/gha", "ca_bundle_endpoint":
-            "https://auth.notme.bot/.well-known/ca-bundle.pem",
+            { "issuer": "https://{{AUTHORITY_HOST}}", "cert_endpoint":
+            "https://{{AUTHORITY_HOST}}/cert", "cert_gha_endpoint":
+            "https://{{AUTHORITY_HOST}}/cert/gha", "ca_bundle_endpoint":
+            "https://{{AUTHORITY_HOST}}/.well-known/ca-bundle.pem",
             "algorithms_supported": ["Ed25519"], "grant_types_supported": [
             "urn:ietf:params:oauth:grant-type:token-exchange" ], "cert_types_supported":
             ["bridge_certificate"], "token_endpoint":
-            "https://auth.notme.bot/token", "jwks_uri":
-            "https://auth.notme.bot/.well-known/jwks.json",
+            "https://{{AUTHORITY_HOST}}/token", "jwks_uri":
+            "https://{{AUTHORITY_HOST}}/.well-known/jwks.json",
             "dpop_signing_alg_values_supported": ["ES256"], "documentation":
             "https://notme.bot/architecture" }
           </div>
