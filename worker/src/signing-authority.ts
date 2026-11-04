@@ -4335,10 +4335,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    *
    * CALLERS SEE `EPOCH_MISMATCH` and retry once against fresh
    * `getReceiptFacts()` — the one retryable code, already specified for this
-   * shape (ADR-014). No operator HTTP route, matching `rotate()`: both are
-   * service-binding operations, and a public door onto mass revocation is a
-   * denial-of-service surface with an authentication bug away from being
-   * free.
+   * shape (ADR-014). Its one HTTP door is the admin-gated
+   * `POST /admin/revoke-epoch` (ADR-019 D7); `rotate()` has none. Any door
+   * onto mass revocation is a denial-of-service surface with an
+   * authentication bug away from being free, so that route stays behind the
+   * authorityManage admin check.
    */
   async revokeEpoch(reason?: string): Promise<{ epoch: number; seqno: number }> {
     this.#ensureSchema();
