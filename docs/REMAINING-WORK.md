@@ -1,9 +1,14 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-03 · **Open beads:** 43 in notme (`rsry status --json` →
+**Updated:** 2026-11-04 · **Open beads:** 43 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
+
+**Status, 2026-11-04: the code side of Goal Zero is done.** Every remaining
+release blocker is an operator action: a P0 bead owned by `operator`, listed
+in order under the epic **notme-5e70d1**. The rest of what's open is either
+blocked on another repo, or after-release work under notme-a93d47.
 
 The goal is zero open beads, or as close to it as the world allows. Any bead
 that can't be finished stays **open**, with the reason written on it, and is
