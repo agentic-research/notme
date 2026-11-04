@@ -2257,19 +2257,20 @@ export default {
         );
         const headers = new Headers(resp.headers);
         headers.set("Cache-Control", "public, max-age=3600");
-        // The asset hardcodes the production authority host. On any other
-        // environment (staging), rewrite it so the docs describe the host
-        // actually serving them — worker:verify treats a production URL
-        // rendered on staging as a config leak.
+        // The asset is a template that names the authority host only through
+        // a placeholder (notme-131c8e). Fill it on EVERY environment, so the
+        // docs describe the host actually serving them — worker:verify treats
+        // a production URL rendered on staging as a config leak. The host is
+        // authorityUrl's (the env var, defaulted as everywhere else in this
+        // block); the request's Host only if that does not parse.
         let body: BodyInit | null = resp.body;
-        if (
-          resp.ok &&
-          authorityHost !== null &&
-          authorityHost !== "auth.notme.bot"
-        ) {
-          const html = await resp.text();
-          body = html.replaceAll("auth.notme.bot", authorityHost);
-          // Stale after rewriting: length changed, and text() already
+        if (resp.ok) {
+          const { renderApiDocs } = await import("./src/api-docs");
+          body = renderApiDocs(
+            await resp.text(),
+            authorityHostFromEnv(authorityUrl) ?? host,
+          );
+          // Stale after rendering: length changed, and text() already
           // decoded any content-encoding.
           headers.delete("Content-Length");
           headers.delete("Content-Encoding");
