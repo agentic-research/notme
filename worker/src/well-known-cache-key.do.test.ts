@@ -72,6 +72,7 @@ describe("routing.cache.query-ignored", () => {
   for (const [path, rpc] of [
     ["/.well-known/jwks.json", "getPublicKeyJwk"],
     ["/.well-known/epochs.json", "listEpochKeys"],
+    ["/.well-known/ct-not-delivered.json", "listNotDeliveredCerts"],
     ["/.well-known/ca-bundle.pem", "getCACertificatePem"],
   ] as const) {
     it(`${path}: two requests differing only by query make one DO call`, async () => {
@@ -115,6 +116,7 @@ describe("routing.cache.method-gate", () => {
   for (const [path, rpc] of [
     ["/.well-known/jwks.json", "getPublicKeyJwk"],
     ["/.well-known/epochs.json", "listEpochKeys"],
+    ["/.well-known/ct-not-delivered.json", "listNotDeliveredCerts"],
     ["/.well-known/ca-bundle.pem", "getCACertificatePem"],
   ] as const) {
     it(`${path}: after one GET, HEAD is served from the cache and POST is 405, with no further DO call`, async () => {

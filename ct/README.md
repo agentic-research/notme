@@ -526,6 +526,42 @@ tried (minted while the pin was broken) is never abandoned.
   certificate life and beyond): the log is slow or down, and rows left past
   their certificate's life are expected to be refused as expired (see above).
 
+### 4a. Precerts for certificates that were never delivered
+
+A monitor matching the log against issuance will find a few precerts whose
+certificate nobody received (notme-b35676). Three paths produce one:
+
+1. **`mint_state_moved`** — a `rotate()` or `revokeEpoch()` lands during the
+   add-pre-chain wait. The re-check after the wait refuses to sign the final
+   certificate under the retired key or old epoch.
+2. The mint is then **retried once** under the new state (review L2), which
+   mints and submits a second precert under a **new serial**. The first
+   serial's certificate never exists. Causes 1 and 2 are one event and one
+   record: the refused attempt's serials. The retry's serials are delivered.
+   (**`mint_failed`** is the same window ending in any other error.)
+3. **`claim_taken_over`** — a tier collect whose mint outlasts the 60 s
+   reclaim window loses its claim to a second collect. Its certificate,
+   already logged or backlogged, is discarded, and the reclaimer's is
+   delivered.
+
+Each serial is kept durably in the DO's `ct_not_delivered` table and
+published read-only:
+
+```bash
+curl -s https://auth.notme.bot/.well-known/ct-not-delivered.json
+# {"notDelivered":[{"serial":"…","reason":"mint_state_moved","discardedAt":1793750400}]}
+```
+
+`serial` is lowercase hex without the DER sign byte, as `openssl x509
+-serial` prints it (case aside). The newest 1000 rows are served, newest
+first, cached for 60 s. The route is unauthenticated, like
+`/.well-known/epochs.json`: every serial is already public in the log, and a
+row adds only a reason and a time, no subject or key. Rows are never
+pruned, because a log entry is permanent. They arise only from an operator
+action inside a log wait or a mint slower than 60 s, so the list stays short.
+A write failure loses the row but not the mint, and is logged as
+`ct.not_delivered_write_failed` with the serials.
+
 ### 5. After `rotate()`: give the log the new root
 
 The log accepts only chains that end in a root compiled into it

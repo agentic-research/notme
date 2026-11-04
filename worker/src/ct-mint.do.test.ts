@@ -22,7 +22,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { X509Certificate } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
 import { CT_POISON_OID, CT_SCT_LIST_OID, type SctResponse } from "./ct/sct";
-import { parseLogPin, spkiOf, tbsWithout, verifySct, type LogPin } from "./ct/verify-sct";
+import { parseLogPin, serialOf, spkiOf, tbsWithout, verifySct, type LogPin } from "./ct/verify-sct";
 
 const SUBJECT = "repo:agentic-research/notme:ref:refs/heads/main";
 const CT_TIMEOUT_MS = 2000;
@@ -1403,8 +1403,16 @@ describe("ct.health — what the operator sees", () => {
 // invariant these pin is: never signed under the captured (stale) key or
 // epoch — the mint that comes back is the retry, under the CURRENT state.
 
-type Minted = { authority: { epoch: number; key_id: string } };
+type Minted = {
+  authority: { epoch: number; key_id: string };
+  /** A pair's two certificates. */
+  certificates?: { mtls: string; signing: string };
+  /** A tier's certificate. */
+  certificate?: string;
+};
+type NotDelivered = { serial: string; reason: string; discardedAt: number };
 type RaceAuth = {
+  listNotDeliveredCerts(): Promise<NotDelivered[]>;
   rotate(): Promise<{ newKeyId: string; epoch: number }>;
   revokeEpoch(): Promise<{ epoch: number; seqno: number }>;
   getAuthorityState(): Promise<{ epoch: number; keyId: string }>;
@@ -1470,12 +1478,18 @@ async function raceMint(
     // it otherwise, this test would not be exercising the race.
     const opInsideHold = Date.now() - arrivedAt < Math.min(holdMs, CT_TIMEOUT_MS);
     const r = await settled;
+    // Every precert the log was sent, in order: the refused attempt's first,
+    // then its retry's (notme-b35676).
+    const precerts = (await received())
+      .filter((x) => x.path.endsWith("/add-pre-chain"))
+      .map((x) => x.chain[0]!);
+    const notDelivered = await a.listNotDeliveredCerts();
 
     // And the authority is not wedged: the next mint goes out under the
     // CURRENT key and epoch.
     await setMode("ok");
     const retry = await doMint();
-    return { before, after, r, retry, opInsideHold };
+    return { before, after, r, retry, opInsideHold, precerts, expected, notDelivered };
   });
 }
 
@@ -1497,6 +1511,37 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
         expect(retry.authority).toEqual({ epoch: after.epoch, key_id: after.keyId });
       });
     }
+  }
+
+  // notme-b35676: the refused attempt's precerts reached the log, but their
+  // certificates were never delivered — the retry (review L2) mints new
+  // serials. A monitor sees issuance that never happened unless the
+  // authority says so; every discarded serial is recorded.
+  for (const [kind, op] of [["pair", "rotate"], ["tier", "revokeEpoch"]] as const) {
+    it(`ct.not-delivered.refused (${kind} + ${op}): the refused attempt's precert serials are recorded as not delivered; the delivered ones are not`, async () => {
+      const { r, precerts, expected, notDelivered } = await raceMint(kind, op);
+      expect(r.ok, r.ok ? "" : r.e).toBe(true);
+      const delivered = r.ok
+        ? (kind === "pair" ? [r.v.certificates!.mtls, r.v.certificates!.signing] : [r.v.certificate!]).map(
+            (pem) => serialOf(new Uint8Array(new X509Certificate(pem).rawData)),
+          )
+        : [];
+      const der = (b64: string) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const discarded = precerts.slice(0, expected).map((b) => serialOf(der(b)));
+      expect(discarded).toHaveLength(expected);
+      // The retry submitted a second precert set, under new serials.
+      expect(precerts.length).toBe(2 * expected);
+      for (const s of discarded) expect(delivered).not.toContain(s);
+
+      for (const s of discarded) {
+        const row = notDelivered.find((x) => x.serial === s);
+        expect(row, `discarded serial ${s} is not recorded`).toBeDefined();
+        expect(row!.reason).toBe("mint_state_moved");
+        expect(row!.discardedAt).toBeGreaterThan(0);
+      }
+      const listed = notDelivered.map((x) => x.serial);
+      for (const s of delivered) expect(listed, "a delivered serial is listed").not.toContain(s);
+    });
   }
 
   // The other post-await signing point: the log outlasts the 2 s bound, the

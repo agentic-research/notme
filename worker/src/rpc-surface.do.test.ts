@@ -401,7 +401,12 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       // exp + 300s. A stub holder can pre-spend a token whose issuer and jti
       // it already knows — the same reach loginWithFederated already gives,
       // and a denial of service against one token, not a credential.
-    ).toBe(67);
+      //
+      // 67 → 68: listNotDeliveredCerts (notme-b35676). Reviewed: read-only,
+      // takes only a row limit, and returns serials, a reason and a time —
+      // what /.well-known/ct-not-delivered.json publishes to anyone, about
+      // certificates whose precerts are already in the public log.
+    ).toBe(68);
   });
 });
 
