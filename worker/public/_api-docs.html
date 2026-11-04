@@ -470,8 +470,9 @@
             Owners are allowed by <code>GHA_ALLOWED_OWNERS</code>, which has
             no default &mdash; an authority that has not declared whose
             workflows it trusts trusts none. The token is spent on first use
-            (<code>jti</code> replay protection) and exchanges are rate
-            limited per repository.
+            (<code>jti</code> replay protection; recorded in eventually
+            consistent KV on this route, so two edge nodes can briefly both
+            accept one token) and exchanges are rate limited per repository.
           </div>
           <div class="ep-note">
             The identity names the stable subject &mdash; the OIDC
@@ -821,7 +822,8 @@
             DPoP proof (RFC 9449). Returns a DPoP-bound access token for the
             workflow's identity carrying <code>bridgeCert</code>. The subject
             token's <code>jti</code> is single-use across <code>/token</code>,
-            <code>/cert/gha</code> and <code>/cert</code>.</span
+            <code>/cert/gha</code> and <code>/cert</code> (recorded in
+            eventually consistent KV).</span
           >
         </div>
       </div>
