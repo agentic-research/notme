@@ -23,6 +23,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { SigningAuthority } from "./signing-authority";
+import { AUTH_METHOD } from "./auth/session";
 
 type Sql = { exec: (q: string, ...a: unknown[]) => unknown };
 
@@ -267,7 +268,7 @@ describe("every mint path refuses if key or epoch moved before signing (notme-b5
             mtlsPublicKeyPem: mtls,
             signingPublicKeyPem: signing,
             scopes: ["bridgeCert"],
-            authMethod: "gha-oidc",
+            authMethod: AUTH_METHOD.ghaOidc,
           });
       },
     ],
