@@ -30,6 +30,17 @@
  * to another principal — which is worse than the current absence, since a
  * false attribution is evidence and a missing one is only a gap.
  *
+ * ── WHAT THIS FILE DOES NOT PROVE (notme-c0db9b) ──
+ * Every case here calls validateCommitment with a hand-built facts object
+ * carrying a `delegation`. Production never builds that shape:
+ * signReceiptCommitment passes no delegation, because ReceiptSigner receives
+ * only the commitment bytes and has no credential to derive one from. So
+ * these tests prove the VALIDATOR; from the only caller the field is
+ * unreachable, and every nine-key commitment is refused there with
+ * DELEGATION_MISMATCH. receipt-signer.do.test.ts pins that refusal through
+ * the real entry point, and carries the `it.fails` that flips when a
+ * producer exists.
+ *
  * ── WHY BYTES AND NOT A TEXT STRING ──
  * `canonical-cbor.ts` deliberately encodes only uints and byte strings, and
  * its header says it must not become a general encoder. UTF-8 bytes of the

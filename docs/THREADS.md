@@ -31,7 +31,7 @@ order:
 | A3 | ~~Grant object~~ **BUILT 2026-08-28** — grants are objects with id, granter, timestamps, revoker (`listGrants`); D3's fuller payload (`parent_grant_id`, `goal_hash`, `delegable`) lands with A5 | ADR-019 req #1 | — | done |
 | A4 | ~~Revocation unit = the grant~~ **BUILT 2026-08-28** — `POST /principals/:id/revoke`; every authority gate reads the grant store live; passkey users are principals with grants (criterion C met) | `notme-77a024` | — | done |
 | A5 | ~~Task-credential producer~~ **BUILT 2026-08-28** — `mintTaskCertPair` (offline, tier-signed; enforces namespace-by-construction, scope narrowing, tier-bounded TTL, possession, task scope at `OID_TASK_SCOPE`); `taskCorrelationKey` derives the third segment from the certs; walker now checks issuer-NAME chaining (found the fixtures lying) | `notme-9f84e6` | — | done |
-| A6 | **Delegation in receipts end-to-end** — the ninth commitment key becomes reachable | `notme-c0db9b` + `cloister-c10ff2` | A5 + cloister adoption | both |
+| A6 | **Delegation in receipts end-to-end** — the ninth commitment key becomes reachable | `notme-c0db9b` + `cloister-c10ff2` | a delegation producer in `signReceipt` (notme), over a wire shape agreed with cloister | notme first |
 | A7 | ~~Stable identity~~ **BUILT 2026-08-29** — `wimse://<domain>/principal/<stable-id>`, one builder, `principal_kind` as its own extension; the SPIFFE inversion is gone and criterion B's code half is met | `notme-77438b` | — | done |
 | A7 | Naming follow-through in signet docs (`id-kp-signet-bridge-delegate` is now a misnomer) | `signet-9dfb44` consequence | nothing | signet |
 
@@ -66,8 +66,12 @@ corrections keep this line honest:
 - `notme-bd133e`: the 404 signpost at that path ships stale integrator
   instructions and needs its wording fixed.
 
-`cloister-c10ff2` (ninth commitment key) is optional-field-shaped: cloister
-can adopt any time; with A5 shipped it carries real data from day one.
+`cloister-c10ff2` (ninth commitment key) is optional-field-shaped, but
+cloister adopting it changes nothing yet: `signReceipt` receives no
+credential, so notme derives no delegation and refuses every nine-key
+commitment (notme-c0db9b). A5 supplies the data (`taskCorrelationKey`); the
+missing piece is notme's producer, wired through a credential-carrying
+`signReceipt` agreed with cloister.
 
 ## Line D — key custody (root must not be weaker than leaves)
 
