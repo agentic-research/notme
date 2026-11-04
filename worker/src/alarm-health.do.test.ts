@@ -316,8 +316,8 @@ describe("bundle refresh alarm (notme-77a024)", () => {
           expect(h.circuitBreakerOpen, `breaker opened early, at fire ${fire}`).toBe(false);
           expect(await alarmOf(stub), `fire ${fire} did not re-arm`).not.toBeNull();
         } else {
-          // Whether the 5th fire leaves an alarm behind is NOT asserted here:
-          // it does (notme-5c2511, below).
+          // That the 5th fire leaves no alarm behind is its own test below
+          // (notme-5c2511).
           expect(h.circuitBreakerOpen).toBe(true);
         }
       }
@@ -377,20 +377,17 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     }
   });
 
-  // notme-5c2511 (found by the strengthened tests above). The breaker does not
-  // actually stop the alarm re-arming, in two ways, both because the warm path
-  // of #getOrCreateSigningKey calls scheduleNextRefresh() BEFORE any breaker
-  // decision:
-  //   1. the tripping fire: #publishBundle -> generateBundle -> warm path arms
-  //      a successor, so alarm() "returns without re-arming" and an alarm is
-  //      pending anyway (the next delivery is then skipped, which ends the
-  //      loop: one extra fire past the threshold);
-  //   2. any later request that reaches the signing key re-arms it again.
-  // Cost stays bounded by the refresh interval, but the code comments and
-  // THREAT_MODEL say the alarm halts. `it.fails` asserts the CLAIMED behaviour
-  // and passes while the gap exists; when 5c2511 is fixed it goes red, and the
-  // fix is to change these to plain `it`.
-  it.fails("signing.alarm.circuit-breaker — the tripping fire leaves no alarm behind (notme-5c2511)", async () => {
+  // notme-5c2511 (found by the strengthened tests above). The breaker used to
+  // leave the alarm armed in two ways, both because the warm path of
+  // #getOrCreateSigningKey calls scheduleNextRefresh():
+  //   1. the tripping fire: #publishBundle -> generateBundle -> warm path armed
+  //      a successor while failure_count was still one short, so alarm()
+  //      "returned without re-arming" with an alarm pending anyway;
+  //   2. any later request that reached the signing key re-armed it again.
+  // Both were pinned as `it.fails` until the fix: scheduleNextRefresh() now
+  // declines behind an open breaker, and the tripping fire deletes whatever
+  // its own bundle work armed. Only resetAlarmHealth() re-arms.
+  it("signing.alarm.circuit-breaker — the tripping fire leaves no alarm behind (notme-5c2511)", async () => {
     const stub = authority("alarm-breaker-trip-rearm");
     const kv = await controlKv(stub);
     try {
@@ -402,7 +399,7 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     }
   });
 
-  it.fails("signing.alarm.circuit-breaker — an open breaker stays un-armed when a request touches the signing key (notme-5c2511)", async () => {
+  it("signing.alarm.circuit-breaker — an open breaker stays un-armed when a request touches the signing key (notme-5c2511)", async () => {
     const stub = authority("alarm-breaker-warm");
     await tripBreaker(stub, 5);
     await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getPublicKeyPem());

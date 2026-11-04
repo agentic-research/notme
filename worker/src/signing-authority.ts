@@ -5178,8 +5178,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   //   - alarm_health table tracks failure_count, total_fires, last_fire_at,
   //     last_outcome, first_fire_at.
   //   - Circuit breaker: after MAX_CONSECUTIVE_ALARM_FAILURES consecutive
-  //     failures, alarm() stops re-arming. Manual recovery via
-  //     resetAlarmHealth() RPC.
+  //     failures, no alarm stays pending: the tripping fire deletes any
+  //     successor its bundle work armed, and scheduleNextRefresh() declines
+  //     while the breaker is open. Manual recovery via resetAlarmHealth() RPC.
   //   - Defense-in-depth: re-arm goes through getAlarm() check first
   //     (mirrors scheduleNextRefresh's pattern).
 
@@ -5233,7 +5234,20 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     );
   }
 
+  /** True once MAX_CONSECUTIVE_ALARM_FAILURES consecutive fires have failed. */
+  #alarmBreakerOpen(): boolean {
+    return (
+      this.#readAlarmHealthRow().failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES
+    );
+  }
+
   async scheduleNextRefresh(): Promise<void> {
+    // An open breaker means NO alarm, from any caller (notme-5c2511). The warm
+    // path of #getOrCreateSigningKey reaches here on every request that
+    // touches the signing key, and generateBundle reaches it inside alarm()
+    // itself; without this check either one re-armed the loop the breaker had
+    // just stopped. Only resetAlarmHealth() re-arms past an open breaker.
+    if (this.#alarmBreakerOpen()) return;
     const current = await this.ctx.storage.getAlarm();
     if (!current) {
       await this.ctx.storage.setAlarm(Date.now() + BUNDLE_REFRESH_MS);
@@ -5373,6 +5387,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           `${postFailureCount} consecutive failures. ` +
           `Not re-arming. Manual recovery via resetAlarmHealth() RPC.`,
       );
+      // This fire's own bundle work ran #getOrCreateSigningKey's warm path
+      // while failure_count was still one short, so it may already have armed
+      // a successor. Clear it: "not re-arming" has to mean no alarm pending.
+      await this.ctx.storage.deleteAlarm();
       return; // do NOT re-arm — breaker tripped on this fire
     }
 
