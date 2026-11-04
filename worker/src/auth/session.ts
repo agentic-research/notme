@@ -147,6 +147,9 @@ export async function verifySessionCookie(
   }
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
 
+  // A missing or non-numeric exp compares false against the clock, so it must
+  // be refused outright, or the session would never expire.
+  if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) return null;
   if (payload.exp < Math.floor(Date.now() / 1000)) return null;
 
   // Migrate v1 sessions

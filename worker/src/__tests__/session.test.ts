@@ -104,6 +104,24 @@ describe("session.expiry", () => {
     const value = expiredCookie.split("notme_session=")[1].split(";")[0];
     expect(await verifySessionCookie(value, secret)).toBeNull();
   });
+
+  it("rejects a signed cookie with no usable exp (it would never expire)", async () => {
+    const { createSessionCookieWithExp, verifySessionCookie } = await import(
+      "../auth/session"
+    );
+    const secret = "test-secret-32-chars-minimum-ok!";
+    // undefined is dropped by JSON.stringify, so the signed payload has no exp;
+    // a string exp compares false against the clock in the same way.
+    for (const exp of [undefined, "9999999999"] as unknown as number[]) {
+      const cookie = await createSessionCookieWithExp(
+        { principalId: "p-1", scopes: ["bridgeCert"], authMethod: "passkey" },
+        secret,
+        exp,
+      );
+      const value = cookie.split("notme_session=")[1].split(";")[0];
+      expect(await verifySessionCookie(value, secret)).toBeNull();
+    }
+  });
 });
 
 describe("session.scopes", () => {
