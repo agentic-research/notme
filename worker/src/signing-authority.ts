@@ -38,13 +38,13 @@ import {
   type SctResponse,
 } from "./ct/sct";
 import {
-  DEFAULT_CT_LOG_PATH,
   DEFAULT_TIMEOUT_MS,
   postChain,
   postPreChain,
   type SubmitResult,
 } from "./ct/log-client";
-import { parseLogPin, precertTbs, spkiOf, verifySct, type LogPin } from "./ct/verify-sct";
+import { notAfterOf, precertTbs, spkiOf, verifySct } from "./ct/verify-sct";
+import { parseShards, selectShard, type CtShard } from "./ct/shards";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 import {
   deriveKek,
@@ -132,6 +132,16 @@ interface SigningAuthorityEnv {
    */
   RENEWAL_BINDING_V3?: string;
   CT_LOG_KEY?: string;
+  /**
+   * The shard set (notme-afa9d8), in place of CT_LOG_ID / CT_LOG_KEY /
+   * CT_LOG_PATH: a JSON array (or a wrangler [vars] array) of
+   * `{path, log_id, key, temporal_interval: {start_inclusive, end_exclusive}}`.
+   * Each certificate goes to the shard whose interval holds its notAfter;
+   * one that no shard covers is backlogged, never sent to the wrong shard.
+   * Setting it together with the single-pin variables is a configError.
+   * See src/ct/shards.ts and ct/README.md.
+   */
+  CT_LOG_SHARDS?: string | unknown[];
 }
 
 /**
@@ -338,8 +348,8 @@ export interface CtHealth {
   /** Mints whose SCTs verified but could not be embedded; backlogged instead. */
   embedFailed: { count: number; lastAt: number };
   /**
-   * Why CT_LOG_ID / CT_LOG_KEY cannot be trusted; null when bound and valid,
-   * or unbound. While set, mints are backlogged and the drain submits
+   * Why CT_LOG_ID / CT_LOG_KEY, or CT_LOG_SHARDS, cannot be trusted; null when
+   * bound and valid, or unbound. While set, mints are backlogged and the drain submits
    * nothing. A drain fire skipped for it does not touch lastError; each mint
    * under it overwrites lastError with "config: …; chains backlogged".
    */
@@ -1951,7 +1961,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // logs them, verified, once CT_LOG_ID / CT_LOG_KEY are fixed, so a
     // fixable deploy mistake does not leave them unlogged for good
     // (notme-c0c9a2). health.configError is the alert.
-    const logPin = await this.#ctLogPin();
+    const shardSet = await this.#ctShards();
     const rootB64 = pemToB64(p.issuerPem);
     // The root is parsed BEFORE the pin branch (review L3): a chain ending in
     // a root that cannot be parsed can never be logged, so it is counted
@@ -1961,27 +1971,47 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       issuerSpki = spkiOf(b64ToBytes(rootB64));
     } catch (err) {
       this.#ctRecord("unloggable", `root unparseable: ${String(err)}`);
-      // Also past the #ctLogPin await: re-check before signing.
+      // Also past the #ctShards await: re-check before signing.
       this.#refuseIfMintStateMoved(p.captured);
       return p.mint(p.pin, () => []);
     }
-    if ("error" in logPin) {
-      console.error({ event: "ct.config_invalid", error: logPin.error });
-      this.#ctRecord("error", `config: ${logPin.error}; chains backlogged`);
-      // #ctLogPin awaited (import + digest on a pin not seen before): the
+    if ("error" in shardSet) {
+      console.error({ event: "ct.config_invalid", error: shardSet.error });
+      this.#ctRecord("error", `config: ${shardSet.error}; chains backlogged`);
+      // #ctShards awaited (import + digest on a pin not seen before): the
       // same re-check as the log path before signing (review I3).
       this.#refuseIfMintStateMoved(p.captured);
       return this.#mintUnloggedAndBacklog(p, rootB64);
     }
 
     const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
-    const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
+    // Each certificate goes to the shard whose temporal interval holds ITS
+    // notAfter (notme-afa9d8). One that no shard covers is not submitted to
+    // any — a shard refuses it, and the wrong shard's SCT would be worthless —
+    // so the whole set is backlogged; the drain picks again by the same rule.
+    const targets = p.pems(pre).map((pem) => {
+      const precertB64 = pemToB64(pem);
+      let notAfter: number;
+      try {
+        notAfter = notAfterOf(b64ToBytes(precertB64));
+      } catch {
+        notAfter = Number.NaN;
+      }
+      return { precertB64, notAfter, shard: selectShard(shardSet.shards, notAfter) };
+    });
+    const uncovered = targets.find((t) => t.shard === null);
+    if (uncovered) {
+      const at = Number.isNaN(uncovered.notAfter) ? "unreadable" : new Date(uncovered.notAfter).toISOString();
+      console.warn({ event: "ct.no_shard", notAfter: at });
+      this.#ctRecord("error", `no shard covers notAfter ${at}; chains backlogged`);
+      this.#refuseIfMintStateMoved(p.captured);
+      return this.#mintUnloggedAndBacklog(p, rootB64);
+    }
     // Each submission is bounded by its timeout; verification after it is
     // local crypto. postPreChain and verifySct never throw.
     const results = await Promise.all(
-      p.pems(pre).map(async (pem): Promise<SubmitResult> => {
-        const precertB64 = pemToB64(pem);
-        const r = await postPreChain(log, [precertB64, rootB64], DEFAULT_TIMEOUT_MS, path);
+      targets.map(async ({ precertB64, shard }): Promise<SubmitResult> => {
+        const r = await postPreChain(log, [precertB64, rootB64], DEFAULT_TIMEOUT_MS, shard!.path);
         if (!r.ok) return r;
         let tbs: Uint8Array;
         try {
@@ -1989,7 +2019,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         } catch (err) {
           return { ok: false, reason: `precert unparseable: ${String(err)}` };
         }
-        const v = await verifySct(r.sct, { kind: "precert", tbs, issuerSpki }, logPin);
+        const v = await verifySct(r.sct, { kind: "precert", tbs, issuerSpki }, shard!.pin);
         return v === "ok" ? r : { ok: false, reason: v };
       }),
     );
@@ -2076,16 +2106,23 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   /**
-   * The pinned log from CT_LOG_ID / CT_LOG_KEY, or why it cannot be trusted.
-   * Cached per value pair: the import and digest run once per DO lifetime.
+   * The pinned shard set — CT_LOG_SHARDS, or the single pin CT_LOG_ID /
+   * CT_LOG_KEY / CT_LOG_PATH — or why it cannot be trusted (notme-afa9d8).
+   * Cached per value: the imports and digests run once per DO lifetime.
    */
-  #ctPinCache: { k: string; v: LogPin | { error: string } } | null = null;
-  async #ctLogPin(): Promise<LogPin | { error: string }> {
-    const k = `${this.env.CT_LOG_ID ?? ""}|${this.env.CT_LOG_KEY ?? ""}`;
-    if (this.#ctPinCache?.k !== k) {
-      this.#ctPinCache = { k, v: await parseLogPin(this.env.CT_LOG_ID, this.env.CT_LOG_KEY) };
+  #ctShardCache: { k: string; v: { shards: CtShard[] } | { error: string } } | null = null;
+  async #ctShards(): Promise<{ shards: CtShard[] } | { error: string }> {
+    const raw = this.env.CT_LOG_SHARDS;
+    const k = JSON.stringify([
+      typeof raw === "string" || raw === undefined ? raw ?? null : JSON.stringify(raw),
+      this.env.CT_LOG_ID ?? null,
+      this.env.CT_LOG_KEY ?? null,
+      this.env.CT_LOG_PATH ?? null,
+    ]);
+    if (this.#ctShardCache?.k !== k) {
+      this.#ctShardCache = { k, v: await parseShards(this.env) };
     }
-    return this.#ctPinCache.v;
+    return this.#ctShardCache.v;
   }
 
   /**
@@ -2237,15 +2274,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const log = this.env.CT_LOG;
     if (!log) return;
     this.#ensureCtSchema();
-    const logPin = await this.#ctLogPin();
-    if ("error" in logPin) {
+    const shardSet = await this.#ctShards();
+    if ("error" in shardSet) {
       // health.configError already reports this on every read. Writing it to
       // lastError on every fire would overwrite the last real submission
       // error with the same config message (notme-c0c9a2).
-      console.warn({ event: "ct.drain_skipped", error: logPin.error });
+      console.warn({ event: "ct.drain_skipped", error: shardSet.error });
       return;
     }
-    const path = this.env.CT_LOG_PATH || DEFAULT_CT_LOG_PATH;
     const now = Math.floor(Date.now() / 1000);
     const max = SigningAuthority.CT_MAX_ATTEMPTS;
     const rows = this.ctx.storage.sql
@@ -2266,10 +2302,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       let ok = false;
       try {
         const chain = JSON.parse(row.chain_json) as string[];
-        const r = await postChain(log, chain, DEFAULT_TIMEOUT_MS, path);
-        const why = r.ok
-          ? await verifySct(r.sct, { kind: "x509", certDer: b64ToBytes(chain[0]!) }, logPin)
-          : r.reason;
+        const certDer = b64ToBytes(chain[0]!);
+        // The shard is chosen again, by the certificate's own notAfter
+        // (notme-afa9d8), so the row goes wherever the CURRENT shard set
+        // says — including a shard added after it was backlogged.
+        const notAfter = notAfterOf(certDer);
+        const shard = selectShard(shardSet.shards, notAfter);
+        let why: string;
+        if (!shard) {
+          why = `no shard covers notAfter ${new Date(notAfter).toISOString()}`;
+        } else {
+          const r = await postChain(log, chain, DEFAULT_TIMEOUT_MS, shard.path);
+          why = r.ok ? await verifySct(r.sct, { kind: "x509", certDer }, shard.pin) : r.reason;
+        }
         ok = why === "ok";
         if (!ok) this.#ctRecord("error", `add-chain failed for backlog row ${row.id}: ${why}`);
       } catch (err) {
@@ -2313,7 +2358,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   async #readCtHealth(): Promise<CtHealth> {
     this.#ensureCtSchema();
-    const pin = this.env.CT_LOG ? await this.#ctLogPin() : null;
+    const pin = this.env.CT_LOG ? await this.#ctShards() : null;
     const sql = this.ctx.storage.sql;
     const max = SigningAuthority.CT_MAX_ATTEMPTS;
     const b = sql

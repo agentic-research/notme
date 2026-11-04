@@ -55,6 +55,12 @@ import { baseMiniflare, CT_BOUND_SUITES, WARM_SETUP_FILES, x509Dir } from "./vit
 //                 resolved from another is not delivered across workerd
 //                 request contexts, so a release endpoint never released and
 //                 every held call ran into the authority's 2 s bound instead.
+//
+// Shards (notme-afa9d8): the stub is TWO logs. A path under /logs/shardb is
+// served with a second test key (STUB_LOG_B_JWK), so its SCTs carry shard B's
+// id and verify only under B's key; every other path is shard A, the key the
+// single-pin tests use. /__control returns both keys, so a test can build a
+// CT_LOG_SHARDS value without another binding.
 
 /** TEST-ONLY log key. Not a secret and not any real log's key. */
 const STUB_LOG_JWK = {
@@ -65,24 +71,35 @@ const STUB_LOG_JWK = {
   d: "v9zRMEqJFEiJH-wtFibVn9vdGjDQejLUUkCsyWMAPdo",
 };
 
+/** TEST-ONLY key for the stub's second shard (/logs/shardb). Not a secret. */
+const STUB_LOG_B_JWK = {
+  kty: "EC",
+  crv: "P-256",
+  x: "ok8p_q2y46DkQCTZ77Gp9KeUA9IYPLK08aOQvEACc6o",
+  y: "PnRIokRXxGjA5bGejWCcllLjSJAIbwQ3d-WILoGvc2A",
+  d: "Qyx6T3mHPKnpTKHUHIDKUmW_vuRYk1Q34PhcIGLoF-8",
+};
+
 const CT_LOG_STUB = /* js */ `
-const JWK = ${JSON.stringify(STUB_LOG_JWK)};
+const JWKS = { a: ${JSON.stringify(STUB_LOG_JWK)}, b: ${JSON.stringify(STUB_LOG_B_JWK)} };
 const b64 = (u) => btoa(String.fromCharCode(...u));
 const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const POISON_OID = "1.3.6.1.4.1.11129.2.4.3";
 // id-ecPublicKey (1.2.840.10045.2.1) as DER: only the mTLS leaf's SPKI has it.
 const EC_OID = [0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 
-let keys = null;
-async function logKeys() {
-  if (keys) return keys;
+const keys = {};
+const shardOf = (pathname) => (pathname.startsWith("/logs/shardb/") ? "b" : "a");
+async function logKeys(shard = "a") {
+  if (keys[shard]) return keys[shard];
+  const JWK = JWKS[shard];
   const priv = await crypto.subtle.importKey("jwk", JWK, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
   const { d, ...pubJwk } = JWK;
   const pub = await crypto.subtle.importKey("jwk", pubJwk, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
   const spki = new Uint8Array(await crypto.subtle.exportKey("spki", pub));
   const id = new Uint8Array(await crypto.subtle.digest("SHA-256", spki));
-  keys = { priv, spki: b64(spki), id };
-  return keys;
+  keys[shard] = { priv, spki: b64(spki), id };
+  return keys[shard];
 }
 
 // ── minimal DER ──
@@ -122,8 +139,8 @@ function rawToDer(raw) {
   return enc(0x30, cat([int(raw.subarray(0, 32)), int(raw.subarray(32))]));
 }
 const u24 = (n) => new Uint8Array([n >> 16, (n >> 8) & 0xff, n & 0xff]);
-async function signSct(chain, precert, tamper) {
-  const k = await logKeys();
+async function signSct(chain, precert, tamper, shard) {
+  const k = await logKeys(shard);
   const leaf = unb64(chain[0]);
   const ext = unb64("AAAFAAAAAAA="); // leaf_index extension, as azul emits
   const timestamp = Date.now();
@@ -175,8 +192,9 @@ export default {
       n = 0;
       received.length = 0;
       holdMs = typeof b.holdMs === "number" ? b.holdMs : 500;
-      const k = await logKeys();
-      return Response.json({ id: b64(k.id), spki: k.spki });
+      const k = await logKeys("a");
+      const kb = await logKeys("b");
+      return Response.json({ id: b64(k.id), spki: k.spki, b: { id: b64(kb.id), spki: kb.spki } });
     }
     if (url.pathname === "/__received") return Response.json(received);
     // Numbered synchronously, before any await: distinct per request, though
@@ -198,7 +216,7 @@ export default {
       (mode === "fail-signing" && !isEcLeaf(body.chain[0]));
     if (fail) return new Response("log unavailable", { status: 500 });
     return Response.json(
-      await signSct(body.chain, url.pathname.endsWith("/add-pre-chain"), mode),
+      await signSct(body.chain, url.pathname.endsWith("/add-pre-chain"), mode, shardOf(url.pathname)),
     );
   },
 };

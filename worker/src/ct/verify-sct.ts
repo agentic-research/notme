@@ -135,6 +135,31 @@ export function spkiOf(certDer: Uint8Array): Uint8Array {
   return certDer.subarray(s.start, s.end);
 }
 
+/**
+ * The certificate's notAfter, in ms since the epoch (notme-afa9d8: the CT
+ * shard is chosen by it). RFC 5280 §4.1.2.5: UTCTime `YYMMDDHHMMSSZ` (YY ≥ 50
+ * is 19YY) or GeneralizedTime `YYYYMMDDHHMMSSZ`. Throws on anything else.
+ */
+export function notAfterOf(certDer: Uint8Array): number {
+  const f = tbsFields(certDer);
+  // [0] version is optional; validity follows serial, sigAlg, issuer.
+  const validity = f[f[0]!.tag === 0xa0 ? 4 : 3];
+  if (!validity || validity.tag !== 0x30) throw new Error("DER: no validity");
+  const t = children(certDer, validity)[1];
+  if (!t) throw new Error("DER: no notAfter");
+  const s = new TextDecoder().decode(certDer.subarray(t.body, t.end));
+  const m =
+    t.tag === 0x17
+      ? /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s)
+      : t.tag === 0x18
+        ? /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s)
+        : null;
+  if (!m) throw new Error(`DER: notAfter is not a UTC time: ${s}`);
+  let year = Number(m[1]);
+  if (t.tag === 0x17) year += year >= 50 ? 1900 : 2000;
+  return Date.UTC(year, Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
+}
+
 /** DER ECDSA-Sig-Value → the raw r‖s (P-256) WebCrypto verifies. */
 function ecdsaDerToRaw(der: Uint8Array): Uint8Array {
   const seq = tlv(der, 0);

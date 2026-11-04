@@ -84,12 +84,18 @@ const ctLog = (): Fetcher => {
 async function setMode(mode: Mode): Promise<string> {
   return (await control(mode)).id;
 }
-async function control(mode: Mode): Promise<{ id: string; spki: string }> {
+interface StubKeys {
+  id: string;
+  spki: string;
+  /** The stub's second shard, served under /logs/shardb (notme-afa9d8). */
+  b: { id: string; spki: string };
+}
+async function control(mode: Mode): Promise<StubKeys> {
   const r = await ctLog().fetch("https://ct-log/__control", {
     method: "POST",
     body: JSON.stringify({ mode }),
   });
-  return (await r.json()) as { id: string; spki: string };
+  return (await r.json()) as StubKeys;
 }
 
 async function received(): Promise<Received[]> {
@@ -454,6 +460,144 @@ describe("ct.pin — only the pinned log's verified SCT is embedded", () => {
       expect(r.health.configError).toMatch(reason);
     });
   }
+});
+
+// ── notme-afa9d8: the shard is chosen per certificate, by its notAfter ─────
+
+const iso = (ms: number) => new Date(ms).toISOString();
+const DAY_MS = 24 * 60 * 60 * 1000;
+const EPOCH_2000 = Date.UTC(2000, 0, 1);
+const EPOCH_2100 = Date.UTC(2100, 0, 1);
+
+/**
+ * envPatch selecting two stub shards: A at /logs/sharda (the stub's key A)
+ * over [a0, a1), and B at /logs/shardb (key B) over [b0, b1). The single-pin
+ * variables are removed: CT_LOG_SHARDS is the only pin.
+ */
+function shardsPatch(
+  k: StubKeys,
+  a: [number, number],
+  b: [number, number],
+): Record<string, string | undefined> {
+  const shard = (path: string, id: string, key: string, [s, e]: [number, number]) => ({
+    path,
+    log_id: id,
+    key,
+    temporal_interval: { start_inclusive: iso(s), end_exclusive: iso(e) },
+  });
+  return {
+    CT_LOG_ID: undefined,
+    CT_LOG_KEY: undefined,
+    CT_LOG_PATH: undefined,
+    CT_LOG_SHARDS: JSON.stringify([
+      shard("/logs/sharda", k.id, k.spki, a),
+      shard("/logs/shardb", k.b.id, k.b.spki, b),
+    ]),
+  };
+}
+
+describe("ct.shards — each certificate goes to the shard whose interval holds its notAfter (notme-afa9d8)", () => {
+  it("notAfter in shard B: submitted to B only, and the embedded SCT verifies under B's key (not A's)", async () => {
+    const k = await control("ok");
+    // The boundary is 2 minutes out; a bridge cert lives 5, so it is B's.
+    const t = Date.now() + 2 * 60 * 1000;
+    const r = await mint({ envPatch: shardsPatch(k, [EPOCH_2000, t], [t, EPOCH_2100]) });
+    const got = await received();
+    expect(got.map((g) => g.path)).toEqual([
+      "/logs/shardb/ct/v1/add-pre-chain",
+      "/logs/shardb/ct/v1/add-pre-chain",
+    ]);
+    const pinA = await stubPin(k);
+    const pinB = await stubPin(k.b);
+    for (const pem of [r.mtls, r.signing]) {
+      const sct = embeddedScts(pem)[0]!;
+      expect(btoa(String.fromCharCode(...sct.subarray(1, 33)))).toBe(k.b.id);
+      expect(await sctVerifies(sct, pem, r.ca, pinB), "SCT under B's key").toBe(true);
+      expect(await sctVerifies(sct, pem, r.ca, pinA), "and NOT under A's").toBe(false);
+    }
+    expect(r.backlog).toEqual([]);
+    expect(r.health.configError).toBeNull();
+    expect(r.health.lastError).toBe("");
+  });
+
+  it("notAfter in shard A: submitted to A only, verifying under A's key", async () => {
+    const k = await control("ok");
+    const t = Date.now() + DAY_MS;
+    const r = await mint({ envPatch: shardsPatch(k, [EPOCH_2000, t], [t, EPOCH_2100]) });
+    expect((await received()).map((g) => g.path)).toEqual([
+      "/logs/sharda/ct/v1/add-pre-chain",
+      "/logs/sharda/ct/v1/add-pre-chain",
+    ]);
+    for (const pem of [r.mtls, r.signing]) {
+      expect(await sctVerifies(embeddedScts(pem)[0]!, pem, r.ca, await stubPin(k))).toBe(true);
+    }
+    expect(r.backlog).toEqual([]);
+  });
+
+  it("notAfter in no shard: nothing is submitted to either, the pair is minted unlogged and backlogged", async () => {
+    const k = await control("ok");
+    const now = Date.now();
+    const r = await mint({
+      envPatch: shardsPatch(k, [EPOCH_2000, now - DAY_MS], [now + DAY_MS, EPOCH_2100]),
+    });
+    expect(await received(), "a cert outside every shard must not be submitted to any").toEqual([]);
+    expectBacklogged(r);
+    await expectWorkingPair(r);
+    expect(r.health.lastError).toMatch(/no shard covers notAfter \d{4}-\d\d-\d\dT/);
+    expect(r.health.configError).toBeNull();
+  });
+
+  it("the drain sends each backlog row to the shard its certificate's notAfter falls in, verified under that shard's key", async () => {
+    const k = await control("ok");
+    const t = Date.now() - 60 * 1000; // the rows' certs expire ~5 min from now: B
+    await withBacklog(2, async (a) => {
+      await a.alarm();
+      expect(rowsOf(a).every((r) => r.logged_at !== null)).toBe(true);
+      expect((await a.getAlarmHealth()).ct.backlog).toBe(0);
+    }, { envPatch: shardsPatch(k, [EPOCH_2000, t], [t, EPOCH_2100]) });
+    expect((await received()).map((g) => g.path)).toEqual([
+      "/logs/shardb/ct/v1/add-chain",
+      "/logs/shardb/ct/v1/add-chain",
+    ]);
+  });
+
+  it("the drain never submits a row whose notAfter is in no shard: a failed attempt, named in lastError", async () => {
+    const k = await control("ok");
+    const now = Date.now();
+    await withBacklog(2, async (a) => {
+      await a.alarm();
+      const rows = rowsOf(a);
+      expect(rows.every((r) => r.logged_at === null && r.attempts === 1)).toBe(true);
+      expect((await a.getAlarmHealth()).ct.lastError).toMatch(
+        /backlog row \d+: no shard covers notAfter \d{4}-/,
+      );
+    }, { envPatch: shardsPatch(k, [EPOCH_2000, now - DAY_MS], [now + DAY_MS, EPOCH_2100]) });
+    expect(await received()).toEqual([]);
+  });
+
+  it("an invalid CT_LOG_SHARDS is a configError: nothing submitted, both chains backlogged", async () => {
+    const k = await control("ok");
+    const now = Date.now();
+    // Overlapping intervals: a cert in the overlap would have two shards.
+    const r = await mint({
+      envPatch: shardsPatch(k, [EPOCH_2000, now + DAY_MS], [now, EPOCH_2100]),
+    });
+    expect(await received()).toEqual([]);
+    expectBacklogged(r);
+    expect(r.health.configError).toMatch(/CT_LOG_SHARDS: .*overlap/);
+    expect(r.health.lastError).toMatch(/^config: CT_LOG_SHARDS/);
+  });
+
+  it("CT_LOG_SHARDS and the single pin together are a configError, not a silent precedence", async () => {
+    const k = await control("ok");
+    const t = Date.now() + DAY_MS;
+    const patch = { ...shardsPatch(k, [EPOCH_2000, t], [t, EPOCH_2100]) };
+    delete patch.CT_LOG_ID; // keep the bound single pin in place
+    delete patch.CT_LOG_KEY;
+    const r = await mint({ envPatch: patch });
+    expect(await received()).toEqual([]);
+    expect(r.health.configError).toMatch(/not both/);
+  });
 });
 
 describe("ct.health — failures that used to reach only console.error", () => {

@@ -84,6 +84,19 @@ RENEWAL_BINDING_V3 = "off"
 # `ct.configError`; once the pin is fixed the backlog drains (notme-c0c9a2).
 # CT_LOG_ID = "<base64 log_id from trust/notme-ct-log.json>"
 # CT_LOG_KEY = "<base64 key from trust/notme-ct-log.json>"
+# OR, instead of the three lines above (setting both is a configError), the
+# shard set (notme-afa9d8): each certificate goes to the shard whose interval
+# holds its notAfter, verified under THAT shard's key; a certificate no shard
+# covers is backlogged and never sent to the wrong shard. Intervals are the
+# shards' `temporal_interval` from ct/config.notme.json, UTC, non-overlapping.
+# Configure the next shard here well before the current one closes
+# (ct/README.md runbook step 6).
+# CT_LOG_SHARDS = '''[
+#   {"path": "/logs/notme", "log_id": "<b64>", "key": "<b64>",
+#    "temporal_interval": {"start_inclusive": "2026-07-01T00:00:00Z", "end_exclusive": "2027-07-01T00:00:00Z"}},
+#   {"path": "/logs/notme2027h2", "log_id": "<b64>", "key": "<b64>",
+#    "temporal_interval": {"start_inclusive": "2027-07-01T00:00:00Z", "end_exclusive": "2028-01-01T00:00:00Z"}}
+# ]'''
 
 # ATTESTED FIRST BOOT (notme-addef9) — the default way a fresh authority gets
 # its administrator, and the reason no secret has to travel through a log.
@@ -155,7 +168,8 @@ class_name = "RevocationAuthority"
 #
 # CT_LOG_PATH (the log's base path behind CT_LOG, default /logs/notme) and
 # CT_LOG_ID / CT_LOG_KEY (the log's pinned id and key, REQUIRED with the
-# binding) are variables: see the commented lines under [vars] above.
+# binding) — or CT_LOG_SHARDS in their place — are variables: see the
+# commented lines under [vars] above.
 
 [[migrations]]
 tag = "v1"

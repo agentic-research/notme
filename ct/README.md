@@ -335,7 +335,10 @@ Uncomment the `[[services]] binding = "CT_LOG"` block in `worker/wrangler.toml`
 (template: `worker/wrangler.toml.example`), pointing at the deployed log
 Worker (`CT_LOG_PATH` only if the shard is not named `notme`), and set
 `CT_LOG_ID` / `CT_LOG_KEY` under `[vars]` to the `log_id` and `key` of the
-reviewed pin, `trust/notme-ct-log.json`. Then use the normal canary path
+reviewed pin, `trust/notme-ct-log.json` — or, in place of those three,
+`CT_LOG_SHARDS`: a JSON array of `{path, log_id, key, temporal_interval}`,
+one per shard, UTC and non-overlapping (step 6; template in
+`worker/wrangler.toml.example`). Then use the normal canary path
 (`task worker:canary` / `worker:promote`). **Unbound means no logging, by
 design:** that is also the rollback.
 
@@ -380,10 +383,10 @@ up means the timeout, not the log, is the problem.
 | `backlog` | unlogged rows still being retried |
 | `oldestUnloggedAgeS` | age of the oldest such row, `null` when none |
 | `gaveUp` | unlogged rows that hit 24 attempts; still retried, at most once per 24 h per row, and counted here until logged |
-| `lastError` / `lastErrorAt` | last submission failure, with the reason: `HTTP <status>`, `timeout`, `invalid SCT`, `network error`, `wrong log` (SCT id is not `CT_LOG_ID`), `bad signature` (does not verify under `CT_LOG_KEY`); or `config: ...` from a mint that found the pin invalid and backlogged its chains. A drain fire skipped for an invalid pin does not overwrite it |
+| `lastError` / `lastErrorAt` | last submission failure, with the reason: `HTTP <status>`, `timeout`, `invalid SCT`, `network error`, `wrong log` (SCT id is not `CT_LOG_ID`), `bad signature` (does not verify under `CT_LOG_KEY`), `no shard covers notAfter <time>` (no configured shard's interval holds the cert's `notAfter`; nothing was submitted); or `config: ...` from a mint that found the pin invalid and backlogged its chains. A drain fire skipped for an invalid pin does not overwrite it |
 | `unloggable` | `{count, lastAt, reason}`: mints that went out with no SCT and **no backlog row**: the root could not be read or parsed, or the backlog INSERT failed. (An invalid pin is not counted here: those mints are backlogged.) |
 | `embedFailed` | `{count, lastAt}`: mints whose SCTs verified but could not be embedded; they were backlogged instead |
-| `configError` | why `CT_LOG_ID` / `CT_LOG_KEY` cannot be trusted; `null` when they are valid (or `CT_LOG` is unbound) |
+| `configError` | why `CT_LOG_ID` / `CT_LOG_KEY`, or `CT_LOG_SHARDS`, cannot be trusted (bad JSON, a bad key, overlapping intervals, both forms set, ...); `null` when they are valid (or `CT_LOG` is unbound) |
 
 Alert on:
 
@@ -424,56 +427,61 @@ those rows are `gaveUp`. Nothing is lost if the log is updated:
 4. Watch `/admin/alarm-health`: `backlog` drains on the next fires; rows
    already `gaveUp` are retried within 24 h, and `gaveUp` returns to 0.
 
-### 6. Roll the shard before it closes
+### 6. Roll the shard before it closes: configure both shards across the boundary
 
 A production shard spans 3 to 12 months (azul `build.rs`, from Chrome's log
 policy), so the log has to be rolled. `notme` accepts certificates whose
 `notAfter` is before **2027-07-01T00:00:00Z**; the next shard accepts only
-`notAfter` from that instant on. The authority submits every certificate,
-and drains every backlog row, to the ONE shard `CT_LOG_PATH` names. So no
-switch time loses nothing:
+`notAfter` from that instant on.
 
-- **Switching early loses certificates whose `notAfter` precedes the new
-  shard's start.** Every certificate minted between the switch and the close
-  expires before 2027-07-01; the new shard refuses it at mint, and refuses it
-  again on every drain retry, because the drain follows `CT_LOG_PATH` too.
-  Those certificates are never logged.
-- **Switching late (at the close) loses the last hour.** A certificate minted
-  in the hour before the close, a tier on its default 1-hour life (up to 24 h
-  if a longer TTL was asked for; a bridge cert's 5 minutes), has a `notAfter`
-  past the close, so the old shard refuses it: it goes out with no embedded
-  SCT. It is backlogged, and once `CT_LOG_PATH` names the new shard the drain
-  records it there. Switching later than the close backlogs everything minted
-  in between the same way.
+The authority chooses the shard **per certificate, by its `notAfter`**
+(notme-afa9d8, `worker/src/ct/shards.ts`). With `CT_LOG_SHARDS` naming both
+shards, a certificate expiring before the boundary goes to `notme` and one
+expiring on or after it goes to `notme2027h2`, whenever it is minted; each
+SCT is verified under the key of the shard it came from. The drain chooses
+again by the same rule, from the certificate's own `notAfter` and the
+CURRENT shard set, so a backlog row goes to the right shard even if it was
+backlogged before the next shard was configured. There is no switch instant
+and nothing to time: the roll is an overlap in configuration, not a cutover.
 
-Switching at the close is therefore the lesser loss: the last hour's
-certificates lose their embedded SCT but are still recorded. The real fix is
-choosing the shard per certificate by its `notAfter`; see notme-afa9d8 for
-per-cert shard selection. Until it lands:
+A certificate whose `notAfter` no configured shard covers is **never
+submitted** (to no shard: the wrong shard would refuse it, or worse, sign an
+SCT for a log nobody checks it against). It is minted unlogged and
+backlogged, `lastError` reads `no shard covers notAfter <time>; chains
+backlogged`, and each drain fire counts a failed attempt with the same
+reason until a shard that covers it is configured.
+
+The single pin (`CT_LOG_ID` / `CT_LOG_KEY` / `CT_LOG_PATH`) still works and
+means one shard with no interval: every certificate goes to it, so it
+cannot roll without the losses below. Move to `CT_LOG_SHARDS` before the
+first roll. (With the single pin, switching early loses certificates whose
+`notAfter` precedes the new shard's start; switching at the close costs the
+last hour's tiers their embedded SCT.)
 
 1. Add the next shard to `config.notme.json`, e.g. `notme2027h2` with
    `temporal_interval` 2027-07-01Z to 2028-01-01Z and the same policy fields
    (`require_server_auth_eku: false`, `enable_ccadb_roots: false`,
-   `reject_expired: false`).
+   `reject_expired: false`, and the sequencing fields).
 2. Provision it (step 1: `LOG_NAME=notme2027h2` gives its own R2 bucket, KV
    namespace and keys) and deploy it, well before the close.
-3. The new shard is a different log with a different key, and the pin
-   (`trust/notme-ct-log.json`) is a **single** object: it names one log. At
-   the switch it is **replaced**, not extended. `task ct:verify -- --write`
-   refuses to overwrite a different pin, so replace it by a reviewed manual
-   edit (record the new shard's `metadata_url`, `log_id`, `key` and digest,
-   then run `task ct:verify`) and cut a release so the signed pin follows.
-   The old pin stays in git history and in the earlier release's signed
-   asset.
-4. Shortly before the switch, check `backlog` and `gaveUp`. A row waiting
-   for a certificate that expires before the close can only be logged by the
-   old shard, and is lost once the path moves; if they are not near 0, fix
-   the cause first.
-5. At 2027-07-01T00:00Z, deploy in ONE change, through the canary:
-   `CT_LOG_PATH` = `/logs/notme2027h2` and `CT_LOG_ID` / `CT_LOG_KEY` = the new
-   shard's. Changing the path without the pin makes the authority refuse
-   every SCT the new shard returns (`lastError` "wrong log").
+3. Record its key. The new shard is a different log with a different key.
+   The pin file (`trust/notme-ct-log.json`) is still a **single** object
+   naming one log, and `task ct:verify -- --write` refuses to overwrite a
+   different pin; until it holds one entry per shard, record the new shard's
+   `metadata_url`, `log_id`, `key` and digest by a reviewed manual edit and
+   cut a release so the signed pin follows. The old pin stays in git history
+   and in the earlier release's signed asset.
+4. Deploy notme, through the canary, with `CT_LOG_SHARDS` holding **both**
+   shards (template in `worker/wrangler.toml.example`) and the single-pin
+   variables removed (setting both is a `configError`). Do this any time
+   before the earliest `notAfter` that can reach the boundary: at the latest
+   24 hours before it, the longest tier TTL; in practice, as soon as the new
+   shard is deployed.
+5. Watch `/admin/alarm-health`: `configError` stays `null` and `lastError`
+   never reads `no shard covers notAfter`.
 6. Keep the old shard serving reads; it stays the record for what it logged.
+   Drop it from `CT_LOG_SHARDS` only once no backlog row can still need it
+   (its interval has ended and `backlog` / `gaveUp` are 0).
 
 ## What is NOT done
 
@@ -481,7 +489,6 @@ per-cert shard selection. Until it lands:
   they do, the log records issuance and enforces nothing.
 - Offline task certificates (`mintTaskCertPair`) are not logged; their tier is.
 - The log is not provisioned and nothing is pinned or bound.
-- Shard rollover (step 6) is a manual runbook step: nothing alerts ahead of
-  `notme`'s 2027-07-01 close, and the authority logs to one shard at a time,
-  so the switch costs the last hour's embedded SCTs. See notme-afa9d8 for
-  per-cert shard selection.
+- The trust pin `trust/notme-ct-log.json` (and `task ct:verify`) holds ONE
+  log; a second shard is recorded by a manual reviewed edit (step 6.3), not
+  as a second entry. notme-afa9d8 asks for one entry per shard.
