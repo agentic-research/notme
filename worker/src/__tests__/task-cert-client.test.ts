@@ -152,7 +152,7 @@ describe("minting a task certificate offline", () => {
 });
 
 // ── renewal, subtasks, ledger, revocation (notme-337d82, notme-9f84e6) ──────
-import { renewProof, isRevokedTask, taskOutDir } from "../../../scripts/task-cert/lib";
+import { renewProof, isRevokedTask, taskOutDir, pemChain } from "../../../scripts/task-cert/lib";
 import { tierRenewalBinding } from "../auth/tier-enrolment-binding";
 
 describe("renewal proof", () => {
@@ -1278,5 +1278,22 @@ describe("tier.json records the criteria the authority granted", () => {
       if ("enrollment_id" in collected) expect(meta.enrollment_id).toBe(collected.enrollment_id);
       else expect("enrollment_id" in meta).toBe(false);
     }
+  });
+});
+
+describe("chain.pem is a well-formed PEM bundle (a strict parser reads every cert)", () => {
+  // A PEM without a trailing newline glued to the next one produced
+  // "-----END CERTIFICATE----------BEGIN CERTIFICATE-----", which Go's
+  // encoding/pem (signet verify) refuses outright.
+  const A = "-----BEGIN CERTIFICATE-----\nQUFB\n-----END CERTIFICATE-----";
+  const B = "-----BEGIN CERTIFICATE-----\nQkJC\n-----END CERTIFICATE-----\n";
+  it("puts each END and BEGIN on its own line, whatever the inputs end with", () => {
+    const out = pemChain(A, B);
+    expect(out).not.toMatch(/-----END CERTIFICATE----------BEGIN/);
+    expect(out).toBe(
+      "-----BEGIN CERTIFICATE-----\nQUFB\n-----END CERTIFICATE-----\n" +
+        "-----BEGIN CERTIFICATE-----\nQkJC\n-----END CERTIFICATE-----\n",
+    );
+    expect(out.match(/^-----BEGIN CERTIFICATE-----$/gm)).toHaveLength(2);
   });
 });

@@ -917,6 +917,16 @@ export function isRevokedTask(taskPath: string, revoked: readonly string[]): boo
 }
 
 /** Where a task's files live: one directory per task-path segment. */
+/**
+ * Join PEM blocks into one bundle with each block on its own lines. A PEM with
+ * no trailing newline glued straight onto the next produced
+ * "-----END CERTIFICATE----------BEGIN CERTIFICATE-----", which a strict
+ * parser (Go's encoding/pem, so `signet verify`) refuses.
+ */
+export function pemChain(...pems: string[]): string {
+  return pems.map((p) => p.trim() + "\n").join("");
+}
+
 export function taskOutDir(base: string, taskPath: string): string {
   return join(base, ...taskPath.split("/"));
 }
