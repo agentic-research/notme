@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * alarm-health.do.test.ts — the bundle-refresh alarm, its circuit breaker, and
  * the recovery procedure (notme-77a024).

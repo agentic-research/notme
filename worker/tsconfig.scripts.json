@@ -7,7 +7,12 @@
   // Run via `task worker:check`.
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "types": ["@cloudflare/workers-types", "node"],
+    // "node" FIRST. workers-types 5.20261019+ declares `var process: any`
+    // (Node globals are on by default from compat date 2026-08-04), and the
+    // first declaration loaded wins: with workers-types first, process.exit()
+    // is `any` rather than `never` and the scripts stop type-checking
+    // (notme-430ad1).
+    "types": ["node", "@cloudflare/workers-types"],
     "paths": { "@peculiar/x509": ["./node_modules/@peculiar/x509"] },
     "noEmit": true
   },

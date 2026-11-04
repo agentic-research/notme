@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * rpc-surface.do.test.ts — pin the RPC-reachable method surface of every
  * WorkerEntrypoint and of the SigningAuthority DO.

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * delegation-depth.do.test.ts — the delegation chain notme ADVERTISES must be
  * the one it can actually ISSUE (notme-600df1, notme-77a024).

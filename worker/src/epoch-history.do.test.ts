@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * epoch-history.do.test.ts — /.well-known/epochs.json is signed by the root
  * and says what ended each epoch (notme-6a4f23, ADR-019 D7).

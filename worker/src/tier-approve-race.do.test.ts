@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * tier-approve-race.do.test.ts — an approve that changed nothing must not
  * report success (notme-052431).

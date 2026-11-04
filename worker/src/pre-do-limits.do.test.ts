@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * pre-do-limits.do.test.ts — an unauthenticated request that is going to be
  * refused must be refused BEFORE it costs the SigningAuthority anything

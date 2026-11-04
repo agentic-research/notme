@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * invite-join.do.test.ts — an invite is RESERVED when a registration starts
  * and CONSUMED only when the passkey verifies (notme-3dfe15, parts 4/5).

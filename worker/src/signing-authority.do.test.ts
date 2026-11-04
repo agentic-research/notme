@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 // Real-Durable-Object test for the SigningAuthority rotation grace window.
 //
 // Maps to notme-b49020 (this test) guarding the notme-54f84b fix: rotate()

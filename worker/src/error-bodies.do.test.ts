@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * error-bodies.do.test.ts — internal error text stays on the server
  * (notme-b567c9).

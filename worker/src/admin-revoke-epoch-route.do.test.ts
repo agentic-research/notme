@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * admin-revoke-epoch-route.do.test.ts — the mass-revocation lever must be
  * reachable by an admin and by nobody else (notme-77a024).

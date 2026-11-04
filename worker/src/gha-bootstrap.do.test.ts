@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * gha-bootstrap.do.test.ts — first boot without a secret in the logs
  * (notme-addef9, Goal Zero criterion E).

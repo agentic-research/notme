@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * fork-acceptance.do.test.ts — the end-to-end acceptance for mint path phase 1
  * (notme-747cc7). The REAL task-cert client (scripts/task-cert/lib.ts

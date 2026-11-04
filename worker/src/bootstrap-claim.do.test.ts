@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * bootstrap-claim.do.test.ts — first boot that a human can finish, with no
  * secret anywhere (notme-486e8a; Goal Zero criterion E, revisited).

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * oidc-jti-cross-route.do.test.ts — one GitHub Actions token, one spend,
  * across /cert/gha, /cert (oidc proof) and the /token exchange, WITHOUT

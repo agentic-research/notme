@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * challenge-freshness.do.test.ts — a WebAuthn REGISTRATION challenge must
  * expire on the same clock as an authentication challenge (notme-addef9, from

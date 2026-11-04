@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * san-length.do.test.ts — the SubjectAltName URI must round-trip at any
  * length a real deployment can produce (notme-193368).

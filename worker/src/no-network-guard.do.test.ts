@@ -8,7 +8,7 @@
  * that it is live in THIS isolate, that it refuses a real host, and that the
  * fixtures that wrap fetch fall through to it rather than past it.
  */
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { installGhaSigner } from "./__tests__/helpers/gha-token";
