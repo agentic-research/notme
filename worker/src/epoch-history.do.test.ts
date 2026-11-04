@@ -11,11 +11,13 @@
  *
  * Runs under vitest.workers.config.mts (`pnpm test:do`).
  */
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker from "../worker";
 import { createSessionCookie } from "./auth/session";
 import { type EpochHistory, verifyEpochHistorySignature } from "./epoch-history";
+import { type PublishedEpochRevocation, verifyRevocationStatement } from "./rekor-revocation";
+import type { SigningAuthority } from "./signing-authority";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
@@ -161,8 +163,34 @@ describe("what ended an epoch: revokedAt vs retiredAt (notme-6a4f23)", () => {
     const after = await stub.getSignedEpochHistory();
     expect(after.revocations).toEqual([
       ...before.revocations,
-      { epoch: before.currentEpoch, revokedAt: expect.any(Number), reason: "rpc reason" },
+      {
+        epoch: before.currentEpoch,
+        revokedAt: expect.any(Number),
+        reason: "rpc reason",
+        // This pool runs REKOR_SUBMIT=off (notme-8befcc): the statement is
+        // still root-signed and published, nothing is logged, and the
+        // no-network guard would fail this test had anything been sent.
+        statement: expect.objectContaining({ payloadType: "application/vnd.in-toto+json" }),
+        rekorLogIndex: null,
+        rekorUuid: null,
+        rekorIntegratedTime: null,
+      },
     ]);
     expect(await verifyEpochHistorySignature(after, await stub.getPublicKeyRawB64())).toBe(true);
+  });
+
+  it("REKOR_SUBMIT=off: the alarm signs and keeps the revocation pending, and sends nothing (notme-8befcc)", async () => {
+    const stub = authority("epoch-history-rekor-off");
+    const before = await stub.getSignedEpochHistory();
+    await stub.revokeEpoch("off switch");
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as unknown as SigningAuthority).alarm();
+    });
+    const r = (await stub.getSignedEpochHistory()).revocations.find((x) => x.epoch === before.currentEpoch) as
+      | PublishedEpochRevocation
+      | undefined;
+    expect(r?.rekorLogIndex).toBeNull();
+    const v = await verifyRevocationStatement(r!.statement!, await stub.getPublicKeyRawB64());
+    expect(v.ok).toBe(true);
   });
 });

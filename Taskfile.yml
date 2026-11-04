@@ -177,6 +177,11 @@ tasks:
       # binding — its suites are the evidence that an unbound deployment mints
       # exactly as before CT, which a per-test toggle could not show.
       - pnpm exec vitest run --config vitest.workers.ct.config.mts
+      # The Rekor-submitting suites (notme-8befcc): submission ON, REKOR_URL a
+      # stubbed `.test` host. Separate for the same reason: the config above
+      # sets REKOR_SUBMIT=off, so every other suite that revokes provably
+      # sends nothing.
+      - pnpm exec vitest run --config vitest.workers.rekor.config.mts
 
   proxy:check:
     desc: Build + test the Rust mTLS proxy crate
