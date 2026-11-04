@@ -1488,7 +1488,7 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
           r.ok ? r.v.authority : null,
           "minted under the captured (stale) key/epoch instead of refusing",
         ).toBeNull();
-        expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+        expect(r.ok ? "" : r.e).toMatch(/changed while the mint was in flight/);
 
         expect(retry.authority).toEqual({ epoch: after.epoch, key_id: after.keyId });
       });
@@ -1503,7 +1503,7 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
     expect(opInsideHold, "the operation did not finish inside the hold").toBe(true);
     expect(after.keyId).not.toBe(before.keyId);
     expect(r.ok ? r.v.authority : null, "fallback minted under the retired key").toBeNull();
-    expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+    expect(r.ok ? "" : r.e).toMatch(/changed while the mint was in flight/);
   });
 
   // The config path awaits #ctLogPin (an importKey + digest on a pin it has
@@ -1547,7 +1547,7 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
         .then((v) => ({ ok: true as const, v }), (err) => ({ ok: false as const, e: String(err) }));
     });
     expect(r.ok ? r.v.authority : null, "minted under the captured (stale) epoch").toBeNull();
-    expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+    expect(r.ok ? "" : r.e).toMatch(/changed while the mint was in flight/);
   });
 
   // The unparseable-root path also signs after `await #ctLogPin()`. Same
@@ -1592,6 +1592,6 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
         .then((v) => ({ ok: true as const, v }), (err) => ({ ok: false as const, e: String(err) }));
     });
     expect(r.ok ? r.v.authority : null, "minted under the captured (stale) epoch").toBeNull();
-    expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+    expect(r.ok ? "" : r.e).toMatch(/changed while the mint was in flight/);
   });
 });
