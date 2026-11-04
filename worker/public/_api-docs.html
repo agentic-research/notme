@@ -723,7 +723,10 @@
             revoked epoch (<code>revocations[]</code>: <code>revokedAt</code>
             and <code>reason</code>), and is signed by the root key with a
             monotonic <code>seqno</code> and an <code>issuedAt</code>, as the
-            CA bundle is. Verifier rule: ADR-019 D7.
+            CA bundle is. Each revocation also carries its root-signed
+            DSSE <code>statement</code> and, once logged in Rekor,
+            <code>rekorLogIndex</code> and <code>rekorUuid</code> (outside the
+            signed form; check them against the log). Verifier rule: ADR-019 D7.
           </div>
         </div>
       </div>

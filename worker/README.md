@@ -203,6 +203,7 @@ npm ci
 npx vitest run                              # unit (1042 tests, 71 files on 2026-11-03): src/__tests__/ + ../packages/dpop/__tests__ (vault retired — see docs/design/012-vault-retirement.md)
 npm run test:do                             # real-DO (638 tests, 70 files): *.do.test.ts via vitest-pool-workers — hermetic (SigningAuthority + RevocationAuthority + checkRevocation)
 npx vitest run --config vitest.workers.ct.config.mts   # CT-bound suites (56), CT_LOG bound to a stub log
+npx vitest run --config vitest.workers.rekor.config.mts   # Rekor-submitting suite (notme-8befcc), REKOR_URL stubbed; the main pool runs REKOR_SUBMIT=off
 npx vitest run src/__tests__/adversarial.test.ts   # focused: adversarial corpus
 npm run build:local                         # esbuild bundle worker.ts → dist/worker.js
 bash test-local.sh                          # workerd smoke: discovery / jwks / ca-bundle + invariant #1 (no private key on disk)

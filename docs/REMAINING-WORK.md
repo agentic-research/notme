@@ -235,6 +235,18 @@ Closed, with the commit that fixed each (all merged into goalzero):
   and notme-afa9d8 (per-cert shard by notAfter, 0357c33), both merged in
   bbe2deb.
 
+**Revocation transparency (notme-6a4f23 → notme-8befcc).** Step 1, the
+signed `/.well-known/epochs.json`, is done. Step 2 is on branch
+`feat/notme-8befcc-rekor-revocations` and not merged yet. With it, each
+revoke-epoch is written to the public Rekor as a root-signed DSSE statement,
+after the commit, and retried from the alarm while Rekor is down.
+epochs.json publishes `rekorLogIndex`, and `checkRevocationsAgainstLog()`
+catches a re-signed history that disagrees with the log (ADR-019 D7). It
+closes on merge. What's left after it isn't in notme:
+- signet has to vendor `schema/fixtures/revocationstatement-epoch1` and
+  read `dsse` entries; its verifier only handles `hashedrekord` today.
+- A self-hosted log on azul's `generic_log_worker` stays in stage 4.
+
 ## Stage 3: task-based certificates
 
 What exists:

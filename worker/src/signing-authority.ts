@@ -39,6 +39,13 @@ import {
   normalizeRevocationReason,
 } from "./epoch-history";
 import {
+  DEFAULT_REKOR_URL,
+  type DsseEnvelope,
+  type PublishedEpochRevocation,
+  signRevocationStatement,
+  submitToRekor,
+} from "./rekor-revocation";
+import {
   ctPoisonExtension,
   sctListExtension,
   serialiseSct,
@@ -153,6 +160,18 @@ interface SigningAuthorityEnv {
    * See src/ct/shards.ts and ct/README.md.
    */
   CT_LOG_SHARDS?: string | unknown[];
+  /**
+   * Where each revoke-epoch statement is logged (notme-8befcc): a Rekor v1
+   * base URL. Defaults to the public sigstore instance, DEFAULT_REKOR_URL.
+   */
+  REKOR_URL?: string;
+  /**
+   * "off" stops submission (tests, self-hosters with no outbound path to a
+   * log). The statement is still signed and published in epochs.json; only
+   * the log entry is skipped, so epochs.json shows `rekorLogIndex: null`.
+   * Anything else, or absent: on.
+   */
+  REKOR_SUBMIT?: string;
 }
 
 /**
@@ -1556,7 +1575,57 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO epoch_history_state (id, seqno) VALUES ('authority', 0)",
     );
+    // The transparency columns (notme-8befcc), added the way ct_backlog's
+    // are. `history_seqno`: an epochs.json seqno reserved with the
+    // revocation, so every document signed after it carries it. `statement`:
+    // the root-signed DSSE envelope (JSON), and `statement_key` the raw public
+    // key that signed it (Rekor's verifier). `rekor_*`: where the log put it,
+    // and the retry bookkeeping. A row is PENDING while rekor_log_index is
+    // NULL; nothing here is ever rewritten once logged.
+    for (const [col, ddl] of [
+      ["history_seqno", "INTEGER"],
+      ["statement", "TEXT"],
+      ["statement_key", "TEXT"],
+      ["rekor_log_index", "INTEGER"],
+      ["rekor_uuid", "TEXT"],
+      ["rekor_integrated_time", "INTEGER"],
+      ["rekor_attempts", "INTEGER NOT NULL DEFAULT 0"],
+      ["rekor_last_attempt_at", "INTEGER"],
+      ["rekor_last_error", "TEXT"],
+    ] as const) {
+      try {
+        this.ctx.storage.sql.exec(`SELECT ${col} FROM epoch_revocations LIMIT 0`);
+      } catch {
+        this.ctx.storage.sql.exec(`ALTER TABLE epoch_revocations ADD COLUMN ${col} ${ddl}`);
+      }
+    }
+    // Rows from before history_seqno existed: reserve one seqno now and give
+    // it to all of them. True by construction — the rows exist, so every
+    // document signed from here on reads them — and it lets their statements
+    // be signed like any other.
+    this.ctx.storage.transactionSync(() => {
+      const unseq = this.ctx.storage.sql
+        .exec("SELECT COUNT(*) AS n FROM epoch_revocations WHERE history_seqno IS NULL")
+        .toArray()[0] as { n: number };
+      if (unseq.n === 0) return;
+      const seqno = this.#reserveHistorySeqno();
+      this.ctx.storage.sql.exec(
+        "UPDATE epoch_revocations SET history_seqno = ? WHERE history_seqno IS NULL",
+        seqno,
+      );
+    });
     this.#epochHistoryReady = true;
+  }
+
+  /** Take the next epochs.json seqno without signing a document with it. Synchronous. */
+  #reserveHistorySeqno(): number {
+    this.ctx.storage.sql.exec(
+      "UPDATE epoch_history_state SET seqno = seqno + 1 WHERE id = 'authority'",
+    );
+    const [{ seqno }] = this.ctx.storage.sql
+      .exec("SELECT seqno FROM epoch_history_state WHERE id = 'authority'")
+      .toArray() as Array<{ seqno: number }>;
+    return seqno;
   }
 
   /**
@@ -1592,20 +1661,40 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // revokedAt is earlier than issuedAt committed before these reads, so it
     // is in this document. The verifier rule leans on it (t < issuedAt).
     const epochs = this.#epochKeyEntries(keyId, livePub);
+    // Beside each signed revocation, its transparency record (notme-8befcc):
+    // the root-signed statement and where Rekor logged it. NOT in the signing
+    // input (epochHistoryCanonical reads only epoch/revokedAt/reason): the
+    // statement is signed on its own, and the log fields are pointers a
+    // verifier checks against the log.
     const revocations = (
       this.ctx.storage.sql
-        .exec("SELECT epoch, revoked_at, reason FROM epoch_revocations ORDER BY epoch ASC")
-        .toArray() as Array<{ epoch: number; revoked_at: number; reason: string }>
-    ).map((r): EpochRevocation => ({ epoch: r.epoch, revokedAt: r.revoked_at, reason: r.reason }));
+        .exec(
+          "SELECT epoch, revoked_at, reason, statement, rekor_log_index, rekor_uuid, rekor_integrated_time FROM epoch_revocations ORDER BY epoch ASC",
+        )
+        .toArray() as Array<{
+        epoch: number;
+        revoked_at: number;
+        reason: string;
+        statement: string | null;
+        rekor_log_index: number | null;
+        rekor_uuid: string | null;
+        rekor_integrated_time: number | null;
+      }>
+    ).map(
+      (r): PublishedEpochRevocation => ({
+        epoch: r.epoch,
+        revokedAt: r.revoked_at,
+        reason: r.reason,
+        statement: r.statement === null ? null : (JSON.parse(r.statement) as DsseEnvelope),
+        rekorLogIndex: r.rekor_log_index,
+        rekorUuid: r.rekor_uuid,
+        rekorIntegratedTime: r.rekor_integrated_time,
+      }),
+    );
     const [{ epoch: currentEpoch }] = this.ctx.storage.sql
       .exec("SELECT epoch FROM state WHERE id = 'authority'")
       .toArray() as Array<{ epoch: number }>;
-    this.ctx.storage.sql.exec(
-      "UPDATE epoch_history_state SET seqno = seqno + 1 WHERE id = 'authority'",
-    );
-    const [{ seqno }] = this.ctx.storage.sql
-      .exec("SELECT seqno FROM epoch_history_state WHERE id = 'authority'")
-      .toArray() as Array<{ seqno: number }>;
+    const seqno = this.#reserveHistorySeqno();
     const unsigned = {
       epochs,
       revocations,
@@ -4362,14 +4451,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       this.ctx.storage.sql.exec(
         "UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'",
       );
+      // The epochs.json seqno reserved WITH the revocation (notme-8befcc):
+      // every document signed after this commit has a larger one and reads
+      // this row, so the statement can say "any history past this seqno
+      // carries me" and a verifier can hold the authority to it.
+      const historySeqno = this.#reserveHistorySeqno();
       this.ctx.storage.sql.exec(
-        "INSERT INTO epoch_revocations (epoch, revoked_at, reason) VALUES (?, ?, ?)",
+        "INSERT INTO epoch_revocations (epoch, revoked_at, reason, history_seqno) VALUES (?, ?, ?, ?)",
         current,
         Math.floor(Date.now() / 1000),
         why,
+        historySeqno,
       );
       return current;
     });
+    // AFTER the commit, and never able to undo it (notme-8befcc): sign the
+    // revocation's statement now, while the key that signs epochs.json is
+    // the one that was live when it happened. A failure here leaves the row
+    // without a statement, and the alarm signs it later.
+    try {
+      await this.#signRevocationStatement(ended);
+    } catch (err) {
+      console.error({ event: "rekor.statement_sign_failed", epoch: ended, error: String(err) });
+    }
     // Publish straight away: the bundle is how a verifier learns the epoch
     // moved, so leaving it stale makes the lever a no-op until the next
     // alarm fires — and an alarm is exactly what cannot be relied on here
@@ -4380,7 +4484,165 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const bundle = await this.#publishBundle();
     const { epoch, seqno } = bundle;
     console.warn({ event: "authority.epoch_revoked", epoch, seqno, revokedEpoch: ended, reason: why });
+    // One immediate submission to Rekor, after the commit AND the publish,
+    // so nothing about the log can delay or undo either. Bounded
+    // (REKOR_TIMEOUT_MS) and never throws: an outage leaves the row pending
+    // and the alarm retries it (#drainRekor).
+    try {
+      await this.#drainRekor({ only: ended });
+    } catch (err) {
+      console.error({ event: "rekor.submit_failed", epoch: ended, error: String(err) });
+    }
     return { epoch, seqno };
+  }
+
+  // ── Revocation transparency: Rekor (notme-8befcc) ──
+  //
+  // Each revocation's root-signed DSSE statement (rekor-revocation.ts) is
+  // logged once in Rekor, AFTER revokeEpoch() commits. Pending rows are
+  // retried from alarm() with bounded exponential backoff and never
+  // abandoned: a revocation is rare and its log entry is permanent evidence,
+  // so a long outage costs a few requests a day, not the record.
+
+  /** Requests are bounded per attempt; revokeEpoch's response waits at most this (x2 on a 409). */
+  static readonly REKOR_TIMEOUT_MS = 5_000;
+  /** Backoff after the n-th failure: REKOR_RETRY_BASE_S * 2^(n-1), capped at REKOR_RETRY_MAX_S. */
+  static readonly REKOR_RETRY_BASE_S = 4 * 60;
+  static readonly REKOR_RETRY_MAX_S = 6 * 60 * 60;
+  /** Rows attempted per alarm fire. */
+  static readonly REKOR_DRAIN_BATCH = 5;
+
+  /** Epochs with a submission in flight in this instance, so the alarm and revokeEpoch never send one twice. */
+  #rekorInFlight = new Set<number>();
+
+  /** Sign `epoch`'s revocation statement with the live root key, once. Idempotent. */
+  async #signRevocationStatement(epoch: number): Promise<void> {
+    this.#ensureEpochHistorySchema();
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT revoked_at, reason, history_seqno, statement FROM epoch_revocations WHERE epoch = ?",
+        epoch,
+      )
+      .toArray()[0] as
+      | { revoked_at: number; reason: string; history_seqno: number; statement: string | null }
+      | undefined;
+    if (!row || row.statement !== null) return;
+    // The root signs through the existing path: the non-extractable
+    // CryptoKey stays in this object, and rekor-revocation.ts only ever sees
+    // a signer callback.
+    const { signingKey, verifyKey, keyId } = await this.#getOrCreateSigningKey();
+    const rootPub = await rawPublicKeyB64(verifyKey);
+    if (this.#getKeyId() !== keyId) return; // rotated mid-sign: the next attempt signs with the new key
+    const envelope = await signRevocationStatement(
+      {
+        epoch,
+        revokedAt: row.revoked_at,
+        reason: row.reason,
+        historySeqno: row.history_seqno,
+        rootKeyId: keyId,
+      },
+      rootPub,
+      (message) => crypto.subtle.sign(ED25519, signingKey, message),
+    );
+    // `statement IS NULL`: the first signature stands, so a statement already
+    // sent to the log is never replaced by a different one.
+    this.ctx.storage.sql.exec(
+      "UPDATE epoch_revocations SET statement = ?, statement_key = ? WHERE epoch = ? AND statement IS NULL",
+      JSON.stringify(envelope),
+      rootPub,
+      epoch,
+    );
+  }
+
+  /**
+   * Sign any unsigned statements, then submit pending ones to Rekor.
+   * `only`: just that epoch, ignoring backoff (revokeEpoch's immediate try).
+   * Otherwise (the alarm): up to REKOR_DRAIN_BATCH pending rows whose backoff
+   * has passed. With REKOR_SUBMIT=off it signs and sends nothing. Never
+   * throws per row; failures are recorded on the row.
+   */
+  async #drainRekor(opts: { only?: number } = {}): Promise<void> {
+    this.#ensureEpochHistorySchema();
+    const sql = this.ctx.storage.sql;
+    const rows = (
+      opts.only === undefined
+        ? sql.exec(
+            "SELECT epoch, statement, rekor_attempts, rekor_last_attempt_at FROM epoch_revocations WHERE rekor_log_index IS NULL ORDER BY epoch ASC",
+          )
+        : sql.exec(
+            "SELECT epoch, statement, rekor_attempts, rekor_last_attempt_at FROM epoch_revocations WHERE rekor_log_index IS NULL AND epoch = ?",
+            opts.only,
+          )
+    ).toArray() as Array<{
+      epoch: number;
+      statement: string | null;
+      rekor_attempts: number;
+      rekor_last_attempt_at: number | null;
+    }>;
+
+    for (const row of rows) {
+      if (row.statement === null) {
+        try {
+          await this.#signRevocationStatement(row.epoch);
+        } catch (err) {
+          console.error({ event: "rekor.statement_sign_failed", epoch: row.epoch, error: String(err) });
+        }
+      }
+    }
+    if (this.env.REKOR_SUBMIT === "off") return;
+
+    const now = Math.floor(Date.now() / 1000);
+    const due = rows.filter((r) => {
+      if (opts.only !== undefined || r.rekor_last_attempt_at === null) return true;
+      const wait = Math.min(
+        SigningAuthority.REKOR_RETRY_BASE_S * 2 ** Math.max(0, r.rekor_attempts - 1),
+        SigningAuthority.REKOR_RETRY_MAX_S,
+      );
+      return now >= r.rekor_last_attempt_at + wait;
+    });
+
+    for (const r of due.slice(0, SigningAuthority.REKOR_DRAIN_BATCH)) {
+      if (this.#rekorInFlight.has(r.epoch)) continue;
+      // Re-read: the statement may have been signed just above.
+      const cur = sql
+        .exec(
+          "SELECT statement, statement_key, rekor_log_index FROM epoch_revocations WHERE epoch = ?",
+          r.epoch,
+        )
+        .toArray()[0] as { statement: string | null; statement_key: string | null; rekor_log_index: number | null };
+      if (!cur || cur.rekor_log_index !== null || cur.statement === null || cur.statement_key === null) continue;
+      this.#rekorInFlight.add(r.epoch);
+      try {
+        const result = await submitToRekor({
+          baseUrl: this.env.REKOR_URL || DEFAULT_REKOR_URL,
+          envelope: JSON.parse(cur.statement) as DsseEnvelope,
+          rootPublicRawB64: cur.statement_key,
+          timeoutMs: SigningAuthority.REKOR_TIMEOUT_MS,
+        });
+        const at = Math.floor(Date.now() / 1000);
+        if (result.ok) {
+          sql.exec(
+            "UPDATE epoch_revocations SET rekor_log_index = ?, rekor_uuid = ?, rekor_integrated_time = ?, rekor_last_attempt_at = ?, rekor_last_error = NULL WHERE epoch = ? AND rekor_log_index IS NULL",
+            result.logIndex,
+            result.uuid,
+            result.integratedTime,
+            at,
+            r.epoch,
+          );
+          console.warn({ event: "rekor.logged", epoch: r.epoch, logIndex: result.logIndex, uuid: result.uuid });
+        } else {
+          sql.exec(
+            "UPDATE epoch_revocations SET rekor_attempts = rekor_attempts + 1, rekor_last_attempt_at = ?, rekor_last_error = ? WHERE epoch = ?",
+            at,
+            result.reason.slice(0, 200),
+            r.epoch,
+          );
+          console.error({ event: "rekor.submit_failed", epoch: r.epoch, reason: result.reason });
+        }
+      } finally {
+        this.#rekorInFlight.delete(r.epoch);
+      }
+    }
   }
 
   // ── Passkey operations (delegates to passkey module, uses DO's SQLite) ──
@@ -5754,6 +6016,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         console.error({ event: "ct.drain_failed", error: String(err) });
         this.#ctRecord("error", `drain: ${String(err)}`);
       }
+    }
+
+    // Retry pending revocation statements to Rekor (notme-8befcc). Outside
+    // the refresh try and swallowed, as the CT drain: a log outage is not a
+    // bundle failure and must never feed the circuit breaker.
+    try {
+      await this.#drainRekor();
+    } catch (err) {
+      console.error({ event: "rekor.drain_failed", error: String(err) });
     }
 
     // Atomic update — `total_fires = total_fires + 1` and (on failure)

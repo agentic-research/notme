@@ -72,6 +72,31 @@ signatures. `epochhistory-revoked` covers a retired key, a live key spanning a
 revocation (`untilEpoch: null`), and one revocation with a reason;
 `epochhistory-basic` is a fresh authority with no history.
 
+## Revocation statement fixture (notme-8befcc)
+
+`revocationstatement-epoch1` is the root-signed DSSE envelope that
+`revokeEpoch()` logs in Rekor (ADR-019 D7), produced by
+`worker/src/rekor-revocation.ts`. It differs from the CBOR fixtures:
+
+| File | Contents |
+|---|---|
+| `.json` | The full envelope: `payloadType` (`application/vnd.in-toto+json`), `payload` (standard base64 of the in-toto Statement v1 JSON) and `signatures[{keyid, sig}]`. |
+| `.bin` / `.expected.hex` | The signing input: DSSE v1 PAE, `"DSSEv1" SP len(type) SP type SP len(payload) SP payload`, lengths in bytes. |
+
+The signature is Ed25519 by the same fixture root as `epochhistory-*`, key id
+`a050837d85070582ccf7394b0988847c`. The statement describes the revocation in
+`epochhistory-revoked`: epoch 1, the same `revokedAt` and reason, and
+`historySeqno: 41`. That history has seqno 42, so it must carry the
+revocation, and it does. A consumer checks four things:
+
+1. The PAE of the decoded payload equals the `.bin`.
+2. The signature verifies over it under the root.
+3. The subject digest is sha256 of the root's 32 raw bytes.
+4. The predicate matches the history's revocation.
+
+The payload bytes are what is signed, so verifying it needs no JSON
+canonicalization.
+
 ## Integrity anchor (notme-1629fe)
 
 The golden bytes are the encoder's own output written to a file, so by

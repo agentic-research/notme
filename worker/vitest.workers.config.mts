@@ -63,6 +63,12 @@ export const baseMiniflare = {
     // (notme-153f03). A reserved `.test` name: the suite stubs fetch, and the
     // no-network guard refuses it if anything forgets to.
     PROXY_ALLOWED_DESTINATIONS: "proxy-dest.notme.test",
+    // The Rekor off switch (notme-8befcc). Every suite here that revokes an
+    // epoch must send nothing, so submission is off in this pool, and the
+    // no-network guard would fail any suite that sent anyway. The suites that
+    // submit run under vitest.workers.rekor.config.mts, which drops this and
+    // points REKOR_URL at a stubbed host.
+    REKOR_SUBMIT: "off",
     // Forwarded from the shell so ct-full-cycle.do.test.ts can be
     // pointed at a locally running transparency log. `env` in this pool
     // is the MINIFLARE binding set, not process.env, so a bare shell
@@ -105,6 +111,13 @@ export const CT_BOUND_SUITES = ["src/ct-mint.do.test.ts"];
 export const CT_LIVE_SUITES = ["src/ct-acceptance.do.test.ts"];
 
 /**
+ * Suites that revoke with Rekor submission ON (notme-8befcc) run under
+ * vitest.workers.rekor.config.mts and are excluded here, where REKOR_SUBMIT is
+ * off.
+ */
+export const REKOR_SUITES = ["src/rekor-revocation.do.test.ts"];
+
+/**
  * Loads the Worker's module graph before a file's tests start, so the first
  * test to reach a dynamically imported module does not pay the cold transform
  * inside its own timeout. Under load that cold start pushed the first mint-path
@@ -133,6 +146,6 @@ export default defineConfig({
   test: {
     include: ["src/**/*.do.test.ts"],
     setupFiles: [...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],
-    exclude: [...configDefaults.exclude, ...CT_BOUND_SUITES, ...CT_LIVE_SUITES],
+    exclude: [...configDefaults.exclude, ...CT_BOUND_SUITES, ...CT_LIVE_SUITES, ...REKOR_SUITES],
   },
 });
