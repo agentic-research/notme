@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * threat-model-routes.do.test.ts — the routing rows of THREAT_MODEL.md §8,
  * exercised against the REAL fetch handler (notme-8da0a3).

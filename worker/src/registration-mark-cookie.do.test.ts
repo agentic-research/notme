@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * registration-mark-cookie.do.test.ts — the FIRST-USER mark belongs to the
  * browser that earned it (notme-a2e75d).

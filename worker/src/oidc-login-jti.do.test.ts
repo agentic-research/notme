@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * oidc-login-jti.do.test.ts — an OIDC token presented at POST
  * /auth/oidc/login is single-use, keyed by its `jti` (review F1 of the

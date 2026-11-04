@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * identity-stability.do.test.ts — one principal, one identity, whatever the
  * ceremony (notme-77438b, ADR-019 D2; Goal Zero criterion B's code half).

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * ct-mint.do.test.ts — every bridge pair the authority mints is logged, or
  * backlogged, and never refused because of the log (notme-1b46a8, Task 2).

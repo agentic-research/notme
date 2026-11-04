@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * rotate-publishes-bundle.do.test.ts — a rotation is visible in the KV
  * CABundle at once, not at the next alarm (notme-ed6114, re-review NEW-1).

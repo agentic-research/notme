@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * tier-renewal.do.test.ts — a paused machine resumes without a human
  * (notme-337d82).

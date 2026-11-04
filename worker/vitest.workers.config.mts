@@ -1,4 +1,4 @@
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import { configDefaults, defineConfig } from "vitest/config";

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * oidc-issuer-audience.do.test.ts — every OIDC route reads its audience pin
  * per ISSUER, from the deployment's env (notme-0a1ee8).

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * verify-chain.do.test.ts — the chain walker carries all three bounds, or it
  * does not ship (ADR-019 D4/D5, notme-acc822).

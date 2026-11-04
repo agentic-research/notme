@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * bundle-consistency.do.test.ts — the prev-key record carries over and the
  * bundle names the key that signs it (notme-b54368, review L1 and L4).

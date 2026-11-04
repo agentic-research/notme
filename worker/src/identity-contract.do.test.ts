@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * identity-contract.do.test.ts — the identity a caller is HANDED must be the
  * identity a verifier READS (notme-729801).

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * ct-acceptance.do.test.ts — the falsifiable end-to-end acceptance for
  * issuance logging (notme-1b46a8, Task 6), against a REAL azul log.

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * epoch-lever.do.test.ts — the epoch is a REVOCATION lever, not a side effect
  * of replacing a key (notme-77a024 finding (a)).

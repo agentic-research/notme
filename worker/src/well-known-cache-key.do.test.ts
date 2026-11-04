@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * well-known-cache-key.do.test.ts — a query string must not buy a cache miss
  * on /.well-known/* (notme-ed6114).

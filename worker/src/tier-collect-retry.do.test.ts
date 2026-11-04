@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * tier-collect-retry.do.test.ts — a failed tier mint at collect leaves the
  * enrolment collectable (notme-d06b7b).

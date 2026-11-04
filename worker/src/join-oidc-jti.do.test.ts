@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * join-oidc-jti.do.test.ts — an OIDC proof presented at POST /join is
  * single-use, keyed by its `jti` (notme-3dfe15 part 1, interim option A).

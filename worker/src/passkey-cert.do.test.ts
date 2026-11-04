@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * passkey-cert.do.test.ts — POST /cert/passkey against the real route and a
  * real SigningAuthority.

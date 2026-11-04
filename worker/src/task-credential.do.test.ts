@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * task-credential.do.test.ts — hop 2: the MACHINE mints task credentials,
  * offline, and everything downstream can still tell what happened (A5;

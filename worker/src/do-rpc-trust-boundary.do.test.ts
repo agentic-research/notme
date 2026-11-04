@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * do-rpc-trust-boundary.do.test.ts — the DO derives the subject, the caller
  * does not assert it (notme-51ccd7).

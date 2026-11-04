@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * invite-federated-admin.do.test.ts — "first user" means "nobody can
  * administer", not "passkey_users is empty" (review L2, notme-3dfe15).

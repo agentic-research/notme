@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * ct-precert.do.test.ts — a precertificate minted by the REAL mint path, with
  * the real CA key (notme-1b46a8).

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * signing-surfaces.do.test.ts — enforce the mechanical parts of ADR-016.
  *

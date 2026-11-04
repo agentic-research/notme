@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * cert-exchange-oidc.do.test.ts — POST /cert with an OIDC proof works
  * (notme-486e8a follow-on: "if it advertises it should work").

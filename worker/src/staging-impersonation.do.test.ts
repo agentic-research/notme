@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * staging-impersonation.do.test.ts — a staging-issued credential must not be
  * string-identical to a production one (notme-1532eb, red-team:trust-root).

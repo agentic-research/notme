@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * threat-model-cert-gha.do.test.ts — every `cert-gha.*` row of
  * THREAT_MODEL.md §OIDC, exercised against the REAL /cert/gha handler

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * api-docs-route.do.test.ts — /api/docs renders the SERVING environment's
  * authority host, in production as well as staging (notme-131c8e).

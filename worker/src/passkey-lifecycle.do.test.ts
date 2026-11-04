@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * passkey-lifecycle.do.test.ts — register → login → revoke → login again,
  * through the REAL routes with a REAL (software) authenticator.

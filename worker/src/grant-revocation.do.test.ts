@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * grant-revocation.do.test.ts — the grant is the revocation unit
  * (notme-77a024, Goal Zero criterion C, ADR-019 D3).

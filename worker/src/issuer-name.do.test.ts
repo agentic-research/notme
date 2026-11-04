@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * issuer-name.do.test.ts — every root-issued certificate names its signing
  * CA's subject as issuer (notme-7ec6fb).
