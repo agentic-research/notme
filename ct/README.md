@@ -202,6 +202,8 @@ In `config.notme.json`:
 | `require_server_auth_eku` | `false` | skips only the serverAuth presence check, so the clientAuth mTLS leaf and no-EKU signing leaf are both recorded; configured roots and every other validation still apply. Needs azul at or after `d9402ec` (#322) |
 | `enable_ccadb_roots` | `false` | this log accepts notme's root and nothing from the WebPKI |
 | `reject_expired` | `false` | the backlog submits after the leaf has expired; `true` would refuse every drained row (see above) |
+| `sequence_interval_millis` | `750` | sequencer alarm period. See "Sequencing: cost against inclusion latency" below |
+| `max_sequence_skips` | `1` | an empty interval does not write a checkpoint, every other one does. Same section |
 | `submission_endpoint` / `monitoring_endpoint` | `https://REPLACE-ME.example/logs/notme/` | **placeholder.** JSON has no comments, so it is explained here: replace both with the URL the deployed log is actually served at (the notme-ct Worker's route, or the R2 public bucket for the monitoring endpoint) before deploying. The log publishes these URLs in its `metadata.json`. |
 
 The file was brought up to the schema in the azul checkout at the #322 head
@@ -210,6 +212,69 @@ The file was brought up to the schema in the azul checkout at the #322 head
 `description` / `log_type` / `submission_url` fields the earlier version used
 are not in that schema. `config.notme.json` validates against
 `crates/ct_worker/config.schema.json`.
+
+### Sequencing: cost against inclusion latency
+
+Read from azul at `d9402ec` (notme-1b46a8, 2026-11-03 cost estimate risk 3,
+`docs/audits/2026-11-03-cost-estimate.md`):
+
+- The field names are `sequence_interval_millis` (integer, minimum 100,
+  default 1000) and `max_sequence_skips` (integer, default 0):
+  `crates/ct_worker/config.schema.json:95` and `:101`,
+  `crates/ct_worker/config/src/lib.rs:80-82`, wired at
+  `crates/ct_worker/src/sequencer_do.rs:33-34`. A bare `sequence_interval`
+  is refused by the schema (additional property), and `build.rs` enforces
+  the schema: `sequence_interval_millis: 50` fails the `DEPLOY_ENV=notme`
+  build.
+- The sequencer re-arms its alarm every interval, unconditionally
+  (`crates/generic_log_worker/src/sequencer_do.rs:181`).
+- On each tick `PoolState::take` (`crates/generic_log_worker/src/log_ops.rs:173-224`)
+  either skips (no full tile to publish and fewer than `max_sequence_skips`
+  consecutive skips: line 221) or sequences everything, **including nothing**
+  (line 212: "even if there are no entries, we want to create a new
+  checkpoint"), and every sequencing uploads a checkpoint to R2
+  (`log_ops.rs:1182`). The skip counter is per pool, not per entry, so it
+  cycles on idle ticks too: an idle log writes one checkpoint every
+  `(max_sequence_skips + 1) × sequence_interval`. Skips **reduce** idle writes;
+  nothing in this version eliminates them.
+- An `add-[pre-]chain` request is answered only after its entry is
+  sequenced and persisted (`crates/ct_worker/README.md`, "Life of an
+  add-[pre-]chain request", steps 6-8; `log_ops.rs:1203` releases the
+  waiters). So the same period is also the **worst-case wait** a submission
+  spends in the pool, plus `batch_timeout_millis` (default 100 ms).
+- Leave `sequence_skip_threshold_millis` unset. On an idle tick the "oldest
+  leftover" timestamp it compares against belongs to an entry already in the
+  tree (or is 0 after a restart), so it reads as expired and forces a
+  checkpoint every tick, which undoes the skips (`log_ops.rs:180-188`; a
+  reading of the code, not exercised).
+
+**The constraint that sets the values is on notme's side**: the mint waits
+for `add-pre-chain` at most `DEFAULT_TIMEOUT_MS` = **2000 ms**
+(`worker/src/ct/log-client.ts`), and the drain's `add-chain` uses the same
+bound. If the worst-case sequencing wait passes 2 s, mints time out, go out
+with no embedded SCT and are backlogged, and the drain's retries time out
+the same way. So the 5-10 s intervals the cost estimate floats would make
+logging fail rather than make it cheaper. With P = `(skips + 1) × interval`:
+
+| interval / skips | P (idle checkpoint period, worst wait) | idle R2 Class A / month | R2 Class A cost over the 1M free | alarm requests / month |
+|---|---|---|---|---|
+| 1000 / 0 (azul default) | 1.0 s | 2.59M | ~$7.16 | 2.59M |
+| **750 / 1 (chosen; azul's own `config.dev.json`)** | **1.5 s** | **1.73M** | **~$3.28** | 3.46M (~$0.13 more) |
+| 1000 / 1 | 2.0 s | 1.30M | ~$1.33 | 2.59M |
+| 2000 / 1 | 4.0 s | 0.65M | $0 | 1.30M |
+
+750 / 1 is the cheapest row whose worst case (1.5 s + 100 ms batching +
+network) stays under the 2 s mint bound; the estimate prices the log side
+at about $8.9 a month with it, against about $12.6 with the defaults. 1000 /
+1 sits at the bound and would time out a share of mints. Getting under R2's
+free tier (P of at least about 2.6 s) needs notme's CT timeout raised first,
+which adds up to P to the latency of every logged mint: an owner decision,
+not a config change. The DO stays resident either way (an alarm at most every
+second keeps it from evicting): about 332k of the 400k included GB-s.
+
+`notmedev` carries the same two values so the local acceptance
+(`task ct:acceptance`) measures `add-pre-chain` latency under the production
+timing. `notmestrict` keeps the defaults: it is only the EKU negative control.
 
 **Roots for the production log are the production root,
 `trust/notme-root.pem`**, copied verbatim to `roots.notme.pem` (the roots file
