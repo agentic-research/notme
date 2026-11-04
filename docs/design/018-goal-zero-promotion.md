@@ -239,10 +239,12 @@ of production in one command, and an omitted `ENV` meant production. Now
   version in the current deployment that is not `NEW` — and **refuses to
   deploy** if there is none or the deployment cannot be read.
 - after the deploy it awaits convergence on the recorded build, then verifies
-  pinned to `NEW`; if either fails, or the run is interrupted (INT/TERM), it
-  **promotes the prior version back**, deletes `NEW`'s pass record so the
-  same version cannot walk back through the gate on it, and exits non-zero.
-  That is the defined failure action.
+  pinned to `NEW`; if either fails, or the run is interrupted (INT, TERM or
+  HUP), it deletes `NEW`'s pass record — first, so a failed rollback cannot
+  leave it — then **promotes the prior version back** with further interrupts
+  ignored (a second Ctrl-C cannot abort the rollback), and exits non-zero.
+  That is the defined failure action. `worker:canary` likewise refuses an
+  `ENV`, `NEW`, `OLD` or `PCT` that came from an exported shell variable.
 - the emergency override is `ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>`: a
   typed reason, an explicit build sha, a loud banner, and a line appended to
   `.release-evidence/overrides.log`.

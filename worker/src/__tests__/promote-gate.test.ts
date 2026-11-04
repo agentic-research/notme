@@ -54,6 +54,10 @@ case "$*" in
     [ -n "\${FAKE_STATUS_FAIL:-}" ] && { echo "auth error" >&2; exit 1; }
     if [ -n "\${FAKE_DEPLOYMENT:-}" ]; then echo "$FAKE_DEPLOYMENT"
     else printf '{"id":"dep","versions":[{"version_id":"%s","percentage":100}]}\\n' "$FAKE_PREV"; fi ;;
+  *"versions deploy $FAKE_PREV@100%"*)
+    [ -n "\${FAKE_ROLLBACK_FAIL:-}" ] && { echo "rollback deploy failed" >&2; exit 1; }
+    if [ -n "\${FAKE_ROLLBACK_SLEEP:-}" ]; then sleep "$FAKE_ROLLBACK_SLEEP"; fi
+    echo "rollback-complete" >> "$FAKE_LOG" ;;
 esac
 exit 0
 `,
@@ -321,4 +325,103 @@ describe("worker:promote — security review fixes (M2, M3, M4, M6, L3)", () => 
     expect(deployed(calls, PREV), out).toBe(true);
     expect(code).not.toBe(0);
   }, 30_000);
+});
+
+describe("worker:promote — re-review N3 (interrupts during rollback)", () => {
+  /** Run the script in its own process group, as a terminal's foreground job is. */
+  function startDetached(extraEnv: Record<string, string>) {
+    const p = spawn("bash", [join(ROOT, "scripts/worker-promote.sh"), "--env", "production", "--new", NEW], {
+      detached: true,
+      env: {
+        ...cleanEnv(),
+        PATH: `${join(dir, "bin")}:${process.env.PATH}`,
+        FAKE_LOG: log,
+        FAKE_PREV: PREV,
+        NOTME_EVIDENCE_DIR: evidence,
+        NOTME_PROMOTE_VERIFY_CMD: stub("verify", 0),
+        NOTME_PROMOTE_CONVERGE_CMD: stub("converge", 0, 30),
+        ...extraEnv,
+      },
+    });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (out += d));
+    const closed = new Promise<number | null>((r) => p.on("close", (c) => r(c)));
+    return { p, closed, out: () => out };
+  }
+  const logHas = (s: string) => existsSync(log) && readFileSync(log, "utf8").includes(s);
+  async function until(cond: () => boolean) {
+    for (let i = 0; i < 150 && !cond(); i++) await new Promise((r) => setTimeout(r, 100));
+  }
+
+  it("SIGHUP (closed terminal) after the deploy rolls back", async () => {
+    writeEvidence("production", NEW, goodEvidence("production"));
+    const run = startDetached({});
+    await until(() => logHas("converge"));
+    process.kill(-run.p.pid!, "SIGHUP");
+    const code = await run.closed;
+    expect(code).not.toBe(0);
+    expect(logHas("rollback-complete"), run.out()).toBe(true);
+  }, 30_000);
+
+  it("a SECOND interrupt during the rollback does not abort it", async () => {
+    writeEvidence("production", NEW, goodEvidence("production"));
+    const run = startDetached({ FAKE_ROLLBACK_SLEEP: "2" });
+    await until(() => logHas("converge"));
+    process.kill(-run.p.pid!, "SIGTERM");
+    await until(() => logHas(`versions deploy ${PREV}@100%`));
+    process.kill(-run.p.pid!, "SIGTERM"); // the impatient second Ctrl-C
+    process.kill(-run.p.pid!, "SIGHUP");
+    await run.closed;
+    const log_ = readFileSync(log, "utf8");
+    // Completed, and completed the FIRST time — not killed mid-deploy and re-run.
+    expect(log_.split("\n").filter((l) => l.includes(`versions deploy ${PREV}@100%`)), run.out()).toHaveLength(1);
+    expect(log_.split("\n").filter((l) => l === "rollback-complete")).toHaveLength(1);
+  }, 30_000);
+
+  it("NEW's record is deleted BEFORE the rollback deploy, so a failed rollback leaves no pass", () => {
+    writeEvidence("production", NEW, goodEvidence("production"));
+    const r = promote({ NEW, ENV: "production" }, { NOTME_PROMOTE_VERIFY_CMD: stub("verify", 1), FAKE_ROLLBACK_FAIL: "1" });
+    expect(r.code).not.toBe(0);
+    expect(r.calls).toContain(`versions deploy ${PREV}@100%`);
+    expect(existsSync(join(evidence, "production", `${NEW}.json`))).toBe(false);
+  });
+});
+
+describe("worker:canary — selectors from the command line only (review M6, re-review N5)", () => {
+  function canary(vars: Record<string, string>, exported: Record<string, string> = {}) {
+    const args = ["-d", ROOT, "worker:canary", ...Object.entries(vars).map(([k, v]) => `${k}=${v}`)];
+    const clean = cleanEnv();
+    for (const k of ["OLD", "PCT"]) delete clean[k];
+    const r = spawnSync("task", args, {
+      env: { ...clean, PATH: `${join(dir, "bin")}:${process.env.PATH}`, FAKE_LOG: log, FAKE_PREV: PREV, ...exported },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+    return { code: r.status, out: `${r.stdout}\n${r.stderr}`, split: calls.includes("versions deploy") };
+  }
+  const typed = { NEW, OLD: PREV, ENV: "production" };
+
+  it("all typed: the split is deployed", () => {
+    const r = canary(typed);
+    expect(r.code, r.out).toBe(0);
+    expect(r.split).toBe(true);
+  });
+
+  for (const k of ["ENV", "NEW", "OLD", "PCT"] as const) {
+    it(`an exported ${k} standing in for a typed one is refused`, () => {
+      const vars: Record<string, string> = { ...typed };
+      const exported: Record<string, string> = { PCT: "50" };
+      if (k !== "PCT") {
+        exported[k] = vars[k];
+        delete vars[k];
+        delete exported.PCT;
+      }
+      const r = canary(vars, exported);
+      expect(r.code).not.toBe(0);
+      expect(r.split).toBe(false);
+      expect(r.out).toMatch(new RegExp(`${k} is exported in your shell`));
+    });
+  }
 });

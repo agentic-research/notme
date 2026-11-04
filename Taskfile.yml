@@ -277,6 +277,13 @@ tasks:
       # the shell must not stand in for typing it (review M6).
       - sh: '[ -z "${ENV:-}" ] || [ "${ENV}" != "{{.ENV}}" ]'
         msg: "ENV is exported in your shell — unset ENV and pass ENV= on the task command line"
+      # Same for every value that moves traffic (re-review N5).
+      - sh: '[ -z "${NEW:-}" ] || [ "${NEW}" != "{{.NEW}}" ]'
+        msg: "NEW is exported in your shell — unset NEW and pass NEW= on the task command line"
+      - sh: '[ -z "${OLD:-}" ] || [ "${OLD}" != "{{.OLD}}" ]'
+        msg: "OLD is exported in your shell — unset OLD and pass OLD= on the task command line"
+      - sh: '[ -z "${PCT:-}" ] || [ "${PCT}" != "{{.PCT}}" ]'
+        msg: "PCT is exported in your shell — unset PCT (default 10) or pass PCT= on the task command line"
       - sh: test -n "{{.NEW}}"
         msg: "NEW=<version-id> is required (task worker:versions to list)"
       - sh: test -n "{{.OLD}}"

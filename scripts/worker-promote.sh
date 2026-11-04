@@ -53,7 +53,7 @@
 # percentage version that is not NEW. If it cannot be resolved, nothing is
 # deployed (review M2, M3). After the deploy: await convergence on the expected
 # build, then verify pinned to NEW. If either fails — or the run is interrupted
-# (INT/TERM, review L3) — PREV is promoted back and the script exits non-zero.
+# (INT/TERM/HUP, review L3, re-review N3) — PREV is promoted back and the script exits non-zero.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -164,18 +164,22 @@ PREV="$(printf '%s' "$STATUS" | node -e '
 [[ "$PREV" =~ $UUID_RE ]] || die "no rollback target: the current $ENV_NAME deployment lists no version other than $NEW — nothing was deployed"
 
 rollback() {
-  echo "▸ rolling back: promoting prior version $PREV to 100%" >&2
-  wrangler versions deploy "$PREV@100%" ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} --yes
-  # The version just failed in production; its old pass must not open the gate again.
+  # Nothing may interrupt a rollback: a second Ctrl-C reaches the whole
+  # foreground process group, and killing the rollback's wrangler would leave
+  # NEW at 100%. Ignored dispositions are inherited by the child (re-review N3).
+  trap '' INT TERM HUP
+  # Delete NEW's record FIRST: the version just failed, and if the rollback
+  # deploy fails too, `set -e` exits — its old pass must not survive that.
   rm -f "$RECORD"
-  echo "✗ rolled back to $PREV; removed $RECORD. Confirm with: task worker:verify ENV=$ENV_NAME" >&2
+  echo "▸ rolling back: promoting prior version $PREV to 100% (removed $RECORD)" >&2
+  wrangler versions deploy "$PREV@100%" ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} --yes
+  echo "✗ rolled back to $PREV. Confirm with: task worker:verify ENV=$ENV_NAME" >&2
 }
 
 echo "▸ promoting $NEW to 100% of $ENV_NAME (expected build ${EXPECT:0:12}; rollback target: $PREV)"
 # From here until the verdict, an interrupt must not leave NEW at 100% unchecked.
 # shellcheck disable=SC2317,SC2329  # invoked by the trap
 on_interrupt() {
-  trap - INT TERM
   echo "✗ interrupted after the deploy" >&2
   # Async children ignore SIGINT in a non-interactive shell; stop the checks
   # explicitly so nothing keeps probing after the rollback.
@@ -186,7 +190,7 @@ on_interrupt() {
   rollback
   exit 130
 }
-trap on_interrupt INT TERM
+trap on_interrupt INT TERM HUP
 wrangler versions deploy "$NEW@100%" ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} --yes
 
 post_check() {
@@ -200,12 +204,10 @@ post_check() {
 post_check &
 CHECK_PID=$!
 if wait "$CHECK_PID"; then
-  trap - INT TERM
+  trap - INT TERM HUP
   echo "✓ $NEW is serving 100% of $ENV_NAME and passed pinned verify"
   exit 0
 fi
-trap - INT TERM
-
 echo "✗ post-promote convergence/verify FAILED for $NEW in $ENV_NAME" >&2
 rollback
 exit 1
