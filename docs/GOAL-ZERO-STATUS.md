@@ -147,9 +147,12 @@ repository under test.
 
 ### Cross-repo, awaiting others
 
-- `cloister-c10ff2` — the optional ninth commitment key `delegation`. **Inert
-  end-to-end until cloister acts**: notme will sign a nine-key commitment and
-  no verifier is obliged to accept one. Also flags that RECEIPTS.md §2.2.1
+- `cloister-c10ff2` — the optional ninth commitment key `delegation`.
+  **Not reachable from production, and the blocker is notme's**
+  (notme-c0db9b): `signReceipt` receives no credential, so no delegation is
+  ever derived and notme refuses every nine-key commitment. The validator
+  exists; the producer does not. Building it means `signReceipt` must accept
+  the presented credential, a wire change to agree with cloister. Also flags that RECEIPTS.md §2.2.1
   step 2 says the envelope must have "exactly the keys" while step 3 says only
   "with the keys named in §2.1" — so whether extra keys must be rejected is
   undefined, and two conformant verifiers can differ. That ambiguity matters

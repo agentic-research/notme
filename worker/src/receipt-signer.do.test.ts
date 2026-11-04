@@ -18,6 +18,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { Encoder } from "cbor-x";
 import { commitmentVector } from "./__tests__/helpers/commitment-vector";
+import { encodeCanonicalMap, type CborValue } from "./receipts/canonical-cbor";
 import type { SigningAuthority } from "./signing-authority";
 
 const cbor = new Encoder({
@@ -184,5 +185,67 @@ describe("receipt signing — real SigningAuthority (ADR-014)", () => {
     const out = await stub.signReceiptCommitment(commitment(facts));
     expect(out.ok).toBe(true);
     expect(Object.keys(out).sort()).toEqual(["epoch", "ok", "signature"]);
+  });
+});
+
+/**
+ * A nine-key commitment from the authority's own facts, carrying `delegation`.
+ * Built with encodeCanonicalMap (as receipt-delegation.test.ts does): the
+ * hand vector has no ninth key, and the refusal below fires before the
+ * canonical-bytes check, so the encoder is not what is under test.
+ */
+function nineKeyCommitment(facts: { actorFp: Uint8Array; epoch: number }, delegation: Uint8Array) {
+  const d = (fill: number) => new Uint8Array(32).fill(fill);
+  const entries: Array<[string, CborValue]> = [
+    ["epoch", { uint: facts.epoch }],
+    ["nonce", { bytes: new Uint8Array(16).fill(0x11) }],
+    ["status", { uint: 200 }],
+    ["actor_fp", { bytes: facts.actorFp }],
+    ["body_hash", { bytes: d(0xbb) }],
+    ["delegation", { bytes: delegation }],
+    ["headers_hash", { bytes: d(0xcc) }],
+    ["request_hash", { bytes: d(0xdd) }],
+    ["timestamp_ms", { uint: Date.now() }],
+  ];
+  return encodeCanonicalMap(entries);
+}
+
+// THE GAP (notme-c0db9b). receipt-delegation.test.ts proves the validator's
+// handling of the optional ninth key, `delegation`, but every case there
+// hands validateCommitment a facts object carrying a delegation, a shape the
+// production entry point never builds. signReceiptCommitment passes only
+// actorFp, epoch and nowMs, and ReceiptSigner.signReceipt receives only the
+// commitment bytes, so there is no presented credential to derive a
+// delegation from. Every nine-key commitment is therefore refused. That is
+// production's behaviour today, pinned so it cannot be read as "inert
+// pending cloister" (ADR-014, "The optional ninth key").
+describe("receipt delegation through the production entry point (notme-c0db9b)", () => {
+  const DELEGATION = new TextEncoder().encode(
+    "wimse://notme.bot/principal/11111111-1111-1111-1111-111111111111/" + "a".repeat(64) + "/task-1",
+  );
+
+  it("refuses every nine-key commitment: no producer derives a delegation", async () => {
+    const stub = authority();
+    const facts = await stub.getReceiptFacts();
+    // The same request without the ninth key signs, so the refusal is the
+    // delegation and nothing else.
+    expect((await stub.signReceiptCommitment(commitment(facts))).ok).toBe(true);
+    const res = await stub.signReceiptCommitment(nineKeyCommitment(facts, DELEGATION));
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.code).toBe("DELEGATION_MISMATCH");
+    expect(res.message).toMatch(/derived none/);
+  });
+
+  // The desired end state, under the repo's gap convention (`it.fails` marks
+  // a gap, not a bug). When a producer passes facts.delegation from a
+  // verified credential, this goes red: drop `.fails`, and replace the
+  // refusal test above with one driving the credential through the entry
+  // point.
+  it.fails("signs a nine-key commitment carrying the delegation the authority derived", async () => {
+    const stub = authority();
+    const facts = await stub.getReceiptFacts();
+    const res = await stub.signReceiptCommitment(nineKeyCommitment(facts, DELEGATION));
+    expect(res.ok).toBe(true);
   });
 });

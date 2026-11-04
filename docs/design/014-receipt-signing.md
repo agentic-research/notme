@@ -142,6 +142,33 @@ happened, and an offline auditor can't tell it from a genuine one. Bounding
 that takes the binding itself: who holds it, and notme's own record of when
 it was used.
 
+### The optional ninth key, `delegation`: validator only, not reachable
+
+`receipts/commitment.ts` admits one key beyond the eight: `delegation`, the
+UTF-8 correlation key `<principal>/<bridge>/<task>` (notme-9f84e6). Like
+`actor_fp`, it is caller-sent and authority-checked: it is signed only if it
+equals the delegation the authority derived itself from the presented
+credential (`CommitmentFacts.delegation`), and refused with
+`DELEGATION_MISMATCH` otherwise, including when the authority derived none.
+
+**No production path derives one** (notme-c0db9b). `signReceipt` receives
+only the commitment bytes, and `signReceiptCommitment` builds its facts from
+`actorFp`, `epoch` and the clock. With no credential, there is nothing to
+derive a delegation from. So today notme **refuses every nine-key
+commitment**. The field is not "inert until cloister adopts it": if cloister
+sent one tomorrow, it would be refused.
+
+The outstanding work is notme's, and it needs a wire decision first:
+`signReceipt` has to receive the credential the request was made under (a
+task cert and its tier), verify it with `verifyCertChain`, and pass
+`taskCorrelationKey()` of the verified chain as `facts.delegation`. That
+changes the `ReceiptSigner` signature, so it is agreed with the caller under
+`cloister-c10ff2`, not chosen unilaterally here.
+
+Tests: `receipt-delegation.test.ts` covers the validator alone.
+`receipt-signer.do.test.ts` pins the refusal through the real entry point,
+and carries an `it.fails` that flips when a producer lands.
+
 ## What is deliberately not built
 
 - **No `/internal/sign-jwt`** (notme-d87ef2). Identical hazard class and it
@@ -220,7 +247,7 @@ a `switch` gets exhaustiveness from the compiler rather than from a guess:
 | `EMPTY_INPUT` | zero-length input | no |
 | `NOT_CBOR` | undecodable — where DER certs and JWT signing inputs land | no |
 | `NOT_A_MAP` | decoded to something other than a CBOR map | no |
-| `WRONG_KEY_COUNT` | not exactly 8 keys | no |
+| `WRONG_KEY_COUNT` | not 8 keys, or 9 whose ninth is not `delegation` | no |
 | `MISSING_KEY` | a required key absent | no |
 | `FIELD_NOT_BYTES` | byte-string field wasn't one | no |
 | `FIELD_NOT_UINT` | uint field wasn't a non-negative integer | no |
@@ -230,6 +257,7 @@ a `switch` gets exhaustiveness from the compiler rather than from a guess:
 | `TIMESTAMP_OUT_OF_RANGE` | outside ±300s of the authority clock | no* |
 | `ACTOR_FP_MISMATCH` | `actor_fp` isn't this authority's | no |
 | `EPOCH_MISMATCH` | `epoch` isn't current | **YES — once** |
+| `DELEGATION_MISMATCH` | `delegation` isn't the one the authority derived. Today it derives none, so every nine-key commitment gets this (see above) | no |
 | `NOT_CANONICAL` | bytes aren't the canonical encoding of the structure | no |
 
 \* not retryable *unchanged*; a caller whose clock has drifted must correct it,

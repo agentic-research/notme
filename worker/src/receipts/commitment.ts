@@ -220,6 +220,10 @@ export interface CommitmentFacts {
    * delegation is then refused rather than signed: an attribution nobody
    * verified is worse than no attribution, because a false one is evidence
    * while a missing one is only a gap.
+   *
+   * NO PRODUCTION CALLER SETS THIS YET (notme-c0db9b): signReceiptCommitment
+   * has no credential to derive one from, so every nine-key commitment is
+   * refused there. See ADR-014, "The optional ninth key".
    */
   delegation?: Uint8Array;
 }
