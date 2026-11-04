@@ -60,7 +60,7 @@ const config :Workerd.Config = (
 
 # ── notme Worker: full identity authority ──
 const notmeWorker :Workerd.Worker = (
-  compatibilityDate = "2026-03-01",
+  compatibilityDate = "2026-07-21",
   compatibilityFlags = ["nodejs_compat"],
 
   modules = [
@@ -108,7 +108,7 @@ const notmeWorker :Workerd.Worker = (
 
 # ── Agent Worker: network-isolated, service binding only ──
 const agentWorker :Workerd.Worker = (
-  compatibilityDate = "2026-03-01",
+  compatibilityDate = "2026-07-21",
 
   modules = [
     ( name = "agent",
