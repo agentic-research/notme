@@ -1,6 +1,6 @@
 # Durable Objects audit against Cloudflare best practices (2026-11-03)
 
-Tracked findings: notme-b51777 (M1), notme-b52d7c (M2), notme-b54368 (M3), notme-b556a4 (M4), notme-b567c9 (error-message leaks); Low items folded into notme-070a8f and notme-5c2511. Line numbers are as of goalzero 2ce4813.
+Tracked findings: notme-b51777 (M1), notme-b52d7c (M2), notme-b54368 (M3), notme-b556a4 (M4), notme-b567c9 (error-message leaks); Low items folded into notme-070a8f and notme-5c2511. **Status 2026-11-03:** all five tracked beads and both Low-holding beads are closed. M1-M4, L1, L7 and L11 are fixed (each finding says where). L2, L8, L9 and L10 are still as described against goalzero ccc2cab and have no open bead now that their holders closed; L3-L6 were not re-checked. Line numbers are as of goalzero 2ce4813.
 
 
 Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests not run. Docs fetched 2026-11-03.
@@ -37,7 +37,7 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
   - One named instance, `idFromName("default")`, used at 37 call sites in worker.ts plus cert-exchange.ts and internal-ca-bundle.ts.
   - About 62 public RPC methods plus `alarm()`. No constructor and no blockConcurrencyWhile; schema is created lazily by `#ensure*Schema` helpers.
 - **RevocationAuthority** (`worker/src/revocation.ts:83`)
-  - A plain class, not `extends DurableObject`. Legacy KV backend (wrangler.toml.example:153-154, `new_classes`).
+  - A plain class, not `extends DurableObject`. Legacy KV backend in production (as audited, the template's v1 used `new_classes`; since 21ab735 the templates create it SQLite-backed, see M4).
   - `fetch()`-only. Its sole caller is `checkRevocation()` (revocation.ts:346), which has no production call sites (by design per bead notme-8d3018). It is bound and deployed but unrouted.
 
 ---
@@ -117,6 +117,8 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
 
 ### M4 (Medium): `wrangler.toml.example` provisions a KV-backed class a fresh account can no longer create
 
+**Fixed in 21ab735** (notme-b556a4): both templates now create `RevocationAuthority` with `new_sqlite_classes` (`worker/wrangler.toml.example:208`, `worker/wrangler.e2e.toml:67`). Production's real `wrangler.toml` is unchanged, as recommended. The text below is the finding as filed.
+
 - **Location:** `worker/wrangler.toml.example:152-154` (`[[migrations]] tag="v1" new_classes=["RevocationAuthority"]`). The same block is in `worker/wrangler.e2e.toml:56-58`.
 - **Docs:**
   - STORAGE: "Creating new namespaces with the key-value storage backend is no longer supported" for accounts without an existing KV-backed namespace. "The key-value storage backend remains available for existing namespaces."
@@ -132,6 +134,8 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
   - Better: if nothing is going to route to it, remove the class with a `deleted_classes` migration in production and drop it from the template.
 
 ### L1 (Low): circuit breaker "do NOT re-arm" is defeated by the warm-path `scheduleNextRefresh()`
+
+**Fixed in 49d9aca** (notme-5c2511): an open circuit breaker now leaves no alarm pending. The text below is the finding as filed.
 
 - **Location:** `signing-authority.ts:722`, 4329-4334, 4415, 4463-4470.
   - Inside `alarm()`, `#publishBundle → generateBundle → #getOrCreateSigningKey` (warm path) calls `scheduleNextRefresh()`. That runs *before* the breaker decision, so the alarm is already re-armed when the "tripped on this fire, not re-arming" branch returns.
@@ -203,6 +207,8 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
 
 ### L7 (Low): DO exception messages are returned to HTTP clients
 
+**Fixed in b511644** (notme-b567c9): error bodies are constant; the exception text is logged, not returned (`opaqueError`, e.g. `cert-exchange.ts:338`). The text below is the finding as filed.
+
 - **Location:** `worker/src/cert-exchange.ts:341` (`"cert minting failed: " + e.message`) and `:373`.
 - **Docs:** ERR: exceptions "will be propagated to the callsite of the client", with `.remote` set for user-code and infrastructure errors.
 - **Risk:**
@@ -231,6 +237,8 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
 
 ### L11 (Low): alarm test arms a 50 ms alarm, then races `runDurableObjectAlarm`
 
+**Fixed in f78addf** (notme-070a8f, closed): the alarm tests no longer arm short real alarms. The text below is the finding as filed.
+
 - **Location:** `worker/src/alarm-health.do.test.ts:76-84` (`setAlarm(Date.now() + 50)`, then `runDurableObjectAlarm`, then `expect(ran).toBe(true)`). The same pattern is at :93-99.
 - **Risk:**
   - Under load the real alarm can fire before `runDurableObjectAlarm`. The helper then returns `false`, the assertion fails, and the KV write lands at an arbitrary time.
@@ -255,7 +263,7 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
 - **I3 — no location hint or jurisdiction.** The CA lives near whoever first touched it. RULES: hints "are suggestions, not guarantees". Acceptable; consider `locationHint` only if latency matters.
 - **I4 — RevocationAuthority uses `fetch()` rather than RPC.** RULES: "Projects with compatibility date `2024-04-03` or later should use RPC methods." Because it is a plain class (no `extends DurableObject`) it has no RPC surface, so its TS `private` (revocation.ts:84, 94) is not an exposure. Also, `checkRevocation` maps any non-ok body, including a 400, to `rollback_attack` (revocation.ts:353-355). Moot while unrouted.
 - **I5 — observability.** Logs and invocation logs are enabled for prod and staging. Traces are not. WBP: "Enable logs and traces before you deploy to production." Optional.
-- **I6 — CT backlog rows are never deleted once logged.** This is unbounded but tiny against LIMITS' "10 GB" per SQLite object and "2 MB" row limit. No action needed; an optional prune of rows where logged_at is older than N days.
+- **I6 — CT backlog rows are never deleted once logged.** (Since 48581c2, logged and abandoned rows are pruned after 7 days, `CT_RETENTION_S`.) This is unbounded but tiny against LIMITS' "10 GB" per SQLite object and "2 MB" row limit. No action needed; an optional prune of rows where logged_at is older than N days.
 - **I7 — warm-path `getAlarm()` on every key access.** `#getOrCreateSigningKey` runs `await scheduleNextRefresh()` (722) on every sign, often 2-3 times per mint via `getAuthorityState`. It is cheap and documented as the notme-4896d8 fix. No action.
 - **I8 — the 4-minute refresh against the 5-minute max age leaves one minute of slack.** ALARMS gives no precision guarantee (only "guaranteed at-least-once execution"). This is mitigated by stale-at-read regeneration (internal-ca-bundle.ts:45). No action unless an external verifier reads KV directly.
 - **I9 — DO tests do not load wrangler config.** They declare bindings inline (vitest.workers.config.mts, for VPC reasons), so the migrations block is never exercised by tests and the compat date is duplicated by hand. This is acceptable and documented in the file.
