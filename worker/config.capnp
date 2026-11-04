@@ -67,6 +67,13 @@ const notmeWorker :Workerd.Worker = (
     ( name = "GHA_ALLOWED_OWNERS",
       text = "agentic-research",
     ),
+    # Where AuthService.proxy() may send an agent's requests (ADR-009,
+    # notme-baea8c): comma-separated hosts, `*.suffix` for subdomains, https
+    # only. Unset allows NOTHING, so proxy() refuses every destination until
+    # this is set, e.g.:
+    # ( name = "PROXY_ALLOWED_DESTINATIONS",
+    #   text = "api.github.com,*.notme.bot",
+    # ),
     # Key storage mode — ephemeral for local dev (no private key on disk)
     ( name = "NOTME_KEY_STORAGE",
       text = "ephemeral",

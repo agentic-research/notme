@@ -43,6 +43,8 @@ type HeldCerts = {
   identity: string;
   scopes: string[];
   expiresAt: number;
+  /** CA epoch the certs were issued under; proxy() checks it (notme-baea8c). */
+  epoch: number;
 };
 
 // Audience allowlist — every endpoint that mints an access token must check
@@ -62,7 +64,7 @@ import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/crit
 import { buildInfo, disclosedVersionId } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
 import { clientIpBucket } from "./src/client-ip-key";
-import { isDeniedDestination } from "./src/destination-policy";
+import { isAllowedDestination, isDeniedDestination, parseDestinationAllowlist } from "./src/destination-policy";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -446,16 +448,29 @@ export class AuthService extends WorkerEntrypoint<any> {
       identity: derived.identity,
       scopes: derived.scopes,
       expiresAt: derived.expiresAt,
+      epoch: derived.epoch,
     };
   }
 
   /**
    * Proxy an HTTP request for the agent Worker, which calls this instead of
-   * fetch() (which is disabled). Gates: held certs present and unexpired,
-   * destination not on the metadata denylist, `bridgeCert` scope held. The
-   * outbound request is a plain fetch — the held P-256 cert is NOT attached
-   * (no mTLS on this path), and there is no epoch check. ADR-009
-   * §"Enforcement guarantees" records the gap (notme-c72e03).
+   * fetch() (which is disabled). Gates, in order (notme-baea8c):
+   *   1. held certs present and unexpired;
+   *   2. destination not on the metadata denylist;
+   *   3. destination on PROXY_ALLOWED_DESTINATIONS — unset allows nothing;
+   *   4. `bridgeCert` scope held;
+   *   5. the held certs' epoch equals the authority's current epoch, so a
+   *      revokeEpoch() or rotate() stops them before they expire.
+   * Every outcome writes one audit line whose `allowed` is the decision and,
+   * on a refusal, `reason` names the gate. Redirects are returned, not
+   * followed: a followed redirect would let a listed host send the request
+   * to one the allowlist refuses.
+   *
+   * The outbound request is a plain fetch — the held P-256 cert is NOT
+   * attached (no mTLS on this path). Workers present a client certificate
+   * only through an `mtls_certificates` binding to a cert uploaded ahead of
+   * time, not one minted per session; ADR-009 records why that stays "Not
+   * yet".
    */
   async proxy(request: {
     url: string;
@@ -467,32 +482,75 @@ export class AuthService extends WorkerEntrypoint<any> {
     headers: Record<string, string>;
     body: string;
   }> {
-    if (!this.#heldCerts) {
-      throw new Error("not authenticated — call authenticate() first");
+    const start = Date.now();
+    const method = request.method || "GET";
+    const audit = (fields: Record<string, unknown>) =>
+      // Structured JSON, feeds into APAS attestations.
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          type: "proxy",
+          identity: this.#heldCerts?.identity ?? null,
+          destination: request.url,
+          method,
+          scope_checked: "bridgeCert",
+          ...fields,
+          duration_ms: Date.now() - start,
+        }),
+      );
+    const deny = (reason: string, message: string): never => {
+      audit({ allowed: false, reason });
+      throw new Error(message);
+    };
+
+    const held = this.#heldCerts;
+    if (!held) {
+      return deny("not_authenticated", "not authenticated — call authenticate() first");
     }
-    if (this.#heldCerts.expiresAt <= Math.floor(Date.now() / 1000)) {
-      throw new Error("credentials expired — re-authenticate");
+    if (held.expiresAt <= Math.floor(Date.now() / 1000)) {
+      return deny("credentials_expired", "credentials expired — re-authenticate");
     }
 
-    // Destination check
+    // Destination: the hard denylist first, then the configured allowlist.
     if (isDeniedDestination(request.url)) {
-      throw new Error(
-        "destination denied — cloud metadata endpoints are blocked",
+      return deny("destination_denied", "destination denied — cloud metadata endpoints are blocked");
+    }
+    if (!isAllowedDestination(request.url, parseDestinationAllowlist(this.env.PROXY_ALLOWED_DESTINATIONS))) {
+      return deny(
+        "destination_not_allowed",
+        "destination not allowed — not on PROXY_ALLOWED_DESTINATIONS (https only; an unset allowlist allows nothing)",
       );
     }
 
     // Scope check
-    if (!this.#heldCerts.scopes.includes("bridgeCert")) {
-      throw new Error("scope insufficient — bridgeCert required for proxy");
+    if (!held.scopes.includes("bridgeCert")) {
+      return deny("scope_insufficient", "scope insufficient — bridgeCert required for proxy");
+    }
+
+    // Epoch: the revocation lever. Last, because it is the one gate that
+    // costs an authority RPC.
+    const { epoch } = await this.#getAuthority().getAuthorityState();
+    if (held.epoch !== epoch) {
+      return deny(
+        "epoch_mismatch",
+        `credentials revoked — cert epoch ${held.epoch} is not the authority's epoch ${epoch}; re-authenticate`,
+      );
     }
 
     // Make the request
-    const start = Date.now();
-    const res = await fetch(request.url, {
-      method: request.method || "GET",
-      headers: request.headers || {},
-      body: request.body,
-    });
+    let res: Response;
+    try {
+      res = await fetch(request.url, {
+        method,
+        headers: request.headers || {},
+        body: request.body,
+        redirect: "manual",
+      });
+    } catch (e) {
+      // Allowed, and attempted: the record says so, and why it has no status.
+      audit({ allowed: true, error: (e as Error)?.message ?? String(e) });
+      throw e;
+    }
 
     const responseHeaders: Record<string, string> = {};
     res.headers.forEach((v, k) => {
@@ -500,20 +558,7 @@ export class AuthService extends WorkerEntrypoint<any> {
     });
     const body = await res.text();
 
-    // Audit log — structured JSON, feeds into APAS attestations
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        type: "proxy",
-        identity: this.#heldCerts.identity,
-        destination: request.url,
-        method: request.method || "GET",
-        scope_checked: "bridgeCert",
-        allowed: true,
-        response_status: res.status,
-        duration_ms: Date.now() - start,
-      }),
-    );
+    audit({ allowed: true, response_status: res.status });
 
     return { status: res.status, headers: responseHeaders, body };
   }

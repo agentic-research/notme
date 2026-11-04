@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import { mintBridgeCertPair } from "../cert-authority";
 import { deriveCredentialsFromCerts } from "../auth/derive-credentials";
 import { ED25519 } from "../platform";
+import { makeCA, mintCreds } from "./helpers/mint-creds";
 
 async function generateCAKeyPair(): Promise<CryptoKeyPair> {
   return (await crypto.subtle.generateKey(ED25519, true, [
@@ -174,5 +175,25 @@ describe("deriveCredentialsFromCerts", () => {
     // Within the minted window, and nowhere near a caller-chosen far future.
     expect(derived.expiresAt).toBeGreaterThanOrEqual(before);
     expect(derived.expiresAt).toBeLessThanOrEqual(before + ttlMs / 1000 + 2);
+  });
+});
+
+describe("deriveCredentialsFromCerts — epoch (notme-baea8c)", () => {
+  // proxy() compares this with the authority's epoch, so it must come from
+  // the certs, and the pair must agree on it.
+  it("returns the epoch both certs carry", async () => {
+    const ca = await makeCA();
+    const c = await mintCreds(ca, "wimse://notme.bot/test/epoch", ["bridgeCert"], 7);
+    const derived = await deriveCredentialsFromCerts(c.signingCert, c.mtlsCert, await spkiToPem(ca.publicKey));
+    expect(derived.epoch).toBe(7);
+  });
+
+  it("rejects a pair whose certs come from different epochs", async () => {
+    const ca = await makeCA();
+    const old = await mintCreds(ca, "wimse://notme.bot/test/epoch-mix", ["bridgeCert"], 1);
+    const cur = await mintCreds(ca, "wimse://notme.bot/test/epoch-mix", ["bridgeCert"], 2);
+    await expect(
+      deriveCredentialsFromCerts(cur.signingCert, old.mtlsCert, await spkiToPem(ca.publicKey)),
+    ).rejects.toThrow(/epoch/);
   });
 });

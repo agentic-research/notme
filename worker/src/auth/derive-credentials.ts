@@ -19,6 +19,7 @@
 
 import { SubjectAlternativeNameExtension, X509Certificate } from "@peculiar/x509";
 import { importPublicKey, OID_SCOPES, OID_SUBJECT } from "../cert-authority";
+import { certEpoch } from "./verify-proof";
 
 export interface DerivedCredentials {
   /**
@@ -37,6 +38,12 @@ export interface DerivedCredentials {
   scopes: string[];
   /** Unix seconds, from the signing cert's notAfter. */
   expiresAt: number;
+  /**
+   * CA epoch both certs were issued under (OID_EPOCH). proxy() compares it
+   * with the authority's current epoch before attaching the certs, so a
+   * revokeEpoch() or rotate() stops them (notme-baea8c).
+   */
+  epoch: number;
 }
 
 /**
@@ -199,7 +206,19 @@ export async function deriveCredentialsFromCerts(
     );
   }
 
+  // One epoch for the pair, and it must be readable: a held cert with no
+  // epoch could not be checked against revocation, so it is not held.
+  const epoch = certEpoch(signingCert);
+  const mtlsEpoch = certEpoch(mtlsCert);
+  if (epoch === null || mtlsEpoch === null) {
+    throw new Error("cert carries no epoch — cannot be checked against rotation");
+  }
+  if (epoch !== mtlsEpoch) {
+    throw new Error(`cert epoch mismatch — signing cert epoch ${epoch}, mTLS cert epoch ${mtlsEpoch}`);
+  }
+
   return {
+    epoch,
     identity,
     principal: extensionString(signingCert, OID_SUBJECT, "subject identity"),
     scopes: extensionScopes(signingCert),

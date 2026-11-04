@@ -51,6 +51,8 @@ export async function mintCreds(
   ca: CryptoKeyPair,
   identity: string,
   scopes: string[] = ["bridgeCert"],
+  /** CA epoch written into both certs (OID_EPOCH). */
+  epoch = 1,
 ): Promise<MintedCreds> {
   const mtls = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
     "sign",
@@ -70,7 +72,7 @@ export async function mintCreds(
     await spkiToPem(mtls.publicKey),
     await spkiToPem(signing.publicKey),
     ca.privateKey,
-    { scopes, epoch: 1, authMethod: "test" },
+    { scopes, epoch, authMethod: "test" },
   );
 
   return {
