@@ -475,6 +475,10 @@ const CLAIM_CAP = 100; // pending claim registrations; storage-exhaustion bound
 const POP_NONCE_TTL_S = 120; // fetched and spent in one page interaction
 const TIER_ENROLMENT_TTL_S = 600; // RFC 8628 device codes are minutes, not hours
 const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
+// A collect claim older than this is abandoned (its isolate was evicted
+// mid-mint) and may be reclaimed (notme-d06b7b). Far above any mint: the CT
+// path is bounded by its 2 s submission timeouts.
+const TIER_COLLECT_RECLAIM_S = 60;
 const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"; // RFC 8628 §6.1: no vowels
 
 /** A positive 128-bit serial, hex — the same shape cert-authority mints. */
@@ -2769,6 +2773,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // { name, version }. NULL is a pre-phase-2 enrollment: its tiers carry
       // no .1.10, at collect and at every renewal, so its tasks stay legacy.
       "criteria TEXT",
+      // The in-flight collect (notme-d06b7b): who holds the claim and since
+      // when. Set while status is 'collecting', between the proof check and
+      // the activation that follows a successful mint.
+      "collect_claim TEXT",
+      "collect_started_at INTEGER",
     ]) {
       try {
         this.ctx.storage.sql.exec(`ALTER TABLE tier_enrolments ADD COLUMN ${col}`);
@@ -2823,12 +2832,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // irrelevant to it, and pruning it would silently end renewal ten minutes
     // after collection.
     sql.exec(
-      "DELETE FROM tier_enrolments WHERE expires_at <= ? AND status IN ('pending', 'approved')",
+      "DELETE FROM tier_enrolments WHERE expires_at <= ? AND status IN ('pending', 'approved', 'collecting')",
       now,
     );
     const [{ n }] = [
       ...sql.exec<{ n: number }>(
-        "SELECT COUNT(*) AS n FROM tier_enrolments WHERE status IN ('pending', 'approved')",
+        "SELECT COUNT(*) AS n FROM tier_enrolments WHERE status IN ('pending', 'approved', 'collecting')",
       ),
     ];
     if (n >= TIER_ENROLMENT_CAP) return { ok: false, reason: "busy" };
@@ -2928,7 +2937,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * key recorded at start, over `"notme/tier-enrol/v1\0" || SPKI ||
    * SHA-256(device_code)`. A bad proof does not consume the enrolment — a
    * thief holding the device code but not the key must not be able to burn
-   * the real holder's approval. A good one consumes it before minting.
+   * the real holder's approval.
+   *
+   * A good proof CLAIMS the enrolment ('collecting') before minting and
+   * activates it only after the mint returns (notme-d06b7b). It used to be
+   * marked 'active' first, so a mint that threw stranded it: every retry got
+   * invalid_grant and the machine had to go back to a human. Now a failed
+   * mint hands the claim back ('approved') and the retry mints; a collect
+   * arriving while a mint is in flight is told authorization_pending; and a
+   * claim abandoned by an evicted isolate is reclaimable after
+   * TIER_COLLECT_RECLAIM_S. Exactly one collect ever DELIVERS a tier: the
+   * activation is a compare-and-swap on the claim id, so a minter whose
+   * claim was taken over discards its certificate and gets invalid_grant.
    */
   async collectTierEnrolment(params: { deviceCode: string; proof: string }): Promise<
     | ({
@@ -2975,6 +2995,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           key_fingerprint: string;
           clone_policy: string;
           criteria: string | null;
+          collect_started_at: number | null;
         }
       | undefined;
     if (!row) return { ok: false, reason: "invalid_grant" };
@@ -2982,7 +3003,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return { ok: false, reason: "expired_token" };
     }
     if (row.status === "pending") return { ok: false, reason: "authorization_pending" };
-    if (row.status !== "approved") return { ok: false, reason: "invalid_grant" };
+    const staleBefore = Math.floor(Date.now() / 1000) - TIER_COLLECT_RECLAIM_S;
+    const claimable =
+      row.status === "approved" ||
+      (row.status === "collecting" && (row.collect_started_at ?? 0) <= staleBefore);
+    // Another collect is minting this enrolment right now. Poll again: it
+    // either delivers (and this device code is then spent) or hands back.
+    if (row.status === "collecting" && !claimable) {
+      return { ok: false, reason: "authorization_pending" };
+    }
+    if (!claimable) return { ok: false, reason: "invalid_grant" };
 
     const { importPublicKey } = await import("./cert-authority");
     const key = await importPublicKey(row.public_key_pem);
@@ -2998,8 +3028,57 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const enrollmentId = hex(await tierEnrolmentId(codeHashBytes));
     const v3On = this.env.RENEWAL_BINDING_V3 === "on";
 
-    // Consume first, atomically: of two concurrent collects with a valid
-    // proof, exactly one sees changes() = 1.
+    const criteria = storedCriteria(row.criteria);
+    const { criteriaId } = await import("./criteria");
+
+    // CLAIM, atomically: of two concurrent collects with a valid proof,
+    // exactly one sees changes() = 1. The claim id is what the activation
+    // compares against, so a claim that was taken over is never the one
+    // that delivers (notme-d06b7b).
+    const claim = b64url(crypto.getRandomValues(new Uint8Array(16)));
+    this.ctx.storage.sql.exec(
+      `UPDATE tier_enrolments SET status = 'collecting', collect_claim = ?, collect_started_at = ?
+        WHERE device_code_hash = ?
+          AND (status = 'approved' OR (status = 'collecting' AND COALESCE(collect_started_at, 0) <= ?))`,
+      claim,
+      Math.floor(Date.now() / 1000),
+      deviceCodeHash,
+      staleBefore,
+    );
+    const [claimed] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+    if (claimed.n !== 1) {
+      // Lost the race to a concurrent collect: poll while it mints.
+      const now = this.ctx.storage.sql
+        .exec("SELECT status FROM tier_enrolments WHERE device_code_hash = ?", deviceCodeHash)
+        .toArray()[0] as { status: string } | undefined;
+      return now?.status === "collecting"
+        ? { ok: false, reason: "authorization_pending" }
+        : { ok: false, reason: "invalid_grant" };
+    }
+
+    let result: Awaited<ReturnType<SigningAuthority["mintIssuingCa"]>>;
+    try {
+      result = await this.mintIssuingCa({
+        subject: row.principal_id,
+        identity: row.identity,
+        publicKeyPem: row.public_key_pem,
+        scopes: JSON.parse(row.granted_scopes),
+        authMethod: row.auth_method,
+        ...(criteria ? { criteria } : {}),
+      });
+    } catch (err) {
+      // Hand the claim back: nothing was delivered and the human's approval
+      // still holds, so the machine's retry mints rather than re-enrolling.
+      // Only OUR claim — one taken over in the meantime is not ours to undo.
+      this.ctx.storage.sql.exec(
+        "UPDATE tier_enrolments SET status = 'approved', collect_claim = NULL, collect_started_at = NULL WHERE device_code_hash = ? AND status = 'collecting' AND collect_claim = ?",
+        deviceCodeHash,
+        claim,
+      );
+      throw err;
+    }
+
+    // ACTIVATE, in one transaction straight after the mint returns.
     //
     // Binding version (notme-c9fc8c). A key collected for the first time
     // speaks v2 or v3: the v2 binding does not name the enrollment, but no
@@ -3009,59 +3088,57 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // speaks v3 only: a v2 request signed for the earlier enrollment could
     // otherwise claim, or fork, this one. Same synchronous block as the
     // activation, so no collect interleaves between the check and the write.
-    const reEnrolled =
-      this.ctx.storage.sql
-        .exec(
-          "SELECT 1 FROM tier_enrolments WHERE key_fingerprint = ? AND device_code_hash != ? AND status IN ('active', 'superseded') LIMIT 1",
-          row.key_fingerprint,
-          deviceCodeHash,
-        )
-        .toArray().length > 0;
-    this.ctx.storage.sql.exec(
-      // 'active', not 'consumed': the enrollment lives on as the record a
-      // machine renews against (notme-337d82). Single use still holds — a
-      // second collect finds status 'active' and is refused.
-      // A collected enrollment starts at generation 0 (notme-747cc7).
-      "UPDATE tier_enrolments SET status = 'active', generation = 0, binding_version = ? WHERE device_code_hash = ? AND status = 'approved'",
-      // While v3 is off no client can learn an id, so a v3-only row would
-      // strand it: re-enrolled keys collect at v2 too (M4 stays open for
-      // them until v3 is turned on).
-      reEnrolled && v3On ? 3 : 2,
-      deviceCodeHash,
-    );
-    const [change] = [
-      ...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n"),
-    ];
-    if (change.n !== 1) return { ok: false, reason: "invalid_grant" };
-    // At most one ACTIVE enrollment per key (notme-747cc7). Re-enrolling a
-    // key retires its earlier enrollments, revoked or not — kept as
-    // 'superseded' for the record. Otherwise renewal (which looks up by key)
-    // could keep counting the old enrollment's generation and read the new
-    // one's generation 0 as a fork; and a revoked old enrollment would hide
-    // the new one, though re-enrolling is how a machine recovers from a fork.
-    // Same synchronous block as the activation: no request sees two.
-    this.ctx.storage.sql.exec(
-      "UPDATE tier_enrolments SET status = 'superseded' WHERE key_fingerprint = ? AND status = 'active' AND device_code_hash != ?",
-      row.key_fingerprint,
-      deviceCodeHash,
-    );
-    // A re-enrolled key starts its generations over: digests recorded under
-    // an earlier enrollment of the same key must not read as this one's.
-    this.ctx.storage.sql.exec(
-      "DELETE FROM tier_renewal_digests WHERE key_fingerprint = ?",
-      row.key_fingerprint,
-    );
-
-    const criteria = storedCriteria(row.criteria);
-    const { criteriaId } = await import("./criteria");
-    const result = await this.mintIssuingCa({
-      subject: row.principal_id,
-      identity: row.identity,
-      publicKeyPem: row.public_key_pem,
-      scopes: JSON.parse(row.granted_scopes),
-      authMethod: row.auth_method,
-      ...(criteria ? { criteria } : {}),
+    const activated = this.ctx.storage.transactionSync(() => {
+      const reEnrolled =
+        this.ctx.storage.sql
+          .exec(
+            "SELECT 1 FROM tier_enrolments WHERE key_fingerprint = ? AND device_code_hash != ? AND status IN ('active', 'superseded') LIMIT 1",
+            row.key_fingerprint,
+            deviceCodeHash,
+          )
+          .toArray().length > 0;
+      this.ctx.storage.sql.exec(
+        // 'active', not 'consumed': the enrollment lives on as the record a
+        // machine renews against (notme-337d82). Single use still holds — a
+        // later collect finds status 'active' and is refused.
+        // A collected enrollment starts at generation 0 (notme-747cc7).
+        `UPDATE tier_enrolments
+            SET status = 'active', generation = 0, binding_version = ?,
+                collect_claim = NULL, collect_started_at = NULL
+          WHERE device_code_hash = ? AND status = 'collecting' AND collect_claim = ?`,
+        // While v3 is off no client can learn an id, so a v3-only row would
+        // strand it: re-enrolled keys collect at v2 too (M4 stays open for
+        // them until v3 is turned on).
+        reEnrolled && v3On ? 3 : 2,
+        deviceCodeHash,
+        claim,
+      );
+      const [change] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+      // Our claim was reclaimed while we minted (we looked abandoned), and
+      // the reclaimer delivers. This certificate is discarded undelivered.
+      if (change.n !== 1) return false;
+      // At most one ACTIVE enrollment per key (notme-747cc7). Re-enrolling a
+      // key retires its earlier enrollments, revoked or not — kept as
+      // 'superseded' for the record. Otherwise renewal (which looks up by key)
+      // could keep counting the old enrollment's generation and read the new
+      // one's generation 0 as a fork; and a revoked old enrollment would hide
+      // the new one, though re-enrolling is how a machine recovers from a fork.
+      // Same transaction as the activation: no request sees two.
+      this.ctx.storage.sql.exec(
+        "UPDATE tier_enrolments SET status = 'superseded' WHERE key_fingerprint = ? AND status = 'active' AND device_code_hash != ?",
+        row.key_fingerprint,
+        deviceCodeHash,
+      );
+      // A re-enrolled key starts its generations over: digests recorded under
+      // an earlier enrollment of the same key must not read as this one's.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM tier_renewal_digests WHERE key_fingerprint = ?",
+        row.key_fingerprint,
+      );
+      return true;
     });
+    if (!activated) return { ok: false, reason: "invalid_grant" };
+
     return {
       ok: true,
       principalId: row.principal_id,
