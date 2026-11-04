@@ -170,10 +170,10 @@ async function mint(
       authMethod: "gha-oidc",
     });
     const elapsed = Date.now() - t0;
-    // Read AFTER the mint. On a fresh authority the first getCACertificatePem
-    // caches its root under the key id read before the key existed (''), so
-    // the next call re-issues it — same key, new serial. Read once the key
-    // exists, the root is the stable one the mint chained to (notme-7aa6dd).
+    // Read after the mint. Before notme-7aa6dd a fresh authority's first
+    // getCACertificatePem cached its root under a key id read before the key
+    // existed, so the next call re-issued it (same key, new serial);
+    // ca-root-stable.do.test.ts now pins that the first root is the one kept.
     const ca = await a.getCACertificatePem();
     const backlog = a.ctx.storage.sql
       .exec("SELECT chain_json, created_at, attempts, logged_at FROM ct_backlog ORDER BY id")

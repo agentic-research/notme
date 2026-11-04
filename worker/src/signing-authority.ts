@@ -1113,7 +1113,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         key_id TEXT NOT NULL
       )
     `);
-    const currentKeyId = this.#getKeyId();
+    // The key FIRST, then its id (notme-7aa6dd). Read the other way round, a
+    // fresh authority cached its first root under the id of a key that did
+    // not exist yet ("unknown"), and the next call saw the mismatch and
+    // re-issued: same key and subject, new serial â a root that changed
+    // bytes once at boot under anything pinning it. Its start comes from
+    // the same row, so a first issue's notBefore is the key's own start.
+    const { signingKey, verifyKey, keyId: currentKeyId } = await this.#getOrCreateSigningKey();
     // The root's validity window belongs to the KEY, not to the moment the
     // root happens to be (re-)issued (notme-0c494f). See keyStart below.
     const keyStart = this.#keyStart();
@@ -1164,7 +1170,6 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       }
     }
 
-    const { signingKey, verifyKey } = await this.#getOrCreateSigningKey();
     // notBefore = when this key began signing. Nothing it signed predates
     // that, so no re-issue under the same key can leave an earlier signature
     // outside the anchor's window. The 1b1db4 heal used `now` and called it
