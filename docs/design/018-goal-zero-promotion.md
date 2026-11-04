@@ -54,7 +54,7 @@ that name the command to run.
   `AUTH_BASE`/`SITE_BASE`; `worker:verify-staging` runs the *same* checks
   against staging. One definition of "the service works," two targets.
 - **Canary/promote tasks**: `worker:versions`, `worker:canary NEW= OLD=
-  [PCT=10]`, `worker:promote NEW=` wrap Cloudflare gradual deployments so
+  ENV= [PCT=10]`, `worker:promote NEW= ENV=` wrap Cloudflare gradual deployments so
   the promotion unit is an explicit version id, and rollback is the same
   command pointed at the old id.
 
@@ -72,9 +72,22 @@ Every PR, no exceptions (`.github/workflows/ci.yml`):
 | Doc/bead integrity | `task docs:check` | claims citing dead code/beads |
 | Package manifest | `task server:check` | server.json schema/version drift |
 | Proxy | `task proxy:check` | Rust build/test/clippy |
+| Runtime contract | `task worker:contract` | the real Worker booted locally (`wrangler dev`, config derived from `wrangler.toml.example`, real DOs in local storage) answering `worker:verify`'s checks — before this, that contract only ran after a deploy (`notme-6ae724`) |
 
 **Entry:** PR opened. **Exit:** all green. **No rollback concept** — nothing
 deployed.
+
+**After merge, optionally:** `.github/workflows/staging-smoke.yml` deploys `main`
+to staging and runs `worker:await-convergence` + `worker:verify-staging`. It
+is **skipped** (grey, not green, with a warning) until the owner configures
+the `staging` GitHub environment, and it never runs on pull requests or off
+`main`. Its token can deploy *production* too — Cloudflare API tokens scope to
+an account or zone, not to one Worker script — so a deployment-branch policy
+of `main` only on that environment is mandatory. Every staging var comes from
+the environment (`scripts/staging-config.ts`), and the deploy refuses if any
+template placeholder survives in a staging table: `wrangler deploy` makes the
+config's vars authoritative, and the template's `GHA_ALLOWED_OWNERS =
+"your-staging-org"` names an org anyone could register.
 
 ### Phase 1 — Staging
 
@@ -129,16 +142,117 @@ disposable by design (its CA is not trusted by anything).
 > demonstrating, by measurement against `/.well-known/version`, that traffic
 > splitting on this Worker routes as configured.
 
+> **CORRECTION (2026-11-03, `notme-325916`) — the canary returns as a PINNED
+> soak, and the measurement is built into every run.** The deletion's
+> condition is met by construction rather than by a one-off demonstration:
+> `task worker:verify VERSION=<id> ENV=<env>` sends
+> `Cloudflare-Workers-Version-Overrides: <worker>="<id>"` on every probe AND
+> brackets every check with a pinned `/.well-known/version` probe that must
+> report the build `<id>` was uploaded from. Both documented failure modes
+> now fail the run instead of reporting the old version's behaviour:
+>
+> - the override is ignored because `<id>` is not in the current deployment
+>   (the pre-promotion probe of `91b54069`) → the opening bracket reports the
+>   old build and the run stops;
+> - unpinned sampling never reaches the canary (the 85/85) → irrelevant:
+>   nothing in a pinned run is sampled.
+>
+> So the soak is run **after** `worker:canary` puts the version in the
+> deployment, never before. A sampled `worker:verify` during a soak is a
+> service-health check and is never evidence about the new version; it writes
+> no record. Proven against a stub of Cloudflare's documented routing in
+> `worker-verify-pinning.test.ts` (a broken canary fails the pinned soak under
+> every routing of unpinned traffic; an ignored override fails closed).
+>
+> **Same-commit versions (security review M5).** The bracket above compares
+> the build *commit*, and two versions can share one — a config- or
+> secret-only re-upload, or the same commit uploaded twice. So a pinned run
+> also (a) requires `wrangler deployments status` to list the version as
+> serving, at the start and again before it writes evidence, and (b) compares
+> the `version_id` that `/.well-known/version` now serves from the
+> `[version_metadata]` binding, whenever the Worker reports one. The record
+> says which (`version_id_checked`). Each pinned run first deletes any earlier
+> record for that version, so a failed re-soak leaves no stale pass behind.
+>
+> The id is served **only to a request whose override header already names
+> it** (re-review N2): Cloudflare honours the header for any client, and a
+> public id would let an outsider pin themselves to either side of a canary —
+> for instance, stay on the old build through the canary of a security fix.
+> The verifier always sends the pin, so under it the new version (when bound)
+> names itself on every probe. A run in which some probes name the version
+> and others name none therefore fails, in either order (re-review N1): part
+> of it was answered by another version. A run where no probe names it passes
+> on commit plus the deployment listing, records `version_id_checked:false`,
+> and promote warns.
+>
+> **Not yet measured against Cloudflare.** The pinned path has not run against
+> a real split since this change. The first run should be a staging
+> rehearsal — `task worker:canary NEW=<id> OLD=<cur> ENV=staging`, then
+> `task worker:verify VERSION=<id> ENV=staging`, then `task worker:promote
+> NEW=<id> ENV=staging` — and until it is green, `ship-prod` remains the
+> default production path.
+
 **Entry:** Phase 1 green at the SHA being released.
-**Command:** `task ship-prod` — preflight → install → check → docs → deploy →
-**await-convergence** → verify, with the promotion steps runnable individually:
+**Command:** two paths, and only one of them is gated per version.
+
+*Direct path* — `task ship-prod`: preflight → install → check → docs → deploy →
+**await-convergence** → verify. The composite task is the gate. It does **not**
+roll back by itself (its description used to say it did, and nothing
+implemented it — `notme-16b2d5` Finding B); on a failed verify the new build is
+still serving 100%, and the exit is `task worker:rollback`.
+
+*Gated path* — promotion by version id:
 
 ```
-task worker:deploy-preview               # upload; stamps BUILD_SHA; prints id
-task worker:promote NEW=<id>             # 100% — atomic, no partial exposure
-task worker:await-convergence            # EXPECT=<sha>: N CONSECUTIVE samples
-task worker:verify                       # behavioural checks, only after that
+task worker:deploy-preview                                 # upload; stamps BUILD_SHA; prints id
+task worker:canary NEW=<id> OLD=<cur> ENV=production       # NEW enters the deployment
+task worker:verify VERSION=<id> ENV=production             # pinned soak; writes evidence
+task worker:promote NEW=<id> ENV=production                # refuses without that evidence
 ```
+
+**Gated-path exit criteria.** A green `worker:verify VERSION=<id>` run —
+pinned, every check bracketed by `/.well-known/version` reporting the build
+`<id>` was uploaded from — taken while `<id>` is in the deployment. Its record
+(`.release-evidence/production/<id>.json`) goes in the release evidence bundle.
+An unpinned verify during the soak does not count. Run it from the checkout
+that uploaded `<id>` (EXPECT defaults to `git rev-parse HEAD`), or pass
+`EXPECT=<sha>`.
+
+**The promotion gate (`notme-16b2d5`).** `worker:promote` used to be
+`wrangler versions deploy NEW@100%` behind one precondition — that `NEW` was a
+non-empty string — so any version in the account's upload history reached 100%
+of production in one command, and an omitted `ENV` meant production. Now
+(`scripts/worker-promote.sh`, pinned by `promote-gate.test.ts`):
+
+- `ENV=production|staging` is mandatory on canary and promote, and must be
+  typed on the task command line: Task fills `{{.ENV}}` from the environment,
+  so a value equal to an exported shell variable of the same name is refused
+  (`ENV`, `NEW`, `EXPECT`, `ALLOW_UNVERIFIED`; `scripts/lib/selectors.sh`).
+  Neither environment is reachable by omission or by a stale `export`.
+- promote refuses unless `.release-evidence/<env>/<version-id>.json` records a
+  **pinned** verify pass for exactly that version in exactly that environment.
+  Only `worker:verify VERSION=<id>` writes one; a sampled verify never does.
+  The record **expires after 24 h**: a soak is evidence against that day's DO
+  state, secrets and dependencies, any of which can move, so it is re-earned
+  rather than trusted indefinitely.
+- before deploying it resolves the rollback target — the highest-percentage
+  version in the current deployment that is not `NEW` — and **refuses to
+  deploy** if there is none or the deployment cannot be read.
+- after the deploy it awaits convergence on the recorded build, then verifies
+  pinned to `NEW`; if either fails, or the run is interrupted (INT, TERM or
+  HUP), it deletes `NEW`'s pass record — first, so a failed rollback cannot
+  leave it — then **promotes the prior version back** with further interrupts
+  ignored (a second Ctrl-C cannot abort the rollback), and exits non-zero.
+  That is the defined failure action. `worker:canary` likewise refuses an
+  `ENV`, `NEW`, `OLD` or `PCT` that came from an exported shell variable.
+- the emergency override is `ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>`: a
+  typed reason, an explicit build sha, a loud banner, and a line appended to
+  `.release-evidence/overrides.log`.
+
+The record is a local file (the directory is gitignored). The gate stops the
+accident-shaped failures — wrong id, wrong environment, never-verified
+artifact — not an operator who forges JSON. Paste the record into the release
+bead as part of the evidence bundle.
 
 **The ordering is the design.** Identity first, behaviour second: the
 convergence gate polls `/.well-known/version` (stamped with `BUILD_SHA` at
@@ -156,10 +270,13 @@ rollback that is the same mechanism as promotion. Identity-critical changes
 (auth/, signing-authority, cert-exchange, DPoP) take their soak on staging,
 where a broken version costs nothing.
 
-**Rollback:** `task worker:promote NEW=<old-id>`, then
-`worker:await-convergence` against the OLD sha, then `worker:verify` — the
-convergence caveat applies on the way back too, which is exactly when nobody
-wants to wait for it.
+**Rollback:** `task worker:promote NEW=<old-id> ENV=production`, which runs
+convergence against the OLD sha and a pinned verify itself — the convergence
+caveat applies on the way back too, which is exactly when nobody wants to wait
+for it. A version that was once promoted through the gate has a record (the
+post-promote pinned verify refreshes it), so rolling back to it needs no
+override. A version that reached traffic by `ship-prod` has none: use
+`task worker:rollback`, or the override with its sha.
 
 **Hard constraint (unchanged):** a version carrying a new `[[migrations]]`
 entry promotes atomically anyway — Durable Object migrations do not split —
@@ -189,7 +306,7 @@ provenance/signature verification steps green (they are part of the
 workflows, not manual).
 
 **Rollback:**
-- Service: `task worker:promote NEW=<old-id>` (or `task worker:rollback`).
+- Service: `task worker:promote NEW=<old-id> ENV=production` (or `task worker:rollback`).
 - Images: previous tags remain; consumers pin digests (cloister fail-closed
   pinning refuses an unresolvable digest — ADR-0041), so a bad image is
   fixed by cutting `v<X.Y.Z+1>`, never by moving a tag.
@@ -202,7 +319,7 @@ Recorded on the release bead (and linked from the PR) at each cut:
 
 1. Git SHA + tag; PR URL; CI run URL (Phase 0).
 2. `ship-staging` transcript tail + staging verify output (Phase 1).
-3. Version id uploaded; promote command + convergence proof (consecutive `/.well-known/version` samples at the released SHA)
+3. Version id uploaded; the pinned-verify evidence record (`.release-evidence/<env>/<id>.json`) when the gated path was used; promote command + convergence proof (consecutive `/.well-known/version` samples at the released SHA)
    transcript (Phase 2–3).
 4. Release workflow run URL; `cosign verify` / `verify-attestation` output
    (in-job); npm provenance attestation URL when dpop shipped.

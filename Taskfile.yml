@@ -132,135 +132,34 @@ tasks:
       - pnpm exec wrangler rollback
 
   worker:verify:
-    desc: Smoke test live endpoints with bounded deployment-convergence retries
-    # AUTH_BASE / SITE_BASE default to production; `worker:verify-staging`
-    # passes the staging hosts so both environments share ONE definition of
-    # "the service works" instead of a staging copy that drifts.
+    desc: "Smoke test live endpoints ([ENV=staging] [VERSION=<id> — pin every probe to that version and record evidence])"
+    # The checks live in scripts/worker-verify.sh so they can be run against a
+    # stub (worker-verify-pinning.test.ts) and a local Worker (ci.yml) — the
+    # same definition everywhere instead of copies that drift.
+    #
+    # AUTH_BASE / SITE_BASE default from ENV (production unless ENV=staging);
+    # `worker:verify-staging` passes the staging hosts so both environments
+    # share ONE definition of "the service works".
+    #
+    # VERSION=<version-id> (notme-325916): every probe carries Cloudflare's
+    # version-override header, and each check is bracketed by a pinned
+    # /.well-known/version probe that must report EXPECT (default: git HEAD).
+    # Cloudflare ignores the header SILENTLY when the version is not in the
+    # current deployment, so the bracket is what turns "pinned" from a request
+    # into a proof. A pinned pass writes the evidence worker:promote requires.
     vars:
-      AUTH_BASE: '{{.AUTH_BASE | default "https://auth.notme.bot"}}'
-      SITE_BASE: '{{.SITE_BASE | default "https://notme.bot"}}'
+      AUTH_BASE: '{{.AUTH_BASE | default (eq .ENV "staging" | ternary "https://auth-staging.notme.bot" "https://auth.notme.bot")}}'
+      SITE_BASE: '{{.SITE_BASE | default (eq .ENV "staging" | ternary "https://staging.notme.bot" "https://notme.bot")}}'
+    # Arguments, not `env:` — an exported variable of the same name would
+    # override a Task env block (review M6; see scripts/lib/selectors.sh).
     cmds:
-      - |
-        FAIL=0
-        AUTH_BASE="{{.AUTH_BASE}}"
-        SITE_BASE="{{.SITE_BASE}}"
-        AUTH_HOST="${AUTH_BASE#https://}"
-        VERIFY_NONCE="$(date +%s)"
-        MAX_ATTEMPTS=5
-        RETRY_DELAY_SECONDS=2
-        BODY_FILE="$(mktemp)"
-        trap 'rm -f "$BODY_FILE"' EXIT
-
-        check_request() {
-          label="$1"
-          method="$2"
-          url="$3"
-          expected_status="$4"
-          expected_pattern="$5"
-          data="${6:-}"
-          accept="${7:-}"
-          attempt=1
-
-          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
-            if [ "$method" = "POST" ]; then
-              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
-                -X POST "$url" -H "Content-Type: application/json" -d "$data")
-            elif [ -n "$accept" ]; then
-              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
-                -H "Accept: $accept" "$url")
-            else
-              status=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" "$url")
-            fi
-
-            if [ "$status" = "$expected_status" ] && grep -Fq "$expected_pattern" "$BODY_FILE"; then
-              echo "✓ $label"
-              return 0
-            fi
-
-            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-              sleep "$RETRY_DELAY_SECONDS"
-            fi
-            attempt=$((attempt + 1))
-          done
-
-          detail=$(head -c 160 "$BODY_FILE" | tr '\n' ' ')
-          echo "✗ $label (got $status; body: $detail)"
-          FAIL=1
-        }
-
-        echo "=== ${AUTH_HOST} ==="
-        check_request "landing" "GET" "${AUTH_BASE}/" "200" "identity authority"
-        check_request "login" "GET" "${AUTH_BASE}/login" "200" "passkey"
-        check_request "discovery" "GET" "${AUTH_BASE}/.well-known/signet-authority.json" "200" '"issuer"'
-        # Cache API entries survive Worker deployments, but every key carries
-        # the build (src/cache-key.ts), so this reads the NEW build's entry.
-        # No query: /.well-known/* keys ignore it (notme-ed6114) — a bypass
-        # that worked for the verifier worked for any flood too.
-        check_request "ca-bundle" "GET" "${AUTH_BASE}/.well-known/ca-bundle.pem" "200" "BEGIN CERTIFICATE"
-        # The SERVED root must carry the budget the code mints. Production
-        # served pathlen:0 for five months after the code moved to pathlen=1,
-        # because the DO's cache check asked only whether BasicConstraints
-        # existed (notme-1b1db4). Every Issuing CA tier minted under that root
-        # was unverifiable by any stock validator, and every test passed —
-        # against a fresh test root. This reads the LIVE root, not a fixture.
-        ROOT_PATHLEN=$(curl -s "${AUTH_BASE}/.well-known/ca-bundle.pem" \
-          | openssl x509 -noout -text 2>/dev/null | grep -o 'pathlen:[0-9]*' | cut -d: -f2)
-        if [ "$ROOT_PATHLEN" = "1" ]; then
-          echo "✓ root-pathlen (served root admits one intermediate tier)"
-        else
-          echo "✗ root-pathlen: served root has pathlen '${ROOT_PATHLEN:-none}', code mints 1 — Issuing CA tiers cannot verify"
-          FAIL=1
-        fi
-        # The committed trust anchor must still be what production serves.
-        # It went stale twice (2026-08-28 pathlen heal, 2026-10-28 notBefore
-        # re-issue) while trust-anchor.test.ts passed, because that test
-        # compares trust/ only to itself (notme-8e8836). Production only:
-        # trust/ pins the production authority.
-        if [ "$AUTH_BASE" = "https://auth.notme.bot" ]; then
-          if pnpm exec tsx scripts/refresh-trust-anchor.ts --check; then
-            echo "✓ trust-anchor (trust/ matches the served root)"
-          else
-            echo "✗ trust-anchor: trust/ disagrees with the served root (see above)"
-            FAIL=1
-          fi
-        fi
-        check_request "jwks" "GET" "${AUTH_BASE}/.well-known/jwks.json" "200" '"crv":"Ed25519"'
-        # The deployed build must be able to NAME ITSELF. Asserting
-        # "stamped":true rather than merely a 200: an endpoint that always
-        # answered "unknown" would pass a liveness check while telling a
-        # consumer nothing, which is the state that made signet's "no positive
-        # evidence" objection correct (notme-9f2f79). No nonce — it is
-        # no-store, so there is no cache entry to bypass.
-        check_request "build-version" "GET" "${AUTH_BASE}/.well-known/version" "200" '"stamped":true'
-        # Expect the environment's own authority host in the docs page — a
-        # staging deploy that renders production URLs is a config leak, not
-        # a pass. Nonce for the same reason as ca-bundle: Cache API entries
-        # survive deployments, and this handler cachePuts with max-age=3600.
-        check_request "api-docs" "GET" "${AUTH_BASE}/api/docs?verify=$VERIFY_NONCE" "200" "${AUTH_HOST}"
-        check_request "passkey-status" "GET" "${AUTH_BASE}/auth/passkey/status" "401" '"error":"unauthorized"'
-        check_request "authorize" "GET" "${AUTH_BASE}/authorize" "400" '"error":"redirect_uri required"'
-        check_request "token" "POST" "${AUTH_BASE}/token" "400" '"error":"dpop_proof_required"' '{"audience":"https://test"}'
-        # Every check above names a route that exists. Nothing covered the
-        # fallthrough, which is where notme-cb0354 lived: unmatched paths came
-        # back as error 1101 in production for as long as the VPC tunnel was
-        # unhealthy, and the gate stayed green throughout.
-        #
-        # The body pattern is the Worker's own constant 404, which it returns
-        # when the VPC fetch fails. A HEALTHY tunnel would instead hand back
-        # whatever signet answers for an unknown path, so if this check ever
-        # fails on the pattern rather than the status, read it as "the tunnel
-        # came up" and decide there whether signet's 404 shape is acceptable
-        # to expose — do not just relax the assertion. The status is the part
-        # that must never regress: 1101 surfaces as 500.
-        check_request "unmatched-path" "GET" "${AUTH_BASE}/.well-known/not-a-route-$VERIFY_NONCE" "404" '"error":"not_found"'
-
-        echo "=== ${SITE_BASE#https://} ==="
-        check_request "homepage" "GET" "${SITE_BASE}/" "200" "notme"
-        check_request "apas" "GET" "${SITE_BASE}/apas?verify=$VERIFY_NONCE" "200" "0.2.1-draft"
-        check_request "apas-schema" "GET" "${SITE_BASE}/provenance/dispatch/v1?verify=$VERIFY_NONCE" "200" '"workItemRef"' "" "application/schema+json"
-
-        echo "---"
-        [ $FAIL -eq 0 ] && echo "All checks passed." || { echo "SOME CHECKS FAILED"; exit 1; }
+      - >-
+        bash scripts/worker-verify.sh
+        --env {{shellQuote (.ENV | default "")}}
+        --auth-base {{shellQuote .AUTH_BASE}}
+        --site-base {{shellQuote .SITE_BASE}}
+        --version {{shellQuote (.VERSION | default "")}}
+        --expect {{shellQuote (.EXPECT | default "")}}
 
   node:preflight:
     desc: Fail fast, with remediation, when local Node can't run the release path
@@ -321,13 +220,24 @@ tasks:
     cmds:
       - pnpm exec wrangler deploy --env staging --var BUILD_SHA:$(git rev-parse HEAD)
 
+  worker:contract:
+    desc: "Boot the real Worker locally (config derived from wrangler.toml.example) and run worker:verify's checks against it — no Cloudflare account (notme-6ae724)"
+    # CI runs this on every PR (ci.yml `contract`). Before it, the post-deploy
+    # contract only ever ran AFTER a build was serving production traffic.
+    deps: [dpop:build]
+    cmds:
+      - bash scripts/worker-contract.sh
+
   worker:verify-staging:
     desc: Smoke test staging endpoints (same checks as production verify)
     cmds:
       - task: worker:verify
         vars:
+          ENV: staging
           AUTH_BASE: "https://auth-staging.notme.bot"
           SITE_BASE: "https://staging.notme.bot"
+          VERSION: ""
+          EXPECT: ""
 
   ship-staging:
     desc: "Staging gate: preflight → install → check → docs → deploy staging → verify staging"
@@ -339,43 +249,71 @@ tasks:
       - task: worker:deploy-staging
       - task: worker:verify-staging
 
-  # ENV selects the wrangler environment: unset = production, ENV=staging =
-  # the staging Worker. The SAME three tasks drive both, so the canary path
-  # rehearsed on staging is literally the one that promotes production —
-  # rather than a staging rehearsal of a different command (same reasoning as
-  # worker:verify's AUTH_BASE/SITE_BASE).
+  # ENV selects the wrangler environment and is REQUIRED on every task that
+  # moves traffic: ENV=production or ENV=staging, never a default. An omitted
+  # ENV used to mean production, so a staging rehearsal with a dropped
+  # `ENV=staging` promoted production (notme-16b2d5, Finding D). The SAME
+  # tasks drive both, so the canary path rehearsed on staging is literally the
+  # one that promotes production — rather than a staging rehearsal of a
+  # different command (same reasoning as worker:verify's AUTH_BASE/SITE_BASE).
   worker:versions:
     desc: "List uploaded versions — ids for canary/promote/rollback ([ENV=staging])"
     dir: worker
     vars:
-      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
+      ENV_FLAG: '{{if eq .ENV "staging"}}--env staging{{end}}'
     cmds:
       - pnpm exec wrangler versions list {{.ENV_FLAG}}
 
   worker:canary:
-    desc: "Split traffic: NEW=<version-id> OLD=<version-id> [PCT=10] [ENV=staging]"
+    desc: "Split traffic: NEW=<version-id> OLD=<version-id> ENV=<production|staging> [PCT=10]"
     dir: worker
     vars:
       PCT: '{{.PCT | default "10"}}'
-      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
+      ENV_FLAG: '{{if eq .ENV "staging"}}--env staging{{end}}'
     preconditions:
+      - sh: '[ "{{.ENV}}" = production ] || [ "{{.ENV}}" = staging ]'
+        msg: "ENV=production or ENV=staging is required — neither is reachable by omission"
+      # Task fills {{.ENV}} from the environment too: an `export ENV=…` left in
+      # the shell must not stand in for typing it (review M6).
+      - sh: '[ -z "${ENV:-}" ] || [ "${ENV}" != "{{.ENV}}" ]'
+        msg: "ENV is exported in your shell — unset ENV and pass ENV= on the task command line"
+      # Same for every value that moves traffic (re-review N5).
+      - sh: '[ -z "${NEW:-}" ] || [ "${NEW}" != "{{.NEW}}" ]'
+        msg: "NEW is exported in your shell — unset NEW and pass NEW= on the task command line"
+      - sh: '[ -z "${OLD:-}" ] || [ "${OLD}" != "{{.OLD}}" ]'
+        msg: "OLD is exported in your shell — unset OLD and pass OLD= on the task command line"
+      - sh: '[ -z "${PCT:-}" ] || [ "${PCT}" != "{{.PCT}}" ]'
+        msg: "PCT is exported in your shell — unset PCT (default 10) or pass PCT= on the task command line"
       - sh: test -n "{{.NEW}}"
         msg: "NEW=<version-id> is required (task worker:versions to list)"
       - sh: test -n "{{.OLD}}"
         msg: "OLD=<version-id> is required — the id traffic falls back to"
+      # atoi("abc") is 0 and 100-110 is -10: validate before the arithmetic.
+      - sh: 'echo "{{.PCT}}" | grep -Eq "^[1-9][0-9]?$"'
+        msg: "PCT must be an integer 1-99"
     cmds:
+      - echo "▸ canary on {{.ENV}} — {{.NEW}} @ {{.PCT}}%, {{.OLD}} @ {{sub 100 (atoi .PCT)}}%"
       - pnpm exec wrangler versions deploy "{{.NEW}}@{{.PCT}}%" "{{.OLD}}@{{sub 100 (atoi .PCT)}}%" {{.ENV_FLAG}} --yes
+      - echo "Next — soak PINNED to the new version (a sampled verify is not evidence about it)"
+      - echo "  task worker:verify VERSION={{.NEW}} ENV={{.ENV}}"
 
   worker:promote:
-    desc: "Route 100% of traffic to NEW=<version-id> ([ENV=staging])"
-    dir: worker
-    vars:
-      ENV_FLAG: '{{if .ENV}}--env {{.ENV}}{{end}}'
-    preconditions:
-      - sh: test -n "{{.NEW}}"
-        msg: "NEW=<version-id> is required (task worker:versions to list)"
+    desc: "Route 100% to NEW=<version-id> ENV=<production|staging> — gated on a pinned verify of THAT version; rolls back on failure"
+    # The gate, the override (ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>), and
+    # the post-promote converge → pinned verify → rollback live in the script
+    # so they are testable without a Cloudflare account (promote-gate.test.ts).
+    #
+    # Values go in as ARGUMENTS, shell-quoted. Not through `env:`: an exported
+    # variable of the same name overrides a Task env block, and Task also
+    # fills `{{.ENV}}` from the environment, so the script refuses any
+    # selector equal to an exported shell variable (scripts/lib/selectors.sh).
     cmds:
-      - pnpm exec wrangler versions deploy "{{.NEW}}@100%" {{.ENV_FLAG}} --yes
+      - >-
+        bash scripts/worker-promote.sh
+        --env {{shellQuote (.ENV | default "")}}
+        --new {{shellQuote (.NEW | default "")}}
+        --allow-unverified {{shellQuote (.ALLOW_UNVERIFIED | default "")}}
+        --expect {{shellQuote (.EXPECT | default "")}}
 
   docs:check:
     desc: Verify doc claims against code
@@ -446,7 +384,12 @@ tasks:
     # build. This closes that gap. See scripts/await-convergence.ts.
     deps: [deps:install]
     cmds:
-      - pnpm exec tsx scripts/await-convergence.ts
+      # Explicit flags override the script's AUTH_BASE/EXPECT environment
+      # fallbacks, so a caller like ship-prod pins the target (review M6).
+      - >-
+        pnpm exec tsx scripts/await-convergence.ts
+        {{if .AUTH_BASE}}--auth-base {{shellQuote .AUTH_BASE}}{{end}}
+        {{if .EXPECT}}--expect {{shellQuote .EXPECT}}{{end}}
 
   ship:
     desc: "Safe path: preflight → install → check → docs → preview → verify instructions"
@@ -458,13 +401,13 @@ tasks:
       - task: worker:deploy-preview
       - echo ""
       - echo "Preview version uploaded. To go live (canary path):"
-      - echo "  task worker:versions                   # find NEW/OLD version ids"
-      - echo "  task worker:canary NEW=<id> OLD=<id>   # 10% canary (PCT=n to change)"
-      - echo "  task worker:verify                     # smoke test during soak"
-      - echo "  task worker:promote NEW=<id>           # 100% after soak"
-      - echo "  task worker:promote NEW=<old-id>       # rollback = promote the old id"
+      - echo "  task worker:versions ENV=production                  # find NEW/OLD version ids"
+      - echo "  task worker:canary NEW=<id> OLD=<id> ENV=production  # 10% canary (PCT=n to change)"
+      - echo "  task worker:verify VERSION=<id> ENV=production       # PINNED soak; records evidence"
+      - echo "  task worker:promote NEW=<id> ENV=production          # refuses without that evidence"
+      - 'echo "  (a failed promote rolls itself back; emergency exit at any time: task worker:rollback)"'
       - echo ""
-      - 'echo "Direct path (skips canary): task worker:deploy && task worker:verify"'
+      - 'echo "Direct path (skips canary, no auto-rollback): task ship-prod"'
 
   trust:refresh:
     desc: "Refresh trust/ from the live root; refuses if the KEY changed. `-- --check` only compares (notme-8e8836)"
@@ -492,7 +435,18 @@ tasks:
       - pnpm exec tsx scripts/task-cert/cli.ts {{.CLI_ARGS}}
 
   ship-prod:
-    desc: "Full send: preflight → install → check → docs → deploy → verify (rollback on failure)"
+    # NO automatic rollback. This description used to end "(rollback on
+    # failure)" and nothing implemented it, so an operator who trusted it would
+    # not roll back a broken deploy by hand (notme-16b2d5, Finding B). If
+    # verify fails here the new build is STILL serving 100%: roll back with
+    # `task worker:rollback` (wrangler's previous deployment, ungated — the
+    # emergency exit), then `task worker:verify`. The path that rolls back by
+    # itself is ship → canary → pinned verify → worker:promote.
+    desc: "Full send: preflight → install → check → docs → deploy → converge → verify. NO auto-rollback: on failure run task worker:rollback"
+    vars:
+      # The build worker:deploy stamps (BUILD_SHA = git HEAD).
+      HEAD_SHA:
+        sh: git rev-parse HEAD
     cmds:
       - task: node:preflight
       - task: worker:install
@@ -501,8 +455,20 @@ tasks:
       - task: worker:deploy
       # Between deploy and verify, because a verify that runs during
       # convergence can pass against the build being replaced (notme-9f2f79).
+      # Every target is stated, never inherited: an exported ENV=staging (or
+      # AUTH_BASE/VERSION/EXPECT) in the operator's shell must not turn the
+      # check of the production deploy into a check of staging (review M6).
       - task: worker:await-convergence
+        vars:
+          AUTH_BASE: https://auth.notme.bot
+          EXPECT: "{{.HEAD_SHA}}"
       - task: worker:verify
+        vars:
+          ENV: production
+          AUTH_BASE: https://auth.notme.bot
+          SITE_BASE: https://notme.bot
+          VERSION: ""
+          EXPECT: ""
 
   worker:build-local:
     desc: Bundle worker for local workerd

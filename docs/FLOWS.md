@@ -324,22 +324,33 @@ Health: `GET /admin/alarm-health` (`authorityManage`-gated).
 ## 8. Deploy — promote, converge, then verify
 
 ```bash
-task worker:deploy-preview                       # uploads, stamps BUILD_SHA
-task worker:promote NEW=<version-id>
-task worker:await-convergence                    # ← the load-bearing step
-task worker:verify
+task worker:deploy-preview                                   # uploads, stamps BUILD_SHA
+task worker:canary NEW=<version-id> OLD=<cur> ENV=production
+task worker:verify VERSION=<version-id> ENV=production       # pinned; writes evidence
+task worker:promote NEW=<version-id> ENV=production          # gated; converges, verifies, rolls back on failure
 ```
+
+`ENV` is required — no environment is reachable by omission. `worker:promote`
+refuses a version with no pinned-verify record unless you type
+`ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>`, which is logged (`notme-16b2d5`).
+`task ship-prod` is the direct path; it does **not** roll back by itself.
 
 **Convergence is not immediate.** After the API reports 100%, live traffic
 alternates between old and new build for roughly a minute. `worker:verify`
 retries for ~10 seconds — shorter than that window — so a verify run straight
-after promotion can pass against the build being *replaced*.
+after promotion can pass against the build being *replaced*. `worker:promote`
+awaits convergence before its verify.
 
 Confirm with `curl -s https://auth.notme.bot/.well-known/version`.
 
-**Rollback** is `task worker:promote NEW=<old-id>` — with the same convergence
-caveat on the way back, which is exactly when nobody wants to wait.
+**Rollback** is `task worker:promote NEW=<old-id> ENV=production` — with the
+same convergence caveat on the way back, which is exactly when nobody wants to
+wait. After a `ship-prod`, use `task worker:rollback`.
 
-**Version-override targeting does not work here** (`notme-9f2f79`): probing a
-specific version returns the *old* one, measured 5/5. Verify after promoting,
-not before.
+**Version-override targeting only works on a version in the deployment.**
+Probing a version that is uploaded but not deployed returns the *old* one,
+measured 5/5 (`notme-9f2f79`) — Cloudflare ignores the header silently. So
+`worker:verify VERSION=<id>` runs after `worker:canary`, and brackets every
+check with a pinned `/.well-known/version` probe: if the pin is ignored, the
+run fails instead of passing on the old build (`notme-325916`). A sampled,
+unpinned verify during a soak is a health check, not evidence about the canary.

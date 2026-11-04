@@ -56,7 +56,7 @@ import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
 import { principalIdentity } from "./src/cert-authority";
 import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
-import { buildInfo } from "./src/build-version";
+import { buildInfo, disclosedVersionId } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
 import { clientIpBucket } from "./src/client-ip-key";
 import { isDeniedDestination } from "./src/destination-policy";
@@ -2041,7 +2041,11 @@ export default {
     // Answered before host canonicalization for the same reason as /health —
     // probes from bare-IP or in-cluster hosts must get an answer, not a 301.
     if (pathname === "/.well-known/version") {
-      return Response.json(buildInfo(env), {
+      // version_id: which Cloudflare VERSION answered — what a pinned probe must
+      // compare, since two versions can share a commit (notme-325916). Only
+      // disclosed to a request whose override header already names it (N2).
+      const vid = disclosedVersionId(env, request.headers.get("Cloudflare-Workers-Version-Overrides"));
+      return Response.json({ ...buildInfo(env), ...(vid ? { version_id: vid } : {}) }, {
         status: 200,
         headers: {
           "Cache-Control": "no-store",

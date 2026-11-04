@@ -35,8 +35,16 @@
  * artifacts of that shape in one cycle.
  */
 
-const AUTH_BASE = process.env.AUTH_BASE ?? "https://auth.notme.bot";
-const EXPECT = process.env.EXPECT ?? "";
+/** `--name value` from argv. Flags win over the environment, so a caller that
+ * states its target (ship-prod, worker:promote) cannot be redirected by an
+ * exported AUTH_BASE/EXPECT left in the operator's shell. */
+function flag(name: string): string | undefined {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+const AUTH_BASE = flag("auth-base") ?? process.env.AUTH_BASE ?? "https://auth.notme.bot";
+const EXPECT = flag("expect") ?? process.env.EXPECT ?? "";
 const SAMPLES = Number(process.env.SAMPLES ?? "5");
 const INTERVAL_S = Number(process.env.INTERVAL ?? "3");
 const TIMEOUT_S = Number(process.env.TIMEOUT ?? "180");
