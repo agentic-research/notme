@@ -12,8 +12,8 @@ import { isExternal, NETWORK_GUARD } from "./setup/no-network";
 describe("plain-suite network guard", () => {
   it("is installed: global fetch is the guard, not the platform's", () => {
     expect(
-      (globalThis.fetch as unknown as Record<symbol, unknown>)[NETWORK_GUARD],
-    ).toBe(true);
+      typeof (globalThis.fetch as unknown as Record<symbol, unknown>)[NETWORK_GUARD],
+    ).toBe("function");
   });
 
   it("refuses production and any other non-loopback host", () => {

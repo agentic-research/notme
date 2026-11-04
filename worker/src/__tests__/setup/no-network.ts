@@ -1,6 +1,7 @@
 /**
  * no-network.ts — the plain suite is hermetic: no test may reach a real host
- * (notme-3fc74b).
+ * (notme-3fc74b). The Durable Object suite loads this same file
+ * (vitest.workers*.mts, notme-73202e).
  *
  * WHY. Two OIDC tests asserted that verification got PAST the issuer or
  * audience check, and past it the verifier fetches discovery and JWKS from the
@@ -46,23 +47,44 @@ export function isExternal(url: URL): boolean {
 let attempted: string[] = [];
 const loopbackFetch = globalThis.fetch;
 
-/** Marks the guard, so a test can pin that this setup file is actually loaded. */
+/**
+ * Returns and clears the refused requests recorded so far in this test. Only
+ * the guard's own test uses it, to make a refusal on purpose without failing
+ * the test that provoked it; every other test leaves the afterEach to judge.
+ */
+export function takeAttempts(): string[] {
+  const made = attempted;
+  attempted = [];
+  return made;
+}
+
+/** Marks the guard, so a test can pin that this setup file is actually loaded. Its value is takeAttempts. */
 export const NETWORK_GUARD = Symbol.for("notme.plain-suite.no-network");
 
 const guardedFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
   const url = urlOf(input);
   if (url && isExternal(url)) {
     attempted.push(url.href);
-    return Promise.reject(
+    const refusal = Promise.reject(
       new Error(
-        `hermetic plain suite (notme-3fc74b): refused a real network request to ${url.href}. ` +
+        `hermetic suite (notme-3fc74b, notme-73202e): refused a real network request to ${url.href}. ` +
           `Stub fetch or serve a fixture (see src/__tests__/helpers/oidc-issuer.ts).`,
       ),
     );
+    // A fixture that wraps fetch (gha-token.ts) hands this promise back through
+    // an async function, so workerd sees it rejected before anyone has
+    // attached a handler and reports an unhandled rejection that masks the
+    // real message. The caller still receives the rejection; the afterEach
+    // below is what fails the test.
+    refusal.catch(() => {});
+    return refusal;
   }
   return loopbackFetch(input, init);
 }) as typeof fetch;
-Object.defineProperty(guardedFetch, NETWORK_GUARD, { value: true });
+// The marker's value is takeAttempts, so a test can find the INSTALLED guard
+// through globalThis.fetch without importing this module (importing it would
+// install the guard itself and make "is it installed?" vacuous).
+Object.defineProperty(guardedFetch, NETWORK_GUARD, { value: takeAttempts });
 globalThis.fetch = guardedFetch;
 
 afterEach(() => {
