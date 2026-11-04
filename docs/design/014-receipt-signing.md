@@ -237,6 +237,17 @@ leaving `NOTME` exactly as it is.
 Yes. Both `receiptFacts()` and `signReceipt()` are methods on `ReceiptSigner`,
 so **one** dedicated binding covers both.
 
+So is `epochPublicKey(epoch)` (notme-a0cff4). It returns every public key
+that served that epoch, current or retired: the same bytes
+`/.well-known/epochs.json` serves. It exists so an archive built by polling
+`/internal/ca-bundle` can backfill an epoch it never observed, such as one that
+two rotations between polls skipped. It returns a result union
+(`EpochPublicKeyResult`). `EPOCH_UNKNOWN` means notme has no key for that
+epoch, and `EPOCH_INVALID` means the argument was not a non-negative integer.
+Neither code is retryable, and a transport failure rejects the call instead.
+The result is a set because several keys can sign under one epoch: pick the
+signer by `actor_fp` = SHA-256(raw public key).
+
 ### 2. The full error-code set
 
 Exported as `CommitmentErrorCode` from `worker/src/receipts/commitment.ts`, so

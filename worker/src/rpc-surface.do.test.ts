@@ -40,7 +40,10 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
   it("ReceiptSigner exposes only receipt signing (ADR-014 least privilege)", () => {
     // The ADR claims a binding to ReceiptSigner "grants receipt signing and
     // nothing else". This is that claim, executable.
-    expect(rpcSurface(ReceiptSigner)).toEqual(["receiptFacts", "signReceipt"]);
+    // epochPublicKey (notme-a0cff4) is PUBLIC key material for one epoch, the
+    // same bytes /.well-known/epochs.json serves, so cloister can archive an
+    // epoch it never observed. Added deliberately; it signs nothing.
+    expect(rpcSurface(ReceiptSigner)).toEqual(["epochPublicKey", "receiptFacts", "signReceipt"]);
   });
 
   it("JwtSigner exposes only delegated JWT signing (ADR-015)", () => {

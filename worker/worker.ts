@@ -83,7 +83,8 @@ import { clientIpBucket } from "./src/client-ip-key";
  * An earlier draft of this comment said to add the entrypoint to `NOTME` — that
  * instruction would have broken the first integrator to follow it.
  *
- * Both methods live on THIS entrypoint, so one dedicated binding is enough.
+ * All three methods live on THIS entrypoint, so one dedicated binding is
+ * enough.
  */
 export class ReceiptSigner extends WorkerEntrypoint<any> {
   /**
@@ -153,6 +154,52 @@ export class ReceiptSigner extends WorkerEntrypoint<any> {
     const id = this.env.SIGNING_AUTHORITY.idFromName("default");
     const authority = this.env.SIGNING_AUTHORITY.get(id);
     return authority.signReceiptCommitment(owned);
+  }
+
+  /**
+   * Every public key that served `epoch`, current or retired (notme-a0cff4).
+   *
+   * Cloister builds its epoch archive from what it OBSERVES by polling
+   * /internal/ca-bundle, which carries only the current and previous key. A
+   * missed poll, or two rotations between polls, left that epoch absent from
+   * its archive for good, although notme still held the key in retired_keys.
+   * This hands it over on the binding cloister already holds.
+   *
+   * Public key material only, the same bytes /.well-known/epochs.json serves,
+   * so it widens what this binding can READ and not what it can sign.
+   *
+   * `EPOCH_UNKNOWN` is an answer, not a failure: notme has no key for that
+   * epoch. A transport failure rejects the call instead, so the two never
+   * look alike.
+   */
+  async epochPublicKey(
+    epoch: number,
+  ): Promise<import("./src/signing-authority").EpochPublicKeyResult> {
+    if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) {
+      return {
+        ok: false,
+        code: "EPOCH_INVALID",
+        message: `epoch must be a non-negative integer, got ${typeof epoch === "number" ? epoch : typeof epoch}`,
+      };
+    }
+    const id = this.env.SIGNING_AUTHORITY.idFromName("default");
+    const keys = await this.env.SIGNING_AUTHORITY.get(id).getEpochPublicKey(epoch);
+    if (keys.length === 0) {
+      return {
+        ok: false,
+        code: "EPOCH_UNKNOWN",
+        message: `no key of this authority served epoch ${epoch}`,
+      };
+    }
+    return {
+      ok: true,
+      epoch,
+      keys: keys.map((k: { keyId: string; publicRawB64: string; retiredAt: number | null }) => ({
+        publicRawB64: k.publicRawB64,
+        kid: k.keyId,
+        retiredAt: k.retiredAt,
+      })),
+    };
   }
 }
 

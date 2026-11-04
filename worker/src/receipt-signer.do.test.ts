@@ -20,6 +20,7 @@ import { Encoder } from "cbor-x";
 import { commitmentVector } from "./__tests__/helpers/commitment-vector";
 import { encodeCanonicalMap, type CborValue } from "./receipts/canonical-cbor";
 import type { SigningAuthority } from "./signing-authority";
+import { ReceiptSigner } from "../worker";
 
 const cbor = new Encoder({
   mapsAsObjects: false,
@@ -248,4 +249,90 @@ describe("receipt delegation through the production entry point (notme-c0db9b)",
     const res = await stub.signReceiptCommitment(nineKeyCommitment(facts, DELEGATION));
     expect(res.ok).toBe(true);
   });
+});
+
+describe("ReceiptSigner.epochPublicKey — epochs cloister never observed (notme-a0cff4)", () => {
+  // Through the ENTRYPOINT, not the DO stub: the gap was that ReceiptSigner,
+  // the one binding cloister holds, could not hand over a retired key.
+  // ReceiptSigner talks to the "default" authority, so these tests do too.
+  const signer = () => new ReceiptSigner({} as any, env as any);
+  const defaultAuthority = () => env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+  const b64ToBytes = (b64: string) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  const sha256 = async (b: Uint8Array) => new Uint8Array(await crypto.subtle.digest("SHA-256", b));
+
+  it("verifies a receipt signed under a key rotated away before anyone archived it", async () => {
+    const rs = signer();
+    const facts = await rs.receiptFacts();
+    const bytes = commitment(facts);
+    const signed = await rs.signReceipt(bytes);
+    expect(signed.ok).toBe(true);
+    if (!signed.ok) return;
+
+    // Two rotations between polls: the key that signed is in neither the
+    // current nor the previous slot of /internal/ca-bundle any more.
+    await defaultAuthority().rotate();
+    await defaultAuthority().rotate();
+
+    const res = await rs.epochPublicKey(signed.epoch);
+    expect(res.ok, res.ok ? "" : `${res.code}: ${res.message}`).toBe(true);
+    if (!res.ok) return;
+    expect(res.epoch).toBe(signed.epoch);
+    expect(res.keys.length).toBeGreaterThanOrEqual(3);
+
+    // Disambiguate by actor_fp, as an auditor does: the epoch is the filter,
+    // the fingerprint is the index.
+    const matches: typeof res.keys = [];
+    for (const k of res.keys) {
+      const fp = await sha256(b64ToBytes(k.publicRawB64));
+      if (fp.every((b, i) => b === facts.actorFp[i])) matches.push(k);
+    }
+    expect(matches).toHaveLength(1);
+    const key = matches[0]!;
+    expect(key.retiredAt).toBeTypeOf("number");
+    expect(key.kid).toMatch(/\S/);
+
+    const verifyKey = await crypto.subtle.importKey("raw", b64ToBytes(key.publicRawB64), { name: "Ed25519" }, false, [
+      "verify",
+    ]);
+    expect(await crypto.subtle.verify({ name: "Ed25519" }, verifyKey, signed.signature, bytes)).toBe(true);
+  });
+
+  it("names the live key with retiredAt null", async () => {
+    const rs = signer();
+    const { epoch } = await rs.receiptFacts();
+    const res = await rs.epochPublicKey(epoch);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const live = res.keys.filter((k) => k.retiredAt === null);
+    expect(live).toHaveLength(1);
+    expect(live[0]!.publicRawB64).toBe(await defaultAuthority().getPublicKeyRawB64());
+  });
+
+  it("still resolves an epoch after revokeEpoch() moves past it", async () => {
+    const rs = signer();
+    const { epoch } = await rs.receiptFacts();
+    await defaultAuthority().revokeEpoch();
+    expect((await rs.receiptFacts()).epoch).toBe(epoch + 1);
+    const res = await rs.epochPublicKey(epoch);
+    expect(res.ok).toBe(true);
+  });
+
+  it("answers EPOCH_UNKNOWN, not a throw, for an epoch notme has no key for", async () => {
+    const rs = signer();
+    const { epoch } = await rs.receiptFacts();
+    // A generation the authority has not reached. Answering with the live key
+    // would hand a verifier a working key for an epoch that does not exist.
+    const res = await rs.epochPublicKey(epoch + 1);
+    expect(res).toEqual({ ok: false, code: "EPOCH_UNKNOWN", message: expect.stringContaining(String(epoch + 1)) });
+  });
+
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "1", null])(
+    "answers EPOCH_INVALID for %s rather than coercing it",
+    async (bad) => {
+      const res = await signer().epochPublicKey(bad as any);
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+      expect(res.code).toBe("EPOCH_INVALID");
+    },
+  );
 });
