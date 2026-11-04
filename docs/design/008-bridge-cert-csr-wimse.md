@@ -146,6 +146,8 @@ The exchange is NOT a PKCS#10 Certificate Signing Request. It is a **proof-of-po
 
 This is analogous to ACME challenge-response (RFC 8555) and FIDO2/WebAuthn registration — prove you hold the key, get a credential.
 
+**Small-order Ed25519 keys are refused** (notme-48226d). A key in the order-8 torsion subgroup has no private key, yet signatures under it can be forged with none: R a small-order point, S = 0. workerd imports all 8 such keys and its `crypto.subtle.verify` accepts those forgeries; for the identity key it accepts one over every message. So a proof "for" such a key proves nothing. `importPublicKey` refuses one (400 `invalid public key`), and every caller-key Ed25519 verify (`verifyPopProofs`, `verifyEd25519PopProof`, `AuthSession.sign()`) goes through `verifyEd25519`, which refuses one again. The check is libsodium's `has_small_order` and is pinned by `worker/src/ed25519-small-order.do.test.ts`.
+
 ### Dual-cert model
 
 Each exchange produces **two certificates** from one request. The caller generates two keypairs in-process (`extractable: false`, never serialized) and proves possession of both:

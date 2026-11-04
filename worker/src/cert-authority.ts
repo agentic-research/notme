@@ -15,6 +15,7 @@ import {
   ExtendedKeyUsageExtension,
 } from "@peculiar/x509";
 import { ED25519 } from "./platform";
+import { isSmallOrderEd25519Key } from "./ed25519-small-order";
 import type { Criteria } from "./criteria";
 
 // Leaf-cert extensions — declare what each cert is for so strict X.509
@@ -354,13 +355,21 @@ export async function importPublicKey(pem: string): Promise<CryptoKey> {
     .replace(/\s/g, "");
   const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
-  return crypto.subtle.importKey(
+  const key = await crypto.subtle.importKey(
     "spki",
     der,
     isEd25519Spki(der) ? ED25519 : { name: "ECDSA", namedCurve: "P-256" },
     true,
     ["verify"],
   );
+  // A small-order Ed25519 key has no private key behind it, and workerd
+  // verifies keyless forgeries under one (notme-48226d). Every caller-supplied
+  // key enters through here, including tier enrolment, which stores the key
+  // before any proof is checked — so refuse it at the door.
+  if (key.algorithm.name === "Ed25519" && (await isSmallOrderEd25519Key(key))) {
+    throw new Error("Ed25519 public key is a small-order point — no private key exists for it");
+  }
+  return key;
 }
 
 export interface BridgeCertResult {

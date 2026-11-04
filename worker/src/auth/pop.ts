@@ -29,6 +29,8 @@
  * is the entire point of a cross-language proof.
  */
 
+import { verifyEd25519 } from "../ed25519-small-order";
+
 /**
  * Base64url (or base64) proof bytes, as they arrive on the wire.
  *
@@ -174,6 +176,12 @@ export async function verifyPopProofs(
     // the same disposition as a signature that simply does not match.
     const attempt = async (message: BufferSource) => {
       try {
+        // The Ed25519 half goes through verifyEd25519, which refuses a
+        // small-order key: workerd verifies keyless forgeries under one
+        // (notme-48226d), so a "proof" for it proves nothing.
+        if (check.algorithm === "Ed25519") {
+          return await verifyEd25519(check.key, bytes, message);
+        }
         return await crypto.subtle.verify(
           check.params,
           check.key,
@@ -234,5 +242,6 @@ export async function verifyEd25519PopProof(
 ): Promise<boolean> {
   const sig = decodeProof(proof);
   if (!sig) return false;
-  return crypto.subtle.verify(ED25519, publicKey, sig, bindingInput);
+  // Refuses a small-order key, as the pair path does (notme-48226d).
+  return verifyEd25519(publicKey, sig, bindingInput);
 }
