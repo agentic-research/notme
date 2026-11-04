@@ -178,7 +178,7 @@ graph LR
 
 **Ephemeral** (local dev, CI): `getOrCreateSigningKey()` generates the key with `extractable: false` and does NOT write the JWK to SQLite. The key lives only in `this.signingKey` as an opaque `CryptoKey` handle — the raw key bytes are inside BoringSSL, not on the V8 heap. `crypto.subtle.exportKey()` throws. `crypto.subtle.sign()` still works (BoringSSL signs internally). Restart = new key. `cat *.sqlite` yields nothing. No JS code path can exfiltrate the key material.
 
-**Encrypted** (self-hosted, not yet implemented): Designed but not built. Will derive a KEK from a machine-generated secret via HKDF (`vault/src/crypto.ts`), wrap the JWK before writing to SQLite, unwrap and re-import as non-extractable on read. Currently, setting `NOTME_KEY_STORAGE=encrypted` is a hard startup error to prevent a false sense of security.
+**Encrypted**: built since this was written (notme-41d0d3), in `worker/src/key-encryption.ts`. It derives a KEK via HKDF from an operator secret, `NOTME_KEK_SECRET` (the construction recovered from the retired `vault/src/crypto.ts`, ADR-012), and wraps the JWK before it is written to SQLite. Setting `NOTME_KEK_SECRET` selects this mode; `NOTME_KEY_STORAGE=encrypted` without it, or with a secret under 128 bits, is a hard startup error (`worker/src/platform.ts:84-118`). Production does not run it yet: turning it on waits on the KEK rehearsal (`scripts/kek-rehearsal.sh`), and notme-41d0d3 stays open until then.
 
 **CF-managed** (production): Current behavior, with one change: after importing the key from SQLite, re-import with `extractable: false`. CF handles encryption at rest for DO SQLite. The key is non-extractable in memory.
 
@@ -309,7 +309,7 @@ These are non-negotiable properties the implementation must maintain. Adversaria
 2. **No extractable CryptoKey in steady state.** After key generation/import completes, `crypto.subtle.exportKey()` on the signing key must throw. Extractable is only `true` during the wrap/persist instant.
 3. **Fail closed on mode misconfiguration.** `NOTME_KEY_STORAGE=encrypted` without a valid `NOTME_KEK_SECRET` is a hard startup error.
 4. **No private key material in any RPC response or error message.** No method on the signing authority DO returns `"d"`, `"k"`, PEM private key headers, or raw key bytes. Error messages must not leak key material.
-5. **JTI replay protection works on all platforms.** KV on CF, SQLite on local — same semantic guarantee.
+5. **JTI replay protection works on all platforms.** KV on CF, SQLite on local. (The guarantee is not the same: KV is eventually consistent, so a KV-only spend can accept one token twice on two edge nodes. Since 2026-11 `/join`, `/auth/oidc/login` and the AUTH binding spend OIDC jtis in the SigningAuthority DO; `/cert/gha`, `/cert` and `/token` are still KV-only, notme-b0d10f.)
 6. **Constant-time comparison for security-sensitive strings.** Bootstrap codes, session tokens, and any value whose timing could leak information use HMAC-based constant-time comparison.
 
 ## Adversarial test strategy

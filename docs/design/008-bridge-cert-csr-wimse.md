@@ -267,7 +267,11 @@ Each proof is a signature over the same binding payload, proving:
 - The caller holds the P-256 private key
 - The caller holds the Ed25519 private key
 - Both keys are bound to this specific OIDC identity
-- The exchange cannot be replayed (OIDC JWT is one-time via JTI)
+- The exchange cannot be replayed (OIDC JWT is one-time via JTI). On
+  `/cert/gha` that spend is recorded in KV only, which is eventually
+  consistent, so two edge nodes can each accept the same token inside the
+  propagation window (notme-b0d10f, open; `/join`, `/auth/oidc/login` and the
+  AUTH binding spend in the Durable Object)
 
 Response:
 ```json
