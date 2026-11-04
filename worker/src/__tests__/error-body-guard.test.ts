@@ -30,14 +30,14 @@ const WORKER = new URL("../../", import.meta.url);
 const SRC = new URL("../", import.meta.url);
 
 function sources(): Array<{ file: string; text: string }> {
-  const out = [{ file: "worker.ts", text: readFileSync(fileURLToPath(new URL("worker.ts", WORKER)), "utf8") }];
+  const out = [{ file: "worker.ts", text: readFileSync(fileURLToPath(new URL("worker.ts", WORKER).href), "utf8") }];
   const walk = (dir: URL, rel: string) => {
-    for (const ent of readdirSync(fileURLToPath(dir), { withFileTypes: true })) {
+    for (const ent of readdirSync(fileURLToPath(dir.href), { withFileTypes: true })) {
       if (ent.isDirectory()) {
         if (ent.name === "__tests__") continue;
         walk(new URL(`${ent.name}/`, dir), `${rel}${ent.name}/`);
       } else if (ent.name.endsWith(".ts") && !ent.name.endsWith(".test.ts")) {
-        out.push({ file: `src/${rel}${ent.name}`, text: readFileSync(fileURLToPath(new URL(ent.name, dir)), "utf8") });
+        out.push({ file: `src/${rel}${ent.name}`, text: readFileSync(fileURLToPath(new URL(ent.name, dir).href), "utf8") });
       }
     }
   };
