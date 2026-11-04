@@ -88,8 +88,17 @@ export type GHARejectedEvent = (typeof GHA_REJECTED_EVENTS)[number];
 // change — bump CONTRACT_VERSION.
 
 export const ERROR_STATUS = {
-  // /join, /auth/oidc/login: bad OIDC proof (signature, aud, issuer, nonce)
+  // /join: bad OIDC proof (signature, aud, issuer, nonce) offered to redeem
+  // an invite. 403, like the garbage-invite refusal beside it, so /join's
+  // refusals share one status and the proof check is no oracle for the rest.
   OIDC_PROOF_REJECTED: 403,
+  // /auth/oidc/login: bad OIDC proof (signature, aud, issuer, nonce).
+  // 401, not 403 (notme-778cbf): this is a login, and a refused credential
+  // is an authentication failure (RFC 9110 §15.5.2), the same answer as
+  // AUTH_FAILED and GHA_TOKEN_INVALID. OIDC_PROOF_REJECTED used to name this
+  // route too, but the route has always answered 401; the entry was wrong,
+  // not the route. Additive, so CONTRACT_VERSION is unchanged.
+  OIDC_LOGIN_REJECTED: 401,
   // /invites, scope grants: caller lacks the required scope
   SCOPE_INSUFFICIENT: 403,
   // /auth/passkey/reset on populated system without admin session

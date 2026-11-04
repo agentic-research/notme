@@ -613,6 +613,65 @@ one-sided (`token.epoch < bundle.epoch`), so a credential naming a *future*
 generation passed step 5 and then matched the current key id at step 6. It is
 equality now: an epoch is not a timestamp and has no skew to tolerate.
 
+**THE HISTORY IS SIGNED, AND SAYS WHAT ENDED EACH EPOCH (`notme-6a4f23`).**
+The "evidence" this section keeps is the retired key archive. What it did not
+keep was *when* and *why* a generation was revoked: `revokeEpoch()` bumped the
+number and logged a line. `/.well-known/epochs.json` listed every key and its
+epoch span, unsigned, and could not tell the two ways a past signature stops
+mattering apart:
+
+| field | set by | means | old signatures |
+|---|---|---|---|
+| `epochs[].retiredAt` | `rotate()` | this KEY stopped signing | still good |
+| `revocations[].revokedAt`, `.reason` | `revokeEpoch()` (`POST /admin/revoke-epoch`, optional `{"reason"}`) | this EPOCH was ended | good only if made before `revokedAt` |
+
+They are separate lists because they are separate axes: rotation is per key,
+revocation is per epoch, and one key can span a revocation. `revokeEpoch()`
+writes its `epoch_revocations` row in the same transaction as the bump, so an
+epoch never moves without its record. A reason is optional (`"unspecified"`),
+at most 200 characters with no control characters, and public.
+
+The document is signed by the root key in the CABundle's discipline: canonical
+CBOR (ADR-010), a fresh `seqno` on every signing (its own counter, not the
+bundle's) and an `issuedAt`. The signing input leads with the domain tag
+`"notme-epoch-history-v1"` under map key 0, which no CABundle encoding has, so
+neither signature can stand in for the other. The existing `epochs` entries are
+unchanged, field for field; `revocations`, `currentEpoch`, `seqno`, `issuedAt`
+and `signature` sit beside them. Canonical form: `worker/src/epoch-history.ts`;
+golden vectors with a known signing root: `schema/fixtures/epochhistory-*`.
+
+**VERIFIER RULE.** For a certificate signature made at trusted time *T* (a
+Rekor integrated time, or another timestamp the verifier trusts more than the
+signer), with the history document *H*:
+
+1. *H*'s signature verifies under the trusted root, and *H*.`seqno` is not
+   below the highest seen (rollback). An online verifier also applies the
+   CABundle's freshness bound, `BUNDLE_MAX_AGE_MS`, to *H*.`issuedAt`.
+2. *T* < *H*.`issuedAt`. A document issued at or before *T* cannot know of a
+   revocation between its issuance and *T*. (The signer reads every record
+   and takes `issuedAt` in one synchronous run, so a revocation with
+   `revokedAt` < `issuedAt` is always in the document.)
+3. The chain was valid at *T* (issuer, validity window, signatures).
+4. `epoch(cert)` ≤ *H*.`currentEpoch`, and `epoch(cert)` was **not revoked at
+   or before *T***: if *H* has a revocation for that epoch, *T* <
+   `revokedAt`. An ended epoch (below `currentEpoch`) with no revocation
+   record is refused: the document cannot say when it ended. That covers
+   epochs ended before revocations were recorded and those ended by the
+   pre-`notme-77a024` coupling, where a rotation moved the epoch.
+5. **Strict mode** refuses any revoked epoch outright, whatever *T*: for a
+   verifier that treats a declared compromise as voiding everything signed
+   under it, including signatures timestamped before the declaration.
+
+`epochStatusAt()` in `epoch-history.ts` is the reference implementation of
+steps 2, 4 and 5.
+
+**LIMIT.** This only helps signatures that carry a trusted timestamp. Without
+one, *T* is the signer's claim, and the verifier can only check revocation as
+of now (the live bundle's equality test). And the authority could still
+rewrite its own history by signing a new document; making revocation events
+append-only against the authority itself (submitting each one to a public
+transparency log) is the second step on `notme-6a4f23`, not done here.
+
 #### "Offline verification" and "not revoked" cannot both be fully true
 
 Downstream descriptions of Interlace verification say it runs **offline**

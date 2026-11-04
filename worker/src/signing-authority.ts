@@ -32,6 +32,13 @@ import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 import { sha256Base64url } from "@agentic-research/dpop";
 import { bundleCanonical, type CABundle } from "./revocation";
 import {
+  type EpochHistory,
+  type EpochKeyEntry,
+  type EpochRevocation,
+  epochHistoryCanonical,
+  normalizeRevocationReason,
+} from "./epoch-history";
+import {
   ctPoisonExtension,
   sctListExtension,
   serialiseSct,
@@ -1465,17 +1472,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * unauthenticated — it is exactly what gets published — which is also why
    * it is safe on the RPC surface.
    */
-  async listEpochKeys(): Promise<
-    Array<{
-      epoch: number;
-      untilEpoch: number | null;
-      keyId: string;
-      publicRawB64: string;
-      retiredAt: number | null;
-    }>
-  > {
+  async listEpochKeys(): Promise<EpochKeyEntry[]> {
     this.#ensureSchema();
+    // The live id is read BEFORE the key is loaded (kek-rehearsal.sh relies
+    // on comparing the bytes, not the id, for exactly this reason).
+    const liveKeyId = this.#getKeyId();
+    return this.#epochKeyEntries(liveKeyId, await this.getPublicKeyRawB64());
+  }
 
+  /**
+   * The epochs.json key list, read synchronously so a caller can take it in
+   * the same run as the rest of a signed document (getSignedEpochHistory).
+   */
+  #epochKeyEntries(liveKeyId: string, livePubB64: string): EpochKeyEntry[] {
     const retired = this.ctx.storage.sql
       .exec(
         "SELECT key_id, public_raw, from_epoch, until_epoch, retired_at FROM retired_keys ORDER BY from_epoch ASC, key_id ASC",
@@ -1488,13 +1497,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       retired_at: number;
     }>;
 
-    const out: Array<{
-      epoch: number;
-      untilEpoch: number | null;
-      keyId: string;
-      publicRawB64: string;
-      retiredAt: number | null;
-    }> = retired.map((r) => ({
+    const out: EpochKeyEntry[] = retired.map((r) => ({
       epoch: r.from_epoch,
       untilEpoch: r.until_epoch,
       keyId: r.key_id,
@@ -1514,12 +1517,105 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       out.push({
         epoch: liveFrom,
         untilEpoch: null,
-        keyId: this.#getKeyId(),
-        publicRawB64: await this.getPublicKeyRawB64(),
+        keyId: liveKeyId,
+        publicRawB64: livePubB64,
         retiredAt: null,
       });
     }
     return out;
+  }
+
+  // ── Signed epoch history (notme-6a4f23, ADR-019 D7) ──
+  //
+  // `epoch_revocations` is the record of what `revokeEpoch()` ended: the
+  // epoch, when, and the operator's stated reason. Written in the same
+  // transaction as the epoch bump, so an epoch can never have moved without
+  // its revocation recorded. Never pruned and never rewritten (plain INSERT:
+  // an epoch is ended once). Epochs ended before this table existed have no
+  // row; the verifier rule refuses them rather than guessing a time.
+  //
+  // `epoch_history_state.seqno` is the epochs.json document's own monotonic
+  // counter, kept apart from the CABundle's `state.seqno` so serving one
+  // document never moves the other's rollback counter.
+  #epochHistoryReady = false;
+  #ensureEpochHistorySchema(): void {
+    if (this.#epochHistoryReady) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS epoch_revocations (
+        epoch      INTEGER PRIMARY KEY,
+        revoked_at INTEGER NOT NULL,
+        reason     TEXT NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS epoch_history_state (
+        id    TEXT PRIMARY KEY,
+        seqno INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO epoch_history_state (id, seqno) VALUES ('authority', 0)",
+    );
+    this.#epochHistoryReady = true;
+  }
+
+  /**
+   * The epochs.json document, signed by the root (notme-6a4f23).
+   *
+   * The CABundle's discipline (generateBundle): every signing takes a fresh
+   * seqno and issuedAt, and the signature is over canonical CBOR
+   * (epoch-history.ts). Public data only, so it is safe on the RPC surface;
+   * the domain tag in the signing input means the signature it returns can
+   * never pass as a CABundle's, so a leaked stub gains no signing oracle.
+   */
+  async getSignedEpochHistory(): Promise<EpochHistory> {
+    // Restart once if a rotate() committed during the key export, as
+    // generateBundle does (review L4).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const doc = await this.#signEpochHistoryOnce();
+      if (doc) return doc;
+    }
+    throw new Error(
+      "epoch history refused: the authority key changed twice while it was built; retry",
+    );
+  }
+
+  async #signEpochHistoryOnce(): Promise<EpochHistory | null> {
+    const { signingKey, verifyKey, keyId } = await this.#getOrCreateSigningKey();
+    const livePub = await rawPublicKeyB64(verifyKey);
+    if (this.#getKeyId() !== keyId) return null;
+    this.#ensureSchema();
+    this.#ensureEpochHistorySchema();
+
+    // SYNCHRONOUS from here to issuedAt, so nothing commits in between. That
+    // is what makes `issuedAt` a coverage claim: a revocation whose
+    // revokedAt is earlier than issuedAt committed before these reads, so it
+    // is in this document. The verifier rule leans on it (t < issuedAt).
+    const epochs = this.#epochKeyEntries(keyId, livePub);
+    const revocations = (
+      this.ctx.storage.sql
+        .exec("SELECT epoch, revoked_at, reason FROM epoch_revocations ORDER BY epoch ASC")
+        .toArray() as Array<{ epoch: number; revoked_at: number; reason: string }>
+    ).map((r): EpochRevocation => ({ epoch: r.epoch, revokedAt: r.revoked_at, reason: r.reason }));
+    const [{ epoch: currentEpoch }] = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    this.ctx.storage.sql.exec(
+      "UPDATE epoch_history_state SET seqno = seqno + 1 WHERE id = 'authority'",
+    );
+    const [{ seqno }] = this.ctx.storage.sql
+      .exec("SELECT seqno FROM epoch_history_state WHERE id = 'authority'")
+      .toArray() as Array<{ seqno: number }>;
+    const unsigned = {
+      epochs,
+      revocations,
+      currentEpoch,
+      seqno,
+      issuedAt: Math.floor(Date.now() / 1000),
+    };
+
+    const sig = await crypto.subtle.sign(ED25519, signingKey, epochHistoryCanonical(unsigned));
+    return { ...unsigned, signature: btoa(String.fromCharCode(...new Uint8Array(sig))) };
   }
 
   async getEpochPublicKey(epoch: number): Promise<
@@ -4244,11 +4340,35 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * denial-of-service surface with an authentication bug away from being
    * free.
    */
-  async revokeEpoch(): Promise<{ epoch: number; seqno: number }> {
+  async revokeEpoch(reason?: string): Promise<{ epoch: number; seqno: number }> {
     this.#ensureSchema();
-    this.ctx.storage.sql.exec(
-      "UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'",
-    );
+    // The reason is published verbatim in /.well-known/epochs.json, so it is
+    // checked here too, not only at the route: this is an RPC method.
+    const why = normalizeRevocationReason(reason);
+    if (why === null) {
+      throw new Error(
+        "revokeEpoch refused: reason must be 1-200 characters with no control characters; nothing was written",
+      );
+    }
+    this.#ensureEpochHistorySchema();
+    // ONE transaction (notme-6a4f23): the epoch moves and the record of what
+    // ended it commits together, or neither does. A bump without its row
+    // would read as "ended, time unknown" to every verifier.
+    const ended = this.ctx.storage.transactionSync(() => {
+      const [{ epoch: current }] = this.ctx.storage.sql
+        .exec("SELECT epoch FROM state WHERE id = 'authority'")
+        .toArray() as Array<{ epoch: number }>;
+      this.ctx.storage.sql.exec(
+        "UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'",
+      );
+      this.ctx.storage.sql.exec(
+        "INSERT INTO epoch_revocations (epoch, revoked_at, reason) VALUES (?, ?, ?)",
+        current,
+        Math.floor(Date.now() / 1000),
+        why,
+      );
+      return current;
+    });
     // Publish straight away: the bundle is how a verifier learns the epoch
     // moved, so leaving it stale makes the lever a no-op until the next
     // alarm fires — and an alarm is exactly what cannot be relied on here
@@ -4258,7 +4378,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // generation a verifier will actually read.
     const bundle = await this.#publishBundle();
     const { epoch, seqno } = bundle;
-    console.warn({ event: "authority.epoch_revoked", epoch, seqno });
+    console.warn({ event: "authority.epoch_revoked", epoch, seqno, revokedEpoch: ended, reason: why });
     return { epoch, seqno };
   }
 

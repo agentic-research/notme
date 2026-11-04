@@ -432,7 +432,20 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       // takes only a row limit, and returns serials, a reason and a time —
       // what /.well-known/ct-not-delivered.json publishes to anyone, about
       // certificates whose precerts are already in the public log.
-    ).toBe(68);
+      //
+      // 68 → 69: getSignedEpochHistory (notme-6a4f23). Reviewed: it signs a
+      // document of PUBLIC data (the listEpochKeys payload, the revocation
+      // records and the current epoch) with the root, and its only write is
+      // its own seqno counter. Not a signing oracle: the caller supplies no
+      // bytes, and the signing input leads with the domain tag
+      // "notme-epoch-history-v1" under CBOR map key 0, which no CABundle
+      // encoding carries, so the signature cannot pass as a bundle's. A stub
+      // holder can advance the document's seqno, as any GET of epochs.json
+      // does. Also reviewed with it: revokeEpoch() now takes an optional
+      // reason, published verbatim in epochs.json; a stub holder could
+      // already revoke, the reason is bounded (200 chars, no control
+      // characters, checked in the DO), and it adds no capability class.
+    ).toBe(69);
   });
 });
 

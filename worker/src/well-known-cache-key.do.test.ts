@@ -71,7 +71,7 @@ describe("routing.cache.query-ignored", () => {
 
   for (const [path, rpc] of [
     ["/.well-known/jwks.json", "getPublicKeyJwk"],
-    ["/.well-known/epochs.json", "listEpochKeys"],
+    ["/.well-known/epochs.json", "getSignedEpochHistory"],
     ["/.well-known/ct-not-delivered.json", "listNotDeliveredCerts"],
     ["/.well-known/ca-bundle.pem", "getCACertificatePem"],
   ] as const) {
@@ -115,7 +115,7 @@ describe("routing.cache.method-gate", () => {
 
   for (const [path, rpc] of [
     ["/.well-known/jwks.json", "getPublicKeyJwk"],
-    ["/.well-known/epochs.json", "listEpochKeys"],
+    ["/.well-known/epochs.json", "getSignedEpochHistory"],
     ["/.well-known/ct-not-delivered.json", "listNotDeliveredCerts"],
     ["/.well-known/ca-bundle.pem", "getCACertificatePem"],
   ] as const) {

@@ -1,0 +1,29 @@
+{
+  "epochs": [
+    {
+      "epoch": 1,
+      "untilEpoch": 1,
+      "keyId": "417e5d372f6f9878e01d729c499b2d01",
+      "publicRawB64": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+      "retiredAt": 1767229200
+    },
+    {
+      "epoch": 1,
+      "untilEpoch": null,
+      "keyId": "a050837d85070582ccf7394b0988847c",
+      "publicRawB64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "retiredAt": null
+    }
+  ],
+  "revocations": [
+    {
+      "epoch": 1,
+      "revokedAt": 1767232800,
+      "reason": "key compromise suspected"
+    }
+  ],
+  "currentEpoch": 2,
+  "seqno": 42,
+  "issuedAt": 1767236400,
+  "signature": "I8QYlQm+CqJv0Pp44po2Gzsq5EQ1n5em91NbUa+l9lzl45Pp/84ZbSEXsQGVAiCBqKRewp6es6jr3n+00ekuCg=="
+}
