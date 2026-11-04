@@ -22,7 +22,7 @@ import {
   stagingVarKeys,
 } from "../../../scripts/staging-config";
 
-const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const ROOT = fileURLToPath(new URL("../../../", import.meta.url).href);
 const template = readFileSync(join(ROOT, "worker/wrangler.toml.example"), "utf8");
 const workflow = readFileSync(join(ROOT, ".github/workflows/staging-smoke.yml"), "utf8");
 

@@ -323,6 +323,7 @@ describe("adversarial: error message leak", () => {
       scope: "bridgeCert",
       audience: "https://rosary.bot",
       jkt: "test-thumbprint",
+      issuer: "https://auth.notme.bot",
       signingKey,
       keyId: "test-kid",
     });
@@ -362,6 +363,7 @@ describe("adversarial: error message leak", () => {
       sub: "principal:test",
       scope: "bridgeCert",
       audience: "https://rosary.bot",
+      issuer: "https://auth.notme.bot",
       signingKey,
       keyId: "test-kid",
     });
@@ -372,7 +374,7 @@ describe("adversarial: error message leak", () => {
 
     let errorMessage = "";
     try {
-      await verifyAccessToken(tampered, kp.publicKey);
+      await verifyAccessToken(tampered, kp.publicKey, "https://auth.notme.bot");
     } catch (e) {
       errorMessage = (e as Error).message;
     }
@@ -611,7 +613,7 @@ describe("adversarial: scope escalation (additional)", () => {
     const token = `${header}.${payload}.${sigB64}`;
 
     await expect(
-      verifyAccessToken(token, kp.publicKey),
+      verifyAccessToken(token, kp.publicKey, "https://auth.notme.bot"),
     ).rejects.toThrow(/exp/i);
   });
 });

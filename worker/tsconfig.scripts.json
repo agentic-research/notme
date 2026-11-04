@@ -1,8 +1,10 @@
 {
-  // Type-checks the task-cert client (scripts/task-cert/*.ts) and its plain
-  // (non-pool) tests. tsconfig.json excludes __tests__ and does not include
-  // scripts/, and tsconfig.test.json covers only *.do.test.ts, so the client
-  // was never type-checked. Run via `task worker:check`.
+  // Type-checks every plain (non-pool) test under src/__tests__ plus its
+  // helpers and setup files, and the repo-root scripts/ they exercise.
+  // tsconfig.json excludes __tests__, and tsconfig.test.json covers only
+  // *.do.test.ts, so these were transpiled by vitest and never checked
+  // (notme-c071be). A glob, not a list: a new test is covered by default.
+  // Run via `task worker:check`.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "types": ["@cloudflare/workers-types", "node"],
@@ -10,21 +12,8 @@
     "noEmit": true
   },
   "include": [
-    "../scripts/task-cert/**/*.ts",
-    "src/__tests__/task-cert-client.test.ts",
-    "src/__tests__/tier-renewal-binding.test.ts",
-    "src/__tests__/capnp-codegen.test.ts",
-    "src/__tests__/ct-log-client.test.ts",
-    "src/__tests__/verify-ct-log.test.ts",
-    "src/__tests__/criteria.test.ts",
-    "src/__tests__/destination-policy.test.ts",
-    "src/__tests__/authority-host.test.ts",
-    "src/__tests__/invite-link-pages.test.ts",
-    "../scripts/verify-ct-log.ts",
-    "src/__tests__/bundle-canonical.test.ts",
-    "../scripts/fixture-manifest.ts",
-    "../scripts/trust-anchor-freshness.ts",
-    "src/__tests__/trust-anchor-freshness.test.ts"
+    "../scripts/**/*.ts",
+    "src/__tests__/**/*.ts"
   ],
   "exclude": ["node_modules"]
 }

@@ -23,8 +23,8 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const publicDir = fileURLToPath(new URL("../../public/", import.meta.url));
-const workerDir = fileURLToPath(new URL("../../", import.meta.url));
+const publicDir = fileURLToPath(new URL("../../public/", import.meta.url).href);
+const workerDir = fileURLToPath(new URL("../../", import.meta.url).href);
 
 const pages = readdirSync(publicDir)
   .filter((f) => f.endsWith(".html"))

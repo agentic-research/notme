@@ -5,7 +5,7 @@ vi.mock("cloudflare:workers", () => ({
   WorkerEntrypoint: class {},
 }));
 
-const cacheMatch = vi.fn(async () => undefined);
+const cacheMatch = vi.fn(async (_request: Request): Promise<Response | undefined> => undefined);
 const cachePut = vi.fn(async () => undefined);
 vi.stubGlobal("caches", {
   default: {

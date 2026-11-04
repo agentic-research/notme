@@ -29,7 +29,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it } from "vitest";
 
-const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const ROOT = fileURLToPath(new URL("../../../", import.meta.url).href);
 
 const NEW = "11111111-2222-4333-8444-555555555555";
 const PREV = "99999999-8888-4777-8666-555555555555";

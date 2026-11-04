@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { createSessionCookie, verifySessionCookie } from "../auth/session";
 
-const root = fileURLToPath(new URL("../../", import.meta.url));
+const root = fileURLToPath(new URL("../../", import.meta.url).href);
 
 describe("authorize.return-to.validation", () => {
   /**

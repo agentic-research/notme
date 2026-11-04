@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const script = readFileSync(fileURLToPath(new URL("../../../scripts/kek-rehearsal.sh", import.meta.url)), "utf8");
+const script = readFileSync(fileURLToPath(new URL("../../../scripts/kek-rehearsal.sh", import.meta.url).href), "utf8");
 const kidFn = script.split("\n").find((l) => l.startsWith("kid() "));
 
 function kidOf(body: unknown): string {

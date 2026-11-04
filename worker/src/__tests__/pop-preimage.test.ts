@@ -283,7 +283,7 @@ describe("ADR-008 specifies what the verifier implements", () => {
   // renders as a picture, and the correction lived below the HTTP example
   // where a reader copying the diagram never reaches it (notme-bd68f2).
   const adr = readFileSync(
-    fileURLToPath(new URL("../../../docs/design/008-bridge-cert-csr-wimse.md", import.meta.url)),
+    fileURLToPath(new URL("../../../docs/design/008-bridge-cert-csr-wimse.md", import.meta.url).href),
     "utf8",
   );
 

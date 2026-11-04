@@ -43,7 +43,7 @@ import * as x509 from "@peculiar/x509";
 
 const TRUST_DIR = new URL("../../../trust/", import.meta.url);
 const read = (f: string) =>
-  readFileSync(fileURLToPath(new URL(f, TRUST_DIR)), "utf8");
+  readFileSync(fileURLToPath(new URL(f, TRUST_DIR).href), "utf8");
 
 const sha256Hex = async (bytes: ArrayBuffer | Uint8Array) =>
   [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as any))]
@@ -83,7 +83,7 @@ describe("committed root trust anchor (notme-8e8836)", () => {
     // until the committed anchor is refreshed to a root that actually
     // carries the new budget.
     const source = readFileSync(
-      fileURLToPath(new URL("../signing-authority.ts", import.meta.url)),
+      fileURLToPath(new URL("../signing-authority.ts", import.meta.url).href),
       "utf8",
     );
     const declared = source.match(/CA_PATH_LEN\s*=\s*(\d+)/);
