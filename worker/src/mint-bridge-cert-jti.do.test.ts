@@ -129,9 +129,10 @@ describe("mintBridgeCert({kind:'gha-oidc'}) spends the token's jti (notme-f850f2
     // Security review F5. The DO key is the authoritative spend; KV only
     // shortens the window for the KV-only routes, so its failure must not
     // turn a spent token into an exception.
-    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("kv-put-fails"));
+    // Typed loosely: the stub's inferred type is too deep for tsc here.
+    const stub: any = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("kv-put-fails"));
     const token = await gha.token();
-    const [first, second] = await runInDurableObject(stub, async (inst: any) => {
+    const [first, second] = (await (runInDurableObject as any)(stub, async (inst: any) => {
       const kv = inst.env.CA_BUNDLE_CACHE;
       inst.env.CA_BUNDLE_CACHE = {
         get: (k: string) => kv.get(k),
@@ -148,7 +149,7 @@ describe("mintBridgeCert({kind:'gha-oidc'}) spends the token's jti (notme-f850f2
         inst.env.CA_BUNDLE_CACHE = kv;
         vi.restoreAllMocks();
       }
-    });
+    })) as Array<{ ok: boolean; reason?: string }>;
     expect(first.ok).toBe(true);
     // And the DO key still made it single-use.
     expect(second).toEqual({ ok: false, reason: "gha_token_reused" });
