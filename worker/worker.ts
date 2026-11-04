@@ -31,22 +31,12 @@ import { ED25519, type Platform } from "./src/platform";
 // binding holder cannot mint a certificate for an identity it has not
 // proved. No HTTP, no public URL, no CORS, no tokens needed.
 
-// ── Held credentials type ─────────────────────────────────────────────────
-// Per-RPC-session — stored on `this.#heldCerts` so concurrent / sequential
-// callers never see each other's principals. See contract test
-// "authenticate must not leak credentials across RPC sessions".
-type HeldCerts = {
-  mtlsCert: string;
-  signingCert: string;
-  /** Absent when authenticated over a binding: CryptoKey does not serialize. */
-  mtlsKey: CryptoKey | null;
-  signingKey: CryptoKey | null;
-  identity: string;
-  scopes: string[];
-  expiresAt: number;
-  /** CA epoch the certs were issued under; proxy() checks it (notme-baea8c). */
-  epoch: number;
-};
+// ── Held credentials ──────────────────────────────────────────────────────
+// Live on the AuthSession that authenticate() returns (notme-153f03), not on
+// AuthService: over a binding every top-level call is a fresh AuthService, so
+// `this` held nothing for the next call. See src/auth/auth-session.ts.
+import { AuthSession, type HeldCerts } from "./src/auth/auth-session";
+import { IsolateRateLimiter } from "./src/isolate-rate-limiter";
 
 // Audience allowlist — every endpoint that mints an access token must check
 // the requested audience against this set. Hoisted to module scope so /token
@@ -65,14 +55,6 @@ import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/crit
 import { buildInfo, disclosedVersionId } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
 import { clientIpBucket } from "./src/client-ip-key";
-import {
-  authoritySelfHosts,
-  forwardableHeaders,
-  isAllowedDestination,
-  isDeniedDestination,
-  parseDestinationAllowlist,
-  urlForLog,
-} from "./src/destination-policy";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -272,19 +254,29 @@ export class JwtSigner extends WorkerEntrypoint<any> {
 /** How long an authChallenge() challenge is good for (notme-fbbfbc). */
 const AUTH_CHALLENGE_TTL_S = 60;
 
+/**
+ * authChallenge()'s limiter when no CERT_LIMITER binding exists (notme-153f03):
+ * the binding's 10 / 60 s, counted in THIS isolate only. Module scope on
+ * purpose — a field on AuthService would reset with every binding call.
+ */
+const AUTH_CHALLENGE_FALLBACK_LIMITER = new IsolateRateLimiter({ limit: 10, periodSeconds: 60 });
+
+/**
+ * The cap shared by EVERY props-less caller in this isolate (review M1):
+ * 60 / 60 s, six identities' worth. Props-less callers are bucketed per
+ * claimed identity so one cannot drain another's budget; this bounds how
+ * many nonce rows they can make the authority write between them, since
+ * the identity is the caller's to choose. Per-isolate, like the fallback.
+ */
+const AUTH_CHALLENGE_NOPROPS_SHARED_CAP = new IsolateRateLimiter({ limit: 60, periodSeconds: 60 });
+
 export class AuthService extends WorkerEntrypoint<any> {
-  // RPC-session-scoped credentials. WorkerEntrypoint creates a fresh `this`
-  // per RPC session in workerd, so this field is naturally per-caller.
-  // DO NOT hoist to module scope — see notme/worker review Finding 1.
-  // `#`-private, NOT TypeScript `private`: this class is RPC-reachable, and
-  // TS `private` is erased at build time, so the field would stay readable on
-  // any stub someone obtains. The runtime mitigations are real — workerd gives
-  // a fresh `this` per RPC session, so a caller sees only their own, and
-  // workerd's serializer refuses CryptoKey (measured by
-  // rpc.cryptokey.isolation; note this is a WORKERD behaviour, not the W3C
-  // one — CryptoKey is `[Serializable]` in the IDL, notme-bcbd74) — but they
-  // are properties of the RUNTIME, not of the declaration (notme-2154b8).
-  #heldCerts: HeldCerts | null = null;
+  // NO credential state on this class (notme-153f03). Each top-level binding
+  // call gets a fresh `this`, so a field here cannot carry anything from
+  // authenticate() to the next call; the verified certs live on the
+  // AuthSession authenticate() returns. Anything this class does declare must
+  // be ECMAScript `#private`: TS `private` is erased and stays callable and
+  // readable over RPC (notme-2154b8).
 
   /**
    * ECMAScript #private, NOT TypeScript `private`.
@@ -410,6 +402,49 @@ export class AuthService extends WorkerEntrypoint<any> {
     if (typeof identity !== "string" || !identity || identity.length > 1024) {
       throw new Error("identity required — the WIMSE identity of the certs you will present");
     }
+    // Throttled before the DO is touched (notme-153f03): any binding holder
+    // can call this unauthenticated, and each call writes one nonce row.
+    //
+    // Keyed by the calling binding's `props`, NOT by `identity`. The identity
+    // is whatever the caller types — keyed on it, a flood rotates names and
+    // never meets the limit. `props` is set per binding by the operator, so
+    // the caller cannot change its own bucket, and a noisy binding exhausts
+    // only its own budget. EVERY agent binding should set props.
+    //
+    // Without props (review M1) a single `null` bucket let one agent lock
+    // out every peer. Props-less calls are bucketed per CLAIMED identity
+    // instead (`authchallenge:null:id:<identity>`, on the same limiter), so
+    // identity A draining its budget does not refuse identity B, AND they
+    // spend AUTH_CHALLENGE_NOPROPS_SHARED_CAP, so rotating identities cannot
+    // make the authority write rows without bound. The identity bucket is
+    // checked first: a caller hammering its own exhausted identity never
+    // reaches the shared cap. A rotating flood can still exhaust the shared
+    // cap and, with it, every props-less caller — which is why props matter.
+    //
+    // CERT_LIMITER (10 / 60 s per key, wrangler.toml.example) is reused under
+    // its own `authchallenge:` prefix, as TOKEN_LIMITER carries `token:` and
+    // `token-ip:`: a key prefix is a separate counter, so this cannot spend a
+    // repository's /cert/gha budget. One authenticate() needs one challenge,
+    // and a bridge cert lives five minutes, so ten a minute is generous.
+    //
+    // Unbound (self-hosted workerd: config.capnp binds no limiter), it does
+    // NOT fail open the way the HTTP routes' limiters do: the same 10 / 60 s
+    // is enforced by AUTH_CHALLENGE_FALLBACK_LIMITER, in this isolate's
+    // memory. That is per-isolate — each isolate counts on its own — which
+    // on one workerd process is the whole service.
+    const limiter = this.env.CERT_LIMITER ?? AUTH_CHALLENGE_FALLBACK_LIMITER;
+    const props = this.#props();
+    const refused = () =>
+      new Error("rate limited — too many authChallenge() calls from this binding; retry in a minute");
+    if (props !== undefined && props !== null) {
+      const { success } = await limiter.limit({ key: `authchallenge:${JSON.stringify(props)}` });
+      if (!success) throw refused();
+    } else {
+      const { success } = await limiter.limit({ key: `authchallenge:null:id:${identity}` });
+      if (!success) throw refused();
+      const shared = await AUTH_CHALLENGE_NOPROPS_SHARED_CAP.limit({ key: "authchallenge:null" });
+      if (!shared.success) throw refused();
+    }
     const issuedAt = Math.floor(Date.now() / 1000);
     const { nonce } = await this.#getAuthority().issuePopNonce(this.#challengeKey(identity, issuedAt));
     return { challenge: `${issuedAt}.${nonce}`, expires_in: AUTH_CHALLENGE_TTL_S };
@@ -417,14 +452,25 @@ export class AuthService extends WorkerEntrypoint<any> {
 
   /** The PoP-nonce principal key a challenge lives under. */
   #challengeKey(identity: string, issuedAt: number): string {
-    // ctx.props is set per binding by the operator; absent in-isolate.
-    const props = (this.ctx as { props?: unknown } | null | undefined)?.props;
-    return `authsvc:v1:${issuedAt}:${JSON.stringify(props ?? null)}:${identity}`;
+    return `authsvc:v1:${issuedAt}:${JSON.stringify(this.#props() ?? null)}:${identity}`;
+  }
+
+  /** ctx.props is set per binding by the operator; absent in-isolate. */
+  #props(): unknown {
+    return (this.ctx as { props?: unknown } | null | undefined)?.props;
   }
 
   /**
-   * Hold a bridge cert pair for proxy()/sign(), once the caller has PROVED it
-   * holds both private keys (notme-fbbfbc).
+   * Verify a bridge cert pair and the caller's possession of both private
+   * keys (notme-fbbfbc), and RETURN an `AuthSession` holding them
+   * (notme-153f03). proxy(), sign() and identity() are the session's methods.
+   *
+   * Over a binding the caller gets a stub to the session, and the session
+   * lives until that stub is disposed (`using session = await
+   * env.NOTME.authenticate(...)`, or `session[Symbol.dispose]()`) or the
+   * caller's execution context ends. Nothing is stored on this AuthService:
+   * each top-level binding call is a fresh instance, which is why storing
+   * the certs on `this` never worked over a binding.
    *
    * `identity`, `scopes` and `expiresAt` are NOT parameters, deliberately
    * (notme-6ad276): they are DERIVED from the CA-signed certs.
@@ -439,39 +485,28 @@ export class AuthService extends WorkerEntrypoint<any> {
    * proofs here. They are checked with the same verifyPopProofs /cert uses,
    * against the public keys IN THE CERTS; the challenge is then spent.
    *
-   * `mtlsKey` / `signingKey` are optional: workerd cannot serialize a
-   * CryptoKey over RPC (`rpc.cryptokey.isolation`), so a binding caller
-   * cannot send them. Without `signingKey`, sign() refuses.
+   * No private key is taken, in any form (notme-153f03). Private keys are
+   * never exported, and a CryptoKey cannot cross a binding anyway
+   * (`rpc.cryptokey.isolation`). The session keeps the signing cert's
+   * PUBLIC key; `session.sign()` calls back to a signer the caller passes
+   * and returns its signature only if it verifies under that key.
    *
    * @throws on a CA, validity, pairing or epoch failure; on a missing,
    *         malformed, expired, replayed or wrongly-bound challenge; or on a
-   *         failed proof. On throw the session holds nothing.
+   *         failed proof. On throw no session exists.
    */
   async authenticate(creds: {
     mtlsCert: string;
     signingCert: string;
     challenge: string;
     proofs: { mtls: string; signing: string };
-    mtlsKey?: CryptoKey;
-    signingKey?: CryptoKey;
-  }) {
-    // Clear first: a failed authenticate() must not leave the previous
-    // identity in place looking like it succeeded.
-    this.#heldCerts = null;
-
-    const { deriveCredentialsFromCerts } =
-      await import("./src/auth/derive-credentials");
-    const authority = this.#getAuthority();
-    const caPublicKeyPem = await authority.getPublicKeyPem();
-
-    const derived = await deriveCredentialsFromCerts(
-      creds.signingCert,
-      creds.mtlsCert,
-      caPublicKeyPem,
-    );
-
+  }): Promise<AuthSession> {
     // The challenge: present, well-formed, and young. Its age is checked
     // here; that the timestamp is genuine is checked by the consume below.
+    // FIRST, because it is free (review I3): it reads only the caller's own
+    // string, so a junk call is refused before it costs a DO RPC or an X.509
+    // parse. Safe to move: nothing it decides depends on the certs, and the
+    // challenge is still spent only after every other check passes.
     const m = /^(\d{1,12})\.([A-Za-z0-9_-]{16,128})$/.exec(
       typeof creds.challenge === "string" ? creds.challenge : "",
     );
@@ -484,6 +519,17 @@ export class AuthService extends WorkerEntrypoint<any> {
       throw new Error("challenge expired — request a new one");
     }
 
+    const { deriveCredentialsFromCerts } =
+      await import("./src/auth/derive-credentials");
+    const authority = this.#getAuthority();
+    const caPublicKeyPem = await authority.getPublicKeyPem();
+
+    const derived = await deriveCredentialsFromCerts(
+      creds.signingCert,
+      creds.mtlsCert,
+      caPublicKeyPem,
+    );
+
     // Possession, against the keys the CERTS carry.
     const { X509Certificate } = await import("@peculiar/x509");
     const { importPublicKey } = await import("./src/cert-authority");
@@ -493,10 +539,11 @@ export class AuthService extends WorkerEntrypoint<any> {
       `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...der))}\n-----END PUBLIC KEY-----`;
     const mtlsSpki = spkiOf(creds.mtlsCert);
     const signingSpki = spkiOf(creds.signingCert);
+    const signingPublicKey = await importPublicKey(toPem(signingSpki));
     const pop = await verifyPopProofs(
       await authenticateBinding(mtlsSpki, signingSpki, creds.challenge),
       await importPublicKey(toPem(mtlsSpki)),
-      await importPublicKey(toPem(signingSpki)),
+      signingPublicKey,
       creds.proofs ?? {},
     );
     if (!pop.ok) {
@@ -510,253 +557,40 @@ export class AuthService extends WorkerEntrypoint<any> {
       throw new Error("challenge unknown, already used, or issued for another identity");
     }
 
-    this.#heldCerts = {
+    const held: HeldCerts = {
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
-      mtlsKey: creds.mtlsKey ?? null,
-      signingKey: creds.signingKey ?? null,
+      signingPublicKey,
       identity: derived.identity,
       scopes: derived.scopes,
       expiresAt: derived.expiresAt,
       epoch: derived.epoch,
     };
-  }
-
-  /**
-   * Proxy an HTTP request for the agent Worker, which calls this instead of
-   * fetch() (which is disabled). Gates, in order (notme-baea8c):
-   *   1. held certs present and unexpired;
-   *   2. destination parses, and is not on the metadata denylist;
-   *   3. destination on PROXY_ALLOWED_DESTINATIONS — unset allows nothing —
-   *      and not the authority's own host unless that is listed exactly;
-   *   4. `bridgeCert` scope held;
-   *   5. the held certs' epoch equals the authority's current epoch, so a
-   *      revokeEpoch() or rotate() stops them before they expire (an RPC
-   *      failure here refuses).
-   * Every outcome writes one audit line whose `allowed` is the decision and,
-   * on a refusal, `reason` names the gate; the logged URL is redacted.
-   * Redirects are returned, not followed: a followed redirect would let a
-   * listed host send the request to one the allowlist refuses. Host, cf-*,
-   * x-forwarded-* and hop-by-hop headers are not forwarded.
-   *
-   * The outbound request is a plain fetch — the held P-256 cert is NOT
-   * attached (no mTLS on this path). Workers present a client certificate
-   * only through an `mtls_certificates` binding to a cert uploaded ahead of
-   * time, not one minted per session; ADR-009 records why that stays "Not
-   * yet".
-   */
-  async proxy(request: {
-    url: string;
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-  }): Promise<{
-    status: number;
-    headers: Record<string, string>;
-    body: string;
-  }> {
-    const start = Date.now();
-    const method = request.method || "GET";
-    const audit = (fields: Record<string, unknown>) =>
-      // Structured JSON, feeds into APAS attestations.
-      console.log(
-        JSON.stringify({
-          ts: new Date().toISOString(),
-          type: "proxy",
-          identity: this.#heldCerts?.identity ?? null,
-          // Redacted and bounded (review F8): no userinfo, no query values.
-          destination: urlForLog(request.url),
-          method: String(method).slice(0, 16),
-          scope_checked: "bridgeCert",
-          ...fields,
-          duration_ms: Date.now() - start,
-        }),
-      );
-    const deny = (reason: string, message: string): never => {
-      audit({ allowed: false, reason });
-      throw new Error(message);
-    };
-
-    const held = this.#heldCerts;
-    if (!held) {
-      return deny("not_authenticated", "not authenticated — call authenticate() first");
-    }
-    if (held.expiresAt <= Math.floor(Date.now() / 1000)) {
-      return deny("credentials_expired", "credentials expired — re-authenticate");
-    }
-
-    // Destination: parseable, then the hard denylist, then the configured
-    // allowlist, then never the authority itself unless listed exactly.
-    let destHost: string;
-    try {
-      destHost = new URL(request.url).host.toLowerCase();
-    } catch {
-      return deny("destination_invalid", "destination invalid — not a parseable URL");
-    }
-    if (isDeniedDestination(request.url)) {
-      return deny("destination_denied", "destination denied — cloud metadata endpoints are blocked");
-    }
-    const allowlist = parseDestinationAllowlist(this.env.PROXY_ALLOWED_DESTINATIONS);
-    if (!isAllowedDestination(request.url, allowlist)) {
-      return deny(
-        "destination_not_allowed",
-        "destination not allowed — not on PROXY_ALLOWED_DESTINATIONS (https only; an unset allowlist allows nothing)",
-      );
-    }
-    if (authoritySelfHosts(this.env).has(destHost) && !allowlist.has(destHost)) {
-      return deny(
-        "destination_self",
-        "destination not allowed — the authority's own host is proxied only when PROXY_ALLOWED_DESTINATIONS lists it exactly",
-      );
-    }
-
-    // Scope check
-    if (!held.scopes.includes("bridgeCert")) {
-      return deny("scope_insufficient", "scope insufficient — bridgeCert required for proxy");
-    }
-
-    // Epoch: the revocation lever. Last, because it is the one gate that
-    // costs an authority RPC.
-    let epoch: number;
-    try {
-      ({ epoch } = await this.#getAuthority().getAuthorityState());
-    } catch {
-      return deny("authority_unavailable", "authority unavailable — cannot check the credentials' epoch");
-    }
-    if (held.epoch !== epoch) {
-      return deny(
-        "epoch_mismatch",
-        `credentials revoked — cert epoch ${held.epoch} is not the authority's epoch ${epoch}; re-authenticate`,
-      );
-    }
-
-    // Make the request
-    let res: Response;
-    try {
-      res = await fetch(request.url, {
-        method,
-        // Host, cf-*, x-forwarded-* and hop-by-hop headers stripped (F6).
-        headers: forwardableHeaders(request.headers),
-        body: request.body,
-        redirect: "manual",
-      });
-    } catch (e) {
-      // Allowed, and attempted: the record says so, and why it has no status.
-      audit({ allowed: true, error: (e as Error)?.message ?? String(e) });
-      throw e;
-    }
-
-    const responseHeaders: Record<string, string> = {};
-    res.headers.forEach((v, k) => {
-      responseHeaders[k] = v;
+    // The epoch is read through env on each proxy()/sign() call rather than through
+    // this call's DO stub, so the session does not lean on an I/O object
+    // belonging to the authenticate() call that created it.
+    const env = this.env;
+    return new AuthSession(held, {
+      env,
+      authorityState: () =>
+        env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default")).getAuthorityState(),
     });
-    let body: string;
-    try {
-      body = await res.text();
-    } catch (e) {
-      // Sent and answered, but the body failed: still one line (review F7).
-      audit({ allowed: true, response_status: res.status, error: (e as Error)?.message ?? String(e) });
-      throw e;
-    }
-
-    audit({ allowed: true, response_status: res.status });
-
-    return { status: res.status, headers: responseHeaders, body };
   }
 
-  /**
-   * Sign data with the held Ed25519 signing key.
-   * Returns the signature + the signing cert (public) + the WIMSE identity.
+
+  /*
+   * proxy(), sign() AND identity() WERE HERE AND ARE NOW ON AuthSession
+   * (notme-153f03, src/auth/auth-session.ts).
+   *
+   * They read credentials authenticate() had stored on `this`. Over a service
+   * binding each top-level call is a fresh AuthService instance, so the
+   * credentials were gone by the next call: proxy() and sign() refused
+   * everything, and identity() answered "not authenticated" to a caller that
+   * had just authenticated. authenticate() now returns the session holding
+   * them, and these are its methods. Removed here rather than left to refuse:
+   * a method that can only ever say "call the other thing" is surface with
+   * nothing behind it, and calling a name that is not there already fails.
    */
-  async sign(
-    payload: ArrayBuffer,
-    format: "raw" | "dsse" | "git-commit" = "raw",
-  ): Promise<{
-    signature: ArrayBuffer;
-    certificate: string;
-    identity: string;
-  }> {
-    if (!this.#heldCerts) {
-      throw new Error("not authenticated — call authenticate() first");
-    }
-
-    // Scope check for signing
-    const signingScopes = ["sign:git", "sign:attestation"];
-    const hasSignScope =
-      format === "raw"
-        ? true // raw signing doesn't require a specific scope
-        : this.#heldCerts.scopes.some((s) => signingScopes.includes(s));
-    if (!hasSignScope) {
-      throw new Error(
-        `scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`,
-      );
-    }
-
-    if (!this.#heldCerts.signingKey) {
-      throw new Error("no signing key held — authenticate() in-isolate with signingKey to sign");
-    }
-    const signature = await crypto.subtle.sign(
-      ED25519,
-      this.#heldCerts.signingKey,
-      payload,
-    );
-
-    // Audit log
-    const payloadHash = Array.from(
-      new Uint8Array(await crypto.subtle.digest("SHA-256", payload)),
-    )
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        type: "sign",
-        identity: this.#heldCerts.identity,
-        format,
-        payload_hash: `sha256:${payloadHash}`,
-        scope_checked:
-          format === "raw"
-            ? "none"
-            : signingScopes.find((s) => this.#heldCerts!.scopes.includes(s)),
-        allowed: true,
-      }),
-    );
-
-    return {
-      signature,
-      certificate: this.#heldCerts.signingCert,
-      identity: this.#heldCerts.identity,
-    };
-  }
-
-  /** Get current identity and capabilities. */
-  async identity(): Promise<{
-    identity: string;
-    scopes: string[];
-    certificates: { mtls: string; signing: string };
-    expires_at: number;
-    authenticated: boolean;
-  }> {
-    if (!this.#heldCerts) {
-      return {
-        identity: "",
-        scopes: [],
-        certificates: { mtls: "", signing: "" },
-        expires_at: 0,
-        authenticated: false,
-      };
-    }
-    return {
-      identity: this.#heldCerts.identity,
-      scopes: this.#heldCerts.scopes,
-      certificates: {
-        mtls: this.#heldCerts.mtlsCert,
-        signing: this.#heldCerts.signingCert,
-      },
-      expires_at: this.#heldCerts.expiresAt,
-      authenticated: true,
-    };
-  }
 }
 
 // ── auth.notme.bot/cert/gha — GitHub Actions OIDC → bridge cert exchange ──

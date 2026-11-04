@@ -56,6 +56,11 @@ export const baseMiniflare = {
     // Production and e2e default it off (wrangler.toml.example,
     // wrangler.e2e.toml); tier-generation.do.test.ts covers off.
     RENEWAL_BINDING_V3: "on",
+    // The one host AuthSession.proxy() may reach in this pool, so
+    // auth-binding-session.do.test.ts can drive proxy() over a real binding
+    // (notme-153f03). A reserved `.test` name: the suite stubs fetch, and the
+    // no-network guard refuses it if anything forgets to.
+    PROXY_ALLOWED_DESTINATIONS: "proxy-dest.notme.test",
     // Forwarded from the shell so ct-full-cycle.do.test.ts can be
     // pointed at a locally running transparency log. `env` in this pool
     // is the MINIFLARE binding set, not process.env, so a bare shell

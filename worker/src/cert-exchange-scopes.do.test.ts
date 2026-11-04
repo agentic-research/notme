@@ -11,7 +11,7 @@
  *
  * /cert applies no such filter — it intersects the request against the
  * SESSION's own scopes — so the same admin session yields a cert carrying
- * both, one route over. Inert inside this repo (AuthService.proxy checks only
+ * both, one route over. Inert inside this repo (AuthSession.proxy checks only
  * bridgeCert) but not outside it: gen/go/verify parses oidScopes into
  * Identity.Scopes for downstream authorization.
  *

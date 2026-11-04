@@ -67,7 +67,7 @@ const notmeWorker :Workerd.Worker = (
     ( name = "GHA_ALLOWED_OWNERS",
       text = "agentic-research",
     ),
-    # Where AuthService.proxy() may send an agent's requests (ADR-009,
+    # Where AuthSession.proxy() may send an agent's requests (ADR-009,
     # notme-baea8c): comma-separated hosts, `*.suffix` for subdomains, https
     # only. Unset allows NOTHING, so proxy() refuses every destination until
     # this is set. List only what agents need; never a wildcard over the
