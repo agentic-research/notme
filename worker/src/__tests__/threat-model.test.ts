@@ -611,9 +611,8 @@ describe("contract.gha-oidc.fork-pr-boundary", () => {
   // (b) we re-document the assumption as "use branch protection + required
   // reviewers, not server-side filtering". Either resolution is a
   // deliberate decision — that's the point of the test.
-  it.todo(
-    "server rejects GHA OIDC tokens whose event_name is pull_request_target (needs handleCertGHA filter)",
-  );
+  // The server half is enforced now (notme-fbb00e): validateGHAToken and
+  // verifyOIDC refuse GHA_REJECTED_EVENTS — gha-rejected-events.do.test.ts.
   it.todo(
     "consumer Action refuses to run on pull_request_target context (needs guard in action/src/index.ts)",
   );

@@ -4,8 +4,26 @@
 // Spec: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect
 
 import { z } from "zod";
+import { GHA_REJECTED_EVENTS } from "@notme/contract";
 
-const GHA_ISSUER = "https://token.actions.githubusercontent.com";
+export const GHA_ISSUER = "https://token.actions.githubusercontent.com";
+
+/**
+ * Refuse a token minted for a GHA_REJECTED_EVENTS run (notme-fbb00e).
+ *
+ * `@notme/contract` says those tokens "MUST NOT receive a notme bridge
+ * cert" and nothing read `event_name`. `pull_request_target` runs FORK code
+ * in the UPSTREAM context, so its token names the upstream owner and clears
+ * GHA_ALLOWED_OWNERS; `pull_request` is listed so its refusal is loud too.
+ * Only GitHub-signed claims reach this, so the value is trustworthy. A token
+ * with no `event_name` is not refused here: GitHub always sets it, and the
+ * contract names events to reject, not ones to require.
+ */
+export function assertGhaEventAllowed(eventName: unknown): void {
+  if (typeof eventName === "string" && (GHA_REJECTED_EVENTS as readonly string[]).includes(eventName)) {
+    throw new Error(`event_name ${eventName} is not accepted (GHA_REJECTED_EVENTS)`);
+  }
+}
 const JWKS_URL = `${GHA_ISSUER}/.well-known/jwks`;
 const JWKS_TTL_MS = 60 * 60 * 1000; // 1 hour
 
@@ -137,6 +155,9 @@ export async function validateGHAToken(
     signingInput,
   );
   if (!valid) throw new Error("invalid signature");
+
+  // Fork-PR events buy nothing, on every path that calls this (notme-fbb00e).
+  assertGhaEventAllowed(rawPayload.event_name);
 
   // Zod parse — strong type guarantee on returned claims
   const parsed = GHAClaimsSchema.safeParse(rawPayload);

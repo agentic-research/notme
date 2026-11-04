@@ -4,6 +4,7 @@
 import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
 import { base64urlDecode } from "@agentic-research/dpop";
 import { OID_EPOCH } from "../cert-authority";
+import { assertGhaEventAllowed, GHA_ISSUER as GHA_OIDC_ISSUER } from "../gha-oidc";
 
 export interface VerifiedIdentity {
   type: "oidc" | "x509";
@@ -204,6 +205,12 @@ export async function verifyOIDC(
     signingInput,
   );
   if (!valid) throw new Error("invalid signature");
+
+  // GitHub Actions tokens from fork-PR events buy nothing (notme-fbb00e):
+  // the same rule validateGHAToken enforces, here for the routes that take a
+  // GitHub token through this verifier (/cert oidc, /join, /auth/oidc/login).
+  // After the signature, so the claim is GitHub-signed.
+  if (iss === GHA_OIDC_ISSUER) assertGhaEventAllowed(payload.event_name);
 
   return {
     type: "oidc",
