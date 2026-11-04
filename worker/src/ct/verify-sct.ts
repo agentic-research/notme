@@ -136,6 +136,23 @@ export function spkiOf(certDer: Uint8Array): Uint8Array {
 }
 
 /**
+ * The certificate's serial number as lowercase hex, without the DER sign
+ * byte: a leading 0x00 that only keeps the INTEGER positive is dropped, so the
+ * value matches `openssl x509 -serial` and what CT monitors display (case
+ * aside). Used to name a certificate that was signed and never delivered
+ * (notme-b35676). Throws on a certificate it cannot parse.
+ */
+export function serialOf(certDer: Uint8Array): string {
+  const f = tbsFields(certDer);
+  // [0] version is optional; serial is the first field after it.
+  const s = f[f[0]!.tag === 0xa0 ? 1 : 0];
+  if (!s || s.tag !== 0x02) throw new Error("DER: no serial INTEGER");
+  let bytes = certDer.subarray(s.body, s.end);
+  if (bytes.length > 1 && bytes[0] === 0x00 && (bytes[1]! & 0x80) !== 0) bytes = bytes.subarray(1);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
  * The certificate's notAfter, in ms since the epoch (notme-afa9d8: the CT
  * shard is chosen by it). RFC 5280 §4.1.2.5: UTCTime `YYMMDDHHMMSSZ` (YY ≥ 50
  * is 19YY) or GeneralizedTime `YYYYMMDDHHMMSSZ`. Throws on anything else.

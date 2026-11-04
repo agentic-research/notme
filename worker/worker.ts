@@ -4472,6 +4472,35 @@ export default {
         if (served) return served;
       }
 
+      // GET /.well-known/ct-not-delivered.json — serials the authority signed
+      // and never delivered (notme-b35676). A CT monitor sees every precert
+      // in the log; a few belong to certificates nobody received (a mint
+      // refused after the log wait and retried under new serials, or a tier
+      // collect whose claim was taken over). This is how it tells them apart.
+      //
+      // Unauthenticated, like epochs.json and jwks.json: the serials are
+      // already in the public log, and a monitor is not a principal. Only the
+      // reason and time are new, and they disclose no subject or key.
+      if (pathname === "/.well-known/ct-not-delivered.json") {
+        const served = await serveCachedPublic(request, async () => {
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const notDelivered = await authority.listNotDeliveredCerts();
+          return Response.json(
+            { notDelivered },
+            {
+              headers: {
+                // The list only grows; a copy a minute old is incomplete,
+                // never wrong.
+                "Cache-Control": "public, max-age=60",
+                "Access-Control-Allow-Origin": "*",
+              },
+            },
+          );
+        });
+        if (served) return served;
+      }
+
       if (pathname === "/.well-known/jwks.json") {
         const served = await serveCachedPublic(request, async () => {
           try {

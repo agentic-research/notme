@@ -15,7 +15,7 @@ import {
   SHARD_WARN_DAYS,
   type CtShard,
 } from "../ct/shards";
-import { notAfterOf } from "../ct/verify-sct";
+import { notAfterOf, serialOf } from "../ct/verify-sct";
 
 function logKey(): { log_id: string; key: string } {
   const spki = generateKeyPairSync("ec", { namedCurve: "P-256" }).publicKey.export({
@@ -170,6 +170,37 @@ describe("notAfterOf — the certificate's own notAfter", () => {
 
   it("throws on bytes that are not a certificate", () => {
     expect(() => notAfterOf(new Uint8Array([0x30, 0x03, 0x02, 0x01, 0x00]))).toThrow();
+  });
+});
+
+describe("serialOf — the serial a CT monitor sees (notme-b35676)", () => {
+  async function cert(serialNumber: string): Promise<x509.X509Certificate> {
+    const alg = { name: "ECDSA", namedCurve: "P-256", hash: "SHA-256" };
+    const keys = (await crypto.subtle.generateKey(alg, true, ["sign", "verify"])) as CryptoKeyPair;
+    return x509.X509CertificateGenerator.createSelfSigned({
+      serialNumber,
+      name: "CN=t",
+      notBefore: new Date("2026-01-01T00:00:00Z"),
+      notAfter: new Date("2027-01-01T00:00:00Z"),
+      keys,
+      signingAlgorithm: alg,
+    });
+  }
+
+  it("reads the serial as lowercase hex", async () => {
+    const c = await cert("1a2b3c4d5e6f");
+    expect(serialOf(new Uint8Array(c.rawData))).toBe("1a2b3c4d5e6f");
+  });
+
+  it("drops the DER sign byte, as openssl and CT monitors do", async () => {
+    // A high first byte is encoded 00 f1 ...; the serial is f1 ...
+    const c = await cert("f1e2d3c4b5a69788");
+    expect(serialOf(new Uint8Array(c.rawData))).toBe("f1e2d3c4b5a69788");
+    expect(c.serialNumber.toLowerCase().replace(/^00/, "")).toBe("f1e2d3c4b5a69788");
+  });
+
+  it("throws on bytes that are not a certificate", () => {
+    expect(() => serialOf(new Uint8Array([0x30, 0x03, 0x02, 0x01, 0x00]))).toThrow();
   });
 });
 

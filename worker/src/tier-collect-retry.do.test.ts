@@ -20,8 +20,10 @@
  */
 import worker from "../worker";
 import { env, runInDurableObject } from "cloudflare:test";
+import { X509Certificate } from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
 import { createSessionCookie } from "./auth/session";
+import { serialOf } from "./ct/verify-sct";
 import { ED25519 } from "./platform";
 import type { SigningAuthority } from "./signing-authority";
 
@@ -202,5 +204,60 @@ describe("a tier mint failure at collect (notme-d06b7b)", () => {
       expect(calls).toBe(2);
       expect(status(state, e.hash)).toBe("active");
     });
+  });
+
+  it("ct.not-delivered.takeover: the taken-over minter's certificate is recorded as not delivered; the reclaimer's is not (notme-b35676)", async () => {
+    // The loser's certificate was signed, and with CT bound was logged or
+    // backlogged, but nobody receives it. A monitor must be able to tell.
+    const e = await approvedEnrolment();
+    await runInDurableObject(authority(), async (inst, state) => {
+      const auth = inst as SigningAuthority;
+      const real = auth.mintIssuingCa.bind(auth);
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let calls = 0;
+      const minted: string[] = [];
+      const mint = (async (p) => {
+        const n = ++calls;
+        const out = await real(p);
+        minted[n - 1] = out.certificate;
+        if (n === 1) await gate;
+        return out;
+      }) as Mint;
+      const { loser, winner } = await withMint(auth, mint, async () => {
+        const slow = auth.collectTierEnrolment({ deviceCode: e.deviceCode, proof: e.proof });
+        await new Promise((r) => setTimeout(r, 50));
+        state.storage.sql.exec(
+          "UPDATE tier_enrolments SET collect_started_at = collect_started_at - 3600 WHERE device_code_hash = ?",
+          e.hash,
+        );
+        const reclaimed = await auth.collectTierEnrolment({ deviceCode: e.deviceCode, proof: e.proof });
+        release();
+        return { loser: await slow, winner: reclaimed };
+      });
+      expect(loser).toEqual({ ok: false, reason: "invalid_grant" });
+      expect(winner.ok).toBe(true);
+      const serial = (pem: string) => serialOf(new Uint8Array(new X509Certificate(pem).rawData));
+      const loserSerial = serial(minted[0]!);
+      const winnerSerial = serial(winner.ok ? winner.certificate : "");
+      expect(loserSerial).not.toBe(winnerSerial);
+
+      const list = await auth.listNotDeliveredCerts();
+      const row = list.find((x) => x.serial === loserSerial);
+      expect(row, "the discarded certificate's serial is not recorded").toBeDefined();
+      expect(row!.reason).toBe("claim_taken_over");
+      expect(list.map((x) => x.serial)).not.toContain(winnerSerial);
+    });
+
+    // ...and a monitor can read it with no credential, read-only.
+    const url = "/.well-known/ct-not-delivered.json";
+    const get = await (worker.fetch as (r: Request, e: unknown) => Promise<Response>)(
+      new Request(`${ORIGIN}${url}`),
+      { ...env, ...LOCAL_ENV },
+    );
+    expect(get.status).toBe(200);
+    const body = (await get.json()) as { notDelivered: Array<{ serial: string; reason: string }> };
+    expect(body.notDelivered.some((x) => x.reason === "claim_taken_over")).toBe(true);
+    expect((await post(url, {})).status).toBe(405);
   });
 });

@@ -47,7 +47,7 @@ const config :Workerd.Config = (
 );
 
 const notmeWorker :Workerd.Worker = (
-  compatibilityDate = "2026-03-01",
+  compatibilityDate = "2026-07-21",
   compatibilityFlags = ["nodejs_compat"],
 
   modules = [

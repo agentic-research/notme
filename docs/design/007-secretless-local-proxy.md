@@ -399,7 +399,7 @@ Every endpoint gets a "try to hack it" test alongside the happy path. Tests are 
 - `worker/src/__tests__/platform.test.ts` — Platform detection + validation tests
 - `worker/e2e/contract.spec.ts` — Playwright e2e contract tests with virtual authenticator
 - `worker/test-local.sh` — workerd smoke test script
-- `worker/test-e2e.sh` — Playwright e2e runner (starts workerd, extracts bootstrap code)
+- `worker/test-e2e.sh` — Playwright e2e runner (starts workerd with a generated BOOTSTRAP_CODE binding)
 - `packages/melange-notme-app.yaml` — Melange package for worker bundle + config
 
 ### Modified files

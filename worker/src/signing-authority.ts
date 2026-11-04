@@ -43,7 +43,7 @@ import {
   postPreChain,
   type SubmitResult,
 } from "./ct/log-client";
-import { notAfterOf, precertTbs, spkiOf, verifySct } from "./ct/verify-sct";
+import { notAfterOf, precertTbs, serialOf, spkiOf, verifySct } from "./ct/verify-sct";
 import { parseShards, selectShard, shardEndHealth, type CtShard } from "./ct/shards";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 import {
@@ -605,6 +605,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * Cached per DO instance because HKDF runs on every call otherwise and
    * `ensureKeys` is on the hot path for every sign. Null is a real answer, not
    * a failure: `cf-managed` and `ephemeral` both legitimately have no KEK.
+   * A failed derivation is not cached; see #getKek.
    */
   #kekPromise: Promise<CryptoKey> | null = null;
   /**
@@ -618,7 +619,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #getKek(): Promise<CryptoKey> | null {
     const secret = this.env.NOTME_KEK_SECRET;
     if (!secret) return null;
-    this.#kekPromise ??= deriveKek(secret);
+    if (!this.#kekPromise) {
+      // Cache only a success (notme-051544). The promise is shared while it
+      // is in flight, so concurrent loads still derive once, but a rejection
+      // clears the cache: a transient failure, such as the secret briefly
+      // unavailable at deploy, must not poison every later key load for the
+      // life of this instance. The identity check keeps a late rejection from
+      // clearing a newer attempt.
+      const attempt = deriveKek(secret);
+      this.#kekPromise = attempt;
+      attempt.catch(() => {
+        if (this.#kekPromise === attempt) this.#kekPromise = null;
+      });
+    }
     return this.#kekPromise;
   }
 
@@ -2145,7 +2158,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * With CT_LOG absent: one mint, no pin, no extension, no row — byte for
    * byte what minting did before CT.
    *
-   * ECMAScript #private: the DO's public surface is pinned at 62 methods.
+   * ECMAScript #private: the DO's public surface is pinned (rpc-surface.do.test.ts).
    */
   async #mintLogged<P, R>(p: {
     pin: P;
@@ -2199,6 +2212,48 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Past the #ctShards await: re-check before the precertificate signature.
     this.#refuseIfMintStateMoved(p.captured);
     const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
+    // From here a precertificate exists and may reach the log. If this mint
+    // then delivers nothing — refused because the key or epoch moved during
+    // the log wait (the retry mints new serials), or failing outright — the
+    // serials are recorded as not delivered, so a CT monitor can match the
+    // logged precerts to an issuance that never happened (notme-b35676).
+    const preSerials = p.pems(pre).flatMap((pem) => {
+      try {
+        return [serialOf(b64ToBytes(pemToB64(pem)))];
+      } catch {
+        return [];
+      }
+    });
+    try {
+      return await this.#finishLogged(p, pre, shardSet.shards, rootB64, issuerSpki, log);
+    } catch (err) {
+      this.#recordNotDelivered(
+        preSerials,
+        err instanceof MintStateMovedError ? "mint_state_moved" : "mint_failed",
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * #mintLogged after the precertificate is signed: submit, then embed or
+   * backlog. Split out so every way it can end without a certificate is seen
+   * by the one catch that records the precert serials (notme-b35676).
+   */
+  async #finishLogged<P, R>(
+    p: {
+      pin: P;
+      mint: (pin: P | undefined, ct: (i: number) => Extension[]) => Promise<R>;
+      pems: (r: R) => string[];
+      captured: { keyId: string; epoch: number };
+    },
+    pre: R,
+    shards: CtShard[],
+    rootB64: string,
+    issuerSpki: Uint8Array,
+    log: Fetcher,
+  ): Promise<R> {
+    const shardSet = { shards };
     // Each certificate goes to the shard whose temporal interval holds ITS
     // notAfter (notme-afa9d8). One that no shard covers is not submitted to
     // any — a shard refuses it, and the wrong shard's SCT would be worthless —
@@ -2551,6 +2606,85 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
     sql.exec("INSERT OR IGNORE INTO ct_health (id) VALUES ('ct')");
     this.#ctSchemaReady = true;
+  }
+
+  // ── Signed, never delivered (notme-b35676) ────────────────────────────────
+  //
+  // A CT monitor reconciles what the log holds against what the authority
+  // issued. Three paths sign a certificate (or the precertificate the log
+  // records under its serial) that nobody ever receives:
+  //   - mint_state_moved: the key/epoch re-check after the log wait refuses;
+  //     the review-L2 retry then mints under NEW serials, so the first
+  //     precerts' certificates never exist (#mintLogged);
+  //   - mint_failed: the same window, ending in any other error;
+  //   - claim_taken_over: a tier collect whose claim was reclaimed while it
+  //     minted (TIER_COLLECT_RECLAIM_S) discards its certificate, which with
+  //     CT bound was logged or backlogged (collectTierEnrolment).
+  // Each serial is kept here, durably, and published read-only at
+  // /.well-known/ct-not-delivered.json. Not pruned: a log entry is
+  // permanent, so its explanation must be too. Growth is bounded by what
+  // causes a row — an operator rotate/revokeEpoch inside a log wait, or a
+  // mint outlasting the 60 s reclaim window — not by request volume.
+
+  #notDeliveredReady = false;
+  #ensureNotDeliveredSchema(): void {
+    if (this.#notDeliveredReady) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS ct_not_delivered (
+        serial       TEXT PRIMARY KEY,
+        reason       TEXT NOT NULL,
+        discarded_at INTEGER NOT NULL
+      )
+    `);
+    this.#notDeliveredReady = true;
+  }
+
+  /** Record serials that were signed and will never be delivered. Never throws. */
+  #recordNotDelivered(
+    serials: string[],
+    reason: "mint_state_moved" | "mint_failed" | "claim_taken_over",
+  ): void {
+    if (serials.length === 0) return;
+    try {
+      this.#ensureNotDeliveredSchema();
+      const now = Math.floor(Date.now() / 1000);
+      for (const serial of serials) {
+        // OR IGNORE: a serial is unique to one certificate, so the first
+        // reason recorded for it stands.
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO ct_not_delivered (serial, reason, discarded_at) VALUES (?, ?, ?)",
+          serial,
+          reason,
+          now,
+        );
+      }
+      console.warn({ event: "ct.not_delivered", reason, serials });
+    } catch (err) {
+      // The mint's outcome is already decided; losing this row loses only
+      // the explanation, and the console line above is the fallback record.
+      console.error({ event: "ct.not_delivered_write_failed", reason, serials, error: String(err) });
+    }
+  }
+
+  /**
+   * Every serial signed and never delivered, newest first, at most `limit`
+   * (default and cap 1000). Read-only; published unauthenticated at
+   * /.well-known/ct-not-delivered.json, because what it names is already in
+   * the public log — it only explains it (notme-b35676).
+   */
+  async listNotDeliveredCerts(
+    limit = 1000,
+  ): Promise<Array<{ serial: string; reason: string; discardedAt: number }>> {
+    this.#ensureNotDeliveredSchema();
+    const n = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 1000)));
+    return (
+      this.ctx.storage.sql
+        .exec(
+          "SELECT serial, reason, discarded_at FROM ct_not_delivered ORDER BY discarded_at DESC, serial LIMIT ?",
+          n,
+        )
+        .toArray() as Array<{ serial: string; reason: string; discarded_at: number }>
+    ).map((r) => ({ serial: r.serial, reason: r.reason, discardedAt: r.discarded_at }));
   }
 
   /** Record a CT observation for health. Never throws. */
@@ -3098,21 +3232,39 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     if (!row) return { ok: false, reason: "not_found" };
     if (row.expires_at <= now) return { ok: false, reason: "expired" };
     if (row.status !== "pending") return { ok: false, reason: "not_pending" };
-    this.ctx.storage.sql.exec(
+    const epoch = (await this.getAuthorityState()).epoch;
+    // The checks above ran before that await, and a revoke, a second approval
+    // or the expiry deadline can land in it (notme-052431). The UPDATE repeats
+    // both guards, and its changed-row count, not the earlier read, decides
+    // the answer: an approve that matched nothing must not report success.
+    const writeAt = Math.floor(Date.now() / 1000);
+    const written = this.ctx.storage.sql.exec(
       `UPDATE tier_enrolments
           SET status = 'approved', principal_id = ?, identity = ?, auth_method = ?, granted_scopes = ?,
               renew_until = ?, approved_epoch = ?, clone_policy = ?, criteria = ?
-        WHERE user_code = ? AND status = 'pending'`,
+        WHERE user_code = ? AND status = 'pending' AND expires_at > ?`,
       params.principalId,
       params.identity,
       params.authMethod,
       JSON.stringify(params.scopes),
       now + params.renewDays * 86400,
-      (await this.getAuthorityState()).epoch,
+      epoch,
       params.clonePolicy,
       JSON.stringify(params.criteria.map(({ name, version }) => ({ name, version }))),
       params.userCode,
-    );
+      writeAt,
+    ).rowsWritten;
+    if (written === 0) {
+      // Say why, from the row as it is now.
+      const after = this.ctx.storage.sql
+        .exec("SELECT status, expires_at FROM tier_enrolments WHERE user_code = ?", params.userCode)
+        .toArray()[0] as { status: string; expires_at: number } | undefined;
+      if (!after) return { ok: false, reason: "not_found" };
+      if (after.status === "pending" && after.expires_at <= writeAt) {
+        return { ok: false, reason: "expired" };
+      }
+      return { ok: false, reason: "not_pending" };
+    }
     return { ok: true };
   }
 
@@ -3321,7 +3473,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       );
       return true;
     });
-    if (!activated) return { ok: false, reason: "invalid_grant" };
+    if (!activated) {
+      // Signed, and with CT bound logged or backlogged, but never handed out:
+      // say so for a CT monitor (notme-b35676).
+      let serial: string[] = [];
+      try {
+        serial = [serialOf(b64ToBytes(pemToB64(result.certificate)))];
+      } catch (err) {
+        console.error({ event: "ct.not_delivered_unparseable", error: String(err) });
+      }
+      this.#recordNotDelivered(serial, "claim_taken_over");
+      return { ok: false, reason: "invalid_grant" };
+    }
 
     return {
       ok: true,
@@ -5347,6 +5510,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async #publishBundle(): Promise<CABundle> {
     const bundle = await this.generateBundle();
     if (this.env.CA_BUNDLE_CACHE) {
+      // No expirationTtl, deliberately (notme-05324c, DO audit L2). The bound
+      // on a bundle's life is checkRevocation's read-time check, issuedAt +
+      // BUNDLE_MAX_AGE_MS, which fails CLOSED (bundle_stale). A KV TTL would
+      // turn a stale bundle into an absent one, and an absent bundle fails
+      // OPEN (the bootstrap case): if the alarm stopped, verifiers would go
+      // from refusing to accepting the moment the key expired.
       await this.env.CA_BUNDLE_CACHE.put(
         "bundle:current",
         JSON.stringify(bundle),
