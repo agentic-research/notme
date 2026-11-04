@@ -344,7 +344,10 @@ creates a key, and `ct/testdata/roots.local-authority.pem` is that key's
 root. azul matches a chain to a root by issuer name and signature, so the
 per-run root certificate (new serial, same key) still chains.
 
-With that file committed there is ONE pass. Two passes are needed only if
+That file is **not** in git: the repo's `*.pem` ignore rule matches it, and
+the public-trust exceptions are deliberately exact paths reviewed as
+trust-root changes. Copy it from an existing checkout, or do the two passes
+below once. With the file present there is ONE pass. Two passes are needed only if
 the fixed key changes: run once (the test prints the authority's root as
 `issuer` in its `CT_ACCEPT log` line, and step 1 fails because the log does
 not trust it), write that root to `ct/testdata/roots.local-authority.pem`,
@@ -432,9 +435,24 @@ mints under the current key (notme-b52d7c).
 
 **Deploy check: measure production `add-pre-chain` latency** against the
 mint's 2000 ms timeout (`DEFAULT_TIMEOUT_MS`, `worker/src/ct/log-client.ts`).
-Locally it was about 950 ms (about 400 to 950 ms over every run of the
-acceptance, dominated by the sequencing interval). If production runs close to
-2000 ms, every mint will time out and be backlogged with no embedded SCT. On
+Measured locally on 2026-11-03 (`wrangler dev`, azul `d9402ec`, fresh state
+per series; `[wrangler:info]` request durations):
+
+| sequencing | first `add-pre-chain` after a cold start | warm `add-pre-chain` | warm `add-chain` (drain) |
+|---|---|---|---|
+| 1000 ms / 0 skips (defaults, control) | 1368-1377 ms (1 series) | 1516 ms | 778-789 ms |
+| **750 ms / 1 skip (chosen)** | **2308 ms, then 1900 ms** (2 series) | 891-1434 ms (6 runs) | 1239-1409 ms |
+
+Warm, the chosen values pass every run of `task ct:acceptance` with 0.6-1.1 s
+of margin. **Cold, the first submission ran 2308 ms in one of two series**:
+that mint timed out, went out without an embedded SCT, was backlogged and
+then drained (the acceptance's step 1 failed on that run and passed on the
+re-run). In production the sequencer stays warm (its alarm fires every
+750 ms), so a cold start is a deploy or restart of the log, not a quiet
+period; the cost is the first pair or two after it losing their embedded SCT
+while still being logged. Local `wrangler dev` timing is not production
+timing, and n is small. If production runs close to 2000 ms, every mint will
+time out and be backlogged with no embedded SCT. On
 the canary, watch the log Worker's request durations and `ct.backlog` /
 `lastError` on `/admin/alarm-health`: a backlog that grows while the log is
 up means the timeout, not the log, is the problem.
