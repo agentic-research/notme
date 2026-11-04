@@ -55,6 +55,8 @@ import { getAllowedAudiences } from "./src/allowed-audiences";
 import { opaqueError } from "./src/error-body";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
+import { AUTH_METHOD, oidcAuthMethod } from "./src/auth/session";
+import { authorityStub } from "./src/authority-stub";
 import { principalIdentity } from "./src/cert-authority";
 import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
 import { buildInfo, disclosedVersionId } from "./src/build-version";
@@ -666,9 +668,9 @@ async function handleCertGHA(
 
   const cfg = getConfig(env);
 
-  // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC)
-  const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-  const authority = env.SIGNING_AUTHORITY.get(authorityId);
+  // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC).
+  // Typed, so the mint's AuthMethod parameter is enforced here (notme-32003c).
+  const authority = authorityStub(env);
 
   const authHeader = request.headers.get("authorization") ?? "";
   if (!authHeader.startsWith("Bearer ")) {
@@ -824,7 +826,7 @@ async function handleCertGHA(
       mtlsPublicKeyPem: body.public_keys.mtls,
       signingPublicKeyPem: body.public_keys.signing,
       scopes: ["bridgeCert"],
-      authMethod: "gha-oidc",
+      authMethod: AUTH_METHOD.ghaOidc,
       ttlMs: cfg.ghaCertTtlMs,
     });
   } catch (e: any) {
@@ -1099,7 +1101,7 @@ async function handlePasskey(
         result.isAdmin,
       );
       const cookie = await createSessionCookie(
-        { principalId: result.userId, scopes, authMethod: "passkey" },
+        { principalId: result.userId, scopes, authMethod: AUTH_METHOD.passkey },
         sessionSecret,
       );
       return new Response(
@@ -1167,7 +1169,7 @@ async function passkeyRegisterVerify(
   if (claim) {
     const { createSessionCookie } = await import("./src/auth/session");
     const cookie = await createSessionCookie(
-      { principalId: body.userId, scopes: [], authMethod: "passkey" },
+      { principalId: body.userId, scopes: [], authMethod: AUTH_METHOD.passkey },
       await authority.getSessionSecret(),
     );
     return new Response(
@@ -1202,7 +1204,7 @@ async function passkeyRegisterVerify(
   const { createSessionCookie } = await import("./src/auth/session");
   const sessionSecret = await authority.getSessionSecret();
   const cookie = await createSessionCookie(
-    { principalId: body.userId, scopes, authMethod: "passkey" },
+    { principalId: body.userId, scopes, authMethod: AUTH_METHOD.passkey },
     sessionSecret,
   );
 
@@ -2770,7 +2772,7 @@ export default {
 
         const { createSessionCookie } = await import("./src/auth/session");
         const cookie = await createSessionCookie(
-          { principalId: joined.principalId, scopes: joined.scopes, authMethod: "invite" },
+          { principalId: joined.principalId, scopes: joined.scopes, authMethod: AUTH_METHOD.invite },
           await authority.getSessionSecret(),
         );
         return new Response(
@@ -2832,7 +2834,7 @@ export default {
           {
             principalId,
             scopes,
-            authMethod: `oidc:${identity.issuer}`,
+            authMethod: oidcAuthMethod(identity.issuer),
           },
           sessionSecret,
         );
@@ -2842,7 +2844,7 @@ export default {
             authenticated: true,
             principalId,
             scopes,
-            authMethod: `oidc:${identity.issuer}`,
+            authMethod: oidcAuthMethod(identity.issuer),
           }),
           {
             status: 200,
@@ -3015,8 +3017,8 @@ export default {
             );
           }
 
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          // Typed stub: the mint below takes a parsed AuthMethod (notme-32003c).
+          const authority = authorityStub(env);
           const { verifySessionCookie } = await import("./src/auth/session");
           const sessionSecret = await authority.getSessionSecret();
           const session = await verifySessionCookie(cookie, sessionSecret);
@@ -3096,30 +3098,22 @@ export default {
           // route: /join sets authMethod "invite" and /auth/oidc/login sets
           // "oidc:<issuer>", and this route accepts those sessions — so a
           // hardcoded "passkey" told verifiers a human touched an
-          // authenticator when none did (notme-ebc9af). encodeURIComponent
-          // keeps an issuer-qualified method one URI path segment.
+          // authenticator when none did (notme-ebc9af).
           //
-          // Validated, not defaulted. verifySessionCookie JSON.parses its
-          // payload with no shape check, so a future issuer that omits
-          // authMethod would otherwise reach the mint as undefined —
-          // stamping the literal "undefined" into a certificate's identity
-          // and extension. Defaulting to "passkey" would be worse: it
-          // re-creates the exact lie notme-ebc9af fixed. A cert that cannot
-          // state its provenance honestly must not be minted.
-          const sessionAuthMethod = session.authMethod;
-          if (
-            typeof sessionAuthMethod !== "string" ||
-            sessionAuthMethod.length === 0
-          ) {
-            return jsonErr("session carries no authMethod", 401);
-          }
+          // Validated, not defaulted, and at the BOUNDARY (notme-32003c):
+          // verifySessionCookie parses authMethod and refuses a session
+          // without one, so session.authMethod is an AuthMethod here and the
+          // mint accepts nothing else. A future issuer that omits it gets
+          // invalid_session, not a cert stamped "undefined" — and not a
+          // default of "passkey", which would re-create the lie notme-ebc9af
+          // fixed.
           const result = await authority.mintBridgeCertPair({
             subject: session.principalId,
             identity: principalIdentity(wimseTrustDomain(env), session.principalId),
             mtlsPublicKeyPem: body.public_keys.mtls,
             signingPublicKeyPem: body.public_keys.signing,
             scopes,
-            authMethod: sessionAuthMethod,
+            authMethod: session.authMethod,
             ttlMs: 5 * 60 * 1000,
           });
 
@@ -3134,7 +3128,7 @@ export default {
           return Response.json({
             ...result,
             principal_id: session.principalId,
-            auth_method: sessionAuthMethod,
+            auth_method: session.authMethod,
           });
         } catch (e: any) {
           return opaqueError("cert-passkey", "passkey cert error", 500, e);
@@ -3245,7 +3239,7 @@ export default {
       if (pathname === "/cert/issuing-ca/device/approve" && request.method === "POST") {
         const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
         if (!cookie) return jsonErr("session_required", 401);
-        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const authority = authorityStub(env);
         const { verifySessionCookie, liveScopes } = await import("./src/auth/session");
         const session = await verifySessionCookie(cookie, await authority.getSessionSecret());
         if (!session) return jsonErr("invalid_session", 401);
@@ -3253,9 +3247,9 @@ export default {
         // working now, not when the cookie expires.
         const live = await liveScopes(session, authority);
         if (!live.includes("certMint")) return jsonErr("certMint scope required", 403);
-        if (typeof session.authMethod !== "string" || !session.authMethod) {
-          return jsonErr("session carries no authMethod", 401);
-        }
+        // No authMethod guard: verifySessionCookie refuses a session without
+        // one, and approveTierEnrolment takes only a parsed AuthMethod
+        // (notme-32003c).
         let body: { user_code?: unknown; renew_days?: unknown; clone_policy?: unknown; criteria?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
@@ -3544,25 +3538,19 @@ export default {
             );
           }
 
-          const sessionAuthMethod = session.authMethod;
-          if (
-            typeof sessionAuthMethod !== "string" ||
-            sessionAuthMethod.length === 0
-          ) {
-            return jsonErr("session carries no authMethod", 401);
-          }
-
+          // session.authMethod is parsed at the boundary: verifySessionCookie
+          // refuses a session without one (notme-32003c).
           const result = await authority.mintIssuingCa({
             subject: session.principalId,
             identity: principalIdentity(wimseTrustDomain(env), session.principalId),
             publicKeyPem: body.public_key,
             scopes,
-            authMethod: sessionAuthMethod,
+            authMethod: session.authMethod,
           });
           return Response.json({
             ...result,
             principal_id: session.principalId,
-            auth_method: sessionAuthMethod,
+            auth_method: session.authMethod,
           });
         } catch (e: any) {
           return opaqueError("issuing-ca", "issuing-ca error", 500, e);

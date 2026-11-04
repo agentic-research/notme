@@ -11,6 +11,8 @@
 
 import { verifyPopProofs } from "./auth/pop";
 import { opaqueError } from "./error-body";
+import { AUTH_METHOD, oidcAuthMethod, type AuthMethod } from "./auth/session";
+import { authorityStub } from "./authority-stub";
 
 // Types from the schema (would import from gen/ts/identity.ts, but
 // we keep it simple and define the wire format inline to avoid
@@ -79,12 +81,13 @@ export async function handleCertExchange(
   }
 
   const requestedScopes = body.scopes ?? ["bridgeCert"];
-  const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-  const authority = env.SIGNING_AUTHORITY.get(authorityId);
+  // Typed stub, and a typed method: the mint takes only a parsed AuthMethod,
+  // so each proof branch below must produce one (notme-32003c).
+  const authority = authorityStub(env);
 
   let principalId: string;
   let grantedScopes: string[];
-  let authMethod: string;
+  let authMethod: AuthMethod;
   // Set only for OIDC proofs: the token the PoP binds, and its jti/exp for
   // single-use accounting after the proofs verify.
   let oidc: { token: string; jti: string; exp: number } | null = null;
@@ -111,19 +114,10 @@ export async function handleCertExchange(
     // stops at once, not when the cookie expires.
     const { liveScopes } = await import("./auth/session");
     grantedScopes = await liveScopes(session, authority);
-    // Same guard as /cert/passkey (worker.ts): provenance is derived from the
-    // session, and a cert that cannot state it honestly must not be minted.
-    // Defaulting to "passkey" here would launder an invite- or OIDC-authed
-    // session into a cert claiming a human touched an authenticator.
-    if (
-      typeof session.authMethod !== "string" ||
-      session.authMethod.length === 0
-    ) {
-      return Response.json(
-        { error: "session carries no authMethod" },
-        { status: 401 },
-      );
-    }
+    // Provenance is derived from the session, and verifySessionCookie has
+    // already refused one that cannot state it (notme-32003c). Defaulting to
+    // "passkey" here would launder an invite- or OIDC-authed session into a
+    // cert claiming a human touched an authenticator.
     authMethod = session.authMethod;
   } else if (body.proof.type === "oidc") {
     // ADR-019 case 3: automation acting under a PRINCIPAL's authority. The
@@ -166,7 +160,7 @@ export async function handleCertExchange(
     principalId = found;
     // LIVE grants — there is no cookie here to mistake for the source.
     grantedScopes = await authority.getPrincipalScopes(found);
-    authMethod = `oidc:${identity.issuer}`;
+    authMethod = oidcAuthMethod(identity.issuer);
     oidc = { token: body.proof.token, jti: claims.jti, exp: Number(claims.exp) || 0 };
   } else if (body.proof.type === "bootstrap") {
     // Bootstrap code — deployer only
@@ -179,7 +173,7 @@ export async function handleCertExchange(
     }
     principalId = crypto.randomUUID();
     grantedScopes = [...(await import("./auth/admin-scopes")).ADMIN_SCOPES];
-    authMethod = "bootstrap";
+    authMethod = AUTH_METHOD.bootstrap;
     // Persist the admin this exchange mints a credential for. Pre-fix,
     // principalId was local-only: the sole bootstrap code was burned, a live
     // credential carrying authorityManage+certMint walked away, and the

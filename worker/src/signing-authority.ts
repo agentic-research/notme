@@ -1947,7 +1947,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     mtlsPublicKeyPem: string;
     signingPublicKeyPem: string;
     scopes: string[];
-    authMethod: string;
+    authMethod: import("./auth/session").AuthMethod; // parsed, never raw (notme-32003c)
     ttlMs?: number;
   }): Promise<
     import("./cert-authority").BridgeCertPairResult & {
@@ -2861,7 +2861,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     userCode: string;
     principalId: string;
     identity: string;
-    authMethod: string;
+    authMethod: import("./auth/session").AuthMethod; // parsed, never raw (notme-32003c)
     scopes: string[];
     /** How long the machine may renew without a human (notme-337d82). */
     renewDays: number;
