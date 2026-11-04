@@ -32,6 +32,7 @@ const fullEnv = (): Record<string, string> => ({
   STAGING_GHA_ALLOWED_OWNERS: "a-real-staging-org",
   STAGING_ALLOWED_AUDIENCES: "https://staging.notme.bot,https://auth-staging.notme.bot",
   STAGING_RENEWAL_BINDING_V3: "off",
+  STAGING_REKOR_URL: "https://rekor.sigstage.dev",
   STAGING_KV_NAMESPACE_ID: "0123456789abcdef0123456789abcdef",
 });
 
@@ -59,6 +60,7 @@ describe("staging config rendering (H1)", () => {
       "SIGNET_AUTHORITY_URL",
       "GHA_ALLOWED_OWNERS",
       "ALLOWED_AUDIENCES",
+      "REKOR_URL",
       "RENEWAL_BINDING_V3",
     ]);
     for (const k of Object.keys(fullEnv())) {

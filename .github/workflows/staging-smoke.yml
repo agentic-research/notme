@@ -50,6 +50,7 @@
 #   var STAGING_GHA_ALLOWED_OWNERS       — staging's OWN allowlist (never production's, notme-1532eb)
 #   var STAGING_ALLOWED_AUDIENCES        — staging audiences
 #   var STAGING_RENEWAL_BINDING_V3       — "off" until a release is at 100% on staging
+#   var STAGING_REKOR_URL                — https://rekor.sigstage.dev (Sigstore STAGING Rekor; never public)
 # `wrangler deploy` makes the config's vars authoritative, so these ARE
 # staging's vars after every merge. scripts/staging-config.ts requires one per
 # key in the template's [env.staging.vars] and refuses any placeholder left in
@@ -90,12 +91,13 @@ jobs:
           STAGING_GHA_ALLOWED_OWNERS: ${{ vars.STAGING_GHA_ALLOWED_OWNERS }}
           STAGING_ALLOWED_AUDIENCES: ${{ vars.STAGING_ALLOWED_AUDIENCES }}
           STAGING_RENEWAL_BINDING_V3: ${{ vars.STAGING_RENEWAL_BINDING_V3 }}
+          STAGING_REKOR_URL: ${{ vars.STAGING_REKOR_URL }}
         run: |
           missing=""
           [ "$HAS_TOKEN" = "true" ] || missing="$missing CLOUDFLARE_STAGING_API_TOKEN(secret)"
           for v in CLOUDFLARE_ACCOUNT_ID STAGING_KV_NAMESPACE_ID STAGING_SITE_URL \
                    STAGING_SIGNET_AUTHORITY_URL STAGING_GHA_ALLOWED_OWNERS \
-                   STAGING_ALLOWED_AUDIENCES STAGING_RENEWAL_BINDING_V3; do
+                   STAGING_ALLOWED_AUDIENCES STAGING_RENEWAL_BINDING_V3 STAGING_REKOR_URL; do
             [ -n "${!v}" ] || missing="$missing $v"
           done
           if [ -n "$missing" ]; then
@@ -138,6 +140,7 @@ jobs:
           STAGING_GHA_ALLOWED_OWNERS: ${{ vars.STAGING_GHA_ALLOWED_OWNERS }}
           STAGING_ALLOWED_AUDIENCES: ${{ vars.STAGING_ALLOWED_AUDIENCES }}
           STAGING_RENEWAL_BINDING_V3: ${{ vars.STAGING_RENEWAL_BINDING_V3 }}
+          STAGING_REKOR_URL: ${{ vars.STAGING_REKOR_URL }}
         run: pnpm exec tsx scripts/staging-config.ts worker/wrangler.toml.example worker/wrangler.toml
 
       # The ONLY step that sees the token.

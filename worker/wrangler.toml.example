@@ -296,6 +296,10 @@ GHA_ALLOWED_OWNERS = "your-staging-org"
 # allowed-audiences.ts, which would let staging mint tokens for production's
 # resource servers.
 ALLOWED_AUDIENCES = "https://staging.notme.bot,https://auth-staging.notme.bot"
+# Staging logs its revocation statements to Sigstore's STAGING Rekor, never the
+# public one: entries there are permanent (notme-8befcc). Production uses the
+# code default, https://rekor.sigstore.dev.
+REKOR_URL = "https://rekor.sigstage.dev"
 # Same rule as production's RENEWAL_BINDING_V3 (above): "on" only after the
 # release is promoted to 100% here. Env vars are not inherited.
 RENEWAL_BINDING_V3 = "off"

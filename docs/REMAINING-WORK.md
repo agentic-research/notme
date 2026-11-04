@@ -172,7 +172,7 @@ The three beads are closed; the fixes merged in cf1c92b.
      Add vars `CLOUDFLARE_ACCOUNT_ID` and `STAGING_KV_NAMESPACE_ID`, plus one
      var per staging setting: `STAGING_SITE_URL`, `STAGING_SIGNET_AUTHORITY_URL`,
      `STAGING_GHA_ALLOWED_OWNERS` (staging's own allowlist, never production's),
-     `STAGING_ALLOWED_AUDIENCES` and `STAGING_RENEWAL_BINDING_V3`. These become
+     `STAGING_ALLOWED_AUDIENCES`, `STAGING_RENEWAL_BINDING_V3` and `STAGING_REKOR_URL` (`https://rekor.sigstage.dev`: staging logs revocations to Sigstore's staging Rekor, never the public one). These become
      staging's vars on every merge. Until they are set, the staging smoke job
      shows as skipped.
   3. Add `[version_metadata]` / `binding = "CF_VERSION_METADATA"`, at top level
