@@ -170,8 +170,12 @@ to publish the tag.
 **H3, correctness and hygiene.** Doesn't gate the tag.
 - notme-baea8c: `proxy()` lacks ADR-009's promised gates.
 - notme-8fb37f: the alarm-defence tests are weak.
-- notme-2098f4: `readScopes` doesn't check lengths.
-- notme-d06b7b: a mint failure during collect strands the enrolment.
+- notme-2098f4: `readScopes` doesn't check lengths. Fix in 701304b.
+- notme-d06b7b: a mint failure during collect strands the enrolment. Fix in
+  1d42837.
+- notme-b54368 and notme-7aa6dd: fixes in e687734 and 4a7f6ac. All four
+  are on branch fix/hardening-do, not merged yet; the beads stay open
+  until it merges.
 - From the Durable Objects audit (docs/audits/2026-11-03-durable-objects.md):
   notme-b54368 (rotate() not atomic), notme-b556a4 (templates use the KV
   storage backend), notme-b567c9 (error messages reach clients).
