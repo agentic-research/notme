@@ -33,4 +33,18 @@ describe("rotate() republishes the CA bundle", () => {
     expect(after.prevKeyId).toBe(before.keyId);
     expect(after.keys[before.keyId]).toBe(before.keys[before.keyId]);
   });
+
+  it("publishes bundle:current with NO KV TTL: the read-time staleness check is the bound (notme-05324c)", async () => {
+    // A TTL would turn a stale bundle into an ABSENT one, and checkRevocation
+    // treats the two oppositely: stale fails closed (bundle_stale), absent
+    // fails open (the bootstrap case). So if the alarm stopped, a TTL would
+    // move every verifier from refusing to accepting once it expired.
+    // revocation.do.test.ts pins both halves of that asymmetry.
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+    await stub.rotate(); // publishes through #publishBundle
+    const { keys } = await env.CA_BUNDLE_CACHE.list({ prefix: "bundle:current" });
+    const entry = keys.find((k) => k.name === "bundle:current");
+    expect(entry, "rotate() published the bundle").toBeDefined();
+    expect(entry!.expiration, "bundle:current must not expire out of KV").toBeUndefined();
+  });
 });

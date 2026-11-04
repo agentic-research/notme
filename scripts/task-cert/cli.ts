@@ -52,7 +52,7 @@ import { X509Certificate } from "@peculiar/x509";
 import { appendFileSync } from "node:fs";
 import {
   enrollInDir, importPrivateKeyPem,
-  explainRenewalFailure, isRevokedTask, mintTask, renewedTierMeta, resolveLegacyCutoff, renewTierInDir, taskOutDir, verifyChain,
+  explainRenewalFailure, isRevokedTask, mintTask, pemChain, renewedTierMeta, resolveLegacyCutoff, renewTierInDir, taskOutDir, verifyChain,
 } from "./lib";
 
 
@@ -217,7 +217,7 @@ async function mint() {
   writeFileSync(join(out, "mtls.pem"), t.certificates.mtls);
   writeFileSync(join(out, "signing.key.pem"), t.keys.signing, { mode: 0o600 });
   writeFileSync(join(out, "mtls.key.pem"), t.keys.mtls, { mode: 0o600 });
-  writeFileSync(join(out, "chain.pem"), t.certificates.signing + need("tier.pem"));
+  writeFileSync(join(out, "chain.pem"), pemChain(t.certificates.signing, need("tier.pem")));
   mkdirSync(TASKS, { recursive: true, mode: 0o700 });
   appendFileSync(
     LEDGER,

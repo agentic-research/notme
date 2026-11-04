@@ -206,7 +206,7 @@ npx vitest run --config vitest.workers.ct.config.mts   # CT-bound suites (56), C
 npx vitest run src/__tests__/adversarial.test.ts   # focused: adversarial corpus
 npm run build:local                         # esbuild bundle worker.ts → dist/worker.js
 bash test-local.sh                          # workerd smoke: discovery / jwks / ca-bundle + invariant #1 (no private key on disk)
-bash test-e2e.sh                            # playwright contract tests (still greps workerd stdout for a bootstrap code, which the worker no longer logs — see below)
+bash test-e2e.sh                            # playwright contract tests: generates a BOOTSTRAP_CODE, binds it into a copy of config.capnp, registers the admin passkey
 npx playwright test e2e/contract.spec.ts    # contract tests directly (workerd must be running)
 ```
 

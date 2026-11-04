@@ -143,3 +143,23 @@ jobs:
       - uses: ./.github/actions/setup-task
 
       - run: task proxy:check
+
+  # The capnp toolchain pin (notme-05324c). gen/go/identity.capnp.go is
+  # committed, so the compiler and plugin that produce it are part of the
+  # build. This installs exactly the pinned pair (Taskfile top-level vars for
+  # capnp, gen/go/go.mod for capnpc-go), refuses anything else, and fails if
+  # the committed gen/go is not what they generate from schema/.
+  schema:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: gen/go/go.mod
+          cache: false
+      - uses: ./.github/actions/setup-task
+      - run: task schema:toolchain:install
+      - run: task schema:go:check

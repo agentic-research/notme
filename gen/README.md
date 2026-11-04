@@ -117,12 +117,14 @@ patterns adapted from [jose](https://github.com/panva/jose) (MIT, Filip Skokan).
 
 ```bash
 task schema:ts     # regenerate gen/ts/identity.ts
-task schema:go     # regenerate gen/go/identity.capnp.go
+task schema:go     # regenerate gen/go/identity.capnp.go (refuses an unpinned toolchain)
 task schema:all    # both
-task schema:check  # diff against checked-in gen/ — fails if stale
+task schema:check  # type-check gen/ts/identity.ts
+task schema:go:check          # diff gen/go against what the pinned toolchain generates — fails if stale
+task schema:toolchain:install # install the pinned capnp + capnpc-go (Linux; what CI runs)
 ```
 
-CI runs `task schema:check`. if you change `../schema/identity.capnp`, regenerate AND commit the regenerated files in the same PR.
+CI runs `task schema:go:check` (the `schema` job in `ci.yml`); the TS side's drift gate is `worker/src/__tests__/capnp-codegen.test.ts`, in `task worker:check`. if you change `../schema/identity.capnp`, regenerate AND commit the regenerated files in the same PR.
 
 `gen/go/verify/*` is hand-written — `task schema:*` does not touch it.
 
@@ -132,7 +134,7 @@ per the workerd / mache RTFM precedent: committing the artifact eliminates versi
 
 > **no Go consumer today.** A cross-repo sweep (`notme-c0a4aa`) found nothing outside this repo importing `gen/go` — no `go.mod` in the ecosystem requires it, signet has no capnp files at all, and `RequireMTLS` has no caller outside notme. `gen/go` and its hand-written `verify/` package are therefore an unconsumed surface; whether to retire, keep as advisory, or recruit the intended consumer is tracked in `notme-ea5c65`. Read the consumer columns below as *intended*, not *observed*. the TS generator is run explicitly via `task schema:ts`; the Go generator via `task schema:go`. neither is wired into a default `build` step.
 
-caveat: the capnp toolchain itself isn't pinned yet. the RTFM recommends pinning compiler + generators + runtimes by exact version with a cross-runtime fixture suite. notme pins no toolchain; the fixture suite exists only for the canonical CBOR signing input (`../schema/fixtures/`), not for capnp. this was `notme-803923` tier 2; that bead is closed and no open bead tracks the pins.
+the capnp toolchain is pinned (notme-05324c): the compiler by `CAPNP_VERSION` + `CAPNP_SHA256` in the root `Taskfile.yml`, and `capnpc-go` (with its `std/go.capnp`) by the `capnproto.org/go/capnp/v3` version in `go/go.mod`, so the plugin and the runtime the generated code links against cannot disagree. `schema:toolchain:check` refuses anything else. pinning it surfaced real drift: the committed `gen/go/identity.capnp.go` predated several schema changes (`BridgeCertPair` among them) and was regenerated in the same change. the cross-runtime fixture suite still exists only for the canonical CBOR signing input (`../schema/fixtures/`), not for capnp.
 
 ## related
 

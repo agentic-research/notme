@@ -1,5 +1,10 @@
 version: "3"
 
+# The capnp compiler pin; see schema:toolchain:install (notme-05324c).
+vars:
+  CAPNP_VERSION: "1.3.0"
+  CAPNP_SHA256: 098f824a495a1a837d56ae17e07b3f721ac86f8dbaf58896a389923458522108
+
 includes:
   dpop:
     taskfile: ./packages/dpop
@@ -25,11 +30,97 @@ tasks:
       - pnpm exec tsx schema/codegen/capnp-to-ts.ts schema/identity.capnp > gen/ts/identity.ts
       - echo "Generated gen/ts/identity.ts"
 
+  # ── capnp toolchain pin (notme-05324c) ────────────────────────────────────
+  #
+  # gen/go/identity.capnp.go is committed, so the toolchain that produced it
+  # is part of the build: a different capnp or capnpc-go emits different
+  # bytes. Two pins, one source each:
+  #   - capnp (the compiler): CAPNP_VERSION + CAPNP_SHA256 (top-level vars).
+  #   - capnpc-go (the Go plugin) and its std/go.capnp: the
+  #     capnproto.org/go/capnp/v3 version in gen/go/go.mod, so the plugin and
+  #     the runtime the generated code links against cannot disagree.
+  # CI (ci.yml `schema`) installs exactly these and runs schema:go:check,
+  # which refuses an unpinned toolchain and fails on drift in gen/go.
+  #
+  # TO UPGRADE capnp: bump CAPNP_VERSION, download
+  # https://capnproto.org/capnproto-c++-<version>.tar.gz, put its sha256 in
+  # CAPNP_SHA256, run `task schema:go` and commit the regenerated gen/go.
+  # capnproto.org publishes no checksum file; 098f82… was computed from the
+  # download on 2026-11-03, so it pins what CI builds rather than vouching
+  # for upstream.
+  schema:toolchain:install:
+    desc: "Install the pinned capnp + capnpc-go (CI; Linux, needs go + a C++ toolchain)"
+    vars:
+      CAPNP_GO_VERSION:
+        sh: awk '$1 == "capnproto.org/go/capnp/v3" {print $2; exit}' "{{.ROOT_DIR}}/gen/go/go.mod"
+      PREFIX: '{{.PREFIX | default "/usr/local"}}'
+    cmds:
+      - |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        curl -sSfL "https://capnproto.org/capnproto-c++-{{.CAPNP_VERSION}}.tar.gz" -o "$tmp/capnp.tar.gz"
+        # Verify BEFORE extracting, as .github/actions/setup-task does.
+        echo "{{.CAPNP_SHA256}}  $tmp/capnp.tar.gz" | sha256sum -c -
+        tar -xzf "$tmp/capnp.tar.gz" -C "$tmp"
+        cd "$tmp/capnproto-c++-{{.CAPNP_VERSION}}"
+        ./configure --disable-shared --prefix="{{.PREFIX}}" >/dev/null
+        make -j"$(nproc)" capnp >/dev/null
+        install -m 0755 capnp "{{.PREFIX}}/bin/capnp"
+        rm -rf "$tmp"
+      # The module proxy's checksum database verifies this, as it does
+      # release.yml's melange/apko installs.
+      - go install "capnproto.org/go/capnp/v3/capnpc-go@{{.CAPNP_GO_VERSION}}"
+      - task: schema:toolchain:check
+
+  schema:toolchain:check:
+    desc: Refuse a capnp or capnpc-go that is not the pinned one
+    vars:
+      CAPNP_GO_VERSION:
+        sh: awk '$1 == "capnproto.org/go/capnp/v3" {print $2; exit}' "{{.ROOT_DIR}}/gen/go/go.mod"
+    cmds:
+      - |
+        set -euo pipefail
+        got="$(capnp --version)"
+        if [ "$got" != "Cap'n Proto version {{.CAPNP_VERSION}}" ]; then
+          echo "FAIL: capnp is '$got'; pinned {{.CAPNP_VERSION}} (task schema:toolchain:install)" >&2
+          exit 1
+        fi
+        plugin="$(command -v capnpc-go || true)"
+        if [ -z "$plugin" ]; then
+          echo "FAIL: capnpc-go not on PATH (go install capnproto.org/go/capnp/v3/capnpc-go@{{.CAPNP_GO_VERSION}})" >&2
+          exit 1
+        fi
+        # The module version is recorded in the binary's build info.
+        mod="$(go version -m "$plugin" | awk '$1 == "mod" && $2 == "capnproto.org/go/capnp/v3" {print $3}')"
+        if [ "$mod" != "{{.CAPNP_GO_VERSION}}" ]; then
+          echo "FAIL: capnpc-go at $plugin is built from capnp/v3 '${mod:-unknown}'; pinned {{.CAPNP_GO_VERSION}} (gen/go/go.mod)" >&2
+          exit 1
+        fi
+        echo "capnp toolchain: capnp {{.CAPNP_VERSION}}, capnpc-go {{.CAPNP_GO_VERSION}}"
+
   schema:go:
     desc: Generate Go types from Cap'n Proto
+    deps: [schema:toolchain:check]
+    vars:
+      CAPNP_GO_VERSION:
+        sh: awk '$1 == "capnproto.org/go/capnp/v3" {print $2; exit}' "{{.ROOT_DIR}}/gen/go/go.mod"
+      OUT: '{{.OUT | default "gen/go"}}'
     cmds:
-      - capnp compile -o go:gen/go --src-prefix=schema -I "$HOME/go/pkg/mod/capnproto.org/go/capnp/v3@v3.1.0-alpha.2/std" schema/identity.capnp
-      - echo "Generated gen/go/identity.capnp.go"
+      - capnp compile -o go:{{.OUT}} --src-prefix=schema -I "$(go env GOMODCACHE)/capnproto.org/go/capnp/v3@{{.CAPNP_GO_VERSION}}/std" schema/identity.capnp
+      - echo "Generated {{.OUT}}/identity.capnp.go"
+
+  schema:go:check:
+    desc: Fail if gen/go is not what the pinned toolchain generates from schema/
+    cmds:
+      - |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        task schema:go OUT="$tmp"
+        if ! diff -u gen/go/identity.capnp.go "$tmp/identity.capnp.go"; then
+          echo "FAIL: gen/go/identity.capnp.go is stale; run 'task schema:go' and commit it" >&2
+          exit 1
+        fi
+        rm -rf "$tmp"
 
   schema:all:
     desc: Generate all language bindings
@@ -545,7 +636,13 @@ tasks:
     desc: Build the notme OCI image via apko (loads to docker via `docker load < packages/notme.tar`)
     deps: [image:apk]
     vars:
-      TAG: '{{.TAG | default "0.1.0"}}'
+      # The release version has ONE source, the notme-app melange recipe
+      # (`server:check` holds the other recipes and server.json to it). A
+      # literal default here drifted to 0.1.0 while the recipe and the
+      # published tag were 0.2.0 (notme-05324c).
+      RECIPE_VERSION:
+        sh: awk '$1 == "version:" {print $2; exit}' "{{.ROOT_DIR}}/packages/melange-notme-app.yaml"
+      TAG: "{{.TAG | default .RECIPE_VERSION}}"
       ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
     cmds:
@@ -602,7 +699,10 @@ tasks:
     desc: Build the notme-proxy OCI image via apko (local tarball, dev loop)
     deps: [image:proxy:apk]
     vars:
-      TAG: '{{.TAG | default "0.1.0"}}'
+      # Same single source as `image` (notme-05324c).
+      RECIPE_VERSION:
+        sh: awk '$1 == "version:" {print $2; exit}' "{{.ROOT_DIR}}/packages/melange-notme-app.yaml"
+      TAG: "{{.TAG | default .RECIPE_VERSION}}"
       ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
     cmds:

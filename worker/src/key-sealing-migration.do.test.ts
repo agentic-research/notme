@@ -27,7 +27,7 @@
  * the isolate's first load.
  */
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { deriveKek, readStoredJwk, serialiseJwkForStorage } from "./key-encryption";
 
 const KEK_SECRET = "k".repeat(64);
@@ -174,5 +174,59 @@ describe("key-storage.migration", () => {
         return a.getPublicKeyPem();
       }),
     ).rejects.toThrow(/sealed|KEK/i);
+  });
+});
+
+describe("key-storage.kek-cache", () => {
+  it("a failed KEK derivation is not cached: the next load retries and succeeds (notme-051544)", async () => {
+    // A transient failure, such as the secret's backing store briefly
+    // unavailable at deploy, used to be cached as a rejected promise for the
+    // life of the instance, so every later key load on it failed too. Only a
+    // success may be cached.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("kek-transient-failure"),
+    );
+    const key = await freshKeyRow();
+    const sealed = await serialiseJwkForStorage(key.jwk, await deriveKek(KEK_SECRET));
+
+    const result = await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as Internals;
+      await a.getSessionSecret();
+      a.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");
+      a.ctx.storage.sql.exec(
+        "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
+        sealed,
+        key.publicSpkiB64,
+        "planted-kid",
+      );
+      a.env = { ...a.env, NOTME_KEK_SECRET: KEK_SECRET };
+
+      // Fail the HKDF import exactly once: the first derivation rejects.
+      const realImport = crypto.subtle.importKey.bind(crypto.subtle);
+      let failed = 0;
+      const spy = vi
+        .spyOn(crypto.subtle, "importKey")
+        .mockImplementation(((...args: Parameters<typeof crypto.subtle.importKey>) => {
+          if (args[2] === "HKDF" && failed === 0) {
+            failed++;
+            return Promise.reject(new Error("transient KEK failure"));
+          }
+          return (realImport as (...a: unknown[]) => Promise<CryptoKey>)(...args);
+        }) as typeof crypto.subtle.importKey);
+      try {
+        const first = await a.getPublicKeyPem().then(
+          () => "ok",
+          (e: unknown) => String(e),
+        );
+        const second = await a.getPublicKeyPem();
+        return { first, second, failed };
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    expect(result.failed, "the injected failure fired").toBe(1);
+    expect(result.first).toMatch(/transient KEK failure/);
+    expect(result.second).toBe(key.pem);
   });
 });

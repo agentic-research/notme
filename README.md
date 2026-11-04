@@ -267,9 +267,9 @@ docker run ghcr.io/agentic-research/notme-proxy:0.2.0 \
 
 **container (build it yourself)**
 ```bash
-task image              # bundles worker, signs apks, builds notme:0.1.0 OCI tar
+task image              # bundles worker, signs apks, builds notme:<recipe version> OCI tar (TAG= overrides)
 docker load < packages/notme.tar
-docker run -p 8788:8788 notme:0.1.0
+docker run -p 8788:8788 notme:0.2.0   # the version in packages/melange-notme-app.yaml
 
 task image:proxy        # same, for notme-proxy
 docker load < packages/notme-proxy.tar

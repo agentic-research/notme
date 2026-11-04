@@ -32,7 +32,10 @@ export const baseMiniflare = {
   // test. Not imported from wrangler.toml on purpose: this config declares
   // bindings inline precisely to avoid loading wrangler.toml (see above),
   // so the date is duplicated here. If you bump it there, bump it here.
-  compatibilityDate: "2026-03-01",
+  // The ceiling is the pinned workerd's own date (workerd 1.20260721.x
+  // supports up to 2026-07-21): a later date could not be exercised by this
+  // gate, so bumping past it waits for a workerd bump (notme-05324c).
+  compatibilityDate: "2026-07-21",
   bindings: {
     // The operator-set admin-recovery secret (notme-4838ae). Bound here
     // so the recovery path can be exercised at all — it is the ONLY way

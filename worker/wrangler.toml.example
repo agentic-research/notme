@@ -2,7 +2,7 @@
 # Copy to wrangler.toml and fill in your CF resource IDs.
 name = "notme-bot"
 main = "worker.ts"
-compatibility_date = "2026-03-01"
+compatibility_date = "2026-07-21"
 
 workers_dev = false
 
