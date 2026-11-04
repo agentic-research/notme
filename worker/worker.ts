@@ -2542,7 +2542,32 @@ export default {
         if (request.method !== "POST") {
           return jsonErr("method not allowed", 405);
         }
-        const result = await authority.revokeEpoch();
+        // Optional `{ "reason": "..." }` (notme-6a4f23). It is published in
+        // the signed /.well-known/epochs.json beside the revocation time, so
+        // a verifier can tell a declared compromise from a precaution. No
+        // body means "unspecified"; a body that is not a JSON object, or a
+        // reason that is empty, over 200 characters or carries control
+        // characters, is refused BEFORE anything moves.
+        const { normalizeRevocationReason } = await import("./src/epoch-history");
+        const raw = await request.text();
+        let reason: unknown;
+        if (raw.trim() !== "") {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            return jsonErr("body must be a JSON object", 400);
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            return jsonErr("body must be a JSON object", 400);
+          }
+          reason = (parsed as { reason?: unknown }).reason;
+        }
+        const why = normalizeRevocationReason(reason);
+        if (why === null) {
+          return jsonErr("reason must be 1-200 characters with no control characters", 400);
+        }
+        const result = await authority.revokeEpoch(why);
         // Dynamic import to match this file's idiom — the constant is only
         // needed on the one request that pulls the lever.
         const { BUNDLE_MAX_AGE_MS } = await import("./src/revocation");
@@ -4335,9 +4360,14 @@ export default {
         const served = await serveCachedPublic(request, async () => {
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const epochs = await authority.listEpochKeys();
+          // Signed by the root, with what ended each epoch (notme-6a4f23):
+          // `epochs` exactly as before, plus `revocations` (epoch, revokedAt,
+          // reason — set only by /admin/revoke-epoch), `currentEpoch`, and
+          // the CABundle-style `seqno` / `issuedAt` / `signature`. Verifier
+          // rule and canonical form: ADR-019 D7, src/epoch-history.ts.
+          const history = await authority.getSignedEpochHistory();
           return Response.json(
-            { epochs },
+            history,
             {
               headers: {
                 // Short max-age: a rotation adds an entry, and an auditor

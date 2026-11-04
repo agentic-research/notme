@@ -1,0 +1,16 @@
+{
+  "epochs": [
+    {
+      "epoch": 1,
+      "untilEpoch": null,
+      "keyId": "a050837d85070582ccf7394b0988847c",
+      "publicRawB64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "retiredAt": null
+    }
+  ],
+  "revocations": [],
+  "currentEpoch": 1,
+  "seqno": 1,
+  "issuedAt": 1767225600,
+  "signature": "ucW+A95zhyfh58LZMfk3zUB8pohC5c1nNcWRdoPZZY77FGNsIyPkw41nxm7ZbcW9hi2RCfZfCO6zb3m9G+NwCQ=="
+}

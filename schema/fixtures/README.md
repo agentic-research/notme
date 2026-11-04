@@ -41,6 +41,37 @@ in non-canonical order. Equal-length kids are decided by the bytewise
 tiebreak, not the length rule `cabundle-multikey` exercises, and a populated
 `prevKeyId` with two keys is the rotation-grace state `generateBundle` emits.
 
+## Epoch history fixtures (notme-6a4f23)
+
+`epochhistory-*` are the signing input of `/.well-known/epochs.json`
+(ADR-019 D7), produced by `worker/src/epoch-history.ts`
+`epochHistoryCanonical`. CBOR canonical form, integer-keyed map:
+
+```
+0: "notme-epoch-history-v1"   1: seqno   2: issuedAt   3: currentEpoch
+4: [ {1: epoch, 2: untilEpoch|null, 3: keyId, 4: publicRaw (bytes), 5: retiredAt|null} ... ]
+5: [ {1: epoch, 2: revokedAt, 3: reason} ... ]
+```
+
+Arrays keep the document's order (they are not sorted by the encoder).
+`null` is CBOR simple value 22 (`0xf6`); in Go, a nil `*uint64`.
+
+Unlike the CABundle fixtures, each `.json` is the **full served document,
+`signature` included**. The signature is excluded from the signing input as
+usual, and is Ed25519 by the fixture root, the key whose 32-byte seed is
+`0x00..0x1f`:
+
+```
+root public key (standard base64): A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=
+```
+
+So a consumer can check the whole path: re-encode the `.json` (minus
+`signature`), compare with the `.bin`, and verify `signature` over those bytes
+under that key. Ed25519 is deterministic, so regenerating gives the same
+signatures. `epochhistory-revoked` covers a retired key, a live key spanning a
+revocation (`untilEpoch: null`), and one revocation with a reason;
+`epochhistory-basic` is a fresh authority with no history.
+
 ## Integrity anchor (notme-1629fe)
 
 The golden bytes are the encoder's own output written to a file, so by

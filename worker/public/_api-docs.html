@@ -718,7 +718,12 @@
           <div class="ep-desc">
             Revocation epochs. A certificate names the epoch it was issued
             under; raising the epoch invalidates everything issued beneath it
-            without waiting for expiry.
+            without waiting for expiry. Lists every signing key with the
+            epochs it served (<code>retiredAt</code>: rotated out), every
+            revoked epoch (<code>revocations[]</code>: <code>revokedAt</code>
+            and <code>reason</code>), and is signed by the root key with a
+            monotonic <code>seqno</code> and an <code>issuedAt</code>, as the
+            CA bundle is. Verifier rule: ADR-019 D7.
           </div>
         </div>
       </div>
