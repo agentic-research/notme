@@ -627,6 +627,217 @@ func (f BridgeCertResult_Future) Struct() (BridgeCertResult, error) {
 	return BridgeCertResult(p.Struct()), err
 }
 
+type BridgeCertPair capnp.Struct
+
+// BridgeCertPair_TypeID is the unique identifier for the type BridgeCertPair.
+const BridgeCertPair_TypeID = 0xb71a99b4f34c35f7
+
+func NewBridgeCertPair(s *capnp.Segment) (BridgeCertPair, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 7})
+	return BridgeCertPair(st), err
+}
+
+func NewRootBridgeCertPair(s *capnp.Segment) (BridgeCertPair, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 7})
+	return BridgeCertPair(st), err
+}
+
+func ReadRootBridgeCertPair(msg *capnp.Message) (BridgeCertPair, error) {
+	root, err := msg.Root()
+	return BridgeCertPair(root.Struct()), err
+}
+
+func (s BridgeCertPair) String() string {
+	str, _ := text.Marshal(0xb71a99b4f34c35f7, capnp.Struct(s))
+	return str
+}
+
+func (s BridgeCertPair) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (BridgeCertPair) DecodeFromPtr(p capnp.Ptr) BridgeCertPair {
+	return BridgeCertPair(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s BridgeCertPair) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s BridgeCertPair) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s BridgeCertPair) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s BridgeCertPair) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s BridgeCertPair) MtlsCert() (string, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.Text(), err
+}
+
+func (s BridgeCertPair) HasMtlsCert() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s BridgeCertPair) MtlsCertBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.TextBytes(), err
+}
+
+func (s BridgeCertPair) SetMtlsCert(v string) error {
+	return capnp.Struct(s).SetText(0, v)
+}
+
+func (s BridgeCertPair) SigningCert() (string, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.Text(), err
+}
+
+func (s BridgeCertPair) HasSigningCert() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s BridgeCertPair) SigningCertBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.TextBytes(), err
+}
+
+func (s BridgeCertPair) SetSigningCert(v string) error {
+	return capnp.Struct(s).SetText(1, v)
+}
+
+func (s BridgeCertPair) Identity() (string, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return p.Text(), err
+}
+
+func (s BridgeCertPair) HasIdentity() bool {
+	return capnp.Struct(s).HasPtr(2)
+}
+
+func (s BridgeCertPair) IdentityBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return p.TextBytes(), err
+}
+
+func (s BridgeCertPair) SetIdentity(v string) error {
+	return capnp.Struct(s).SetText(2, v)
+}
+
+func (s BridgeCertPair) Scopes() (capnp.TextList, error) {
+	p, err := capnp.Struct(s).Ptr(3)
+	return capnp.TextList(p.List()), err
+}
+
+func (s BridgeCertPair) HasScopes() bool {
+	return capnp.Struct(s).HasPtr(3)
+}
+
+func (s BridgeCertPair) SetScopes(v capnp.TextList) error {
+	return capnp.Struct(s).SetPtr(3, v.ToPtr())
+}
+
+// NewScopes sets the scopes field to a newly
+// allocated capnp.TextList, preferring placement in s's segment.
+func (s BridgeCertPair) NewScopes(n int32) (capnp.TextList, error) {
+	l, err := capnp.NewTextList(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return capnp.TextList{}, err
+	}
+	err = capnp.Struct(s).SetPtr(3, l.ToPtr())
+	return l, err
+}
+func (s BridgeCertPair) ExpiresAt() int64 {
+	return int64(capnp.Struct(s).Uint64(0))
+}
+
+func (s BridgeCertPair) SetExpiresAt(v int64) {
+	capnp.Struct(s).SetUint64(0, uint64(v))
+}
+
+func (s BridgeCertPair) Subject() (string, error) {
+	p, err := capnp.Struct(s).Ptr(4)
+	return p.Text(), err
+}
+
+func (s BridgeCertPair) HasSubject() bool {
+	return capnp.Struct(s).HasPtr(4)
+}
+
+func (s BridgeCertPair) SubjectBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(4)
+	return p.TextBytes(), err
+}
+
+func (s BridgeCertPair) SetSubject(v string) error {
+	return capnp.Struct(s).SetText(4, v)
+}
+
+func (s BridgeCertPair) Binding() (string, error) {
+	p, err := capnp.Struct(s).Ptr(5)
+	return p.Text(), err
+}
+
+func (s BridgeCertPair) HasBinding() bool {
+	return capnp.Struct(s).HasPtr(5)
+}
+
+func (s BridgeCertPair) BindingBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(5)
+	return p.TextBytes(), err
+}
+
+func (s BridgeCertPair) SetBinding(v string) error {
+	return capnp.Struct(s).SetText(5, v)
+}
+
+func (s BridgeCertPair) Epoch() uint64 {
+	return capnp.Struct(s).Uint64(8)
+}
+
+func (s BridgeCertPair) SetEpoch(v uint64) {
+	capnp.Struct(s).SetUint64(8, v)
+}
+
+func (s BridgeCertPair) AuthMethod() (string, error) {
+	p, err := capnp.Struct(s).Ptr(6)
+	return p.Text(), err
+}
+
+func (s BridgeCertPair) HasAuthMethod() bool {
+	return capnp.Struct(s).HasPtr(6)
+}
+
+func (s BridgeCertPair) AuthMethodBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(6)
+	return p.TextBytes(), err
+}
+
+func (s BridgeCertPair) SetAuthMethod(v string) error {
+	return capnp.Struct(s).SetText(6, v)
+}
+
+// BridgeCertPair_List is a list of BridgeCertPair.
+type BridgeCertPair_List = capnp.StructList[BridgeCertPair]
+
+// NewBridgeCertPair creates a new list of BridgeCertPair.
+func NewBridgeCertPair_List(s *capnp.Segment, sz int32) (BridgeCertPair_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 16, PointerCount: 7}, sz)
+	return capnp.StructList[BridgeCertPair](l), err
+}
+
+// BridgeCertPair_Future is a wrapper for a BridgeCertPair promised by a client call.
+type BridgeCertPair_Future struct{ *capnp.Future }
+
+func (f BridgeCertPair_Future) Struct() (BridgeCertPair, error) {
+	p, err := f.Future.Ptr()
+	return BridgeCertPair(p.Struct()), err
+}
+
 type CertScope uint16
 
 // CertScope_TypeID is the unique identifier for the type CertScope.
@@ -764,6 +975,341 @@ type AuthorityState_Future struct{ *capnp.Future }
 func (f AuthorityState_Future) Struct() (AuthorityState, error) {
 	p, err := f.Future.Ptr()
 	return AuthorityState(p.Struct()), err
+}
+
+type CertPairRequest capnp.Struct
+
+// CertPairRequest_TypeID is the unique identifier for the type CertPairRequest.
+const CertPairRequest_TypeID = 0xbf0703b044b996d7
+
+func NewCertPairRequest(s *capnp.Segment) (CertPairRequest, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 3})
+	return CertPairRequest(st), err
+}
+
+func NewRootCertPairRequest(s *capnp.Segment) (CertPairRequest, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 3})
+	return CertPairRequest(st), err
+}
+
+func ReadRootCertPairRequest(msg *capnp.Message) (CertPairRequest, error) {
+	root, err := msg.Root()
+	return CertPairRequest(root.Struct()), err
+}
+
+func (s CertPairRequest) String() string {
+	str, _ := text.Marshal(0xbf0703b044b996d7, capnp.Struct(s))
+	return str
+}
+
+func (s CertPairRequest) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (CertPairRequest) DecodeFromPtr(p capnp.Ptr) CertPairRequest {
+	return CertPairRequest(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s CertPairRequest) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s CertPairRequest) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s CertPairRequest) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s CertPairRequest) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s CertPairRequest) Proof() (Proof, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return Proof(p.Struct()), err
+}
+
+func (s CertPairRequest) HasProof() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s CertPairRequest) SetProof(v Proof) error {
+	return capnp.Struct(s).SetPtr(0, capnp.Struct(v).ToPtr())
+}
+
+// NewProof sets the proof field to a newly
+// allocated Proof struct, preferring placement in s's segment.
+func (s CertPairRequest) NewProof() (Proof, error) {
+	ss, err := NewProof(capnp.Struct(s).Segment())
+	if err != nil {
+		return Proof{}, err
+	}
+	err = capnp.Struct(s).SetPtr(0, capnp.Struct(ss).ToPtr())
+	return ss, err
+}
+
+func (s CertPairRequest) PublicKeys() (CertPairPublicKeys, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return CertPairPublicKeys(p.Struct()), err
+}
+
+func (s CertPairRequest) HasPublicKeys() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s CertPairRequest) SetPublicKeys(v CertPairPublicKeys) error {
+	return capnp.Struct(s).SetPtr(1, capnp.Struct(v).ToPtr())
+}
+
+// NewPublicKeys sets the publicKeys field to a newly
+// allocated CertPairPublicKeys struct, preferring placement in s's segment.
+func (s CertPairRequest) NewPublicKeys() (CertPairPublicKeys, error) {
+	ss, err := NewCertPairPublicKeys(capnp.Struct(s).Segment())
+	if err != nil {
+		return CertPairPublicKeys{}, err
+	}
+	err = capnp.Struct(s).SetPtr(1, capnp.Struct(ss).ToPtr())
+	return ss, err
+}
+
+func (s CertPairRequest) Proofs() (CertPairPoP, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return CertPairPoP(p.Struct()), err
+}
+
+func (s CertPairRequest) HasProofs() bool {
+	return capnp.Struct(s).HasPtr(2)
+}
+
+func (s CertPairRequest) SetProofs(v CertPairPoP) error {
+	return capnp.Struct(s).SetPtr(2, capnp.Struct(v).ToPtr())
+}
+
+// NewProofs sets the proofs field to a newly
+// allocated CertPairPoP struct, preferring placement in s's segment.
+func (s CertPairRequest) NewProofs() (CertPairPoP, error) {
+	ss, err := NewCertPairPoP(capnp.Struct(s).Segment())
+	if err != nil {
+		return CertPairPoP{}, err
+	}
+	err = capnp.Struct(s).SetPtr(2, capnp.Struct(ss).ToPtr())
+	return ss, err
+}
+
+// CertPairRequest_List is a list of CertPairRequest.
+type CertPairRequest_List = capnp.StructList[CertPairRequest]
+
+// NewCertPairRequest creates a new list of CertPairRequest.
+func NewCertPairRequest_List(s *capnp.Segment, sz int32) (CertPairRequest_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 3}, sz)
+	return capnp.StructList[CertPairRequest](l), err
+}
+
+// CertPairRequest_Future is a wrapper for a CertPairRequest promised by a client call.
+type CertPairRequest_Future struct{ *capnp.Future }
+
+func (f CertPairRequest_Future) Struct() (CertPairRequest, error) {
+	p, err := f.Future.Ptr()
+	return CertPairRequest(p.Struct()), err
+}
+func (p CertPairRequest_Future) Proof() Proof_Future {
+	return Proof_Future{Future: p.Future.Field(0, nil)}
+}
+func (p CertPairRequest_Future) PublicKeys() CertPairPublicKeys_Future {
+	return CertPairPublicKeys_Future{Future: p.Future.Field(1, nil)}
+}
+func (p CertPairRequest_Future) Proofs() CertPairPoP_Future {
+	return CertPairPoP_Future{Future: p.Future.Field(2, nil)}
+}
+
+type CertPairPublicKeys capnp.Struct
+
+// CertPairPublicKeys_TypeID is the unique identifier for the type CertPairPublicKeys.
+const CertPairPublicKeys_TypeID = 0xa6a5990cd1c93814
+
+func NewCertPairPublicKeys(s *capnp.Segment) (CertPairPublicKeys, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return CertPairPublicKeys(st), err
+}
+
+func NewRootCertPairPublicKeys(s *capnp.Segment) (CertPairPublicKeys, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return CertPairPublicKeys(st), err
+}
+
+func ReadRootCertPairPublicKeys(msg *capnp.Message) (CertPairPublicKeys, error) {
+	root, err := msg.Root()
+	return CertPairPublicKeys(root.Struct()), err
+}
+
+func (s CertPairPublicKeys) String() string {
+	str, _ := text.Marshal(0xa6a5990cd1c93814, capnp.Struct(s))
+	return str
+}
+
+func (s CertPairPublicKeys) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (CertPairPublicKeys) DecodeFromPtr(p capnp.Ptr) CertPairPublicKeys {
+	return CertPairPublicKeys(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s CertPairPublicKeys) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s CertPairPublicKeys) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s CertPairPublicKeys) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s CertPairPublicKeys) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s CertPairPublicKeys) Mtls() (string, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.Text(), err
+}
+
+func (s CertPairPublicKeys) HasMtls() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s CertPairPublicKeys) MtlsBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.TextBytes(), err
+}
+
+func (s CertPairPublicKeys) SetMtls(v string) error {
+	return capnp.Struct(s).SetText(0, v)
+}
+
+func (s CertPairPublicKeys) Signing() (string, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.Text(), err
+}
+
+func (s CertPairPublicKeys) HasSigning() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s CertPairPublicKeys) SigningBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.TextBytes(), err
+}
+
+func (s CertPairPublicKeys) SetSigning(v string) error {
+	return capnp.Struct(s).SetText(1, v)
+}
+
+// CertPairPublicKeys_List is a list of CertPairPublicKeys.
+type CertPairPublicKeys_List = capnp.StructList[CertPairPublicKeys]
+
+// NewCertPairPublicKeys creates a new list of CertPairPublicKeys.
+func NewCertPairPublicKeys_List(s *capnp.Segment, sz int32) (CertPairPublicKeys_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2}, sz)
+	return capnp.StructList[CertPairPublicKeys](l), err
+}
+
+// CertPairPublicKeys_Future is a wrapper for a CertPairPublicKeys promised by a client call.
+type CertPairPublicKeys_Future struct{ *capnp.Future }
+
+func (f CertPairPublicKeys_Future) Struct() (CertPairPublicKeys, error) {
+	p, err := f.Future.Ptr()
+	return CertPairPublicKeys(p.Struct()), err
+}
+
+type CertPairPoP capnp.Struct
+
+// CertPairPoP_TypeID is the unique identifier for the type CertPairPoP.
+const CertPairPoP_TypeID = 0xe4f3e62f1a3881ea
+
+func NewCertPairPoP(s *capnp.Segment) (CertPairPoP, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return CertPairPoP(st), err
+}
+
+func NewRootCertPairPoP(s *capnp.Segment) (CertPairPoP, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return CertPairPoP(st), err
+}
+
+func ReadRootCertPairPoP(msg *capnp.Message) (CertPairPoP, error) {
+	root, err := msg.Root()
+	return CertPairPoP(root.Struct()), err
+}
+
+func (s CertPairPoP) String() string {
+	str, _ := text.Marshal(0xe4f3e62f1a3881ea, capnp.Struct(s))
+	return str
+}
+
+func (s CertPairPoP) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (CertPairPoP) DecodeFromPtr(p capnp.Ptr) CertPairPoP {
+	return CertPairPoP(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s CertPairPoP) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s CertPairPoP) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s CertPairPoP) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s CertPairPoP) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s CertPairPoP) Mtls() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return []byte(p.Data()), err
+}
+
+func (s CertPairPoP) HasMtls() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s CertPairPoP) SetMtls(v []byte) error {
+	return capnp.Struct(s).SetData(0, v)
+}
+
+func (s CertPairPoP) Signing() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return []byte(p.Data()), err
+}
+
+func (s CertPairPoP) HasSigning() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s CertPairPoP) SetSigning(v []byte) error {
+	return capnp.Struct(s).SetData(1, v)
+}
+
+// CertPairPoP_List is a list of CertPairPoP.
+type CertPairPoP_List = capnp.StructList[CertPairPoP]
+
+// NewCertPairPoP creates a new list of CertPairPoP.
+func NewCertPairPoP_List(s *capnp.Segment, sz int32) (CertPairPoP_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2}, sz)
+	return capnp.StructList[CertPairPoP](l), err
+}
+
+// CertPairPoP_Future is a wrapper for a CertPairPoP promised by a client call.
+type CertPairPoP_Future struct{ *capnp.Future }
+
+func (f CertPairPoP_Future) Struct() (CertPairPoP, error) {
+	p, err := f.Future.Ptr()
+	return CertPairPoP(p.Struct()), err
 }
 
 type CertRequest capnp.Struct
@@ -1387,12 +1933,12 @@ type DispatchPredicate capnp.Struct
 const DispatchPredicate_TypeID = 0xdee9be6704d1bfda
 
 func NewDispatchPredicate(s *capnp.Segment) (DispatchPredicate, error) {
-	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 4})
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 5})
 	return DispatchPredicate(st), err
 }
 
 func NewRootDispatchPredicate(s *capnp.Segment) (DispatchPredicate, error) {
-	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 4})
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 5})
 	return DispatchPredicate(st), err
 }
 
@@ -1524,12 +2070,36 @@ func (s DispatchPredicate) NewSigningCert() (BridgeCertResult, error) {
 	return ss, err
 }
 
+func (s DispatchPredicate) CertPair() (BridgeCertPair, error) {
+	p, err := capnp.Struct(s).Ptr(4)
+	return BridgeCertPair(p.Struct()), err
+}
+
+func (s DispatchPredicate) HasCertPair() bool {
+	return capnp.Struct(s).HasPtr(4)
+}
+
+func (s DispatchPredicate) SetCertPair(v BridgeCertPair) error {
+	return capnp.Struct(s).SetPtr(4, capnp.Struct(v).ToPtr())
+}
+
+// NewCertPair sets the certPair field to a newly
+// allocated BridgeCertPair struct, preferring placement in s's segment.
+func (s DispatchPredicate) NewCertPair() (BridgeCertPair, error) {
+	ss, err := NewBridgeCertPair(capnp.Struct(s).Segment())
+	if err != nil {
+		return BridgeCertPair{}, err
+	}
+	err = capnp.Struct(s).SetPtr(4, capnp.Struct(ss).ToPtr())
+	return ss, err
+}
+
 // DispatchPredicate_List is a list of DispatchPredicate.
 type DispatchPredicate_List = capnp.StructList[DispatchPredicate]
 
 // NewDispatchPredicate creates a new list of DispatchPredicate.
 func NewDispatchPredicate_List(s *capnp.Segment, sz int32) (DispatchPredicate_List, error) {
-	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 4}, sz)
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 5}, sz)
 	return capnp.StructList[DispatchPredicate](l), err
 }
 
@@ -1551,6 +2121,9 @@ func (p DispatchPredicate_Future) Pipeline() PipelineContext_Future {
 }
 func (p DispatchPredicate_Future) SigningCert() BridgeCertResult_Future {
 	return BridgeCertResult_Future{Future: p.Future.Field(3, nil)}
+}
+func (p DispatchPredicate_Future) CertPair() BridgeCertPair_Future {
+	return BridgeCertPair_Future{Future: p.Future.Field(4, nil)}
 }
 
 type BeadRef capnp.Struct
@@ -1926,12 +2499,12 @@ type HandoffPredicate capnp.Struct
 const HandoffPredicate_TypeID = 0x93849ef5dbe9a941
 
 func NewHandoffPredicate(s *capnp.Segment) (HandoffPredicate, error) {
-	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 8})
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 9})
 	return HandoffPredicate(st), err
 }
 
 func NewRootHandoffPredicate(s *capnp.Segment) (HandoffPredicate, error) {
-	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 8})
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 9})
 	return HandoffPredicate(st), err
 }
 
@@ -2127,12 +2700,36 @@ func (s HandoffPredicate) NewSigningCert() (BridgeCertResult, error) {
 	return ss, err
 }
 
+func (s HandoffPredicate) CertPair() (BridgeCertPair, error) {
+	p, err := capnp.Struct(s).Ptr(8)
+	return BridgeCertPair(p.Struct()), err
+}
+
+func (s HandoffPredicate) HasCertPair() bool {
+	return capnp.Struct(s).HasPtr(8)
+}
+
+func (s HandoffPredicate) SetCertPair(v BridgeCertPair) error {
+	return capnp.Struct(s).SetPtr(8, capnp.Struct(v).ToPtr())
+}
+
+// NewCertPair sets the certPair field to a newly
+// allocated BridgeCertPair struct, preferring placement in s's segment.
+func (s HandoffPredicate) NewCertPair() (BridgeCertPair, error) {
+	ss, err := NewBridgeCertPair(capnp.Struct(s).Segment())
+	if err != nil {
+		return BridgeCertPair{}, err
+	}
+	err = capnp.Struct(s).SetPtr(8, capnp.Struct(ss).ToPtr())
+	return ss, err
+}
+
 // HandoffPredicate_List is a list of HandoffPredicate.
 type HandoffPredicate_List = capnp.StructList[HandoffPredicate]
 
 // NewHandoffPredicate creates a new list of HandoffPredicate.
 func NewHandoffPredicate_List(s *capnp.Segment, sz int32) (HandoffPredicate_List, error) {
-	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 8}, sz)
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 9}, sz)
 	return capnp.StructList[HandoffPredicate](l), err
 }
 
@@ -2146,156 +2743,672 @@ func (f HandoffPredicate_Future) Struct() (HandoffPredicate, error) {
 func (p HandoffPredicate_Future) SigningCert() BridgeCertResult_Future {
 	return BridgeCertResult_Future{Future: p.Future.Field(7, nil)}
 }
+func (p HandoffPredicate_Future) CertPair() BridgeCertPair_Future {
+	return BridgeCertPair_Future{Future: p.Future.Field(8, nil)}
+}
 
-const schema_b8e3f1a2c4d5e6f7 = "x\xda\x94W}\x8c\x14w\xf9\x7f\x9e\xefw\xf7\xf6^" +
-	"vwn~\xb3?|I\xc96XLQ1\xbcH" +
-	"\xd2\x904\xc7\xddA\xe4x\x91\x9b[M\x01\xd1tv" +
-	"\xe7{\xb7\xc3\xed\xce,3\xb3w,\x81\\\xda\x94h" +
-	"\xa3\xa4M\x95\xc4\xb7`S\xdfb\xa5\xb1\x18H\xa8B" +
-	"\xa5M\xd1\x16hR\x0c$@\xa1\x81\x08m1V\xa9" +
-	"\x91J-:\xe6\xf9\xee\xde\xcc\xb0wM\xf4\xbf\xd9\xcf" +
-	"<\xf3\xbc~\x9e\x97]\xb4:\xb9\"\xb18\xf3V\x07" +
-	"0}8\xd9\x11\xe4O\xe2'\xf7\xa6\xbf\xfa\x0d\xd0\x15" +
-	"d\xc1?\xde<\xfb\xd2S\xef\xfe\xf10$y\x0a`" +
-	"\xe9&\xceP\x13\xf2\xd1\xe0y\x04\x0c\xd2\xcf\xcf\xc1u" +
-	"}\x7f\xd8C\xe2\x18\x89'HdW\x82\xa1\xf6(=" +
-	"j\xbb\x13\x93\x80\xc1\xcf\xac\x93\xe9E\xef\xee|\xac]" +
-	"w\x96D\xae$Nh\xef\xc8\xef\xae'\xbe\xc6\x01\x83" +
-	"\xfe\x9f_\x7f\xfd\xe6\xbeG\xbe\x05\xaa\x12\xd3\x9c\xec$" +
-	"\x91\x9ft2\xd4\x0e\xc8\xc7g:\x7fO\x8e\x1c\xdai" +
-	"\x9e\xdc\xf1\x89\x83\xdfo\x93&_\xb5g\xba\x7f\xad\x1d" +
-	"\xea\xa6\xa7\x03\xdd\xbf\x04\x0c~\xf5\xf7\xb5\xfb7n\xda" +
-	"\xff#P\x95\x98\x1b\x80\xda\xfa\x9e\x13\xda\xa6\x1e\x12\xfc" +
-	"R\xcf\x06\xc0@\xfb\xde\xd3\x1f\x1c\xf9\xcd\x9c\xdf\xb5)" +
-	"e$Q\xefyQ\xdb%e\x1b=\x14\xdc{\xe5\x9d" +
-	"\xd9'\xff\xba\xe0D\x9b\xac\x0c\xff|\xcf\x9f\xb4kR" +
-	"\xf6J\xcf[\x80\xc1\x95\x1f\x16\x1f\xfcH\xe7\xf97\xda" +
-	"\xb2\xd6T|4\xfdO\xed\x954=\x1dO\x93\xb7\x17" +
-	"~{:1\xf6\xfc\xf57fQ\xbc\xb4\x9e\xe9Fm" +
-	"w\x86\x84\x1f\xca\x90\xe6\xe3\xbc\xfb\x81-\x0f}\xfcZ" +
-	"\xbbf$\x91\xafd\xff\xa6Y2\xd9\"K.o\xae" +
-	"\xfct\xdf\xff=\xf5\x8b7g\x0b\xef\x85\xec\x05\xedU" +
-	")\xfb\x8a\x94\xbd\xf9\xe3//\xfc\xe8\xbc9\x7fi\xcf" +
-	"\xd9\xd2e\x0aC\xad_!\xc9\xfb\x95)\xc0\xe0T}" +
-	"\xee\x13\xc6\xf1\xa1\x9b\xe4\x02o\xcf\xc4n\xe5Em\x0f" +
-	"\x09/}Ty\x8c\xeav~\xfe\xe4\xba,\x7f\xfd\x83" +
-	"6\x87Wa\x8a\x03h\x0b\xd5\xa7\xb5e*}\xb8X" +
-	"\xa5\\t\x1d\xdd\xf7\xde\xdeO\xef\xb9=kx\xaf\xaa" +
-	"\x17\xb4\xf3R\xf8\xac:\x09\x0b\x03\xcb\x14\xb6o\xf9\x0d" +
-	"\xfe\xd9\x92Q\xb3k\xcb\x07\\\xcb\x1c\x13\x83\xc2\xf5G" +
-	"\x84W\xaf\xf80\x8c\xa8\xe7x\x02 \x81\x00\xea\xae\"" +
-	"\x80\xbe\x93\xa3\xfeu\x86*b\x0e\x09\xdc\xbd\x19@\x7f" +
-	"\x84\xa3\xfe8Cd9d\x00\xea\x9e\x11\x00\xfd\x9b\x1c" +
-	"\xf5\xef0T9\xcb!\x07P\xf7\x0e\x00\xe8\x8fs\xd4" +
-	"\x7f\xc0PM$r\x98\x00P\xbf\xbb\x04@\xff6G" +
-	"\xfdI\x86AI\xb8\xbe5j\x95 e\xf8\x02\xd3\xc0" +
-	"0\x0d\x18\xd4\\k\xc2\xf0\xc5Z\xe0\xa2\x11\x82b{" +
-	"\xcdr\x85\xd7\x0f\xe8c\x12\x18&\x01\xa7\xbczq\xab" +
-	"(\xf9\xd32y\xaf\xe4\xd4\x04*\x11\x99\x01Q\x01\x9c" +
-	"\x11\xf5\x88\x98pJ\x86o9v,\xea\xce0\xea\x05" +
-	"\xe4\xf7=\x1c\xf5E\xb1\xa8\x17.\x07\xd0\xef\xe5\xa8\x7f" +
-	"\x8e\xe1\x94+&\x9cqa\"\x02C\x04\xecs\x85\xe1" +
-	"96*\x11%\xda,\xb3\x96\xe5\xcf\xaf\xee\x1f\xac\x18" +
-	"V\xd5\x03is\xc5\xb4M\xed\x00\xce\x03(\xecG\x8e" +
-	"\x85\xc3\x18\x99\xd5\x0eI\xfcY\xc2\x8f\x10\xce\x9a\x09\xd7" +
-	"\x9e\x93\xf8A\xc2\x8f!C\xe42\xe5\xdaQ\x09\x1f&" +
-	"\xf8%\x12O\xa0\xcc\xba\xf6\x82\xc4\x8f\x10\xfe2\xe1I" +
-	"\x9e\xc3$\xb5\x93\xc4\x8f\x11~\x8a\xf0\x8eD\x0e;\x88" +
-	"\xe0\xb8\x19\xa0\xf02\xe1g\x08O%s\x92O\xa7\xf1" +
-	"a\x80\xc2k\x84_$\xbc\xb3#\x87\x9d\xd4\xcdR\xcf" +
-	"\x19\xc2/\x13\xde\x95\xcaa\x17\x80vI\xe2\xe7\x08\xbf" +
-	"Jxwg\x0e\xbb\xa9\xe7q\x09@\xe1\"\xe1o\x13" +
-	"\xde\xd3\x95\xc3\x1e\x00\xed\x1a\xae\x01(\\%\xfc\x06\xe1" +
-	"\xe9\xee\x1c\xa6\x01\xb4wp\x07@\xe1\xcf\x84\xdf\"<" +
-	"\xd3\x93\xc3\x0c\x80vS\xea\xb9A\xf8m\xc2\xb3\xe9\x1c" +
-	"f\x01\xb4\xf7q\x04\xa0p\x8b\xf0\x04c\xa8*\x99\x1c" +
-	"*\x00\x1a\xb2\"\xc0\x08\xe3XH3\x86)\xcb\xf3\xa6" +
-	"\xc9\x93\xf2\xea\xc5\xf0\xd9\xa8\x9b\xe1\xb3\xd8^\x9b&\\" +
-	"\xca2B\xf2\xa5\xb6\xfaVHNW\xd4\x1c\xcf\xf2\x1d" +
-	"\xe0nc\x06\x88nc\xc3\xa4-\\\x08U\xbab4" +
-	"2[6B\xfe\x1a%\xdfq\xc3\xef'\x1dw|\xb4" +
-	"\xe2L\x02\x84_\x06[\x9d\xe2\x03\x04C_\xc5\x99\x1c" +
-	"\x89\xd4\xe4\xdd\xba=dF\xcd2!l\xff\x0bF\x15" +
-	"0\xea*aOX\xaecW!%\xec\xb0ef\xb4" +
-	"\xc6j\xc36\x9d\xd1\xd1aW\x98V\xc9\xf0\x85\xa4\xe9" +
-	"\xddak\x9c\xa6>\x7f\x8d\xa3~1\xd6\x1a\xe7\xa9_" +
-	"\xcep\xd4/G\x04U/\x11x\x8e\xa3~\x95&B" +
-	"\x93\x9e\xea\x95\xad\x00\xfae\x8e\xfa\xed\xd8Dx\x9f\xe6" +
-	"\xc9-\x8e\x85\x9cdf\xb2\xc9L\x15\x9f\x00(\xe4\xa8" +
-	"\x82wKfv4\x999WV\xf6.\xc2\xef\x95\xcc" +
-	"L5\x999\x1f\x8b\x00\x85{\x08_\x84\x0c\x83Q\xd7" +
-	"\xa9\x0e\x97\x0d/\x96\x82)\xdf!$\xfa\xed\xd5\xabU" +
-	"#V\xb1Q\xab\"\xbc\xc1\xb2\x01\x8a=&L\xcc\x02" +
-	"\x0es\x94o\xb3\x80A\xc9\xa9V-\xbfP\x06nx" +
-	"\xed\xefj\xae\x98\xb0\x9c\xba\x87\x83e\xc3\xb2W\x1b\x1e" +
-	"\x96C\xad\xa5\x16\x041\xcc\xb3\xc6l\xcb\x1e\x1b\x84\x94" +
-	"p}\xec\x8dN\x0c@\xec\x8d\x95\x05\xa7\xe7t\x9f0" +
-	"\xcc\x111J\xd5H\x87\xd5X\xf5)\x00}\x05G}" +
-	"]\xac\x1aC4\xa8Vr\xd4\x87c\xd5XO\x83|" +
-	"\x1dG}#C\x85\x889\xedI_Q\x18f\x8c9" +
-	"%\xc7\xf6\x85\xed\xaf\x86\x94\xe1\x95g\xb0dz\x8c\xd1" +
-	"\xc2(\xd0\xb0m\x8e\xb1\xb4\xb41w3y\xaf~\xec" +
-	"a\x00d\xea\xff\xaf\x01\x08\x8a\xad\xf5\x02\xdc\xf5\x03\xa3" +
-	"\xee\x97\x1d\xd7\xf2Yc\xbda\x1bc\x02h\xfa\xaf\xb7" +
-	"l\x1f`\x86\x81\xb5\xa2\xb1\xca\xf6\xddF\xfbd\x9e7" +
-	"\xdbd&N~\x86\xa3~\x1f\xc3\xd4\xb8\x15\xc5R\xab" +
-	"\x17+Vi\xad\x00l`\x06\x18ff\x89\xa4\x7fL" +
-	"\xd8\xfe\x90)l\x85P\xb2\xd6\x1bZ3(\xbd[8" +
-	"\xea\xe5\x985\xb1\x06@79\xea\xb5Xz\xab\xb4\xd4" +
-	"\xca\x1cu?F\xf6m\xc4\xeb\x1aG}'C\xc56" +
-	"\xaa\xf1\x05\xe7LX\xa6pc\x9d\x9d\xaf:\xa6\xa8\x84" +
-	"\x12\xa6\x18\xb5l\xcb\xb7\x80;\xf6\x87Va\xd8\xaa\x89" +
-	"\x8ae\x8b\xc1>*\xdav\xbf\x8d\x1c\xcb[\xe4\xd8\xc2" +
-	"p\xda\xf9M\xd4\x7f\x1b9\xea&9\x8fM\xe7\x0d\xf2" +
-	"\xf3A\x8ez\x85a_\x8d\x1ad\x06\xbdKu\xd7\x15" +
-	"\xb6?\x0c\x8a\xec\x9fN`\xd8Iq\xb4\x1c\x00\x1ec" +
-	"P\xfbDYiy5\xc3/\x95\xa3\x91\x02mi\x1e" +
-	"\x98-\xcdK\"\xa7\xc24[kfKs1J\xf3" +
-	"T\xb1\xd9&\xd8\x1b\x1d\xbf\xcd\x8e\xca\x1bTh\xec\x8d" +
-	"n\xd2V\xa7\x851\x00`ot\x85\xb6\xde\xfe\xb7}" +
-	"\x1a\xd2\xa9\xc5\xf1F\xbe\xe0\x1b\xbehc\xef\x92\x88\xbd" +
-	"!y\x97DgE^\xd4\x9cR\x19\xbb\x80a\x17`" +
-	"~\\4fIk\xbc\x05G\xc4\xb6\xba\xe0\x9e\xdff" +
-	"fy\xcb\xcc\x8aX>\xef';\xf7q\xd4W2\xec" +
-	"\x93wRX\xe4;\xef\xa5,`\xbe\xe6:\x0e\xe50" +
-	"<D\xdb\xa2\x9d\xed\x8e\xa2\x03\xa8y=\xcaR-s" +
-	"\xe50X\xbcY\x0e\x83\x85;\x00\x90\xab\x0b\x08L\xa8" +
-	"\xf3\x8b\x00\x81\x8cu\xbd\xe5A\xbeJ\xec\x08\xea\xf6\xb8" +
-	"\xedL\xda\xf2\xe8\x0b\\\xa7R)\x1a\xa5q\xe8\xeb\xf7" +
-	"}\xa34\x1e\x14\xeb\xb6Y\x11C6\xe4'\x8c\x8ae" +
-	"\xb6~\x17|H\x19\x15137\xfd\x03\xf2\xbd\xf4\xe7" +
-	"\xae01\x87(\x07\xcfr\xd4\x8f\xc4\x12\xf3\x1c\x81\x07" +
-	"9\xea\xc7\xa2k\xf6(5\xfea\x8e\xfa\x19\xe2\x196" +
-	"yv\x9a\x04Oq\xd4\xcf\xd1\xeeb\xcd\xdduv$" +
-	"\xb6\xfa\x92L\xae.\xf5\x12\xd1\xf4\"G\xfdm\xda[" +
-	"\\\xee-\xf5\x1aI^\xe5\xa8\xdf\x98QhOl\xb3" +
-	"\x9d\xe9_\xca\xb8h\x84\xa5\xe9\x8d\xfen\xb5Js'" +
-	")h\xed\xac\x15\x8d!\xc0\x18Q<\xaf.\xcc~\x9f" +
-	"\x08\xdd\xbaU$\x8d\x0d\xbf\xee\xd22l\x9f\x84\xd3+" +
-	"fX\xa1\xaa\xb7fH:\x08\x9aCd \xda0\x19" +
-	"\xfcw\xd0Z1\x03\xd1\x8a\xc9\xb0\x7f\x05\xad\x1d\xe3F" +
-	";fj\xacll\xb0\xcc\x12\xf6F\xffp\x9b$\x9a" +
-	"\xaa\x19\x9e7.\xa2\x89\\t\x1c\xdf\xf3]\x03\xf2\xb5" +
-	"A\xc7\x14\x1fJ\xf8/:\xe3\xc2\xa6\xe3\x99W\xbd\xff" +
-	"\xb1\xaf\xeeH\xda\x9d\xc9\xffO\x00\x00\x00\xff\xff\x92\xbf" +
-	"\xd1\xd9"
+type SignRequest capnp.Struct
+
+// SignRequest_TypeID is the unique identifier for the type SignRequest.
+const SignRequest_TypeID = 0x8940b4fc6c79174c
+
+func NewSignRequest(s *capnp.Segment) (SignRequest, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 3})
+	return SignRequest(st), err
+}
+
+func NewRootSignRequest(s *capnp.Segment) (SignRequest, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 3})
+	return SignRequest(st), err
+}
+
+func ReadRootSignRequest(msg *capnp.Message) (SignRequest, error) {
+	root, err := msg.Root()
+	return SignRequest(root.Struct()), err
+}
+
+func (s SignRequest) String() string {
+	str, _ := text.Marshal(0x8940b4fc6c79174c, capnp.Struct(s))
+	return str
+}
+
+func (s SignRequest) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SignRequest) DecodeFromPtr(p capnp.Ptr) SignRequest {
+	return SignRequest(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SignRequest) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SignRequest) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SignRequest) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SignRequest) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SignRequest) Digest() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return []byte(p.Data()), err
+}
+
+func (s SignRequest) HasDigest() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SignRequest) SetDigest(v []byte) error {
+	return capnp.Struct(s).SetData(0, v)
+}
+
+func (s SignRequest) Algorithm() (string, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.Text(), err
+}
+
+func (s SignRequest) HasAlgorithm() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s SignRequest) AlgorithmBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.TextBytes(), err
+}
+
+func (s SignRequest) SetAlgorithm(v string) error {
+	return capnp.Struct(s).SetText(1, v)
+}
+
+func (s SignRequest) Purpose() (string, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return p.Text(), err
+}
+
+func (s SignRequest) HasPurpose() bool {
+	return capnp.Struct(s).HasPtr(2)
+}
+
+func (s SignRequest) PurposeBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return p.TextBytes(), err
+}
+
+func (s SignRequest) SetPurpose(v string) error {
+	return capnp.Struct(s).SetText(2, v)
+}
+
+// SignRequest_List is a list of SignRequest.
+type SignRequest_List = capnp.StructList[SignRequest]
+
+// NewSignRequest creates a new list of SignRequest.
+func NewSignRequest_List(s *capnp.Segment, sz int32) (SignRequest_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 3}, sz)
+	return capnp.StructList[SignRequest](l), err
+}
+
+// SignRequest_Future is a wrapper for a SignRequest promised by a client call.
+type SignRequest_Future struct{ *capnp.Future }
+
+func (f SignRequest_Future) Struct() (SignRequest, error) {
+	p, err := f.Future.Ptr()
+	return SignRequest(p.Struct()), err
+}
+
+type SignResponse capnp.Struct
+
+// SignResponse_TypeID is the unique identifier for the type SignResponse.
+const SignResponse_TypeID = 0xe71582b1979fd89a
+
+func NewSignResponse(s *capnp.Segment) (SignResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return SignResponse(st), err
+}
+
+func NewRootSignResponse(s *capnp.Segment) (SignResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return SignResponse(st), err
+}
+
+func ReadRootSignResponse(msg *capnp.Message) (SignResponse, error) {
+	root, err := msg.Root()
+	return SignResponse(root.Struct()), err
+}
+
+func (s SignResponse) String() string {
+	str, _ := text.Marshal(0xe71582b1979fd89a, capnp.Struct(s))
+	return str
+}
+
+func (s SignResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SignResponse) DecodeFromPtr(p capnp.Ptr) SignResponse {
+	return SignResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SignResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SignResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SignResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SignResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SignResponse) Signature() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return []byte(p.Data()), err
+}
+
+func (s SignResponse) HasSignature() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SignResponse) SetSignature(v []byte) error {
+	return capnp.Struct(s).SetData(0, v)
+}
+
+func (s SignResponse) Identity() (string, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.Text(), err
+}
+
+func (s SignResponse) HasIdentity() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s SignResponse) IdentityBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.TextBytes(), err
+}
+
+func (s SignResponse) SetIdentity(v string) error {
+	return capnp.Struct(s).SetText(1, v)
+}
+
+// SignResponse_List is a list of SignResponse.
+type SignResponse_List = capnp.StructList[SignResponse]
+
+// NewSignResponse creates a new list of SignResponse.
+func NewSignResponse_List(s *capnp.Segment, sz int32) (SignResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2}, sz)
+	return capnp.StructList[SignResponse](l), err
+}
+
+// SignResponse_Future is a wrapper for a SignResponse promised by a client call.
+type SignResponse_Future struct{ *capnp.Future }
+
+func (f SignResponse_Future) Struct() (SignResponse, error) {
+	p, err := f.Future.Ptr()
+	return SignResponse(p.Struct()), err
+}
+
+type OraclePublicKey capnp.Struct
+
+// OraclePublicKey_TypeID is the unique identifier for the type OraclePublicKey.
+const OraclePublicKey_TypeID = 0xc3ae82ff7f78a42a
+
+func NewOraclePublicKey(s *capnp.Segment) (OraclePublicKey, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 4})
+	return OraclePublicKey(st), err
+}
+
+func NewRootOraclePublicKey(s *capnp.Segment) (OraclePublicKey, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 4})
+	return OraclePublicKey(st), err
+}
+
+func ReadRootOraclePublicKey(msg *capnp.Message) (OraclePublicKey, error) {
+	root, err := msg.Root()
+	return OraclePublicKey(root.Struct()), err
+}
+
+func (s OraclePublicKey) String() string {
+	str, _ := text.Marshal(0xc3ae82ff7f78a42a, capnp.Struct(s))
+	return str
+}
+
+func (s OraclePublicKey) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (OraclePublicKey) DecodeFromPtr(p capnp.Ptr) OraclePublicKey {
+	return OraclePublicKey(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s OraclePublicKey) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s OraclePublicKey) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s OraclePublicKey) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s OraclePublicKey) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s OraclePublicKey) Key() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return []byte(p.Data()), err
+}
+
+func (s OraclePublicKey) HasKey() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s OraclePublicKey) SetKey(v []byte) error {
+	return capnp.Struct(s).SetData(0, v)
+}
+
+func (s OraclePublicKey) Algorithm() (string, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.Text(), err
+}
+
+func (s OraclePublicKey) HasAlgorithm() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s OraclePublicKey) AlgorithmBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.TextBytes(), err
+}
+
+func (s OraclePublicKey) SetAlgorithm(v string) error {
+	return capnp.Struct(s).SetText(1, v)
+}
+
+func (s OraclePublicKey) CertPem() (string, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return p.Text(), err
+}
+
+func (s OraclePublicKey) HasCertPem() bool {
+	return capnp.Struct(s).HasPtr(2)
+}
+
+func (s OraclePublicKey) CertPemBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return p.TextBytes(), err
+}
+
+func (s OraclePublicKey) SetCertPem(v string) error {
+	return capnp.Struct(s).SetText(2, v)
+}
+
+func (s OraclePublicKey) Identity() (string, error) {
+	p, err := capnp.Struct(s).Ptr(3)
+	return p.Text(), err
+}
+
+func (s OraclePublicKey) HasIdentity() bool {
+	return capnp.Struct(s).HasPtr(3)
+}
+
+func (s OraclePublicKey) IdentityBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(3)
+	return p.TextBytes(), err
+}
+
+func (s OraclePublicKey) SetIdentity(v string) error {
+	return capnp.Struct(s).SetText(3, v)
+}
+
+func (s OraclePublicKey) ExpiresAt() int64 {
+	return int64(capnp.Struct(s).Uint64(0))
+}
+
+func (s OraclePublicKey) SetExpiresAt(v int64) {
+	capnp.Struct(s).SetUint64(0, uint64(v))
+}
+
+// OraclePublicKey_List is a list of OraclePublicKey.
+type OraclePublicKey_List = capnp.StructList[OraclePublicKey]
+
+// NewOraclePublicKey creates a new list of OraclePublicKey.
+func NewOraclePublicKey_List(s *capnp.Segment, sz int32) (OraclePublicKey_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 8, PointerCount: 4}, sz)
+	return capnp.StructList[OraclePublicKey](l), err
+}
+
+// OraclePublicKey_Future is a wrapper for a OraclePublicKey promised by a client call.
+type OraclePublicKey_Future struct{ *capnp.Future }
+
+func (f OraclePublicKey_Future) Struct() (OraclePublicKey, error) {
+	p, err := f.Future.Ptr()
+	return OraclePublicKey(p.Struct()), err
+}
+
+type OracleInfo capnp.Struct
+
+// OracleInfo_TypeID is the unique identifier for the type OracleInfo.
+const OracleInfo_TypeID = 0xdcf95acc5ea13fff
+
+func NewOracleInfo(s *capnp.Segment) (OracleInfo, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2})
+	return OracleInfo(st), err
+}
+
+func NewRootOracleInfo(s *capnp.Segment) (OracleInfo, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2})
+	return OracleInfo(st), err
+}
+
+func ReadRootOracleInfo(msg *capnp.Message) (OracleInfo, error) {
+	root, err := msg.Root()
+	return OracleInfo(root.Struct()), err
+}
+
+func (s OracleInfo) String() string {
+	str, _ := text.Marshal(0xdcf95acc5ea13fff, capnp.Struct(s))
+	return str
+}
+
+func (s OracleInfo) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (OracleInfo) DecodeFromPtr(p capnp.Ptr) OracleInfo {
+	return OracleInfo(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s OracleInfo) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s OracleInfo) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s OracleInfo) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s OracleInfo) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s OracleInfo) Keys() (OraclePublicKey_List, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return OraclePublicKey_List(p.List()), err
+}
+
+func (s OracleInfo) HasKeys() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s OracleInfo) SetKeys(v OraclePublicKey_List) error {
+	return capnp.Struct(s).SetPtr(0, v.ToPtr())
+}
+
+// NewKeys sets the keys field to a newly
+// allocated OraclePublicKey_List, preferring placement in s's segment.
+func (s OracleInfo) NewKeys(n int32) (OraclePublicKey_List, error) {
+	l, err := NewOraclePublicKey_List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return OraclePublicKey_List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(0, l.ToPtr())
+	return l, err
+}
+func (s OracleInfo) Scopes() (capnp.TextList, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return capnp.TextList(p.List()), err
+}
+
+func (s OracleInfo) HasScopes() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s OracleInfo) SetScopes(v capnp.TextList) error {
+	return capnp.Struct(s).SetPtr(1, v.ToPtr())
+}
+
+// NewScopes sets the scopes field to a newly
+// allocated capnp.TextList, preferring placement in s's segment.
+func (s OracleInfo) NewScopes(n int32) (capnp.TextList, error) {
+	l, err := capnp.NewTextList(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return capnp.TextList{}, err
+	}
+	err = capnp.Struct(s).SetPtr(1, l.ToPtr())
+	return l, err
+}
+func (s OracleInfo) Epoch() uint64 {
+	return capnp.Struct(s).Uint64(0)
+}
+
+func (s OracleInfo) SetEpoch(v uint64) {
+	capnp.Struct(s).SetUint64(0, v)
+}
+
+// OracleInfo_List is a list of OracleInfo.
+type OracleInfo_List = capnp.StructList[OracleInfo]
+
+// NewOracleInfo creates a new list of OracleInfo.
+func NewOracleInfo_List(s *capnp.Segment, sz int32) (OracleInfo_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2}, sz)
+	return capnp.StructList[OracleInfo](l), err
+}
+
+// OracleInfo_Future is a wrapper for a OracleInfo promised by a client call.
+type OracleInfo_Future struct{ *capnp.Future }
+
+func (f OracleInfo_Future) Struct() (OracleInfo, error) {
+	p, err := f.Future.Ptr()
+	return OracleInfo(p.Struct()), err
+}
+
+const schema_b8e3f1a2c4d5e6f7 = "x\xda\xacX{\x8c\x1b\xd5\xd5?g\xae\xbd\xde]\xbc" +
+	"k;\xe3dID\xe4\x8f|\xc9'\xc2G\xda\x90\x14" +
+	")D gw\x135\x9bG\xb3\xb3N\x05l\x03b" +
+	"l\xdf]O\xd6\x9e13\xe3\xdd\x18\xa5\xda&\x02\xb5" +
+	"\xa8DP\xda\xb4\x0d-\xcf\xf2\x10\x94\xb6\xa4J\xd4\xa4" +
+	"\x0d\xcf\x92\x8aG*5(\xa8\x10\x02\x826\xe1%h" +
+	"\x13 @ \xe9T\xe7\xda\x9e\x99\x9d\xf5Fm\xd5\xff" +
+	"\xae\x7f>\xbe\xf7w\xcf\xfd\xfd\xce=\xd7\x0b\xf7E\x96" +
+	"\x85.\xeex\xb0\x0d$\xa5\x1cnq\xd6tU\x8b\xa7" +
+	"w-\xbb\x09\x121t>}\xeb\xa5g\xee=\xf1\xd7" +
+	"=\x10f\x11\x00yo\xe8\xb0\xbc?D\xa3\xa7B\xbf" +
+	"\x02tR/\xe0\xffm\x8f^\xf3]Pb(\x05\x82" +
+	"\x17_\x1d\x96P\xd6\xc24\xe4\xe1\x14\x02:\xd1\xc7g" +
+	"\xe0\x9a\xf4\x8b\xdb(\xdc77M\xb8xK\x8b\x84\xf2" +
+	"\xb6\x16\x9a\xfb\xa6\x961@\xe7A\xed\x85\xe8\xc2\x13\x9b" +
+	"o\x09\xce\xddI!\xc7Z\x9e\x97OP\xf0\xe2\x0fZ" +
+	"\xbe\xcd\x00\x9d\xee\x87\xde}\xf5\xe4\x9d7|?\xc0\xba" +
+	"\x8dB\x1ej\x97P\xde\xddN\xc3\x9d\xed\x0e\x11\xd9\xbd" +
+	"9\xff\xc2\xf5\xff\xbb\xeb'\xcd\xf6x\"\xfa[\xf9T" +
+	"\x94F'\xa3\xb4\xc7_\x7f\xbc\xfa\x91+\xafz\xe4g" +
+	"\x90\x88\xf9h\x00\xca\xdf\xebx^\xbe\xa3\x83\x02wt" +
+	"\xac\x03t\x92K\x9e;\x18\xddq\xff\x03\x81I%Z" +
+	"wo\xc74\x94\x9f\x13\xc1\xfb;hw\x9f^\xb2\xe6" +
+	"\xa3];f\xfd&\xb8\xbb\x08\x85\x9c\xdf\xf9\xa1\xbc\x80" +
+	"\xf6\xb9x~\xa7\xe0\xfb\xe7\x1f\xee]\xfe(\x8b<\xd1" +
+	"\x8c\xef\xda\xf8\xe7\xf2Uq\x1a}=N|/\xbco" +
+	"\xd3\xb8\xb3\xf5\x97\xbf\x0f$9,\x8e\xedD\xfcs\xf9" +
+	"\x0c\x05/>\x15\x17G\"\xdf\xfe\xf0\x17\xfb~7\xe3" +
+	"\x0fMH\xcb\xd3\xa7=-\xcf\x9eF\xa3\x99\xd3\x88\xf3" +
+	"'\x85\xcd\x9dw\xff}\xfe\xf3\x81X1qu\xda{" +
+	"\xf2\x8d\"v\xcb\xb4\xb7\x01\x1d'}\xcf5\x07\x06O" +
+	"\x1d\x09\xb2\x10\x13_-\xbf(k2\x8d\xb8L\x94\xdf" +
+	"\xbc+{mW\xeb+\xaf7\x0d\x9e\x9d\xfc\\\x9e\x9f" +
+	"\xa4\xd1\xbc$\x05\x1f~\xe2`h\xf8\xf1w_\x0f\xb0" +
+	"\x10:{)\xd9\x8e\xf21\x0a^\xfcfR\xec\xef\xbd" +
+	"-Kf}\xf9\xad\x8f\x8e6\xdb\xdf\x99\xe9\x87\xe5\xb6" +
+	"\x194\x0a\xcf\xa0\xfd\xedg\xedWl\xd82\xebX\x90" +
+	"\x06R\x88:\xe3C\xb9$\x825\x11<X|\xe0\xce" +
+	"i\xf7\xfe\xfc\xadf\x13\xef\x9fqX>(b\xff(" +
+	"bo\x7f\xf9\xae\x1f\xed\xdc:\xfd\xedf\xb1\x97v\xfd" +
+	"E^\xd1E\xa3\xee.\x8a=y\xdf7\x16\x9c;g" +
+	"\xc6\xdf\x82r[|\x7f\x97\x84\xf2N\x11\xf9\x8b\xaeq" +
+	"@\xe7@e\xf6m\xea\xfe\xbe\x93D\x97\x05\xcf\xe3d" +
+	"\xd7\xd3\xf2\x99.q\xd0]\xb7P\"^\x997\xb6\xa6" +
+	"\x93\xbd\xfaE`s+0\xc2\x00\xe4;f>,\xdf" +
+	"?\x93~x\xcfLJr\xdbcw~\xb2\xfd\xff\xb7" +
+	"\x9dn\x9a\x8a\xcbg\x1d\x96\xfbf\xd1h\xc5\xac1X" +
+	"\xe0hy\xae\xdb\x9a]\x95\xbe\x94S\xcbzyiF" +
+	"\x1b\xd6\x07\xf8u\x15\xce,\xbb\x1fQ\x89\xb2\x10@\x08" +
+	"\x01\x12+\x96\x02(\xcb\x18*k$L &\x91\xc0" +
+	"\xbe\x01\x00e%Ce\xbd\x84\x09IJ\xa2\x04\x90P" +
+	"z\x00\x945\x0c\x95+%L\xe7\xb5an\xd9\xd8\x01" +
+	"\x12v\x00:jq\xd805\xbb\x00X\xc2(H\x18" +
+	"\x05\x1c/W\xcc\xb2a\xf1\xc6g\x97\x13\xabs\xea1" +
+	"\xb5\xfc0\xef\xe5\xa6=\xc0\xadJ\xd1\x06\"\x96t\x89" +
+	"}3\x0b\xa0lf\xa8|\xc7G\xec\xc6A\x00\xe5\x06" +
+	"\x86\xca\xad\x12b\x9d\xd76\"{3C\xe5\xc7\x12&" +
+	"\x98\x94D\x06\x90\xd8Ndoe\xa8\xfcT\xc2D(" +
+	"\x94\xc4\x10@b\xc7\"\x00\xe5\x07\x0c\x95\xbb%tr" +
+	"\xdc\xb4\xb5!-\x07\x11\xd5\xf6H\x96MmT\xb5\xf9" +
+	"j`\xbc\xea\x82|SY3\xb9\xd5\x0dhc\x18$" +
+	"\x0c\x03\x8e[\x95\xecF\x9e\xb3\x1b1)+g\x949" +
+	"\xc6\xbc\xda\x04\x88\xb1&\xbb\x1e\xe0\xa3FN\xb55C" +
+	"\xf7\xed\xba\xd5\xdd\xf5|\xe2=\x97\xa1\xb2\xd0\xb7\xeb\x05" +
+	"tF\x170T\xbe\"\xe1\xb8\xc9G\x8d\x11\x9eG\x04" +
+	"\x09\x110mr\xd52t\x8cy2\x0d\xac\xdc\xd0\xc0" +
+	"WWv\xf7\x16U\xadd\x81XsYcMy'" +
+	"\xce\x01\xc8<\x82\x0c3{\xd0[V\xde-\xf0G\x09" +
+	"\xdf\x87\x9e\x10\xe4\xbd\x02\xdfE\xf8\x93(!2\x91r" +
+	"\xf91\x01\xef!\xf8\x19\x0a\x0f\xa1\xc8\xba\xfc\x94\xc0\xf7" +
+	"\x11\xfe,\xe1a\x96\xc40YR\xe0O\x12~\x80\xf0" +
+	"\x96P\x12[\x00\xe4\xe7p\x10 \xf3,\xe1\x87\x08\x8f" +
+	"\x84\x93B\xe3\x07q+@\xe6O\x84\x1f!\xbc\xb5%" +
+	"\x89\xad\x00\xf2+b\x9eC\x84\xbfAx[$\x89m" +
+	"\x00\xf2k\x02\x7f\x99\xf0\xa3\x84\xb7\xb7&\xb1\x1d@~" +
+	"\x13\x17\x01d\x8e\x10\xfe\x0e\xe1\xe7\xb4%\xf1\x1c\xba\xc0" +
+	"p\x15@\xe6(\xe1\xc7\x09\x8f\xb6'1\x0a \x7f\x80" +
+	"\xd7\x03d\xde'\xfc3\xc2;\xceIb\x07\xf9Y\xcc" +
+	"s\x9c\xf0\xd3\x84wF\x93\xd8\x09 \x9f\xc2\x01\x80\xcc" +
+	"g\x84\x87$\x09\x13\xb1\x8e$\xc6\x00d\x94\xb2\x00\x03" +
+	"\x12\xc3LT\x920\xa2YVC<\x11\xab\x92u\xc7" +
+	"j%\xef\x8e\xf9\xa6rCp\x11Mu\xc5\x17\xd9h" +
+	"k\xae8M^6,\xcd6\x80\x99\xd5I \x9a\xd5" +
+	"uc:7\xc1\x9d\xd2\xe4C\xde\xb2\x05\xd5\xd5\xaf\x9a" +
+	"\xb3\x0d\xd3\xfd\xfd\x98a\x8e\x0c\x15\x8d1\x00\xf7\x97\xce" +
+	"F#{\x05\xc1\x90.\x1ac\x03\xde4)\xb3\xa2\xf7" +
+	"\xe5=\xb3\x8cr\xdd\xfe\x9aZ\x02\xf4\\\xc5\xf5Q\xcd" +
+	"4\xf4\x12D\xb8nOY\x10V\xaaz\xde\x18\x1a\xea" +
+	"7y^\xcb\xa96\x172\x9d\xebZ\xe3\x03\xf2\xf9\xfb" +
+	"\x0c\x95\xcf|\xd68I~9\xceP9\xed\xabT\xa7" +
+	"\x08\xfc\x98\xe1\x00\x1d\x0b\xab\xc93qf#\x80r\x9a" +
+	"a\xe6\\\xf4J\x82<]\x88-I\x87\xb5P\x883" +
+	"\\\x13\xe7\x02\xbc\x0d \xb3\x90\xf0\xcb\x848[j\xe2" +
+	"\xbcT\x1c\xee\x12\xc2\x97\x0bqFj\xe2\xec\xc6,@" +
+	"f\x19\xe1k\x848[k\xe2\xec\x13\xa2ZI\xf8z" +
+	"\x94\xd0\x192\x8dR\x7fA\xb5|\xd9\x19\xb7\x0dB\xbc" +
+	"\xcfV\xa5TR}\x879\xa4\x15\xb9\xd5[P!\xa6" +
+	"\x0f\xf3<v\x02\xf63\x14\xdfv\x02:9\xa3T\xd2" +
+	"\xecL\x01\x98j\x05\xbf+\x9b|T3*\x16\xf6\x16" +
+	"TM_\xa9ZXpg\xcd\xd5!\xf0a\x966\xac" +
+	"k\xfap/D\xb8ic\xdck&\x011\x0e\xb5\x9a" +
+	"\xd9\xafj&\xc9\"\xee5L\xf5o\x1b\xe7\x89\x8d\x02" +
+	"\x9f\xe6j~\x80\x0f\x05.\x9c\x0b\x9b]8T\xe1\x96" +
+	"3T\xfa}\xc7\xb86\xeb]81Rt\x83g:" +
+	"\xcb\xd5\xbcOr9C\xb7\xb9n\xaf\x84\x88j\x15&" +
+	"\xc9\xabQ\xff\xe8\xa6\xc9P\x95\xae\xd5\xbf\xa8Xc\xf6" +
+	" \xb1O\xcc\xdc\x0a\x80Rb\xfa*\x00'[\xbf\x97" +
+	"\x80\x99\xb6\xa3V\xec\x02\xddlRu\xad\xaa\xab\xc3\x1c" +
+	"(\x05k5\xdd\x06\x98\xa4\xdf\xdezv\xfa+\xd9\xa2" +
+	"\x96[\xcd\xabh\x05\x8a\xfb\x85\xcd\x8a{\x8fW\xdcc" +
+	"%\xbbhy:\xa8\x9d\xc6\x94\x1br/\xd0Tm\xd9" +
+	"\x89nY\xd5\xcc-Y\x9f1\x1ai>\xb3\xaan\x8c" +
+	"V\x9f]\xe40.\x05\x18 \xdd\x9eG5\xben\x97" +
+	"\x99B\xfe\xe7\x12<W\xd8%T\xb3\xcb\xf9\xd8\x03\x90" +
+	"9\x8f\xf0\x0b\x84]\xc25\xbb\xcc\x13\xf8\xff\x10~\x91" +
+	"\xb0\x0b\xd6\xec2_\xd4\xce\xb9\xae\xed\x1a\xb5|\x81\xb0" +
+	"\xe3E\x84/!\xbbP>(\xad\xfe:4Q\xa4\xc1" +
+	"\xe4\xf8\"\xd3\xe2N\x9ed\x8a\x7f\xe16\x1f\xcfjz" +
+	"\xde\x97\xfa\x14/\x1b\xb9\x02\xb6\x81\x84m\xd4\xedT\xec" +
+	"\xc2Zn\x17\x80\x19\xf9\xb3\xca\x8d\x8ee M}\xd7" +
+	"\xa4\xb6kQ3\x17\x0c6k\xbb\x96z.H\x95M" +
+	"\xc3\x18\xc2\xb8\xd7:\xd6\xadW\xaeK\x0eX\xd5\xc2\xb8" +
+	"\xf7\xee\xa9}\x9d\x16?\xa3/\xdc\xde;`\xd9\x06\xe9" +
+	"u\xa6\x9a+\xf2\xfeJ6]Sp\xa0%\x9b\x03\xa0" +
+	"lb\xa8\xdc\xe0#\xbd\x85\xca\xf2\xb7\x18*7\xfbH" +
+	"\xdf\xd4\xe3\xf5in\x05\xde\xb6\xcak\xd4\xea\x82Jl" +
+	"\x1f\xf0Z\xb2\xc8\x08\xaf\x9e\xb5\xa3\x14\xe5\x87\x97\xcev" +
+	"\xe6\xcdNw\xd2.W\xf3\xea\x0a\xdd6\xab\xc1\xdek" +
+	"N3{\x12\xc1\x8b\x18*K\x88\xa0\xe6\x9d\xb7\x9br" +
+	"\xf4H\x07\x17\xea\x1e\xe6\xba\xdd\x97\xe7z\x8cPZ-" +
+	"\xee\xae\xa6R1\xd8\xc0P)\xf8V\xe3\x94\xa2<C" +
+	"\xa5\xecKf\x89\xb4R`\xa8\xd8\xbed^GZ)" +
+	"3T6K\x18\xd3\xd5\x92\xbf\x855F\xb5<7}" +
+	"YI\x95\x8c</\xba\x11y>\xa4\xe9\x9a\xad\x013" +
+	"\xf4)\xf5[\x93B\x9f>\x84\xc6\x14\x05|\x83\x8f\xf8" +
+	"U\xa4\xd2\xf55\xe2\xd8\x84wl\x84W]'\xc6\xbd" +
+	"\x171 \x81\xcd\x9d\x1ap]\x90`\xbfV\xe6EM" +
+	"\xe7\xbdi*\xff\x9b\xa6z\xd7l\x90\xd0%I-\xc0" +
+	"\x95\x0c\x95<e\x17k,UJ\xe4\xb5\x0c\x95\xa2\x84" +
+	"\xe92]\xc4\x93*F\xaeb\x9a\\\xb7\xfb!&\xee" +
+	"\xe9V\x90\xb0\x95\x12]'\x00\xac/?eS\xb3\\" +
+	"\xb3\xca\xaa\x9d+x]M\xf0\x9d\xd3\xd3\xccT\x8b|" +
+	"\x8f\x9f\x86\x0en\\\xd5\xccTY\xdf\xeb\xa7\xf1\xd0\xd9" +
+	"\xbe\xcas\xd5x\xb6v\x0bc\xdc\xfb\x8f\xa5\xe6\xfe\x94" +
+	"J\xf2\xc4\xb8\xf7/B\xa3\x9a46&\xaey\xf7\xaf" +
+	"\x80\xfa\xb7\xff\x9d&!X&\xfb\x99\xd1\xff\x1f\xdd\x96" +
+	"u\xef\xb9\xb7\xe5\x94^\xac\xdf\xe4\xd5T\xc6Vm\x1e" +
+	"Xk\x91\xb7\x96\xbb\xd4\"o\xa9\x89RL\x8d\xf0j" +
+	"\xdf\xd9+\xbf\xff\xb1\xed[fi}\x99e\xbe-]" +
+	"N\xeb,a\xa8,\x97\x82F\x98\xf8\x9c$KLu" +
+	"\x014\x7f\xf0[e#\xa2[\xc1\xbd\x0ex\xfbrI" +
+	"\\L\x8aY\xc8P\xb9L\xaa\x9d\xb0jWLjR" +
+	"\x83\xe9\xf4\xd7\xda\xb3\xbdm\xe9QZS\xba\xd0\xee%" +
+	"\xa6\xe8\xb3.\x1e\x14}\xd6\x82\xeb\x01\x90%\xe6\x13\x18" +
+	"J\xcc\xcb\x028\"\xc1k5\x0bR%\xb2\x8bS\xd1" +
+	"GtcL\x17\x0fq\xc74\x8a\xc5\xac\x9a\x1b\x81t" +
+	"\xb7m\xab\xb9\x11'[\xd1\xf3T\x9c 5\xaa\x16\xb5" +
+	"|\xfds\xc6\x86\x88Z\xe4\x93\x0f\xa4\xbbG|/\xf8" +
+	"\x9c\xe7&b7%\xfeQ\x86\xca>_\"\xf6\x12\xb8" +
+	"\x8b\xa1\xf2\xa4W\xc8\x1e#%\xeea\xa8\x1c\"\xe3a" +
+	"\xcdx\x07)\xf0\x00C\xe5e2\x9eT3\xdeK\x94" +
+	"\xdbC\x0c\x957\xa89\x92Ds\x94x\x8dr{\x84" +
+	"\xa1\xf2\x0euFLtF\x89c\x14y\x94\xa1r|" +
+	"\x92\xba,~\x9dn4>\x05\x0a\xa7\xfb\xe7`]\x0f" +
+	"\x13\x95H\xfd\xfej^\xed\x03\xf4\xa9\xd3\xb2*<\xdf" +
+	"-Z\xa8\xc6\x85x\xb6\x03nt\xef\xfd1\x92Z\xbd" +
+	"\xa8F\x1d\xa7VU{\xbc\xb6\xa5\x03\xff\xe1\xd4\xfb\x96" +
+	"\x1e\xaf{\xef\x90\xce8\xf5\xf6\xdd\xf4\x1a\x97\xf1\xe1\x82" +
+	"\xbaN\xcb\xe70\xee\xfd\x89\\S\xeexY\xb5,\xff" +
+	"\xc5\x9f5\x0c\xdb\xb2M\x15R\xe5^#\xcf\xa7t\xd9" +
+	"zc\x84\xeb\xbdEUc%\xeb\xdf4\xf3\x84\xa4M" +
+	"L\xfe?\x03\x00\x00\xff\xff\x0a\xb7\x96\xb5"
 
 func RegisterSchema(reg *schemas.Registry) {
 	reg.Register(&schemas.Schema{
 		String: schema_b8e3f1a2c4d5e6f7,
 		Nodes: []uint64{
+			0x8940b4fc6c79174c,
 			0x8b5e0c952601cb1f,
 			0x8dd23f4c0116be0c,
 			0x8f7cf1300ccb69a7,
 			0x93849ef5dbe9a941,
 			0x9bb4237acb647cb5,
 			0xa3ac5958ac4bf4b2,
+			0xa6a5990cd1c93814,
+			0xb71a99b4f34c35f7,
+			0xbf0703b044b996d7,
+			0xc3ae82ff7f78a42a,
 			0xc616bbbcfbaa9a13,
 			0xca29efa00e7c68f6,
+			0xdcf95acc5ea13fff,
 			0xded9081760629fe1,
 			0xdee9be6704d1bfda,
+			0xe4f3e62f1a3881ea,
 			0xe51a815c570a03c5,
 			0xe6aba2129ea66c5a,
+			0xe71582b1979fd89a,
 			0xee1622182d5ba4f5,
 			0xf549c561921d75cc,
 			0xfbdb030e4c7725d9,

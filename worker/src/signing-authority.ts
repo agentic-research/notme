@@ -5378,6 +5378,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async #publishBundle(): Promise<CABundle> {
     const bundle = await this.generateBundle();
     if (this.env.CA_BUNDLE_CACHE) {
+      // No expirationTtl, deliberately (notme-05324c, DO audit L2). The bound
+      // on a bundle's life is checkRevocation's read-time check, issuedAt +
+      // BUNDLE_MAX_AGE_MS, which fails CLOSED (bundle_stale). A KV TTL would
+      // turn a stale bundle into an absent one, and an absent bundle fails
+      // OPEN (the bootstrap case): if the alarm stopped, verifiers would go
+      // from refusing to accepting the moment the key expired.
       await this.env.CA_BUNDLE_CACHE.put(
         "bundle:current",
         JSON.stringify(bundle),
