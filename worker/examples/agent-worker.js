@@ -8,6 +8,23 @@
 //   1. Add this to config.capnp as a second Worker
 //   2. workerd serve config.capnp --experimental
 //   3. Agent code runs in this isolate, calls env.NOTME for everything
+//
+// Credentials: proxy() and sign() use the bridge cert pair AuthService holds
+// for the session. authenticate() holds a pair only after the holder PROVES
+// possession of both private keys (notme-fbbfbc):
+//
+//   const { challenge } = await env.NOTME.authChallenge(identity);
+//   // sign authenticateBinding(mtlsSPKI, signingSPKI, challenge) — see
+//   // worker/src/auth/cert-pair-binding.ts — with the P-256 and Ed25519 keys
+//   await env.NOTME.authenticate({ mtlsCert, signingCert, challenge,
+//                                  proofs: { mtls, signing } });
+//
+// The challenge is single-use and good for 60 s. Each top-level binding call
+// is its own RPC session, so credentials authenticated in one call are not
+// held for the next: as measured (auth-binding-session.do.test.ts), the
+// /proxy and /sign routes below work only where notme authenticates in the
+// same session — a design gap ADR-009 records, not something this example
+// solves.
 
 export default {
   async fetch(request, env) {

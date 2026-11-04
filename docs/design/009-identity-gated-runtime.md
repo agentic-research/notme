@@ -274,35 +274,90 @@ export default {
 > binding as the only channel) are properties of the workerd config, not of
 > notme code, and are unchanged by this note. The "Escalate scope" row and the
 > flowchart below describe `AuthService.proxy()` (`worker/worker.ts`), which
-> is listed above as already implemented — and four of its five gates differ
-> from what that method does. What `proxy()` actually does, in order:
+> is listed above as already implemented — and four of its five gates differed
+> from what that method did. **Updated 2026-11-03 (`notme-baea8c`).** What
+> `proxy()` does now, in order — every step that refuses throws, and writes an
+> audit line first:
 >
-> 1. Throws `"not authenticated"` if no certs are held.
-> 2. Throws `"credentials expired — re-authenticate"` if the held certs have
->    expired. Nothing re-authenticates transparently; the caller must call
->    `authenticate()` again.
-> 3. Throws if `isDeniedDestination(url)` is true. That is a **denylist**, not
->    an allowlist: three metadata hostnames (`169.254.169.254`,
->    `metadata.google.internal`, `100.100.100.200`), any hostname starting
->    `169.254.` or `fd00:`, and unparseable URLs. Every other destination is
->    permitted.
-> 4. Throws unless the held cert's scopes include `bridgeCert`. This is a
->    single capability check. The request carries no scopes, so there is no
->    `request.scopes ⊆ cert.scopes` relation to check.
-> 5. Calls plain `fetch(url, { method, headers, body })`. The held P-256 cert
->    is not attached; there is no mTLS on this path. (mTLS with the bridge key
->    is what the Rust proxy in `proxy/` does; that is a different code path.)
-> 6. Logs a JSON line with `scope_checked: "bridgeCert"` and `allowed: true`.
->    Both are constants: the log line is written only after the checks above
->    passed, so it never records a denial.
+> 1. Refuses (`not_authenticated`) if no certs are held. Certs are held
+>    only after `authenticate()` has verified them against the CA AND the
+>    caller has proved it holds both private keys (`notme-fbbfbc`): it calls
+>    `authChallenge(identity)` for a challenge — single-use, at most 60 s
+>    old, bound to that identity and to the calling binding's `props` when
+>    set, spent in the authority's PoP-nonce store — signs
+>    `authenticateBinding(mtlsSPKI, signingSPKI, challenge)`
+>    (`worker/src/auth/cert-pair-binding.ts`, tag
+>    `notme/authservice-authenticate/v1`) with each key, and passes certs,
+>    challenge and proofs. Before this, any binding holder could present
+>    another principal's public certs and be audited as them. Measured over a
+>    real binding (`auth-binding-session.do.test.ts`): each top-level binding
+>    call is its own session, so held certs do not survive from
+>    `authenticate()` to the next call — `proxy()` and `sign()` work only
+>    in-isolate today, and the attack did not chain end to end. CryptoKeys
+>    do not serialize, so a binding caller passes no keys and `sign()`
+>    refuses without one.
+> 2. Refuses (`credentials_expired`) if the held certs have expired. Nothing
+>    re-authenticates transparently; the caller must call `authenticate()`
+>    again.
+> 3. Refuses (`destination_invalid`) if the URL does not parse, then
+>    (`destination_denied`) if `isDeniedDestination(url)` is true: the hard
+>    metadata denylist in `worker/src/destination-policy.ts`
+>    (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`,
+>    169.254.0.0/16, fc00::/7, fe80::/10, IPv4-mapped forms of those). No
+>    configuration overrides it.
+> 4. Refuses (`destination_not_allowed`) unless the URL is https and its host
+>    is on `PROXY_ALLOWED_DESTINATIONS` — see "Destination allowlist" below.
+>    **Unset or empty allows nothing.** Then refuses (`destination_self`) the
+>    authority's own host — the hosts of `SIGNET_AUTHORITY_URL` and
+>    `SITE_URL` — unless the allowlist names it exactly; a wildcard over the
+>    authority's zone does not admit its admin surface.
+> 5. Refuses (`scope_insufficient`) unless the held cert's scopes include
+>    `bridgeCert`. This is a single capability check. The request carries no
+>    scopes, so there is no `request.scopes ⊆ cert.scopes` relation to check.
+> 6. Refuses (`epoch_mismatch`) unless the epoch both held certs carry
+>    (`OID_EPOCH`, read and cross-checked by `authenticate()`) equals the
+>    authority's current epoch (`getAuthorityState()`, one DO RPC per call).
+>    `revokeEpoch()` and `rotate()` both move the epoch, so either stops held
+>    certs at once instead of when they expire. Strict equality: a cert from a
+>    later epoch than the authority's is refused too. If that RPC fails, the
+>    request is refused (`authority_unavailable`), not sent.
+> 7. Calls plain `fetch(url, { method, headers, body, redirect: "manual" })`,
+>    with the caller's `Host`, `cf-*`, `x-forwarded-*`, `forwarded`,
+>    `x-real-ip` and hop-by-hop headers (and any header its `Connection`
+>    names) removed: on Cloudflare a `Host` or `cf-*` header can steer a
+>    subrequest to a hostname the allowlist did not name.
+>    A redirect is returned to the agent, not followed, so a listed host
+>    cannot forward the request to one the allowlist refuses. The held P-256
+>    cert is not attached; there is no mTLS on this path. (mTLS with the
+>    bridge key is what the Rust proxy in `proxy/` does; that is a different
+>    code path.)
+> 8. Logs a JSON line with `allowed: true` and `response_status`, or, if the
+>    fetch or the response body read throws, `allowed: true` and `error`.
+>    Every refusal above logs `allowed: false` with `reason` naming its gate.
+>    The logged `destination` drops userinfo and the fragment, replaces the
+>    query with `?<redacted>`, and is capped at 512 characters; `method` at
+>    16.
 >
-> There is no epoch check in `proxy()`: it keeps working on certs from a
-> rotated-out epoch until they expire.
+> Covered by `worker/src/__tests__/proxy-gates.test.ts` (`proxy.allowlist.*`,
+> `proxy.epoch.*`, `proxy.audit.*`).
 >
 > Not yet:
-> - no destination allowlist (`proxy()` permits anything not on the denylist);
-> - no epoch / revocation check on held certs;
-> - no mTLS on outbound requests from `proxy()`;
+> - no mTLS on outbound requests from `proxy()`. On Cloudflare, a Worker
+>   presents a client certificate only through an `mtls_certificates`
+>   binding, whose certificate is uploaded ahead of time
+>   (`wrangler mtls-certificate upload`) and named by `certificate_id` in the
+>   Wrangler config. The bridge cert `proxy()` holds is minted per session
+>   with a key held only in memory, so it cannot be that certificate, and a
+>   static operator certificate on the binding would present the operator's
+>   identity, not the agent's — the opposite of what this ADR promises.
+>   Self-hosted workerd is tracked under `notme-89eeed`. No code path is
+>   added until one of those can present the held cert;
+> - revocation is the epoch only. There is no per-certificate revocation
+>   list for bridge certs to consult, so a single compromised cert is stopped
+>   by `revokeEpoch()` (which stops every cert of its epoch) or by expiry;
+> - `sign()` does not run the epoch check. Its output carries the signing
+>   cert, and every verifier checks that cert's epoch itself (`verifyX509`),
+>   so a revoked cert's signature fails where it is used rather than here;
 > - (fixed, `notme-bad2e5`) the IPv6 gap in the denylist: `new URL()` keeps
 >   brackets on IPv6 hostnames, so the old `startsWith("fd00:")` test never
 >   fired and IPv4-mapped literals slipped through. The policy now lives in
@@ -384,11 +439,28 @@ graph TD
 
 Cloud metadata endpoints are hard-denied (same approach as [nono](https://nono.sh)). The allowlist is configured at startup via environment variable.
 
-> **CORRECTION (2026-11-02, `notme-c72e03`).** No allowlist exists and no
-> environment variable configures one. Only the denied half is implemented,
-> as a hardcoded `DENIED_HOSTS` set plus IPv4/IPv6 range checks in
-> `worker/src/destination-policy.ts` (the earlier IPv6 gap, `notme-bad2e5`,
-> is fixed; see the note under "Enforcement guarantees").
+> **Updated 2026-11-03 (`notme-baea8c`).** The allowed half now exists.
+> `PROXY_ALLOWED_DESTINATIONS` is a comma-separated list of hosts — not the
+> JSON above — read on every call from the Worker's environment (a wrangler
+> var, or a `text` binding in `config.capnp`). An entry is an exact host
+> (`api.github.com`) or `*.` plus a suffix (`*.example.com`), which matches
+> subdomains and not the apex. It is matched against the URL's host
+> including any non-default port, and only https is proxied. Each entry is
+> normalised by the WHATWG URL parser (a Unicode entry becomes its
+> punycode). Dropped: a bare `*`, or a `*` anywhere but the leading label;
+> anything that is not a bare host; a wildcard over an IP literal
+> (`*.0.0.1`); and a wildcard over a single label or a known public suffix
+> (`*.com`, `*.co.uk`) — that list is short and hand-kept, not the Public
+> Suffix List. The JSON example above lists `*.notme.bot`; do not copy it:
+> a wildcard over the authority's own zone would put its admin surface
+> behind its own egress, which is why `proxy()` refuses the authority's own
+> host unless it is listed exactly. **Unset or empty allows
+> nothing** — this ADR did not say which way an unset list should fail, and
+> an authority that has not said where its agents may go should send them
+> nowhere, as an unset `GHA_ALLOWED_OWNERS` trusts no one (`notme-1532eb`).
+> The denied half is still the hardcoded `DENIED_HOSTS` set plus IPv4/IPv6
+> range checks, runs first, and is not overridden by listing a denied
+> address.
 
 ## Audit trail
 
@@ -408,10 +480,16 @@ Every proxied request and signing operation is logged as structured JSON:
 }
 ```
 
-> **Note (2026-11-02, `notme-c72e03`).** For `type: "proxy"` entries,
-> `scope_checked` and `allowed` are constants in the code that writes them;
-> a denied request throws before logging, so no entry ever has
-> `allowed: false`.
+> **Updated 2026-11-03 (`notme-baea8c`).** For `type: "proxy"` entries,
+> `allowed` is the decision: a refused request logs `allowed: false` with a
+> `reason` naming the gate (`not_authenticated`, `credentials_expired`,
+> `destination_invalid`, `destination_denied`, `destination_not_allowed`,
+> `destination_self`, `scope_insufficient`, `authority_unavailable`,
+> `epoch_mismatch`) before it throws, and has no `response_status`.
+> `destination` is redacted (no userinfo or fragment, query replaced by
+> `?<redacted>`, at most 512 characters).
+> `identity` is `null` when nothing is held. `scope_checked` is still the
+> constant `bridgeCert`, the only scope `proxy()` checks.
 
 These logs feed into APAS attestations — the identity service IS the execution evidence for the agent's session. Each proxy/sign event becomes a verifiable entry in the provenance chain.
 

@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
+import { authenticateWithPop, makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
 
 // The Worker's transitive imports reach `cloudflare:workers` (DurableObject,
 // WorkerEntrypoint) which is not available in plain vitest. Stub the runtime
@@ -63,12 +63,11 @@ describe("Threat: a bound Worker asserts its own identity (notme-6ad276)", () =>
     const svc = makeAuthService();
     const real = await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]);
 
-    await svc.authenticate({
-      ...real,
+    await authenticateWithPop(svc, real, {
       identity: "wimse://notme.bot/gha/agentic-research/cloister",
       scopes: ["bridgeCert", "sign:git", "sign:attestation", "authorityManage"],
       expiresAt: Math.floor(Date.now() / 1000) + 86_400,
-    } as never);
+    });
 
     const id = await svc.identity();
     expect(id.identity).toBe("wimse://notme.bot/test/alice");
@@ -94,9 +93,8 @@ describe("Threat: AuthService credentials must not leak across RPC sessions", ()
     const svcA = makeAuthService();
     const svcB = makeAuthService();
 
-    await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
-    await svcB.authenticate(
-      await makeRealCreds("wimse://notme.bot/test/bob", ["bridgeCert", "sign:git"]),
+    await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
+    await authenticateWithPop(svcB, await makeRealCreds("wimse://notme.bot/test/bob", ["bridgeCert", "sign:git"]),
     );
 
     const idA = await svcA.identity();
@@ -112,7 +110,7 @@ describe("Threat: AuthService credentials must not leak across RPC sessions", ()
     const svcA = makeAuthService();
     const svcB = makeAuthService();
 
-    await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
+    await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
 
     const idB = await svcB.identity();
     expect(idB.authenticated).toBe(false);
@@ -124,11 +122,11 @@ describe("Threat: AuthService credentials must not leak across RPC sessions", ()
     const svcA = makeAuthService();
     const svcB = makeAuthService();
 
-    await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice", []));
-    await svcB.authenticate(await makeRealCreds("wimse://notme.bot/test/bob", []));
+    await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice", []));
+    await authenticateWithPop(svcB, await makeRealCreds("wimse://notme.bot/test/bob", []));
 
     // Now re-authenticate A — must not affect B.
-    await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice-rekeyed", []));
+    await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice-rekeyed", []));
 
     expect((await svcA.identity()).identity).toBe("wimse://notme.bot/test/alice-rekeyed");
     expect((await svcB.identity()).identity).toBe("wimse://notme.bot/test/bob");
@@ -145,11 +143,11 @@ describe("Threat: AuthService credentials must not leak across RPC sessions", ()
 
     const [idA, idB] = await Promise.all([
       (async () => {
-        await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
+        await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
         return svcA.identity();
       })(),
       (async () => {
-        await svcB.authenticate(await makeRealCreds("wimse://notme.bot/test/bob", ["sign:git"]));
+        await authenticateWithPop(svcB, await makeRealCreds("wimse://notme.bot/test/bob", ["sign:git"]));
         return svcB.identity();
       })(),
     ]);

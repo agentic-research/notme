@@ -107,7 +107,14 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
     // cloister, ley-line, ley-line-open, rosary, mache), the live /token
     // route calls the DO's mintDPoPTokenOnce directly, and an unused method
     // here is one env.AUTH.mintDPoPToken() away from being reachable again.
+    //
+    // authChallenge ADDED (notme-fbbfbc). Reviewed: it returns a random,
+    // single-use, 60 s challenge and writes one pop_nonces row under an
+    // `authsvc:` key, nothing else. A binding holder can already make the DO
+    // write PoP-nonce rows (that is what /cert/nonce does for a session); the
+    // challenge buys nothing without both private keys for the certs.
     expect(rpcSurface(AuthService)).toEqual([
+      "authChallenge",
       "authenticate",
       "getAuthorityState",
       "getCACertificatePem",
@@ -386,7 +393,15 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       // already read both (findPrincipalByOIDC, getPrincipalScopes) and mint
       // a session with getSessionSecret; the only write is a dpop_jtis row,
       // which at worst pre-spends a token whose jti the holder already knows.
-    ).toBe(66);
+      //
+      // 66 → 67: spendOidcJti (notme-b0d10f). The DO spend for /cert/gha,
+      // /cert (oidc proof), /token and /bootstrap/claim, which spent in KV
+      // alone. Reviewed: it takes no token, returns a boolean, and its only
+      // write is one dpop_jtis row under the `oidc:` prefix, kept to
+      // exp + 300s. A stub holder can pre-spend a token whose issuer and jti
+      // it already knows — the same reach loginWithFederated already gives,
+      // and a denial of service against one token, not a credential.
+    ).toBe(67);
   });
 });
 
@@ -499,11 +514,11 @@ describe("rpc.cryptokey.isolation", () => {
   });
 
   it("...nor nested inside an argument object", async () => {
-    // AuthService.authenticate's declared parameter is exactly this shape:
+    // AuthService.authenticate's parameter used to be exactly this shape:
     // { mtlsCert, signingCert, mtlsKey: CryptoKey, signingKey: CryptoKey }.
-    // Nesting does not help; the whole argument fails to serialize. Which
-    // means that signature cannot be satisfied across a service binding at
-    // all — see the note on authenticate() in worker.ts.
+    // Nesting does not help; the whole argument fails to serialize. So the
+    // keys are optional now and possession is PROVED with signatures instead
+    // (notme-fbbfbc) — strings, which do cross a binding.
     const { privateKey } = await edKeys();
     const stub = env.SIGNING_AUTHORITY.get(
       env.SIGNING_AUTHORITY.idFromName("cryptokey-isolation"),

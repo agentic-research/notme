@@ -38,11 +38,14 @@ import { ED25519, type Platform } from "./src/platform";
 type HeldCerts = {
   mtlsCert: string;
   signingCert: string;
-  mtlsKey: CryptoKey;
-  signingKey: CryptoKey;
+  /** Absent when authenticated over a binding: CryptoKey does not serialize. */
+  mtlsKey: CryptoKey | null;
+  signingKey: CryptoKey | null;
   identity: string;
   scopes: string[];
   expiresAt: number;
+  /** CA epoch the certs were issued under; proxy() checks it (notme-baea8c). */
+  epoch: number;
 };
 
 // Audience allowlist — every endpoint that mints an access token must check
@@ -62,7 +65,14 @@ import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/crit
 import { buildInfo, disclosedVersionId } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
 import { clientIpBucket } from "./src/client-ip-key";
-import { isDeniedDestination } from "./src/destination-policy";
+import {
+  authoritySelfHosts,
+  forwardableHeaders,
+  isAllowedDestination,
+  isDeniedDestination,
+  parseDestinationAllowlist,
+  urlForLog,
+} from "./src/destination-policy";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -259,6 +269,9 @@ export class JwtSigner extends WorkerEntrypoint<any> {
   }
 }
 
+/** How long an authChallenge() challenge is good for (notme-fbbfbc). */
+const AUTH_CHALLENGE_TTL_S = 60;
+
 export class AuthService extends WorkerEntrypoint<any> {
   // RPC-session-scoped credentials. WorkerEntrypoint creates a fresh `this`
   // per RPC session in workerd, so this field is naturally per-caller.
@@ -381,56 +394,75 @@ export class AuthService extends WorkerEntrypoint<any> {
   // ── 009: Identity-gated runtime methods ──────────────────────────────────
 
   /**
-   * Store credentials for proxy/sign operations.
-   * Called after a successful 008 PoP exchange. Keys must be CryptoKey objects
-   * (non-extractable). Certs are PEM strings (public data).
+   * Issue a challenge for authenticate() (notme-fbbfbc): single-use, bound to
+   * the identity the caller says it will prove and to the calling binding's
+   * `props` (when the binding sets any), and good for AUTH_CHALLENGE_TTL_S.
    *
-   * `identity`, `scopes` and `expiresAt` are NOT parameters, deliberately.
-   * This method is reachable by any Worker holding an `AUTH` service binding,
-   * and it used to accept all three as caller-supplied fields and assign them
-   * verbatim — so a bound Worker could name itself any WIMSE principal and
-   * grant itself any scope, while `proxy()` gated on those scopes and the
-   * audit log recorded that identity as fact (notme-6ad276).
+   * Built on the authority's existing PoP-nonce store (issuePopNonce /
+   * consumePopNonce, the /cert/nonce primitive): a random 32-byte nonce kept
+   * in the DO, spent atomically, only for the principal key it was issued
+   * under. That key embeds the issue time, so the `<issuedAt>.` prefix of
+   * the challenge is authenticated by the row itself — editing it names a
+   * key no row has — and the 60 s bound needs no new secret. The `authsvc:`
+   * prefix keeps these rows out of /cert's principal-id space.
+   */
+  async authChallenge(identity: string): Promise<{ challenge: string; expires_in: number }> {
+    if (typeof identity !== "string" || !identity || identity.length > 1024) {
+      throw new Error("identity required — the WIMSE identity of the certs you will present");
+    }
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const { nonce } = await this.#getAuthority().issuePopNonce(this.#challengeKey(identity, issuedAt));
+    return { challenge: `${issuedAt}.${nonce}`, expires_in: AUTH_CHALLENGE_TTL_S };
+  }
+
+  /** The PoP-nonce principal key a challenge lives under. */
+  #challengeKey(identity: string, issuedAt: number): string {
+    // ctx.props is set per binding by the operator; absent in-isolate.
+    const props = (this.ctx as { props?: unknown } | null | undefined)?.props;
+    return `authsvc:v1:${issuedAt}:${JSON.stringify(props ?? null)}:${identity}`;
+  }
+
+  /**
+   * Hold a bridge cert pair for proxy()/sign(), once the caller has PROVED it
+   * holds both private keys (notme-fbbfbc).
    *
-   * The certs are the only unforgeable thing a caller can present: they are
-   * CA-signed and already carry the subject and granted scopes. So the
-   * principal is DERIVED from them here and the caller's opinion of who it is
-   * never enters. Extra fields on the argument are structurally ignored.
+   * `identity`, `scopes` and `expiresAt` are NOT parameters, deliberately
+   * (notme-6ad276): they are DERIVED from the CA-signed certs.
    *
-   * @throws if either cert fails CA verification, is outside its validity
-   *         window, or names a different principal than its partner. On throw
-   *         the session stays unauthenticated — a failed authenticate() must
-   *         not leave stale creds from a previous successful one.
+   * Possession: this used to check only that the certs chained to the CA.
+   * Bridge certs are public — returned to clients, CT-logged when CT_LOG is
+   * bound — so any AUTH-binding holder could present a victim's pair and have
+   * proxy() audit its traffic as the victim. Now the caller first calls
+   * authChallenge(identity), then signs
+   * `authenticateBinding(mtlsSPKI, signingSPKI, challenge)`
+   * (src/auth/cert-pair-binding.ts) with EACH private key, and passes the
+   * proofs here. They are checked with the same verifyPopProofs /cert uses,
+   * against the public keys IN THE CERTS; the challenge is then spent.
    *
-   * CALLING CONVENTION, measured (notme-bcbd74): this signature cannot be
-   * satisfied over a service binding today. workerd's RPC serializer refuses
-   * `CryptoKey` — the whole argument fails with a DataCloneError before the
-   * method runs, nested or not (`rpc.cryptokey.isolation`). Every caller in
-   * this repo constructs an AuthService directly, in-isolate, where that does
-   * not apply.
+   * `mtlsKey` / `signingKey` are optional: workerd cannot serialize a
+   * CryptoKey over RPC (`rpc.cryptokey.isolation`), so a binding caller
+   * cannot send them. Without `signingKey`, sign() refuses.
    *
-   * The reachability reasoning above still holds and the derivation is still
-   * required: a bound Worker CAN reach this method, and can pass the cert
-   * strings — which serialize fine — with the key fields absent. That call
-   * would set credentials whose identity and scopes came from certs, which is
-   * the point; it simply could not then sign. Do not read "unreachable in
-   * practice" into a serializer limitation.
+   * @throws on a CA, validity, pairing or epoch failure; on a missing,
+   *         malformed, expired, replayed or wrongly-bound challenge; or on a
+   *         failed proof. On throw the session holds nothing.
    */
   async authenticate(creds: {
     mtlsCert: string;
     signingCert: string;
-    mtlsKey: CryptoKey;
-    signingKey: CryptoKey;
+    challenge: string;
+    proofs: { mtls: string; signing: string };
+    mtlsKey?: CryptoKey;
+    signingKey?: CryptoKey;
   }) {
+    // Clear first: a failed authenticate() must not leave the previous
+    // identity in place looking like it succeeded.
+    this.#heldCerts = null;
+
     const { deriveCredentialsFromCerts } =
       await import("./src/auth/derive-credentials");
     const authority = this.#getAuthority();
     const caPublicKeyPem = await authority.getPublicKeyPem();
-
-    // Clear first: if verification throws, the session must not keep whatever
-    // it held before. Re-authenticating with a bad cert would otherwise leave
-    // the previous identity in place and look like it succeeded.
-    this.#heldCerts = null;
 
     const derived = await deriveCredentialsFromCerts(
       creds.signingCert,
@@ -438,24 +470,80 @@ export class AuthService extends WorkerEntrypoint<any> {
       caPublicKeyPem,
     );
 
+    // The challenge: present, well-formed, and young. Its age is checked
+    // here; that the timestamp is genuine is checked by the consume below.
+    const m = /^(\d{1,12})\.([A-Za-z0-9_-]{16,128})$/.exec(
+      typeof creds.challenge === "string" ? creds.challenge : "",
+    );
+    if (!m) {
+      throw new Error("challenge required — call authChallenge(identity) and prove both keys over it");
+    }
+    const issuedAt = Number(m[1]);
+    const age = Math.floor(Date.now() / 1000) - issuedAt;
+    if (age < 0 || age > AUTH_CHALLENGE_TTL_S) {
+      throw new Error("challenge expired — request a new one");
+    }
+
+    // Possession, against the keys the CERTS carry.
+    const { X509Certificate } = await import("@peculiar/x509");
+    const { importPublicKey } = await import("./src/cert-authority");
+    const { authenticateBinding } = await import("./src/auth/cert-pair-binding");
+    const spkiOf = (pem: string) => new Uint8Array(new X509Certificate(pem).publicKey.rawData);
+    const toPem = (der: Uint8Array) =>
+      `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...der))}\n-----END PUBLIC KEY-----`;
+    const mtlsSpki = spkiOf(creds.mtlsCert);
+    const signingSpki = spkiOf(creds.signingCert);
+    const pop = await verifyPopProofs(
+      await authenticateBinding(mtlsSpki, signingSpki, creds.challenge),
+      await importPublicKey(toPem(mtlsSpki)),
+      await importPublicKey(toPem(signingSpki)),
+      creds.proofs ?? {},
+    );
+    if (!pop.ok) {
+      throw new Error(`${pop.algorithm} proof-of-possession failed`);
+    }
+
+    // Spent only after the proofs verify (as /cert), so a forged attempt
+    // cannot burn the holder's challenge. Bound to the DERIVED identity: a
+    // challenge asked for one identity does not authenticate another.
+    if (!(await authority.consumePopNonce(m[2]!, this.#challengeKey(derived.identity, issuedAt)))) {
+      throw new Error("challenge unknown, already used, or issued for another identity");
+    }
+
     this.#heldCerts = {
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
-      mtlsKey: creds.mtlsKey,
-      signingKey: creds.signingKey,
+      mtlsKey: creds.mtlsKey ?? null,
+      signingKey: creds.signingKey ?? null,
       identity: derived.identity,
       scopes: derived.scopes,
       expiresAt: derived.expiresAt,
+      epoch: derived.epoch,
     };
   }
 
   /**
    * Proxy an HTTP request for the agent Worker, which calls this instead of
-   * fetch() (which is disabled). Gates: held certs present and unexpired,
-   * destination not on the metadata denylist, `bridgeCert` scope held. The
-   * outbound request is a plain fetch — the held P-256 cert is NOT attached
-   * (no mTLS on this path), and there is no epoch check. ADR-009
-   * §"Enforcement guarantees" records the gap (notme-c72e03).
+   * fetch() (which is disabled). Gates, in order (notme-baea8c):
+   *   1. held certs present and unexpired;
+   *   2. destination parses, and is not on the metadata denylist;
+   *   3. destination on PROXY_ALLOWED_DESTINATIONS — unset allows nothing —
+   *      and not the authority's own host unless that is listed exactly;
+   *   4. `bridgeCert` scope held;
+   *   5. the held certs' epoch equals the authority's current epoch, so a
+   *      revokeEpoch() or rotate() stops them before they expire (an RPC
+   *      failure here refuses).
+   * Every outcome writes one audit line whose `allowed` is the decision and,
+   * on a refusal, `reason` names the gate; the logged URL is redacted.
+   * Redirects are returned, not followed: a followed redirect would let a
+   * listed host send the request to one the allowlist refuses. Host, cf-*,
+   * x-forwarded-* and hop-by-hop headers are not forwarded.
+   *
+   * The outbound request is a plain fetch — the held P-256 cert is NOT
+   * attached (no mTLS on this path). Workers present a client certificate
+   * only through an `mtls_certificates` binding to a cert uploaded ahead of
+   * time, not one minted per session; ADR-009 records why that stays "Not
+   * yet".
    */
   async proxy(request: {
     url: string;
@@ -467,53 +555,111 @@ export class AuthService extends WorkerEntrypoint<any> {
     headers: Record<string, string>;
     body: string;
   }> {
-    if (!this.#heldCerts) {
-      throw new Error("not authenticated — call authenticate() first");
+    const start = Date.now();
+    const method = request.method || "GET";
+    const audit = (fields: Record<string, unknown>) =>
+      // Structured JSON, feeds into APAS attestations.
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          type: "proxy",
+          identity: this.#heldCerts?.identity ?? null,
+          // Redacted and bounded (review F8): no userinfo, no query values.
+          destination: urlForLog(request.url),
+          method: String(method).slice(0, 16),
+          scope_checked: "bridgeCert",
+          ...fields,
+          duration_ms: Date.now() - start,
+        }),
+      );
+    const deny = (reason: string, message: string): never => {
+      audit({ allowed: false, reason });
+      throw new Error(message);
+    };
+
+    const held = this.#heldCerts;
+    if (!held) {
+      return deny("not_authenticated", "not authenticated — call authenticate() first");
     }
-    if (this.#heldCerts.expiresAt <= Math.floor(Date.now() / 1000)) {
-      throw new Error("credentials expired — re-authenticate");
+    if (held.expiresAt <= Math.floor(Date.now() / 1000)) {
+      return deny("credentials_expired", "credentials expired — re-authenticate");
     }
 
-    // Destination check
+    // Destination: parseable, then the hard denylist, then the configured
+    // allowlist, then never the authority itself unless listed exactly.
+    let destHost: string;
+    try {
+      destHost = new URL(request.url).host.toLowerCase();
+    } catch {
+      return deny("destination_invalid", "destination invalid — not a parseable URL");
+    }
     if (isDeniedDestination(request.url)) {
-      throw new Error(
-        "destination denied — cloud metadata endpoints are blocked",
+      return deny("destination_denied", "destination denied — cloud metadata endpoints are blocked");
+    }
+    const allowlist = parseDestinationAllowlist(this.env.PROXY_ALLOWED_DESTINATIONS);
+    if (!isAllowedDestination(request.url, allowlist)) {
+      return deny(
+        "destination_not_allowed",
+        "destination not allowed — not on PROXY_ALLOWED_DESTINATIONS (https only; an unset allowlist allows nothing)",
+      );
+    }
+    if (authoritySelfHosts(this.env).has(destHost) && !allowlist.has(destHost)) {
+      return deny(
+        "destination_self",
+        "destination not allowed — the authority's own host is proxied only when PROXY_ALLOWED_DESTINATIONS lists it exactly",
       );
     }
 
     // Scope check
-    if (!this.#heldCerts.scopes.includes("bridgeCert")) {
-      throw new Error("scope insufficient — bridgeCert required for proxy");
+    if (!held.scopes.includes("bridgeCert")) {
+      return deny("scope_insufficient", "scope insufficient — bridgeCert required for proxy");
+    }
+
+    // Epoch: the revocation lever. Last, because it is the one gate that
+    // costs an authority RPC.
+    let epoch: number;
+    try {
+      ({ epoch } = await this.#getAuthority().getAuthorityState());
+    } catch {
+      return deny("authority_unavailable", "authority unavailable — cannot check the credentials' epoch");
+    }
+    if (held.epoch !== epoch) {
+      return deny(
+        "epoch_mismatch",
+        `credentials revoked — cert epoch ${held.epoch} is not the authority's epoch ${epoch}; re-authenticate`,
+      );
     }
 
     // Make the request
-    const start = Date.now();
-    const res = await fetch(request.url, {
-      method: request.method || "GET",
-      headers: request.headers || {},
-      body: request.body,
-    });
+    let res: Response;
+    try {
+      res = await fetch(request.url, {
+        method,
+        // Host, cf-*, x-forwarded-* and hop-by-hop headers stripped (F6).
+        headers: forwardableHeaders(request.headers),
+        body: request.body,
+        redirect: "manual",
+      });
+    } catch (e) {
+      // Allowed, and attempted: the record says so, and why it has no status.
+      audit({ allowed: true, error: (e as Error)?.message ?? String(e) });
+      throw e;
+    }
 
     const responseHeaders: Record<string, string> = {};
     res.headers.forEach((v, k) => {
       responseHeaders[k] = v;
     });
-    const body = await res.text();
+    let body: string;
+    try {
+      body = await res.text();
+    } catch (e) {
+      // Sent and answered, but the body failed: still one line (review F7).
+      audit({ allowed: true, response_status: res.status, error: (e as Error)?.message ?? String(e) });
+      throw e;
+    }
 
-    // Audit log — structured JSON, feeds into APAS attestations
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        type: "proxy",
-        identity: this.#heldCerts.identity,
-        destination: request.url,
-        method: request.method || "GET",
-        scope_checked: "bridgeCert",
-        allowed: true,
-        response_status: res.status,
-        duration_ms: Date.now() - start,
-      }),
-    );
+    audit({ allowed: true, response_status: res.status });
 
     return { status: res.status, headers: responseHeaders, body };
   }
@@ -546,6 +692,9 @@ export class AuthService extends WorkerEntrypoint<any> {
       );
     }
 
+    if (!this.#heldCerts.signingKey) {
+      throw new Error("no signing key held — authenticate() in-isolate with signingKey to sign");
+    }
     const signature = await crypto.subtle.sign(
       ED25519,
       this.#heldCerts.signingKey,
@@ -698,17 +847,11 @@ async function handleCertGHA(
   if (!claims.jti) {
     return jsonErr("jti claim required for replay protection", 400);
   }
-  {
-    const jtiKey = `jti:${claims.jti}`;
-    const seen = await platform.cache.get(jtiKey);
-    if (seen) {
-      return jsonErr("token already used", 401);
-    }
-    const ttl = Math.max(
-      cfg.jtiMinTtlSeconds,
-      claims.exp - Math.floor(Date.now() / 1000),
-    );
-    await platform.cache.put(jtiKey, "1", { expirationTtl: ttl });
+  // KV first, as the cheap cross-check: a token KV already knows is spent is
+  // refused without charging the repository's rate-limit budget.
+  const jtiKey = `jti:${claims.jti}`;
+  if (await platform.cache.get(jtiKey)) {
+    return jsonErr("token already used", 401);
   }
 
   // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
@@ -800,6 +943,24 @@ async function handleCertGHA(
   if (!pop.ok) {
     return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
   }
+
+  // The authoritative spend (notme-b0d10f): the DO's `oidc:<iss>#<jti>`, the
+  // key /join, /auth/oidc/login, /cert, /token, /bootstrap/claim and the AUTH
+  // binding share. KV alone is eventually consistent, so it let one token
+  // win here and at another route at once.
+  //
+  // LAST before the mint, as /cert does (security review F1): every refusal
+  // this route can make — token, owner, limiter, CA bundle, body, keys, PoP —
+  // is made first, so a client error or a 503 leaves the token spendable and
+  // a corrected retry with the same token works. Only a mint that throws
+  // after this line burns it (THREAT_MODEL). Still after the limiter, which
+  // must precede any DO RPC (notme-ed6114).
+  if (!(await authority.spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
+    return jsonErr("token already used", 401);
+  }
+  await platform.cache.put(jtiKey, "1", {
+    expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+  });
 
   // Build WIMSE identity URI
   // The identity names the stable subject — the OIDC `sub`, which is also
@@ -3577,23 +3738,50 @@ export default {
           return jsonErr("invalid token", 401);
         }
         if (!claims.jti) return jsonErr("jti claim required for replay protection", 400);
-        // Same keyspace as /cert/gha, /cert and /token: one token, one spend.
-        const jtiKey = `jti:${claims.jti}`;
-        if (await platform.cache.get(jtiKey)) return jsonErr("token already used", 401);
-        await platform.cache.put(jtiKey, "1", {
-          expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
-        });
+        // Every refusal the worker can make comes BEFORE the spend (security
+        // review F3), so a wrong workflow, a typo'd code or a 429 does not
+        // burn the token or cost the singleton a DO write. The DO repeats the
+        // subject check as the authority; this copy only orders the refusal.
+        const { bootstrapAttestedSubject } = await import("./src/auth/bootstrap-policy");
+        const expectedSubject = bootstrapAttestedSubject(env);
+        if (expectedSubject === null) {
+          return jsonErr("BOOTSTRAP_GHA_SUBJECT is not set on this deployment", 403);
+        }
+        const { timingSafeEqual } = await import("./src/auth/timing-safe");
+        if (!(await timingSafeEqual(String(claims.sub), expectedSubject))) {
+          return jsonErr("this workflow is not the one BOOTSTRAP_GHA_SUBJECT names", 403);
+        }
         let body: { code?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
         } catch {
           /* empty body */
         }
+        // The shape finalizeClaimRegistration issues: XXXX-XXXX over the
+        // RFC 8628 no-vowel alphabet, case-insensitive (the DO upper-cases).
+        const code = typeof body.code === "string" ? body.code.trim().toUpperCase() : "";
+        if (!/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/.test(code)) {
+          return jsonErr("code must be the XXXX-XXXX claim code /auth/passkey/register/verify returned", 400);
+        }
+        // Same keyspace as /cert/gha, /cert and /token: one token, one spend.
+        const jtiKey = `jti:${claims.jti}`;
+        if (await platform.cache.get(jtiKey)) return jsonErr("token already used", 401);
+        // Limited per repository, as /cert/gha, and before any DO RPC
+        // (notme-ed6114).
+        if (platform.rateLimit && !(await platform.rateLimit(`bootstrap:${claims.repository}`))) {
+          return jsonErr("rate limit exceeded", 429);
+        }
+        // The authoritative spend (notme-b0d10f), in the DO key every OIDC
+        // route shares; KV above is the cross-check. A refusal the DO makes
+        // after this (no_such_claim, governed) has used the token.
+        if (!(await authorityStub(env).spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
+          return jsonErr("token already used", 401);
+        }
+        await platform.cache.put(jtiKey, "1", {
+          expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+        });
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const r = await authority.approveBootstrapClaim(
-          typeof body.code === "string" ? body.code : "",
-          claims.sub,
-        );
+        const r = await authority.approveBootstrapClaim(code, claims.sub);
         if (!r.ok) {
           const map = {
             not_configured: [403, "BOOTSTRAP_GHA_SUBJECT is not set on this deployment"],
@@ -4033,7 +4221,7 @@ export default {
               let sessionSecret: string | null = null;
               // Set for token exchange: the subject token's jti and exp, spent
               // only after the DPoP proof verifies.
-              let exchanged: { jti: string; exp: number } | null = null;
+              let exchanged: { iss: string; jti: string; exp: number } | null = null;
 
               if (grantType === TOKEN_EXCHANGE_GRANT) {
                 // RFC 8693, a GitHub Actions OIDC token as the subject
@@ -4072,7 +4260,7 @@ export default {
                 // (rig's notme-access-token proof), nothing more.
                 principalId = claims.sub;
                 scopes = ["bridgeCert"];
-                exchanged = { jti: claims.jti, exp: Number(claims.exp) || 0 };
+                exchanged = { iss: String(claims.iss), jti: claims.jti, exp: Number(claims.exp) || 0 };
                 // GitHub-signed, so the subject is known (and not the
                 // caller's to vary) without asking the DO.
                 if (await rateLimited(`token:${principalId}`)) return tooMany();
@@ -4187,6 +4375,11 @@ export default {
                 // and /cert's oidc proof use: one GitHub token, one spend.
                 const key = `jti:${exchanged.jti}`;
                 if (await platform.cache.get(key)) {
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                // The authoritative spend (notme-b0d10f): the DO key every
+                // OIDC route shares; KV above is the cross-check.
+                if (!(await authority.spendOidcJti(exchanged.iss, exchanged.jti, exchanged.exp))) {
                   return Response.json({ error: "invalid_grant" }, { status: 400 });
                 }
                 await platform.cache.put(key, "1", {

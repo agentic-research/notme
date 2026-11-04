@@ -51,6 +51,8 @@ export async function mintCreds(
   ca: CryptoKeyPair,
   identity: string,
   scopes: string[] = ["bridgeCert"],
+  /** CA epoch written into both certs (OID_EPOCH). */
+  epoch = 1,
 ): Promise<MintedCreds> {
   const mtls = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
     "sign",
@@ -70,7 +72,7 @@ export async function mintCreds(
     await spkiToPem(mtls.publicKey),
     await spkiToPem(signing.publicKey),
     ca.privateKey,
-    { scopes, epoch: 1, authMethod: "test" },
+    { scopes, epoch, authMethod: "test" },
   );
 
   return {
@@ -82,16 +84,96 @@ export async function mintCreds(
 }
 
 /**
- * A stub env exposing just the SIGNING_AUTHORITY binding `authenticate()`
- * reaches for the CA public key it verifies against.
+ * The SigningAuthority methods AuthService reaches, faked in memory: the CA
+ * public key `authenticate()` verifies against, and the single-use,
+ * principal-bound PoP nonce pair (`issuePopNonce` / `consumePopNonce`) its
+ * challenge is built on (notme-fbbfbc). The fake keeps the real contract —
+ * a nonce is spent once, only for the principal it was issued to.
  */
+export function stubAuthority(ca: CryptoKeyPair, extra: Record<string, unknown> = {}) {
+  const nonces = new Map<string, string>();
+  return {
+    getPublicKeyPem: async () => spkiToPem(ca.publicKey),
+    issuePopNonce: async (principalId: string) => {
+      const nonce = b64u(crypto.getRandomValues(new Uint8Array(32)));
+      nonces.set(nonce, principalId);
+      return { nonce, expiresIn: 120 };
+    },
+    consumePopNonce: async (nonce: string, principalId: string) => {
+      if (nonces.get(nonce) !== principalId) return false;
+      nonces.delete(nonce);
+      return true;
+    },
+    ...extra,
+  };
+}
+
+/** A stub env exposing just the SIGNING_AUTHORITY binding AuthService reaches. */
 export function stubEnv(ca: CryptoKeyPair) {
+  const authority = stubAuthority(ca);
   return {
     SIGNING_AUTHORITY: {
       idFromName: () => "default",
-      get: () => ({
-        getPublicKeyPem: async () => spkiToPem(ca.publicKey),
-      }),
+      get: () => authority,
     },
   };
+}
+
+function b64u(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function pemToDer(pem: string): Uint8Array {
+  const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s/g, "");
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+/** SPKI DER of a cert's public key. */
+async function certSpki(certPem: string): Promise<Uint8Array> {
+  const { X509Certificate } = await import("@peculiar/x509");
+  return new Uint8Array(new X509Certificate(pemToDer(certPem)).publicKey.rawData);
+}
+
+/**
+ * The proofs `authenticate()` requires: each held private key signs the
+ * authenticate binding over `challenge` (notme-fbbfbc). `signWith` lets a
+ * test sign with keys OTHER than the certs' — the wrong-key case.
+ */
+export async function popProofs(
+  creds: MintedCreds,
+  challenge: string,
+  signWith: { mtlsKey: CryptoKey; signingKey: CryptoKey } = creds,
+): Promise<{ mtls: string; signing: string }> {
+  const { authenticateBinding } = await import("../../auth/cert-pair-binding");
+  const binding = await authenticateBinding(await certSpki(creds.mtlsCert), await certSpki(creds.signingCert), challenge);
+  const mtls = new Uint8Array(
+    await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, signWith.mtlsKey, binding),
+  );
+  const signing = new Uint8Array(await crypto.subtle.sign(ED25519, signWith.signingKey, binding));
+  return { mtls: b64u(mtls), signing: b64u(signing) };
+}
+
+/** The identity a cert pair names (its SAN URI). */
+export async function identityOf(creds: MintedCreds): Promise<string> {
+  const { X509Certificate, SubjectAlternativeNameExtension } = await import("@peculiar/x509");
+  const cert = new X509Certificate(pemToDer(creds.signingCert));
+  const san = cert.getExtension(SubjectAlternativeNameExtension);
+  return san!.names.items.find((n) => n.type === "url")!.value;
+}
+
+/**
+ * authenticate() as a real caller does it: ask for a challenge, prove both
+ * keys over it, present certs + challenge + proofs (+ the keys, in-isolate,
+ * so sign() can use them).
+ */
+export async function authenticateWithPop(
+  svc: {
+    authChallenge(identity: string): Promise<{ challenge: string }>;
+    authenticate(creds: any): Promise<void>;
+  },
+  creds: MintedCreds,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  const { challenge } = await svc.authChallenge(await identityOf(creds));
+  await svc.authenticate({ ...creds, challenge, proofs: await popProofs(creds, challenge), ...extra });
 }
