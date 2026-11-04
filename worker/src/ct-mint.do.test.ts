@@ -71,7 +71,11 @@ interface CtHealthView {
   lastErrorAt: number;
   unloggable: { count: number; lastAt: number; reason: string };
   embedFailed: { count: number; lastAt: number };
+  abandoned: { count: number; lastAt: number };
   configError: string | null;
+  shardEndsAt: string | null;
+  shardEndsInDays: number | null;
+  shardClosingSoon: boolean;
 }
 
 const ctLog = (): Fetcher => {
@@ -84,12 +88,18 @@ const ctLog = (): Fetcher => {
 async function setMode(mode: Mode): Promise<string> {
   return (await control(mode)).id;
 }
-async function control(mode: Mode): Promise<{ id: string; spki: string }> {
+interface StubKeys {
+  id: string;
+  spki: string;
+  /** The stub's second shard, served under /logs/shardb (notme-afa9d8). */
+  b: { id: string; spki: string };
+}
+async function control(mode: Mode): Promise<StubKeys> {
   const r = await ctLog().fetch("https://ct-log/__control", {
     method: "POST",
     body: JSON.stringify({ mode }),
   });
-  return (await r.json()) as { id: string; spki: string };
+  return (await r.json()) as StubKeys;
 }
 
 async function received(): Promise<Received[]> {
@@ -454,6 +464,162 @@ describe("ct.pin — only the pinned log's verified SCT is embedded", () => {
       expect(r.health.configError).toMatch(reason);
     });
   }
+});
+
+// ── notme-afa9d8: the shard is chosen per certificate, by its notAfter ─────
+
+const iso = (ms: number) => new Date(ms).toISOString();
+const DAY_MS = 24 * 60 * 60 * 1000;
+const EPOCH_2000 = Date.UTC(2000, 0, 1);
+const EPOCH_2100 = Date.UTC(2100, 0, 1);
+
+/**
+ * envPatch selecting two stub shards: A at /logs/sharda (the stub's key A)
+ * over [a0, a1), and B at /logs/shardb (key B) over [b0, b1). The single-pin
+ * variables are removed: CT_LOG_SHARDS is the only pin.
+ */
+function shardsPatch(
+  k: StubKeys,
+  a: [number, number],
+  b: [number, number],
+): Record<string, string | undefined> {
+  const shard = (path: string, id: string, key: string, [s, e]: [number, number]) => ({
+    path,
+    log_id: id,
+    key,
+    temporal_interval: { start_inclusive: iso(s), end_exclusive: iso(e) },
+  });
+  return {
+    CT_LOG_ID: undefined,
+    CT_LOG_KEY: undefined,
+    CT_LOG_PATH: undefined,
+    CT_LOG_SHARDS: JSON.stringify([
+      shard("/logs/sharda", k.id, k.spki, a),
+      shard("/logs/shardb", k.b.id, k.b.spki, b),
+    ]),
+  };
+}
+
+describe("ct.shards — each certificate goes to the shard whose interval holds its notAfter (notme-afa9d8)", () => {
+  it("notAfter in shard B: submitted to B only, and the embedded SCT verifies under B's key (not A's)", async () => {
+    const k = await control("ok");
+    // The boundary is 2 minutes out; a bridge cert lives 5, so it is B's.
+    const t = Date.now() + 2 * 60 * 1000;
+    const r = await mint({ envPatch: shardsPatch(k, [EPOCH_2000, t], [t, EPOCH_2100]) });
+    const got = await received();
+    expect(got.map((g) => g.path)).toEqual([
+      "/logs/shardb/ct/v1/add-pre-chain",
+      "/logs/shardb/ct/v1/add-pre-chain",
+    ]);
+    const pinA = await stubPin(k);
+    const pinB = await stubPin(k.b);
+    for (const pem of [r.mtls, r.signing]) {
+      const sct = embeddedScts(pem)[0]!;
+      expect(btoa(String.fromCharCode(...sct.subarray(1, 33)))).toBe(k.b.id);
+      expect(await sctVerifies(sct, pem, r.ca, pinB), "SCT under B's key").toBe(true);
+      expect(await sctVerifies(sct, pem, r.ca, pinA), "and NOT under A's").toBe(false);
+    }
+    expect(r.backlog).toEqual([]);
+    expect(r.health.configError).toBeNull();
+    expect(r.health.lastError).toBe("");
+  });
+
+  it("notAfter in shard A: submitted to A only, verifying under A's key", async () => {
+    const k = await control("ok");
+    const t = Date.now() + DAY_MS;
+    const r = await mint({ envPatch: shardsPatch(k, [EPOCH_2000, t], [t, EPOCH_2100]) });
+    expect((await received()).map((g) => g.path)).toEqual([
+      "/logs/sharda/ct/v1/add-pre-chain",
+      "/logs/sharda/ct/v1/add-pre-chain",
+    ]);
+    for (const pem of [r.mtls, r.signing]) {
+      expect(await sctVerifies(embeddedScts(pem)[0]!, pem, r.ca, await stubPin(k))).toBe(true);
+    }
+    expect(r.backlog).toEqual([]);
+  });
+
+  it("notAfter in no shard: nothing is submitted to either, the pair is minted unlogged and backlogged", async () => {
+    const k = await control("ok");
+    const now = Date.now();
+    const r = await mint({
+      envPatch: shardsPatch(k, [EPOCH_2000, now - DAY_MS], [now + DAY_MS, EPOCH_2100]),
+    });
+    expect(await received(), "a cert outside every shard must not be submitted to any").toEqual([]);
+    expectBacklogged(r);
+    await expectWorkingPair(r);
+    expect(r.health.lastError).toMatch(/no shard covers notAfter \d{4}-\d\d-\d\dT/);
+    expect(r.health.configError).toBeNull();
+  });
+
+  it("the drain sends each backlog row to the shard its certificate's notAfter falls in, verified under that shard's key", async () => {
+    const k = await control("ok");
+    const t = Date.now() - 60 * 1000; // the rows' certs expire ~5 min from now: B
+    await withBacklog(2, async (a) => {
+      await a.alarm();
+      expect(rowsOf(a).every((r) => r.logged_at !== null)).toBe(true);
+      expect((await a.getAlarmHealth()).ct.backlog).toBe(0);
+    }, { envPatch: shardsPatch(k, [EPOCH_2000, t], [t, EPOCH_2100]) });
+    expect((await received()).map((g) => g.path)).toEqual([
+      "/logs/shardb/ct/v1/add-chain",
+      "/logs/shardb/ct/v1/add-chain",
+    ]);
+  });
+
+  it("the drain never submits a row whose notAfter is in no shard: a failed attempt, named in lastError", async () => {
+    const k = await control("ok");
+    const now = Date.now();
+    await withBacklog(2, async (a) => {
+      await a.alarm();
+      const rows = rowsOf(a);
+      expect(rows.every((r) => r.logged_at === null && r.attempts === 1)).toBe(true);
+      expect((await a.getAlarmHealth()).ct.lastError).toMatch(
+        /backlog row \d+: no shard covers notAfter \d{4}-/,
+      );
+    }, { envPatch: shardsPatch(k, [EPOCH_2000, now - DAY_MS], [now + DAY_MS, EPOCH_2100]) });
+    expect(await received()).toEqual([]);
+  });
+
+  it("an invalid CT_LOG_SHARDS is a configError: nothing submitted, both chains backlogged", async () => {
+    const k = await control("ok");
+    const now = Date.now();
+    // Overlapping intervals: a cert in the overlap would have two shards.
+    const r = await mint({
+      envPatch: shardsPatch(k, [EPOCH_2000, now + DAY_MS], [now, EPOCH_2100]),
+    });
+    expect(await received()).toEqual([]);
+    expectBacklogged(r);
+    expect(r.health.configError).toMatch(/CT_LOG_SHARDS: .*overlap/);
+    expect(r.health.lastError).toMatch(/^config: CT_LOG_SHARDS/);
+  });
+
+  it("health reports when the NEWEST shard closes, and flags it inside 60 days (notme-a806d0)", async () => {
+    const k = await control("ok");
+    const now = Date.now();
+    const t = now + DAY_MS;
+    const soon = await mint({ envPatch: shardsPatch(k, [EPOCH_2000, t], [t, now + 30 * DAY_MS]) });
+    expect(soon.health.shardEndsAt).toBe(iso(now + 30 * DAY_MS));
+    expect(soon.health.shardEndsInDays).toBe(29); // floor: a little under 30 days by read time
+    expect(soon.health.shardClosingSoon).toBe(true);
+    const later = await mint({ envPatch: shardsPatch(k, [EPOCH_2000, t], [t, now + 100 * DAY_MS]) });
+    expect(later.health.shardEndsInDays).toBe(99);
+    expect(later.health.shardClosingSoon).toBe(false);
+    // The single pin has no interval to report.
+    const single = await mint();
+    expect(single.health.shardEndsAt).toBeNull();
+    expect(single.health.shardEndsInDays).toBeNull();
+    expect(single.health.shardClosingSoon).toBe(false);
+  });
+
+  it("CT_LOG_SHARDS and the single pin together are a configError, not a silent precedence", async () => {
+    const k = await control("ok");
+    const t = Date.now() + DAY_MS;
+    const patch = { ...shardsPatch(k, [EPOCH_2000, t], [t, EPOCH_2100]) };
+    delete patch.CT_LOG_ID; // keep the bound single pin in place
+    delete patch.CT_LOG_KEY;
+    const r = await mint({ envPatch: patch });
+    expect(await received()).toEqual([]);
+    expect(r.health.configError).toMatch(/not both/);
+  });
 });
 
 describe("ct.health — failures that used to reach only console.error", () => {
@@ -840,7 +1006,7 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
       a.ctx.storage.sql.exec("DROP TABLE ct_backlog");
       await expect(a.alarm()).resolves.toBeUndefined();
       a.ctx.storage.sql.exec(
-        "CREATE TABLE ct_backlog (id INTEGER PRIMARY KEY, chain_json TEXT NOT NULL, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, logged_at INTEGER)",
+        "CREATE TABLE ct_backlog (id INTEGER PRIMARY KEY, chain_json TEXT NOT NULL, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, logged_at INTEGER, last_attempt_at INTEGER, abandoned_at INTEGER)",
       );
       const h = await a.getAlarmHealth();
       expect(h.failureCount).toBe(0);
@@ -1040,12 +1206,105 @@ describe("ct.drain — rows past the attempt cap are retried once per 24 h", () 
         (c) => c.name,
       );
       expect(cols).toContain("last_attempt_at");
+      expect(cols).toContain("abandoned_at");
       expect(sql.exec("SELECT last_attempt_at FROM ct_backlog").toArray()).toEqual([{ last_attempt_at: null }]);
       const idx = sql
         .exec("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ct_backlog_drain'")
         .toArray() as Array<{ sql: string }>;
       expect(idx).toHaveLength(1);
       expect(idx[0]!.sql).toMatch(/\(logged_at, attempts, created_at\)/);
+    });
+  });
+});
+
+// ── notme-1b46a8 (2026-11-03 cost review): the backlog does not grow forever ─
+
+type HygieneRow = {
+  id: number;
+  attempts: number;
+  logged_at: number | null;
+  abandoned_at: number | null;
+};
+const allRows = (a: DrainAuth) =>
+  a.ctx.storage.sql
+    .exec("SELECT id, attempts, logged_at, abandoned_at FROM ct_backlog ORDER BY id")
+    .toArray() as HygieneRow[];
+
+describe("ct.drain — logged rows are pruned, and the gaveUp retry is bounded in total", () => {
+  it("a logged row is kept for 7 days after it was logged, then deleted", async () => {
+    await withBacklog(2, async (a) => {
+      const sql = a.ctx.storage.sql;
+      const [r1, r2] = rowsOf(a);
+      sql.exec("UPDATE ct_backlog SET logged_at = ? WHERE id = ?", nowS() - 7 * DAY_S - 60, r1!.id);
+      sql.exec("UPDATE ct_backlog SET logged_at = ? WHERE id = ?", nowS() - 7 * DAY_S + 3600, r2!.id);
+      await a.alarm();
+      expect(allRows(a).map((r) => r.id)).toEqual([r2!.id]);
+    });
+    // Logged rows are not re-submitted.
+    expect(await received()).toEqual([]);
+  });
+
+  it("a gaveUp row 30 days old is abandoned: never retried again, counted in health, no longer in gaveUp", async () => {
+    await withBacklog(1, async (a) => {
+      const sql = a.ctx.storage.sql;
+      // Due for its daily slow retry, but minted 30 days and a minute ago.
+      sql.exec(
+        "UPDATE ct_backlog SET attempts = 40, created_at = ?, last_attempt_at = ?",
+        nowS() - 30 * DAY_S - 60,
+        nowS() - DAY_S - 60,
+      );
+      expect((await a.getAlarmHealth()).ct.gaveUp).toBe(1);
+      await a.alarm();
+      const [row] = allRows(a);
+      expect(row!.abandoned_at, "abandoned, not deleted").not.toBeNull();
+      expect(row!.logged_at).toBeNull();
+      let h = (await a.getAlarmHealth()).ct;
+      expect(h.gaveUp).toBe(0);
+      expect(h.backlog).toBe(0);
+      expect(h.abandoned.count).toBe(1);
+      expect(h.abandoned.lastAt).toBeGreaterThan(0);
+      // A second fire neither retries it nor counts it again.
+      await a.alarm();
+      h = (await a.getAlarmHealth()).ct;
+      expect(h.abandoned.count).toBe(1);
+    });
+    expect(await received(), "an abandoned row is never submitted").toEqual([]);
+  });
+
+  it("an abandoned row is deleted 7 days after it was abandoned, not before", async () => {
+    await withBacklog(2, async (a) => {
+      const sql = a.ctx.storage.sql;
+      const [r1, r2] = rowsOf(a);
+      sql.exec("UPDATE ct_backlog SET attempts = 40, abandoned_at = ? WHERE id = ?", nowS() - 7 * DAY_S - 60, r1!.id);
+      sql.exec("UPDATE ct_backlog SET attempts = 40, abandoned_at = ? WHERE id = ?", nowS() - 7 * DAY_S + 3600, r2!.id);
+      await a.alarm();
+      expect(allRows(a).map((r) => r.id)).toEqual([r2!.id]);
+    });
+    expect(await received()).toEqual([]);
+  });
+
+  it("a row that is neither logged nor abandoned is never deleted, however old", async () => {
+    await withBacklog(3, async (a) => {
+      const sql = a.ctx.storage.sql;
+      const [r1, r2, r3] = rowsOf(a);
+      // A year old but never tried (minted while the pin was broken): not
+      // gaveUp, so not abandoned — it is recoverable.
+      sql.exec("UPDATE ct_backlog SET created_at = ? WHERE id = ?", nowS() - 365 * DAY_S, r1!.id);
+      // gaveUp, 29 days old: still inside the bounded retry.
+      sql.exec(
+        "UPDATE ct_backlog SET attempts = 40, created_at = ?, last_attempt_at = ? WHERE id = ?",
+        nowS() - 29 * DAY_S, nowS() - 60, r2!.id,
+      );
+      // Fresh, failing.
+      await setMode("500");
+      for (let i = 0; i < 3; i++) await a.alarm();
+      const rows = allRows(a);
+      expect(rows.map((r) => r.id)).toEqual([r1!.id, r2!.id, r3!.id]);
+      expect(rows.every((r) => r.logged_at === null && r.abandoned_at === null)).toBe(true);
+      const h = (await a.getAlarmHealth()).ct;
+      expect(h.abandoned.count).toBe(0);
+      expect(h.backlog).toBe(2);
+      expect(h.gaveUp).toBe(1);
     });
   });
 });

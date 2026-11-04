@@ -21,7 +21,9 @@
             "enable_dedup": false,
             "require_server_auth_eku": false,
             "location_hint": "enam",
-            "reject_expired": false
+            "reject_expired": false,
+            "sequence_interval_millis": 750,
+            "max_sequence_skips": 1
         },
         "notmestrict": {
             "friendly_name": "notme strict twin - RFC 6962 serverAuth required (negative control)",
@@ -61,7 +63,9 @@
             "enable_ccadb_roots": false,
             "require_server_auth_eku": false,
             "reject_expired": false,
-            "location_hint": "enam"
+            "location_hint": "enam",
+            "sequence_interval_millis": 750,
+            "max_sequence_skips": 1
         }
     }
 }

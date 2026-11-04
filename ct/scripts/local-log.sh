@@ -19,10 +19,11 @@
 # Then, from <azul-checkout>/crates/ct_worker:
 #   npx wrangler -c wrangler.notmelocal.jsonc dev --persist-to .wrangler/state
 #
-# WHY NOT config.notme.json VERBATIM: its production shard `notme` has an
-# 18-month temporal interval and azul's build.rs refuses a production shard
-# outside 3..=12 months, so the full file does not build. The local shards
-# `notmedev` / `notmestrict` are what the acceptance test needs anyway.
+# WHY NOT config.notme.json VERBATIM: its production shard `notme` would need
+# its own bindings and keys, and the acceptance test needs only the local
+# shards `notmedev` / `notmestrict`. (The full file does build: notme-a3a2bc
+# fixed the earlier 18-month interval.) `notmedev` carries the production
+# sequencing values, so the acceptance measures production timing.
 #
 # The roots file is compiled in at build time (build.rs), and it is the
 # FIXED test authority key's root, so it stays valid across runs; see
