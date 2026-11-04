@@ -92,6 +92,34 @@ describe("the fallthrough is identical WITHOUT a VPC binding (notme-cb0354)", ()
     expect(await withoutVpc.text()).toBe(await withFailingVpc.text());
   });
 
+  it("vpc.passthrough.no-cookies — the VPC_AUTH passthrough forwards no Cookie header (security review F3 of notme-a2e75d)", async () => {
+    // The registration cookie is Path=/ (its __Host- prefix requires it),
+    // so for 300 s it rides on every same-origin request — including this
+    // passthrough to the signet origin, which reads no cookies. Neither it
+    // nor the session cookie has any business leaving the Worker.
+    let seen: Headers | null = null;
+    const capture = {
+      fetch: async (req: Request) => {
+        seen = req.headers;
+        return new Response("upstream", { status: 200 });
+      },
+    };
+    const res = await worker.fetch(
+      new Request(`${ORIGIN}/no/such/endpoint`, {
+        headers: {
+          cookie: "__Host-notme_registration=s3cret; notme_session=sess",
+          authorization: "Bearer keep-me",
+        },
+      }),
+      { ...env, ...LOCAL_ENV, VPC_AUTH: capture },
+    );
+    expect(res.status).toBe(200);
+    expect(seen).not.toBeNull();
+    expect(seen!.get("cookie")).toBeNull();
+    // Everything else still travels: this is a proxy, not a filter.
+    expect(seen!.get("authorization")).toBe("Bearer keep-me");
+  });
+
   it("does not disclose configuration state to unauthenticated callers", async () => {
     const res = await get("/whatever");
     expect(await res.text()).not.toMatch(/configur/i);

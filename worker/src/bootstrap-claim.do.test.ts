@@ -56,7 +56,11 @@ const call = (path: string, init: RequestInit) =>
   worker.fetch(new Request(`${ORIGIN}${path}`, init), { ...env, ...LOCAL_ENV });
 const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
   call(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
-const cookieOf = (res: Response) => res.headers.get("set-cookie")!.split(";")[0]!;
+const cookieOf = (res: Response) =>
+  res.headers.getSetCookie().find((c) => c.startsWith("notme_session="))!.split(";")[0]!;
+/** The registration cookie options set (notme-a2e75d), carried as a browser would. */
+const regCookie = (res: Response) =>
+  /__Host-notme_registration=[^;,\s]+/.exec(res.headers.get("set-cookie") ?? "")?.[0] ?? "";
 
 /** Register a passkey with no bootstrap code and no invite — a claim. */
 async function claimRegistration() {
@@ -64,10 +68,11 @@ async function claimRegistration() {
   const opts = await post("/auth/passkey/register/options", {});
   expect(opts.status, await opts.clone().text()).toBe(200);
   const o = (await opts.json()) as { userId: string; options: { challenge: string }; claim?: boolean };
-  const verify = await post("/auth/passkey/register/verify", {
-    userId: o.userId,
-    response: await auth.register(o.options.challenge),
-  });
+  const verify = await post(
+    "/auth/passkey/register/verify",
+    { userId: o.userId, response: await auth.register(o.options.challenge) },
+    { cookie: regCookie(opts) },
+  );
   expect(verify.status, await verify.clone().text()).toBe(200);
   const v = (await verify.json()) as { scopes: string[]; claim?: { code: string; command: string; expires_in: number } };
   return { auth, principalId: o.userId, optionsClaim: o.claim, scopes: v.scopes, claim: v.claim, cookie: cookieOf(verify) };
@@ -93,6 +98,42 @@ describe("claiming a fresh authority with a passkey and an attested workflow", (
     expect(res.status, await res.clone().text()).toBe(200);
     expect(((await res.json()) as { principal_id?: string }).principal_id).toBeUndefined();
     expect(await authority().hasAdministrator()).toBe(false);
+  });
+
+  it("registration.claim.cookie — a claim verify without the mark's cookie is refused; with it, the claim opens (notme-a2e75d)", async () => {
+    // The claim mark was keyed on the userId alone, which comes back in the
+    // same body as the challenge. It now carries the reserving browser's
+    // HttpOnly secret, as an invite reservation does (review M1).
+    const opts = await post("/auth/passkey/register/options", {});
+    expect(opts.status, await opts.clone().text()).toBe(200);
+    const o = (await opts.json()) as { userId: string; options: { challenge: string }; claim?: boolean };
+    expect(o.claim).toBe(true);
+    const thief = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
+    const stolen = await post("/auth/passkey/register/verify", {
+      userId: o.userId,
+      response: await thief.register(o.options.challenge),
+    });
+    expect(stolen.status).toBe(403);
+    expect(((await stolen.json()) as { claim?: unknown }).claim).toBeUndefined();
+    expect(stolen.headers.get("set-cookie") ?? "").not.toMatch(/notme_session=[^;]+/);
+    // Nor with a VALID cookie from the thief's own claim (security review F8).
+    const own = await post("/auth/passkey/register/options", {});
+    expect(own.status).toBe(200);
+    const crossed = await post(
+      "/auth/passkey/register/verify",
+      { userId: o.userId, response: await thief.register(o.options.challenge) },
+      { cookie: regCookie(own) },
+    );
+    expect(crossed.status).toBe(403);
+
+    const owner = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
+    const ok = await post(
+      "/auth/passkey/register/verify",
+      { userId: o.userId, response: await owner.register(o.options.challenge) },
+      { cookie: regCookie(opts) },
+    );
+    expect(ok.status, await ok.clone().text()).toBe(200);
+    expect(((await ok.json()) as { claim?: { code: string } }).claim?.code).toBeTruthy();
   });
 
   it("registering on an unclaimed authority yields a claim code and NO scopes", async () => {

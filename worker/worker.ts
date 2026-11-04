@@ -52,6 +52,7 @@ type HeldCerts = {
 // Implementation in src/allowed-audiences.ts so unit tests can import it
 // without pulling in cloudflare:workers via worker.ts.
 import { getAllowedAudiences } from "./src/allowed-audiences";
+import { opaqueError } from "./src/error-body";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
 import { principalIdentity } from "./src/cert-authority";
@@ -643,17 +644,10 @@ function getConfig(env: any) {
  * config said nothing (notme-1532eb). An authority that has not declared
  * whose workflows it trusts must trust none.
  */
-export function getAllowedOwners(env: {
-  GHA_ALLOWED_OWNERS?: string;
-}): Set<string> {
-  const raw: string = env.GHA_ALLOWED_OWNERS ?? "";
-  return new Set(
-    raw
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean),
-  );
-}
+// Lives in src/gha-oidc.ts so the DO's mintBridgeCert applies the SAME
+// allowlist (security review F7); re-exported for the routes and tests.
+export { getAllowedOwners } from "./src/gha-oidc";
+import { getAllowedOwners } from "./src/gha-oidc";
 
 const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 
@@ -687,7 +681,9 @@ async function handleCertGHA(
   try {
     claims = await validateGHAToken(token, cfg.ghaCertAudience);
   } catch (e: any) {
-    return jsonErr(`invalid token: ${e.message}`, 401);
+    // Constant body (notme-b567c9): the verifier's message names what it
+    // expected (audience, issuer, key id). Logged, not returned.
+    return opaqueError("cert-gha", "invalid token", 401, e);
   }
 
   // Allowlist check — only permitted owners can get certs from this authority
@@ -729,7 +725,7 @@ async function handleCertGHA(
     // read, so an anonymous or rate-limited request paid for it.
     await ensureCurrentCABundle(env, platform);
   } catch (e: any) {
-    return jsonErr("authority unavailable: " + e.message, 503);
+    return opaqueError("cert-gha", "authority unavailable", 503, e);
   }
 
   // ── Bridge cert pair via PoP exchange (008) ──
@@ -767,7 +763,7 @@ async function handleCertGHA(
     mtlsPubKey = await importPublicKey(body.public_keys.mtls);
     signingPubKey = await importPublicKey(body.public_keys.signing);
   } catch (e: any) {
-    return jsonErr(`invalid public key: ${e.message}`, 400);
+    return opaqueError("cert-gha", "invalid public key", 400, e);
   }
 
   // Compute binding payload: SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
@@ -832,7 +828,7 @@ async function handleCertGHA(
       ttlMs: cfg.ghaCertTtlMs,
     });
   } catch (e: any) {
-    return jsonErr(e.message || "cert minting failed", 500);
+    return opaqueError("cert-gha", "cert minting failed", 500, e);
   }
 
   return Response.json({
@@ -916,7 +912,11 @@ async function handlePasskey(
             mark.reason === "busy" ? 503 : 409,
           );
         }
-        return Response.json({ ...result, userId, scopes: [], claim: true });
+        // The claim belongs to THIS browser (notme-a2e75d), as an invite
+        // reservation does: verify must present the mark's secret.
+        const res = Response.json({ ...result, userId, scopes: [], claim: true });
+        res.headers.append("Set-Cookie", registrationCookie(mark.secret));
+        return res;
       }
       // First user requires bootstrap code (proves deployer ownership)
       // Everyone else can register freely — gets bridgeCert scope only
@@ -981,13 +981,18 @@ async function handlePasskey(
             );
         }
       }
+      // The secret that binds this registration's mark to THIS browser
+      // (review M1 for an invite reservation, notme-a2e75d for the first-user
+      // mark): set below as an HttpOnly cookie, required at verify.
+      let markSecret: string | null = null;
       if (firstUser) {
         // Consumes the code AND marks this userId, so verify admits it as the
         // admin — the mark, not a passkey count, is what verify trusts.
-        const valid = await authority.beginFirstUserRegistration(body.bootstrapCode!, userId);
-        if (!valid) {
+        const mark = await authority.beginFirstUserRegistration(body.bootstrapCode!, userId);
+        if (!mark) {
           return jsonErr("invalid or already-used bootstrap code", 403);
         }
+        markSecret = mark.secret;
       }
 
       // REGISTRATION IS GATED (notme-2c4209, ADR-021). Until now everyone
@@ -1005,7 +1010,6 @@ async function handlePasskey(
       // Scopes come from the INVITE, never from the request: a caller that
       // could name its own scopes would make the gate decorative.
       let invitedScopes: string[] | null = null;
-      let reservationSecret: string | null = null;
       if (!firstUser) {
         if (!body.inviteToken) {
           return jsonErr(
@@ -1025,7 +1029,7 @@ async function handlePasskey(
           return jsonErr("invalid, expired or already-used invite", 403);
         }
         invitedScopes = reserved.scopes;
-        reservationSecret = reserved.secret;
+        markSecret = reserved.secret;
       }
 
       // Deployer gets all; an invited user gets exactly what the invite says.
@@ -1034,98 +1038,28 @@ async function handlePasskey(
         : (invitedScopes ?? ["bridgeCert"]);
 
       const res = Response.json({ ...result, isFirstUser: firstUser, userId, scopes });
-      if (reservationSecret) {
-        // The reservation belongs to THIS browser (review M1): verify must
-        // present the secret, and HttpOnly keeps it out of page script, so
-        // learning the userId and challenge is no longer enough to finish
-        // someone else's ceremony.
-        res.headers.append(
-          "Set-Cookie",
-          `${INVITE_RESERVATION_COOKIE}=${reservationSecret}; Path=/auth/passkey/register; HttpOnly; Secure; SameSite=Strict; Max-Age=300`,
-        );
-      }
+      // The mark belongs to THIS browser: verify must present the secret,
+      // and HttpOnly keeps it out of page script, so learning the userId and
+      // challenge is no longer enough to finish someone else's ceremony.
+      res.headers.append("Set-Cookie", registrationCookie(markSecret!));
       return res;
     }
 
     if (pathname === "/auth/passkey/register/verify") {
-      const body = (await request.json()) as {
-        userId: string;
-        scopes?: string[];
-        response: any;
-      };
-      if (!body.userId) {
-        return jsonErr("userId required (from register/options response)", 400);
+      // The mark's secret is single-use: whatever verify decides, the browser
+      // is told to drop it (notme-a2e75d) rather than carry it on every
+      // request for the rest of its Max-Age.
+      // A THROW is an outcome too (security review F2): a malformed body or
+      // a failing DO call used to reach the outer catch, which answered
+      // without the clear.
+      let res: Response;
+      try {
+        res = await passkeyRegisterVerify(request, authority, host, origin);
+      } catch (e) {
+        res = opaqueError("passkey", "passkey error", 500, e);
       }
-      const result = await authority.passkeyVerifyRegistration(
-        body.userId,
-        "user",
-        body.response,
-        host,
-        origin,
-        parseCookie(request.headers.get("cookie") || "", INVITE_RESERVATION_COOKIE) ?? undefined,
-      );
-      if (result.refused) {
-        // Verified, but not authorized: no live invite reservation (another
-        // registration consumed the invite first, or the window passed), no
-        // claim, not the first credential. Nothing was stored (notme-3dfe15).
-        return jsonErr("invalid, expired or already-used invite", 403);
-      }
-      if (!result.verified) {
-        return jsonErr("registration verification failed", 400);
-      }
-      // A claim registration holds NOTHING until the named workflow approves
-      // it (notme-486e8a) — even if it is the first credential, which
-      // verifyRegistration would otherwise treat as the admin.
-      const claim = await authority.finalizeClaimRegistration(body.userId);
-      if (claim) {
-        const { createSessionCookie } = await import("./src/auth/session");
-        const cookie = await createSessionCookie(
-          { principalId: body.userId, scopes: [], authMethod: "passkey" },
-          await authority.getSessionSecret(),
-        );
-        return new Response(
-          JSON.stringify({
-            verified: true,
-            scopes: [],
-            claim: {
-              code: claim.code,
-              expires_in: claim.expiresIn,
-              command: `gh workflow run claim-authority.yml -f code=${claim.code}`,
-              note: "Run this from the repository named by BOOTSTRAP_GHA_SUBJECT, then sign in again with this passkey.",
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json", "Set-Cookie": cookie } },
-        );
-      }
-
-      // Scopes come from the GRANT STORE — never from the client body (scope
-      // escalation vector) and no longer from the is_admin bit alone. The
-      // passkey user becomes a principal with grants here, so its authority
-      // has one source and one revoke path (notme-77a024 finding b). An
-      // invited registration's principal already exists by now, created
-      // with the INVITE's scopes when verification consumed the reservation
-      // (notme-3dfe15), so this returns those rather than enrolling it with
-      // bridgeCert.
-      const scopes = await authority.ensurePasskeyPrincipal(
-        body.userId,
-        result.isAdmin,
-      );
-
-      // Issue session immediately after registration
-      const { createSessionCookie } = await import("./src/auth/session");
-      const sessionSecret = await authority.getSessionSecret();
-      const cookie = await createSessionCookie(
-        { principalId: body.userId, scopes, authMethod: "passkey" },
-        sessionSecret,
-      );
-
-      return new Response(JSON.stringify({ verified: true, scopes }), {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json",
-          "Set-Cookie": cookie,
-        },
-      });
+      res.headers.append("Set-Cookie", CLEAR_REGISTRATION_COOKIE);
+      return res;
     }
 
     if (pathname === "/auth/passkey/login/options") {
@@ -1194,8 +1128,110 @@ async function handlePasskey(
   }
 }
 
-/** HttpOnly cookie binding an invite reservation to the reserving browser (review M1). */
-const INVITE_RESERVATION_COOKIE = "notme_invite_reservation";
+/** POST /auth/passkey/register/verify — the route body; the caller clears the registration cookie. */
+async function passkeyRegisterVerify(
+  request: Request,
+  authority: any,
+  host: string,
+  origin: string,
+): Promise<Response> {
+  const body = (await request.json()) as {
+    userId: string;
+    scopes?: string[];
+    response: any;
+  };
+  if (!body.userId) {
+    return jsonErr("userId required (from register/options response)", 400);
+  }
+  const result = await authority.passkeyVerifyRegistration(
+    body.userId,
+    "user",
+    body.response,
+    host,
+    origin,
+    parseCookie(request.headers.get("cookie") || "", REGISTRATION_COOKIE) ?? undefined,
+  );
+  if (result.refused) {
+    // Verified, but not authorized: no live invite reservation (another
+    // registration consumed the invite first, or the window passed), no
+    // claim, not the first credential. Nothing was stored (notme-3dfe15).
+    return jsonErr("invalid, expired or already-used invite", 403);
+  }
+  if (!result.verified) {
+    return jsonErr("registration verification failed", 400);
+  }
+  // A claim registration holds NOTHING until the named workflow approves
+  // it (notme-486e8a) — even if it is the first credential, which
+  // verifyRegistration would otherwise treat as the admin.
+  const claim = await authority.finalizeClaimRegistration(body.userId);
+  if (claim) {
+    const { createSessionCookie } = await import("./src/auth/session");
+    const cookie = await createSessionCookie(
+      { principalId: body.userId, scopes: [], authMethod: "passkey" },
+      await authority.getSessionSecret(),
+    );
+    return new Response(
+      JSON.stringify({
+        verified: true,
+        scopes: [],
+        claim: {
+          code: claim.code,
+          expires_in: claim.expiresIn,
+          command: `gh workflow run claim-authority.yml -f code=${claim.code}`,
+          note: "Run this from the repository named by BOOTSTRAP_GHA_SUBJECT, then sign in again with this passkey.",
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json", "Set-Cookie": cookie } },
+    );
+  }
+
+  // Scopes come from the GRANT STORE — never from the client body (scope
+  // escalation vector) and no longer from the is_admin bit alone. The
+  // passkey user becomes a principal with grants here, so its authority
+  // has one source and one revoke path (notme-77a024 finding b). An
+  // invited registration's principal already exists by now, created
+  // with the INVITE's scopes when verification consumed the reservation
+  // (notme-3dfe15), so this returns those rather than enrolling it with
+  // bridgeCert.
+  const scopes = await authority.ensurePasskeyPrincipal(
+    body.userId,
+    result.isAdmin,
+  );
+
+  // Issue session immediately after registration
+  const { createSessionCookie } = await import("./src/auth/session");
+  const sessionSecret = await authority.getSessionSecret();
+  const cookie = await createSessionCookie(
+    { principalId: body.userId, scopes, authMethod: "passkey" },
+    sessionSecret,
+  );
+
+  return new Response(JSON.stringify({ verified: true, scopes }), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Set-Cookie": cookie,
+    },
+  });
+}
+
+/**
+ * HttpOnly cookie binding a registration's mark — an invite reservation
+ * (review M1), a first-user mark or a claim mark (notme-a2e75d) — to the
+ * browser that ran options. Only the secret's SHA-256 is stored with the
+ * mark, and #admitRegistration requires it.
+ *
+ * `__Host-`: the browser accepts it only with Secure, Path=/ and no Domain,
+ * so a sibling subdomain or a plain-http response cannot plant or shadow it.
+ * The prefix forces Path=/ — the cookie used to be scoped to
+ * /auth/passkey/register — and that is the trade taken: a path is no
+ * boundary within one origin (any same-origin page can fetch that path), the
+ * cookie is HttpOnly and SameSite=Strict, lives 300 s, and verify clears it.
+ */
+const REGISTRATION_COOKIE = "__Host-notme_registration";
+const registrationCookie = (secret: string) =>
+  `${REGISTRATION_COOKIE}=${secret}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=300`;
+const CLEAR_REGISTRATION_COOKIE = `${REGISTRATION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
 
 function parseCookie(cookieHeader: string, name: string): string | null {
   const match = cookieHeader
@@ -2328,7 +2364,7 @@ export default {
             currentEpoch,
           );
         } catch (e: any) {
-          return jsonErr("proof verification failed: " + e.message, 401);
+          return opaqueError("connections", "proof verification failed", 401, e);
         }
 
         // Store the connection (via DO RPC, not the imported function)
@@ -2840,7 +2876,7 @@ export default {
           const result = await authority.resetPasskeyData();
           return Response.json({ ok: true, ...result });
         } catch (e: any) {
-          return jsonErr("reset failed: " + e.message, 500);
+          return opaqueError("passkey-reset", "reset failed", 500, e);
         }
       }
 
@@ -2882,7 +2918,7 @@ export default {
             rpId: request.headers.get("host") || "auth.notme.bot",
           });
         } catch (e: any) {
-          return jsonErr("status unavailable: " + e.message, 503);
+          return opaqueError("status", "status unavailable", 503, e);
         }
       }
 
@@ -2994,7 +3030,7 @@ export default {
             mtlsPubKey = await importPublicKey(body.public_keys.mtls);
             signingPubKey = await importPublicKey(body.public_keys.signing);
           } catch (e: any) {
-            return jsonErr("invalid public key: " + e.message, 400);
+            return opaqueError("cert-passkey", "invalid public key", 400, e);
           }
 
           // Binding = SHA-256(mtls_spki || signing_spki || SHA-256(session
@@ -3100,7 +3136,7 @@ export default {
             auth_method: sessionAuthMethod,
           });
         } catch (e: any) {
-          return jsonErr("passkey cert error: " + e.message, 500);
+          return opaqueError("cert-passkey", "passkey cert error", 500, e);
         }
       }
 
@@ -3464,7 +3500,7 @@ export default {
           try {
             publicKey = await importPublicKey(body.public_key);
           } catch (e: any) {
-            return jsonErr("invalid public key: " + e.message, 400);
+            return opaqueError("issuing-ca", "invalid public key", 400, e);
           }
           if (publicKey.algorithm.name !== "Ed25519") {
             // The tier signs certificates and the chain is Ed25519
@@ -3528,7 +3564,7 @@ export default {
             auth_method: sessionAuthMethod,
           });
         } catch (e: any) {
-          return jsonErr("issuing-ca error: " + e.message, 500);
+          return opaqueError("issuing-ca", "issuing-ca error", 500, e);
         }
       }
 
@@ -3774,7 +3810,7 @@ export default {
             expires_in: expiresAt - Math.floor(Date.now() / 1000),
           });
         } catch (e: any) {
-          return jsonErr("authorize code error: " + e.message, 500);
+          return opaqueError("authorize-code", "authorize code error", 500, e);
         }
       }
 
@@ -3855,7 +3891,7 @@ export default {
             expires_in: 300,
           });
         } catch (e: any) {
-          return jsonErr("authorize redeem error: " + e.message, 500);
+          return opaqueError("authorize-redeem", "authorize redeem error", 500, e);
         }
       }
 
@@ -3922,10 +3958,7 @@ export default {
             expires_in: 300,
           });
         } catch (e: any) {
-          return Response.json(
-            { error: "authorize token error: " + e.message },
-            { status: 500 },
-          );
+          return opaqueError("authorize-token", "authorize token error", 500, e);
         }
       }
 
@@ -4212,7 +4245,7 @@ export default {
                 { headers: successHeaders },
               );
             } catch (e: any) {
-              return jsonErr("token endpoint error: " + e.message, 500);
+              return opaqueError("token", "token endpoint error", 500, e);
             }
           })(),
         );
@@ -4448,11 +4481,17 @@ export default {
       // answers here.
       if (env.VPC_AUTH) {
         const originUrl = `http://localhost${pathname}${url.search}`;
+        // No cookies cross to the origin (security review F3 of
+        // notme-a2e75d). The registration cookie is Path=/ and the session
+        // cookie always was, so both rode on every passthrough. signet reads
+        // no cookies, and nothing behind this tunnel should hold either.
+        const forwarded = new Headers(request.headers);
+        forwarded.delete("cookie");
         try {
           return await env.VPC_AUTH.fetch(
             new Request(originUrl, {
               method: request.method,
-              headers: request.headers,
+              headers: forwarded,
               body: request.body,
             }),
           );

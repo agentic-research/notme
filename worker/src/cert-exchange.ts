@@ -10,6 +10,7 @@
 // Schema-driven: input/output types from gen/ts/identity.ts (generated from identity.capnp).
 
 import { verifyPopProofs } from "./auth/pop";
+import { opaqueError } from "./error-body";
 
 // Types from the schema (would import from gen/ts/identity.ts, but
 // we keep it simple and define the wire format inline to avoid
@@ -137,7 +138,9 @@ export async function handleCertExchange(
     try {
       identity = await verifyOIDC(body.proof.token, "notme.bot");
     } catch (e: any) {
-      return Response.json({ error: "invalid token: " + e.message }, { status: 401 });
+      // Constant bodies on this route (notme-b567c9): verifier, key-import
+      // and Durable Object messages are logged, not returned.
+      return opaqueError("cert", "invalid token", 401, e);
     }
     const claims = JSON.parse(
       atob(body.proof.token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/")),
@@ -256,7 +259,7 @@ export async function handleCertExchange(
       mtlsPubKey = await importPublicKey(body.public_keys.mtls);
       signingPubKey = await importPublicKey(body.public_keys.signing);
     } catch (e: any) {
-      return Response.json({ error: "invalid public key: " + e.message }, { status: 400 });
+      return opaqueError("cert", "invalid public key", 400, e);
     }
 
     // Verify PoP proofs against a binding payload.
@@ -338,7 +341,7 @@ export async function handleCertExchange(
         authMethod,
       });
     } catch (e: any) {
-      return Response.json({ error: "cert minting failed: " + e.message }, { status: 500 });
+      return opaqueError("cert", "cert minting failed", 500, e);
     }
 
     const response: CertPairExchangeResponse = {
@@ -370,7 +373,7 @@ export async function handleCertExchange(
       audience: "https://notme.bot",
     });
   } catch (e: any) {
-    return Response.json({ error: "token minting failed: " + e.message }, { status: 500 });
+    return opaqueError("cert", "token minting failed", 500, e);
   }
 
   const state = await authority.getAuthorityState();

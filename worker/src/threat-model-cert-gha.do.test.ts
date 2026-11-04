@@ -19,7 +19,7 @@
  * first time.
  */
 import { env } from "cloudflare:test";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { getAllowedOwners } from "../worker";
 import { type GhaSigner, ghaPopBody, installGhaSigner } from "./__tests__/helpers/gha-token";
 
@@ -62,6 +62,19 @@ async function certGha(
 }
 
 const errorOf = async (res: Response) => ((await res.json()) as { error: string }).error;
+
+// WHICH verifier check refused is LOGGED, not returned (notme-b567c9): the
+// body is the constant "invalid token" — the verifier's message names what
+// it expected — and the reason is read from the warning the route logs.
+let warned: ReturnType<typeof vi.spyOn>;
+beforeEach(() => {
+  warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+});
+afterEach(() => warned.mockRestore());
+async function verifierReason(res: Response): Promise<string> {
+  expect(await errorOf(res)).toBe("invalid token");
+  return JSON.stringify(warned.mock.calls);
+}
 
 describe("cert-gha.owner.allowlist", () => {
   it("refuses a repository whose owner is not listed", async () => {
@@ -113,7 +126,7 @@ describe("cert-gha.audience.validation", () => {
     const token = await signer.token({ aud: "someone-else.example" });
     const res = await certGha(token);
     expect(res.status).toBe(401);
-    expect(await errorOf(res)).toMatch(/wrong audience/);
+    expect(await verifierReason(res)).toMatch(/wrong audience/);
   });
 
   it("the audience checked is the CONFIGURED one, not a constant", async () => {
@@ -123,7 +136,7 @@ describe("cert-gha.audience.validation", () => {
     const token = await signer.token();
     const res = await certGha(token, { GHA_CERT_AUDIENCE: "staging.notme.bot" });
     expect(res.status).toBe(401);
-    expect(await errorOf(res)).toMatch(/wrong audience: notme\.bot/);
+    expect(await verifierReason(res)).toMatch(/wrong audience: notme\.bot/);
   });
 });
 
@@ -141,7 +154,7 @@ describe("cert-gha.signature.verification", () => {
     const bad = `${h}.${p}.${s.slice(0, 10)}${flipped}${s.slice(11)}`;
     const res = await certGha(bad);
     expect(res.status).toBe(401);
-    expect(await errorOf(res)).toMatch(/invalid signature/);
+    expect(await verifierReason(res)).toMatch(/invalid signature/);
   });
 
   it("refuses alg=none — the classic JWT forgery", async () => {
@@ -151,7 +164,7 @@ describe("cert-gha.signature.verification", () => {
       .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     const res = await certGha(`${header}.${p}.${s}`);
     expect(res.status).toBe(401);
-    expect(await errorOf(res)).toMatch(/unsupported alg: none/);
+    expect(await verifierReason(res)).toMatch(/unsupported alg: none/);
   });
 
   it("refuses a token signed by a key GitHub does not publish", async () => {
@@ -168,7 +181,7 @@ describe("cert-gha.signature.verification", () => {
       .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     const res = await certGha(`${h}.${p}.${b64u}`);
     expect(res.status).toBe(401);
-    expect(await errorOf(res)).toMatch(/invalid signature/);
+    expect(await verifierReason(res)).toMatch(/invalid signature/);
   });
 });
 
@@ -177,7 +190,7 @@ describe("cert-gha.token.expiry", () => {
     const now = Math.floor(Date.now() / 1000);
     const res = await certGha(await signer.token({ iat: now - 600, exp: now - 1 }));
     expect(res.status).toBe(401);
-    expect(await errorOf(res)).toMatch(/token expired/);
+    expect(await verifierReason(res)).toMatch(/token expired/);
   });
 });
 
@@ -186,7 +199,7 @@ describe("cert-gha.token.future", () => {
     const now = Math.floor(Date.now() / 1000);
     const res = await certGha(await signer.token({ iat: now + 120, exp: now + 900 }));
     expect(res.status).toBe(401);
-    expect(await errorOf(res)).toMatch(/issued in the future/);
+    expect(await verifierReason(res)).toMatch(/issued in the future/);
   });
 
   it("ACCEPTS a token inside the 60s skew allowance", async () => {

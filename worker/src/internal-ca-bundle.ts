@@ -1,3 +1,4 @@
+import { opaqueError } from "./error-body";
 import type { Platform } from "./platform";
 import { isBundleStale } from "./revocation";
 import type { CABundle } from "./revocation";
@@ -90,9 +91,7 @@ export async function handleInternalCABundle(
       headers: { "Cache-Control": "no-store" },
     });
   } catch (e: any) {
-    return Response.json(
-      { error: `authority unavailable: ${e?.message ?? "unknown"}` },
-      { status: 503 },
-    );
+    // Constant body (notme-b567c9); the authority's error is logged.
+    return opaqueError("internal-ca-bundle", "authority unavailable", 503, e);
   }
 }
