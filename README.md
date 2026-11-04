@@ -196,6 +196,25 @@ docs/design/        ADRs 005–022
 
 see [ARCHITECTURE.md](ARCHITECTURE.md) for the full subsystem map, data flow, and security model.
 
+## certificate extensions
+
+notme certs carry their meaning in custom X.509 extensions. **the arc they sit under, `1.3.6.1.4.1.99999`, is a placeholder:** it's IANA's private-experiment arc, which anyone may use, so a verifier seeing `99999.1.3` can't tell notme's field from someone else's. a registered Private Enterprise Number is being applied for (notme-229dc3). when it's assigned, the arc changes in one place (`OID_PEN` in `worker/src/cert-authority.ts`) and every extension moves with it.
+
+| OID | meaning |
+|---|---|
+| `.1.1` | subject identity |
+| `.1.2` | issuance time (RFC 3339) |
+| `.1.3` | granted scopes |
+| `.1.4` | CA epoch at issuance (what revocation checks) |
+| `.1.5` | authentication method |
+| `.1.6` | peer binding: SHA-256(P-256 SPKI ‖ Ed25519 SPKI) |
+| `.1.7` | **not notme's:** ley-line-open's `confinementDigest` |
+| `.1.8` | principal kind (`human`, `agent`, `workload`, `organization`) |
+| `.1.9` | task scope: task id and goal hash |
+| `.1.10` | criteria: what kind of task this is |
+
+**if you verify notme certs, plan for one migration.** read these OIDs from one constant rather than hard-coding them. when the real arc lands, accept both arcs for a transition window. task certs live 5 minutes and tiers 24 hours, so live credentials turn over fast, but certs on released artifacts carry the old arc permanently, so a verifier checking old releases has to keep accepting it.
+
 ## endpoints (auth.notme.bot)
 
 | method | path | what |
