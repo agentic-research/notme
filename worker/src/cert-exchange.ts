@@ -127,10 +127,10 @@ export async function handleCertExchange(
     //
     // This branch used to verify the token and return 501 — while the API
     // docs advertised `oidc` as a supported proof type with an example.
-    const { verifyOIDC } = await import("./auth/verify-proof");
+    const { verifyOIDC, issuerAudiences } = await import("./auth/verify-proof");
     let identity: { issuer: string; subject: string };
     try {
-      identity = await verifyOIDC(body.proof.token, "notme.bot");
+      identity = await verifyOIDC(body.proof.token, issuerAudiences(env));
     } catch (e: any) {
       // Constant bodies on this route (notme-b567c9): verifier, key-import
       // and Durable Object messages are logged, not returned.

@@ -57,10 +57,11 @@ export type OIDCAllowedAlg = (typeof OIDC_ALLOWED_ALGS)[number];
 //   - auth.notme.bot       — self-issued, always carries aud=notme.bot.
 //   - GitHub Actions       — workflows can mint tokens with arbitrary
 //                            audience via core.getIDToken(audience).
-// Google ID tokens carry aud=<client-id>.apps.googleusercontent.com and
-// would fail the audience check, so are intentionally omitted — including
-// them here would produce confusing "wrong audience" failures instead of
-// clear "untrusted issuer" rejections.
+// Google ID tokens carry aud=<client-id>.apps.googleusercontent.com, an
+// audience that belongs to a DEPLOYMENT, so Google cannot be in a baseline.
+// The worker adds it to its per-issuer audience map when the operator sets
+// GOOGLE_CLIENT_ID, pinned to that client id (notme-0a1ee8,
+// worker/src/auth/verify-proof.ts issuerAudiences).
 
 export const TRUSTED_ISSUERS = [
   "https://auth.notme.bot",

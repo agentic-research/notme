@@ -4,13 +4,14 @@
  *   oidc.audience.confused-deputy
  *   oidc.connections.audience-binding
  *
- * The audience check runs BEFORE any network/JWKS call (see verify-proof.ts
- * lines 108-119), so we can test it without mocking fetch — a token with a
- * mismatched audience throws synchronously on the audience branch.
+ * The trust and audience checks run BEFORE any network/JWKS call, so a token
+ * with a mismatched audience is refused without a fetch. Each issuer has its
+ * own audience pin (notme-0a1ee8); the Google cases below configure Google's
+ * client id, so they test Google's pin rather than an untrusted issuer.
  */
 
 import { describe, expect, it, beforeAll } from "vitest";
-import { verifyOIDC, verifyProof, selectVerifyingKey } from "../auth/verify-proof";
+import { issuerAudiences, verifyOIDC, verifyProof, selectVerifyingKey } from "../auth/verify-proof";
 import { OID_EPOCH } from "../cert-authority";
 import { fakeIssuer } from "./helpers/oidc-issuer";
 
@@ -41,7 +42,7 @@ describe("oidc.audience.confused-deputy", () => {
       aud: "evil-app.com",
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(token, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(token, issuerAudiences({ GOOGLE_CLIENT_ID: "notme-client.apps.googleusercontent.com" }))).rejects.toThrow(
       /wrong audience/,
     );
   });
@@ -53,7 +54,7 @@ describe("oidc.audience.confused-deputy", () => {
       aud: ["evil-app.com", "another-app.com"],
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(token, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(token, issuerAudiences({ GOOGLE_CLIENT_ID: "notme-client.apps.googleusercontent.com" }))).rejects.toThrow(
       /wrong audience/,
     );
   });
@@ -64,7 +65,7 @@ describe("oidc.audience.confused-deputy", () => {
       sub: "victim@gmail.com",
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(token, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(token, issuerAudiences({ GOOGLE_CLIENT_ID: "notme-client.apps.googleusercontent.com" }))).rejects.toThrow(
       /wrong audience/,
     );
   });
@@ -77,32 +78,27 @@ describe("oidc.audience.confused-deputy", () => {
       aud: "notme.bot",
       exp: Math.floor(Date.now() / 1000) - 60,
     });
-    await expect(verifyOIDC(token, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(token, issuerAudiences({ GOOGLE_CLIENT_ID: "notme-client.apps.googleusercontent.com" }))).rejects.toThrow(
       /token expired/,
     );
   });
 });
 
 describe("oidc.issuer.allowlist (notme-ae65a0, M1)", () => {
-  // Google is intentionally absent from TRUSTED_ISSUERS — Google ID tokens
-  // carry aud=<client-id>.apps.googleusercontent.com so they can never match
-  // the "notme.bot" audience pin used by /connections, /auth/oidc/login,
-  // /join. Including Google would be misleading. A proper fix needs a
-  // per-issuer audience map (filed elsewhere); until then, failing fast at
-  // the issuer-trust check gives a clearer error than "wrong audience" on
-  // every legitimate Google token.
+  // Google is trusted only when the deployment sets GOOGLE_CLIENT_ID, and then
+  // pinned to that client id (notme-0a1ee8). The baseline map has no Google
+  // entry, so Google is refused at the trust check.
 
-  it("rejects Google as untrusted issuer when audience would otherwise pass", async () => {
-    // Audience matches what /connections expects — would pass the audience
-    // check. The trust check at fetchJWKS fires next and surfaces the
-    // architectural gap clearly.
+  it("rejects Google as untrusted issuer when GOOGLE_CLIENT_ID is unset", async () => {
+    // Even with aud=notme.bot, which every baseline issuer accepts: trust is
+    // per issuer, and Google has no entry.
     const token = makeJwt({
       iss: "https://accounts.google.com",
       sub: "alice@gmail.com",
       aud: "notme.bot",
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(token, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(token, issuerAudiences({}))).rejects.toThrow(
       /untrusted issuer/,
     );
   });
@@ -115,7 +111,7 @@ describe("oidc.issuer.allowlist (notme-ae65a0, M1)", () => {
   it("accepts auth.notme.bot as trusted issuer: the token verifies against its JWKS", async () => {
     const issuer = await fakeIssuer("https://auth.notme.bot");
     const token = await issuer.token({ sub: "principal-test", aud: "notme.bot" });
-    const id = await verifyOIDC(token, "notme.bot");
+    const id = await verifyOIDC(token, issuerAudiences({}));
     expect(id).toMatchObject({ type: "oidc", issuer: "https://auth.notme.bot", subject: "principal-test" });
     expect(issuer.requests).toContain("https://auth.notme.bot/.well-known/jwks");
   });
@@ -124,7 +120,7 @@ describe("oidc.issuer.allowlist (notme-ae65a0, M1)", () => {
     const issuer = await fakeIssuer("https://token.actions.githubusercontent.com");
     const sub = "repo:agentic-research/notme:ref:refs/heads/main";
     const token = await issuer.token({ sub, aud: "notme.bot" });
-    const id = await verifyOIDC(token, "notme.bot");
+    const id = await verifyOIDC(token, issuerAudiences({}));
     expect(id).toMatchObject({ issuer: "https://token.actions.githubusercontent.com", subject: sub });
     expect(issuer.requests).toContain("https://token.actions.githubusercontent.com/.well-known/jwks");
   });
@@ -136,7 +132,7 @@ describe("oidc.issuer.allowlist (notme-ae65a0, M1)", () => {
       aud: "notme.bot",
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(token, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(token, issuerAudiences({}))).rejects.toThrow(
       /untrusted issuer/,
     );
   });
@@ -156,7 +152,7 @@ describe("oidc.connections.audience-binding", () => {
       exp: FUTURE_EXP,
     });
     await expect(
-      verifyProof({ type: "oidc", token }, undefined, "notme.bot"),
+      verifyProof({ type: "oidc", token }, undefined, issuerAudiences({ GOOGLE_CLIENT_ID: "notme-client.apps.googleusercontent.com" })),
     ).rejects.toThrow(/wrong audience/);
   });
 
@@ -175,7 +171,7 @@ describe("oidc.connections.audience-binding", () => {
     // X.509 path also accepts the parameter for signature-uniformity even
     // though certs don't carry an aud claim — the value is ignored.
     await expect(
-      verifyProof({ type: "oidc", token }, undefined, "notme.bot"),
+      verifyProof({ type: "oidc", token }, undefined, issuerAudiences({ GOOGLE_CLIENT_ID: "notme-client.apps.googleusercontent.com" })),
     ).rejects.toThrow(/wrong audience/);
   });
 });
@@ -264,7 +260,7 @@ describe("oidc.x509.ca-pem-shape", () => {
     const identity = await verifyProof(
       { type: "x509", cert: leafCertPem },
       caCertPem,
-      "notme.bot",
+      issuerAudiences({}),
       TEST_EPOCH,
     );
     expect(identity.type).toBe("x509");
@@ -279,10 +275,84 @@ describe("oidc.x509.ca-pem-shape", () => {
       verifyProof(
         { type: "x509", cert: leafCertPem },
         caSpkiPem,
-        "notme.bot",
+        issuerAudiences({}),
         TEST_EPOCH,
       ),
     ).rejects.toThrow();
+  });
+});
+
+describe("oidc.issuer.audience-map — each issuer carries its own audience pin (notme-0a1ee8)", () => {
+  const CLIENT_ID = "1234567890-notme.apps.googleusercontent.com";
+
+  it("the baseline map is the old single pin, per issuer: GitHub and auth.notme.bot both pin notme.bot", () => {
+    // Byte-identical GitHub behaviour: same issuers, same audience, nothing else.
+    expect(issuerAudiences({})).toEqual({
+      "https://auth.notme.bot": "notme.bot",
+      "https://token.actions.githubusercontent.com": "notme.bot",
+    });
+  });
+
+  it("adds Google only when GOOGLE_CLIENT_ID is set, pinned to that client id", () => {
+    expect(issuerAudiences({ GOOGLE_CLIENT_ID: CLIENT_ID })).toEqual({
+      "https://auth.notme.bot": "notme.bot",
+      "https://token.actions.githubusercontent.com": "notme.bot",
+      "https://accounts.google.com": CLIENT_ID,
+    });
+    // Blank or not a string is unset, never "trusted with no audience".
+    for (const v of ["", "   ", undefined, 42]) {
+      expect(issuerAudiences({ GOOGLE_CLIENT_ID: v })).not.toHaveProperty(["https://accounts.google.com"]);
+    }
+  });
+
+  it("verifies a Google token whose aud is the configured client id", async () => {
+    const google = await fakeIssuer("https://accounts.google.com");
+    const token = await google.token({ sub: "alice-google-sub", aud: CLIENT_ID });
+    const id = await verifyOIDC(token, issuerAudiences({ GOOGLE_CLIENT_ID: CLIENT_ID }));
+    expect(id).toMatchObject({ issuer: "https://accounts.google.com", subject: "alice-google-sub" });
+  });
+
+  it("refuses that same Google token as untrusted when GOOGLE_CLIENT_ID is unset", async () => {
+    const google = await fakeIssuer("https://accounts.google.com");
+    const token = await google.token({ sub: "alice-google-sub", aud: CLIENT_ID });
+    await expect(verifyOIDC(token, issuerAudiences({}))).rejects.toThrow(/untrusted issuer/);
+  });
+
+  it("pins do not bleed across issuers: a GitHub token with Google's audience is refused", async () => {
+    const gha = await fakeIssuer("https://token.actions.githubusercontent.com");
+    const token = await gha.token({ sub: "repo:o/r:ref:refs/heads/main", aud: CLIENT_ID });
+    await expect(verifyOIDC(token, issuerAudiences({ GOOGLE_CLIENT_ID: CLIENT_ID }))).rejects.toThrow(
+      "wrong audience: expected notme.bot, got " + CLIENT_ID,
+    );
+  });
+
+  it("a Google token carrying aud=notme.bot is refused: Google's pin is its client id", async () => {
+    const google = await fakeIssuer("https://accounts.google.com");
+    const token = await google.token({ sub: "alice-google-sub", aud: "notme.bot" });
+    await expect(verifyOIDC(token, issuerAudiences({ GOOGLE_CLIENT_ID: CLIENT_ID }))).rejects.toThrow(
+      /wrong audience/,
+    );
+  });
+
+  it.each(["constructor", "__proto__", "toString", "hasOwnProperty"])(
+    "an iss of %j does not resolve through Object.prototype",
+    async (iss) => {
+      const token = makeJwt({ iss, sub: "x", aud: "notme.bot", exp: FUTURE_EXP });
+      await expect(verifyOIDC(token, issuerAudiences({}))).rejects.toThrow(/untrusted issuer/);
+    },
+  );
+
+  it("an INHERITED entry is not trust: only the map's own issuers count (prototype pollution)", async () => {
+    const polluted = Object.create({ "https://inherited.example": "notme.bot" }) as Record<string, string>;
+    const token = makeJwt({ iss: "https://inherited.example", sub: "x", aud: "notme.bot", exp: FUTURE_EXP });
+    await expect(verifyOIDC(token, polluted)).rejects.toThrow(/untrusted issuer/);
+  });
+
+  it("an entry with no usable audience is untrusted, not a wildcard", async () => {
+    const token = makeJwt({ iss: "https://idp.example", sub: "x", aud: "", exp: FUTURE_EXP });
+    for (const aud of ["", [] as string[], [""]]) {
+      await expect(verifyOIDC(token, { "https://idp.example": aud })).rejects.toThrow(/untrusted issuer/);
+    }
   });
 });
 

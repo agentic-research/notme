@@ -2356,7 +2356,7 @@ export default {
         // Narrow the request body to the Proof discriminated union before
         // handing off to verifyProof — keeps the unsafe cast at the trust
         // boundary (request input) rather than scattered through the call.
-        const { verifyProof } = await import("./src/auth/verify-proof");
+        const { verifyProof, issuerAudiences } = await import("./src/auth/verify-proof");
         type Proof =
           | { type: "oidc"; token: string }
           | { type: "x509"; cert: string; chain?: string[] };
@@ -2405,7 +2405,7 @@ export default {
           identity = await verifyProof(
             typedProof,
             caCertPem,
-            "notme.bot",
+            issuerAudiences(env),
             currentEpoch,
           );
         } catch (e: any) {
@@ -2766,10 +2766,10 @@ export default {
           return jsonErr("unsupported proof — omit it to join with a passkey, or send an oidc token", 400);
         }
 
-        const { verifyOIDC } = await import("./src/auth/verify-proof");
+        const { verifyOIDC, issuerAudiences } = await import("./src/auth/verify-proof");
         let identity;
         try {
-          identity = await verifyOIDC(body.proof.token, "notme.bot");
+          identity = await verifyOIDC(body.proof.token, issuerAudiences(env));
         } catch (e: any) {
           // Logged, not returned (review L4): verifier messages describe
           // what the server expected (audience, issuer, key id).
@@ -2831,10 +2831,10 @@ export default {
         const body = (await request.json()) as { token: string };
         if (!body.token) return jsonErr("token required", 400);
 
-        const { verifyOIDC } = await import("./src/auth/verify-proof");
+        const { verifyOIDC, issuerAudiences } = await import("./src/auth/verify-proof");
         let identity;
         try {
-          identity = await verifyOIDC(body.token, "notme.bot");
+          identity = await verifyOIDC(body.token, issuerAudiences(env));
         } catch (e: any) {
           // Logged, not returned (review F1, as /join's L4): verifier
           // messages describe what the server expected.
