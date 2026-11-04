@@ -304,6 +304,8 @@ export type MintBridgeCertProof =
  */
 export type BridgeCertRefusal =
   | "invalid_gha_token"
+  /** The GHA token's jti was already spent — here, at /cert/gha, /join, /auth/oidc/login, /cert or /token (notme-f850f2). */
+  | "gha_token_reused"
   | "invalid_session"
   | "invalid_access_token"
   | "unknown_proof_kind";
@@ -1194,8 +1196,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * on purpose: SQLite's PRIMARY KEY, not a read-then-write, decides the
    * winner, and a caller can put it inside the same block as the write the
    * identifier licenses. Shared by DPoP proofs (`mintDPoPTokenOnce`) and
-   * OIDC proofs (`joinInviteWithFederated`, `loginWithFederated`), which
-   * both spend the one `oidc:<issuer>#<jti>` key from `#oidcJtiKey`.
+   * OIDC proofs (`joinInviteWithFederated`, `loginWithFederated`, and the
+   * `gha-oidc` proof of `mintBridgeCert`), which all spend the one
+   * `oidc:<issuer>#<jti>` key from `#oidcJtiKey`.
    */
   #consumeJti(key: string, expiresAt: number): boolean {
     const sql = this.ctx.storage.sql;
@@ -1784,9 +1787,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // Audience from OUR env, never the envelope (notme-51ccd7).
       const expectedAudience = this.env.GHA_CERT_AUDIENCE ?? "notme.bot";
       const { validateGHAToken } = await import("./gha-oidc");
+      let claims: Awaited<ReturnType<typeof validateGHAToken>>;
       try {
-        const claims = await validateGHAToken(proof.token, expectedAudience);
-        subject = claims.sub;
+        claims = await validateGHAToken(proof.token, expectedAudience);
       } catch (e) {
         console.warn({
           event: "mint.gha_proof_rejected",
@@ -1794,6 +1797,39 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         });
         return { ok: false, reason: "invalid_gha_token" };
       }
+      // SINGLE USE (notme-f850f2). Re-verifying the token was not spending
+      // it: one already used at /cert/gha, /join or /auth/oidc/login — or
+      // here — kept buying certs through the binding until it expired.
+      // Fail closed without a jti, as /cert/gha does.
+      if (!claims.jti) {
+        console.warn({ event: "mint.gha_proof_rejected", detail: "jti claim required" });
+        return { ok: false, reason: "invalid_gha_token" };
+      }
+      // Spent in BOTH keyspaces the routes use. KV `jti:<jti>` is the one
+      // /cert/gha, /cert, /token and /join share — eventually consistent, so
+      // read here and written after. The DO's `oidc:<iss>#<jti>` is the
+      // /join and /auth/oidc/login key; its PRIMARY KEY decides between two
+      // binding calls racing on the same token.
+      const kv = this.env.CA_BUNDLE_CACHE;
+      const kvKey = `jti:${claims.jti}`;
+      if (kv && (await kv.get(kvKey))) {
+        console.warn({ event: "mint.gha_proof_reused", where: "kv" });
+        return { ok: false, reason: "gha_token_reused" };
+      }
+      this.#ensureSchema();
+      if (!this.#consumeJti(
+        SigningAuthority.#oidcJtiKey(claims.iss, claims.jti),
+        claims.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS,
+      )) {
+        console.warn({ event: "mint.gha_proof_reused", where: "do" });
+        return { ok: false, reason: "gha_token_reused" };
+      }
+      if (kv) {
+        // KV's floor is 60 s; kept past exp for the same leeway reason as the DO key.
+        const ttl = claims.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS - Math.floor(Date.now() / 1000);
+        await kv.put(kvKey, "1", { expirationTtl: Math.max(60, ttl) });
+      }
+      subject = claims.sub;
     } else if (proof?.kind === "session-cookie") {
       // The secret is read inside the DO and does not leave it.
       const { verifySessionCookie } = await import("./auth/session");
@@ -3991,8 +4027,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   /**
    * The ONE `dpop_jtis` key for an OIDC proof spent in this DO, whichever
-   * route spends it: /join (joinInviteWithFederated) and /auth/oidc/login
-   * (loginWithFederated). One key, not one per route (re-review N1): with
+   * route spends it: /join (joinInviteWithFederated), /auth/oidc/login
+   * (loginWithFederated) and the AUTH binding's mintBridgeCert gha-oidc
+   * proof (notme-f850f2). One key, not one per route (re-review N1): with
    * per-route keys the only guard between the two legs was KV `jti:<jti>`,
    * written after the DO commit and eventually consistent, so a token just
    * spent at /join could still become a session. Namespaced so it cannot
