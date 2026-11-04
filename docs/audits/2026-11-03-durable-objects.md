@@ -67,7 +67,7 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
 
 ### M2 (Medium): a CT-bound mint can sign with a key or epoch that changed during its log round-trip
 
-**Fixed in 1a91149** (notme-b52d7c): after the add-pre-chain await the key id and epoch are re-read and the mint is refused if either moved.
+**Fixed in 1a91149** (notme-b52d7c): after the add-pre-chain await the key id and epoch are re-read and the mint is refused if either moved. Since e687734 (notme-b54368) the same re-check runs before every signature on every cert mint path, not only after the log await. Since review L2, a refusal is retried once under a fresh capture, because the caller's proof may already be spent; only a second refusal propagates. mintBridgeCert returns `authority_state_changed` instead of throwing. The retry never signs under the captured state. Since 1d42837 (notme-d06b7b) a refused or failed tier mint at collect gives the enrolment back, so a retry can still collect it.
 
 - **Location:**
   - `signing-authority.ts:1803-1810` (mintBridgeCertPair) and `2266-2270` (mintIssuingCa) capture `signingKey` and `state.epoch/keyId`.
@@ -85,6 +85,15 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
   - Optionally keep a monotonically increasing `key_generation` in `state` and compare it.
 
 ### M3 (Medium): `rotate()` is not atomic
+
+**Fixed in e687734** (notme-b54368):
+- rotate() does all its crypto first: it loads the old key, exports its public half, then generates, exports, seals and imports the new key.
+- Then it makes every storage change in one `ctx.storage.transactionSync`: the archive, delete, insert, seqno bump and both prev-key values. The in-memory key switches in the same synchronous run.
+- `prevKeyId`/`prevPubKey` now use the synchronous `ctx.storage.kv` API. It reads and writes the same `__cf_kv` store as the async `put()` used before, so existing records carry over. A probe confirmed it rolls back with the transaction.
+- If the old key was replaced while rotate() was awaiting, it refuses and writes nothing.
+- Cold start converges in both modes. Each attempt finishes its async work, then synchronously adopts the key already in memory, or runs `INSERT … ON CONFLICT DO NOTHING` and re-reads the row, retrying if the stored row is not its own.
+- The comment's follow-up is also done. Every cert mint captures key, kid and epoch in one synchronous read. `#mintLogged` re-checks them before every signature, including the no-log and no-issuer paths, which used to sign unchecked.
+- Tests: `worker/src/rotate-atomic.do.test.ts`.
 
 - **Location:** `signing-authority.ts:3111-3176`
   - The archive INSERT, `DELETE FROM keys`, and seqno bump are synchronous (3144-3161).

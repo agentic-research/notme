@@ -170,10 +170,10 @@ async function mint(
       authMethod: "gha-oidc",
     });
     const elapsed = Date.now() - t0;
-    // Read AFTER the mint. On a fresh authority the first getCACertificatePem
-    // caches its root under the key id read before the key existed (''), so
-    // the next call re-issues it — same key, new serial. Read once the key
-    // exists, the root is the stable one the mint chained to (notme-7aa6dd).
+    // Read after the mint. Before notme-7aa6dd a fresh authority's first
+    // getCACertificatePem cached its root under a key id read before the key
+    // existed, so the next call re-issued it (same key, new serial);
+    // ca-root-stable.do.test.ts now pins that the first root is the one kept.
     const ca = await a.getCACertificatePem();
     const backlog = a.ctx.storage.sql
       .exec("SELECT chain_json, created_at, attempts, logged_at FROM ct_backlog ORDER BY id")
@@ -1397,6 +1397,11 @@ describe("ct.health — what the operator sees", () => {
 // the just-retired key, or carried the pre-revocation epoch. The stub's
 // `hold` mode keeps add-pre-chain open while the test runs the operation
 // INSIDE the same DO, then releases it.
+//
+// Since review L2 (notme-b54368) the refusal is retried ONCE under a fresh
+// capture, because the caller's proof may already be spent. So the
+// invariant these pin is: never signed under the captured (stale) key or
+// epoch — the mint that comes back is the retry, under the CURRENT state.
 
 type Minted = { authority: { epoch: number; key_id: string } };
 type RaceAuth = {
@@ -1477,18 +1482,17 @@ async function raceMint(
 describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)", () => {
   for (const kind of ["pair", "tier"] as const) {
     for (const op of ["rotate", "revokeEpoch"] as const) {
-      it(`${kind} + ${op}: a mint whose key or epoch changed under add-pre-chain is refused, not signed with the captured key`, async () => {
+      it(`${kind} + ${op}: a mint whose key or epoch changed under add-pre-chain is not signed with the captured key; the retry mints under the current one`, async () => {
         const { before, after, r, retry, opInsideHold } = await raceMint(kind, op);
         expect(opInsideHold, "the operation did not finish inside the hold").toBe(true);
         // The race really happened: the operation changed what it changes.
         if (op === "rotate") expect(after.keyId).not.toBe(before.keyId);
         else expect(after.epoch).toBe(before.epoch + 1);
 
-        expect(
-          r.ok ? r.v.authority : null,
-          "minted under the captured (stale) key/epoch instead of refusing",
-        ).toBeNull();
-        expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+        // Refused under the captured state, then retried (review L2): what
+        // comes back was signed under the state AFTER the operation.
+        expect(r.ok ? r.v.authority : r.e).toEqual({ epoch: after.epoch, key_id: after.keyId });
+        expect(r.ok && r.v.authority).not.toEqual({ epoch: before.epoch, key_id: before.keyId });
 
         expect(retry.authority).toEqual({ epoch: after.epoch, key_id: after.keyId });
       });
@@ -1498,19 +1502,22 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
   // The other post-await signing point: the log outlasts the 2 s bound, the
   // mint falls back to an unlogged cert plus a backlog row — and that cert
   // too must not be signed under the captured key.
-  it("pair + rotate, log times out: the unlogged fallback mint is refused too", async () => {
+  it("pair + rotate, log times out: the unlogged fallback is not signed with the retired key", async () => {
     const { before, after, r, opInsideHold } = await raceMint("pair", "rotate", CT_TIMEOUT_MS + 500);
     expect(opInsideHold, "the operation did not finish inside the hold").toBe(true);
     expect(after.keyId).not.toBe(before.keyId);
-    expect(r.ok ? r.v.authority : null, "fallback minted under the retired key").toBeNull();
-    expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
-  });
+    // The fallback is refused under the retired key and the retry mints
+    // under the new one (review L2).
+    expect(r.ok ? r.v.authority.key_id : r.e, "fallback minted under the retired key").toBe(after.keyId);
+    // Two log timeouts now (the refused attempt and its retry) plus the
+    // follow-up mint: past vitest's 5 s default.
+  }, 15_000);
 
   // The config path awaits #ctLogPin (an importKey + digest on a pin it has
   // not seen) before its backlog mint (review I3). The epoch moving inside
   // that await is simulated deterministically: reading CT_LOG_KEY, which
   // #ctLogPin does synchronously before its await, bumps the epoch once.
-  it("bad pin: an epoch that moved during the pin check refuses the backlog mint", async () => {
+  it("bad pin: an epoch that moved during the pin check refuses the backlog mint; the retry uses the new epoch", async () => {
     const name = `ct-pinrace-${++seq}-${crypto.randomUUID()}`;
     const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
     const { ED25519 } = await import("./platform");
@@ -1546,14 +1553,15 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
         })
         .then((v) => ({ ok: true as const, v }), (err) => ({ ok: false as const, e: String(err) }));
     });
-    expect(r.ok ? r.v.authority : null, "minted under the captured (stale) epoch").toBeNull();
-    expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+    // Refused at the captured epoch 1, then retried at the moved epoch 2
+    // (review L2) — never signed with the stale epoch.
+    expect(r.ok ? r.v.authority.epoch : r.e, "minted under the captured (stale) epoch").toBe(2);
   });
 
   // The unparseable-root path also signs after `await #ctLogPin()`. Same
   // deterministic technique; the pin itself is valid here (the getter
   // returns the real key), only the root is broken.
-  it("unparseable root: an epoch that moved during the pin check refuses the unlogged mint", async () => {
+  it("unparseable root: an epoch that moved during the pin check refuses the unlogged mint; the retry uses the new epoch", async () => {
     const name = `ct-rootrace-${++seq}-${crypto.randomUUID()}`;
     const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
     const { ED25519 } = await import("./platform");
@@ -1591,7 +1599,8 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
         })
         .then((v) => ({ ok: true as const, v }), (err) => ({ ok: false as const, e: String(err) }));
     });
-    expect(r.ok ? r.v.authority : null, "minted under the captured (stale) epoch").toBeNull();
-    expect(r.ok ? "" : r.e).toMatch(/changed while the CT log was consulted/);
+    // Refused at the captured epoch 1, then retried at the moved epoch 2
+    // (review L2) — never signed with the stale epoch.
+    expect(r.ok ? r.v.authority.epoch : r.e, "minted under the captured (stale) epoch").toBe(2);
   });
 });

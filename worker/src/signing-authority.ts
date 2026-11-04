@@ -312,7 +312,13 @@ export type BridgeCertRefusal =
   | "gha_token_reused"
   | "invalid_session"
   | "invalid_access_token"
-  | "unknown_proof_kind";
+  | "unknown_proof_kind"
+  /**
+   * The signing key or epoch changed between capture and signature twice
+   * running (a rotate or revokeEpoch in flight). The proof may be spent;
+   * retry with a fresh one (notme-b54368, review L2).
+   */
+  | "authority_state_changed";
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
@@ -481,6 +487,10 @@ const CLAIM_CAP = 100; // pending claim registrations; storage-exhaustion bound
 const POP_NONCE_TTL_S = 120; // fetched and spent in one page interaction
 const TIER_ENROLMENT_TTL_S = 600; // RFC 8628 device codes are minutes, not hours
 const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
+// A collect claim older than this is abandoned (its isolate was evicted
+// mid-mint) and may be reclaimed (notme-d06b7b). Far above any mint: the CT
+// path is bounded by its 2 s submission timeouts.
+const TIER_COLLECT_RECLAIM_S = 60;
 const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"; // RFC 8628 §6.1: no vowels
 
 /** A positive 128-bit serial, hex — the same shape cert-authority mints. */
@@ -546,6 +556,27 @@ function randomUserCode(): string {
   }
   return `${out.slice(0, 4).join("")}-${out.slice(4).join("")}`;
 }
+
+/**
+ * Thrown by #refuseIfMintStateMoved: the key or epoch a mint captured moved
+ * before it signed. Its own class so #withMintRetry retries exactly this and
+ * nothing else (notme-b54368, review L2).
+ */
+class MintStateMovedError extends Error {}
+
+/** Raw 32-byte Ed25519 public key, base64 (the CABundle.keys encoding). */
+async function rawPublicKeyB64(verifyKey: CryptoKey): Promise<string> {
+  const raw = (await crypto.subtle.exportKey("raw", verifyKey)) as ArrayBuffer;
+  return btoa(String.fromCharCode(...new Uint8Array(raw)));
+}
+
+/** The `keys` row (one, id = 'authority'). `private_jwk` is '' in ephemeral mode. */
+type KeyRow = {
+  private_jwk: string;
+  public_spki: string;
+  key_id: string;
+  from_epoch: number;
+};
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #initialized = false;
@@ -822,101 +853,136 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     this.#ensureSchema();
 
-    const rows = this.ctx.storage.sql
+    // COLD START CONVERGES (notme-b54368). Two first callers used to both
+    // find no row, both generate, and then the second INSERT either hit the
+    // primary key (persistent) or silently replaced the first caller's key
+    // while the first caller went on signing with it (ephemeral). Now every
+    // attempt does its async work first and then, synchronously, either
+    // adopts what is already in memory, adopts the row it wrote, or reports
+    // that storage moved under it — in which case the next attempt loads the
+    // winner's row. A handful of attempts is generous: the loser of a race
+    // finds the winner's key on its second.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const got = await this.#loadOrCreateKeyOnce();
+      if (!got) continue;
+      if (got.created) await this.scheduleNextRefresh();
+      return got.key;
+    }
+    throw new Error(
+      "authority key did not settle under concurrent creation; retry the request",
+    );
+  }
+
+  /** The authority key row, read synchronously; undefined when there is none. */
+  #readKeyRow(): KeyRow | undefined {
+    return this.ctx.storage.sql
       .exec(
-        "SELECT private_jwk, public_spki, key_id FROM keys WHERE id = 'authority'",
+        "SELECT private_jwk, public_spki, key_id, from_epoch FROM keys WHERE id = 'authority'",
       )
-      .toArray() as Array<{
-      private_jwk: string;
-      public_spki: string;
-      key_id: string;
-    }>;
+      .toArray()[0] as KeyRow | undefined;
+  }
 
-    if (rows.length > 0) {
-      const row = rows[0]!;
+  /** The in-memory key with the stored kid, when one is loaded. */
+  #heldKey(): { signingKey: CryptoKey; verifyKey: CryptoKey; keyId: string } | null {
+    if (!this.#signingKey || !this.#verifyKey) return null;
+    return {
+      signingKey: this.#signingKey,
+      verifyKey: this.#verifyKey,
+      keyId: this.#getKeyId(),
+    };
+  }
 
-      // Ephemeral mode: private_jwk is empty — key only exists in memory.
-      // If we restarted, we need to generate a new key (fall through below).
-      if (!row.private_jwk) {
-        // Fall through to key generation
-      } else {
-        // May be a sealed envelope or a legacy bare JWK — readStoredJwk
-        // discriminates on an explicit marker and throws if a sealed row is
-        // met with no KEK, rather than falling through to key generation and
-        // silently invalidating every cert and token ever issued.
-        const kek = this.#getKek();
-        const resolvedKek = kek ? await kek : null;
-        const { jwk, wasSealed } = await readStoredJwk(
-          row.private_jwk,
-          resolvedKek,
-        );
+  /**
+   * One attempt at loading or creating the authority key. Every await comes
+   * first; the decision and every write after it are synchronous, so no
+   * other request can interleave between "what is stored" and "what this
+   * isolate signs with". null means storage moved during the awaits: try
+   * again.
+   */
+  async #loadOrCreateKeyOnce(): Promise<{
+    key: { signingKey: CryptoKey; verifyKey: CryptoKey; keyId: string };
+    created: boolean;
+  } | null> {
+    const row = this.#readKeyRow();
 
-        // Migrate in place. An operator who sets NOTME_KEK_SECRET on an
-        // existing deployment expects the key to become sealed; without this
-        // it would stay in cleartext until the next rotation, which may be
-        // never. Best-effort: a failure here must not take down signing, since
-        // the key itself is loaded fine either way.
-        if (!wasSealed && resolvedKek) {
-          try {
-            this.ctx.storage.sql.exec(
-              "UPDATE keys SET private_jwk = ? WHERE id = 'authority'",
-              await serialiseJwkForStorage(jwk, resolvedKek),
-            );
-          } catch (e) {
-            console.error("authority key re-seal failed (key still usable)", e);
-          }
+    // Ephemeral mode stores no private key, so a row with an empty one is a
+    // previous isolate's public half and is replaced below.
+    if (row && row.private_jwk) {
+      // May be a sealed envelope or a legacy bare JWK — readStoredJwk
+      // discriminates on an explicit marker and throws if a sealed row is
+      // met with no KEK, rather than falling through to key generation and
+      // silently invalidating every cert and token ever issued.
+      const kek = this.#getKek();
+      const resolvedKek = kek ? await kek : null;
+      const { jwk, wasSealed } = await readStoredJwk(row.private_jwk, resolvedKek);
+      // Migrate in place. An operator who sets NOTME_KEK_SECRET on an
+      // existing deployment expects the key to become sealed; without this
+      // it would stay in cleartext until the next rotation, which may be
+      // never. Best-effort: a failure here must not take down signing, since
+      // the key itself is loaded fine either way.
+      let resealed: string | null = null;
+      if (!wasSealed && resolvedKek) {
+        try {
+          resealed = await serialiseJwkForStorage(jwk, resolvedKek);
+        } catch (e) {
+          console.error("authority key re-seal failed (key still usable)", e);
         }
+      }
+      const signingKey = await crypto.subtle.importKey(
+        "jwk",
+        jwk,
+        ED25519,
+        false, // NON-EXTRACTABLE after import
+        ["sign"],
+      );
+      const spkiBytes = Uint8Array.from(atob(row.public_spki), (c) => c.charCodeAt(0));
+      const verifyKey = await crypto.subtle.importKey(
+        "spki",
+        spkiBytes,
+        ED25519,
+        true, // public key stays extractable (needed for JWKS, raw export)
+        ["verify"],
+      );
+      const keyId = row.key_id || (await SigningAuthority.#keyIdFromSpki(row.public_spki));
 
-        this.#signingKey = await crypto.subtle.importKey(
-          "jwk",
-          jwk,
-          ED25519,
-          false, // NON-EXTRACTABLE after import
-          ["sign"],
-        );
-        const spkiBytes = Uint8Array.from(atob(row.public_spki), (c) =>
-          c.charCodeAt(0),
-        );
-        this.#verifyKey = await crypto.subtle.importKey(
-          "spki",
-          spkiBytes,
-          ED25519,
-          true, // public key stays extractable (needed for JWKS, raw export)
-          ["verify"],
-        );
-        let keyId = row.key_id;
-        if (!keyId) {
-          keyId = await SigningAuthority.#keyIdFromSpki(row.public_spki);
+      // ── Synchronous from here. ──
+      const held = this.#heldKey();
+      if (held) return { key: held, created: false };
+      // The row must still be the one decrypted: a rotate() that committed
+      // during the awaits replaced it, and adopting the old key now would
+      // sign with a retired key under the new kid.
+      if (this.#readKeyRow()?.public_spki !== row.public_spki) return null;
+      // Guarded on the public key for the same reason: never write one
+      // key's sealed bytes or kid over another key's row.
+      try {
+        if (resealed) {
           this.ctx.storage.sql.exec(
-            "UPDATE keys SET key_id = ? WHERE id = 'authority'",
-            keyId,
+            "UPDATE keys SET private_jwk = ? WHERE id = 'authority' AND public_spki = ?",
+            resealed,
+            row.public_spki,
           );
         }
-        return {
-          signingKey: this.#signingKey,
-          verifyKey: this.#verifyKey,
-          keyId,
-        };
+      } catch (e) {
+        console.error("authority key re-seal failed (key still usable)", e);
       }
+      if (!row.key_id) {
+        this.ctx.storage.sql.exec(
+          "UPDATE keys SET key_id = ? WHERE id = 'authority' AND public_spki = ?",
+          keyId,
+          row.public_spki,
+        );
+      }
+      this.#signingKey = signingKey;
+      this.#verifyKey = verifyKey;
+      return { key: { signingKey, verifyKey, keyId }, created: false };
     }
 
-    // Generate the authority keypair
-    const isEphemeral = this.#keyStorageMode === "ephemeral";
-    const kp = (await crypto.subtle.generateKey(
-      ED25519,
-      !isEphemeral, // extractable:false in ephemeral mode
-      ["sign", "verify"],
-    )) as CryptoKeyPair;
+    const fresh = await this.#generateKeyMaterial();
 
-    // Always extract public key (for key ID + JWKS)
-    const publicSpki = (await crypto.subtle.exportKey(
-      "spki",
-      kp.publicKey,
-    )) as ArrayBuffer;
-    const publicSpkiB64 = btoa(
-      String.fromCharCode(...new Uint8Array(publicSpki)),
-    );
-    const keyId = await SigningAuthority.#keyIdFromSpki(publicSpkiB64);
+    // ── Synchronous from here. ──
+    // A concurrent caller finished first: its key is the authority's.
+    const held = this.#heldKey();
+    if (held) return { key: held, created: false };
 
     // The epoch this key begins serving (notme-77a024). The epoch moves on
     // `revokeEpoch()` alone, so a new key INHERITS the current generation
@@ -928,50 +994,74 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           .exec("SELECT epoch FROM state WHERE id = 'authority'")
           .toArray() as Array<{ epoch: number }>
       )[0]?.epoch ?? 1;
+    this.ctx.storage.transactionSync(() => {
+      // A previous isolate's ephemeral public half is stale by definition:
+      // its private key died with that isolate. A row WITH a private key is
+      // never removed here — it is somebody's live key.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM keys WHERE id = 'authority' AND private_jwk = ''",
+      );
+      // Create-if-absent, then re-read: the stored row decides.
+      this.ctx.storage.sql.exec(
+        "INSERT INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+        fresh.storedPrivate,
+        fresh.publicSpkiB64,
+        fresh.keyId,
+        startEpoch,
+      );
+    });
+    if (this.#readKeyRow()?.key_id !== fresh.keyId) return null;
+    this.#signingKey = fresh.signingKey;
+    this.#verifyKey = fresh.verifyKey;
+    return {
+      key: { signingKey: fresh.signingKey, verifyKey: fresh.verifyKey, keyId: fresh.keyId },
+      created: true,
+    };
+  }
 
+  /**
+   * Generate a new authority keypair and everything storing it needs — the
+   * async half of key creation, with no storage access, so callers can do
+   * all of it before a synchronous commit (notme-b54368).
+   *
+   * `storedPrivate` is the value for `keys.private_jwk`: '' in ephemeral
+   * mode (no private key material on disk), otherwise the JWK — sealed when
+   * a KEK is configured (notme-41d0d3), bare otherwise, which is the
+   * cf-managed behaviour and relies solely on Cloudflare's encryption at
+   * rest. The signing key returned is non-extractable in both modes.
+   */
+  async #generateKeyMaterial(): Promise<{
+    signingKey: CryptoKey;
+    verifyKey: CryptoKey;
+    publicSpkiB64: string;
+    keyId: string;
+    storedPrivate: string;
+  }> {
+    const isEphemeral = this.#keyStorageMode === "ephemeral";
+    const kp = (await crypto.subtle.generateKey(
+      ED25519,
+      !isEphemeral, // extractable:false in ephemeral mode
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+    // Always extract public key (for key ID + JWKS)
+    const publicSpki = (await crypto.subtle.exportKey("spki", kp.publicKey)) as ArrayBuffer;
+    const publicSpkiB64 = btoa(String.fromCharCode(...new Uint8Array(publicSpki)));
+    const keyId = await SigningAuthority.#keyIdFromSpki(publicSpkiB64);
     if (isEphemeral) {
-      // Store public key + key ID only — no private key material on disk
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', '', ?, ?, ?)",
+      return {
+        signingKey: kp.privateKey,
+        verifyKey: kp.publicKey,
         publicSpkiB64,
         keyId,
-        startEpoch,
-      );
-      this.#signingKey = kp.privateKey;
-      this.#verifyKey = kp.publicKey;
-    } else {
-      // Persistent: export JWK, store, then re-import as non-extractable.
-      // Sealed when a KEK is configured (notme-41d0d3); a bare JWK otherwise,
-      // which is the pre-existing cf-managed behaviour and relies solely on
-      // Cloudflare's encryption at rest.
-      const privateJwk = (await crypto.subtle.exportKey(
-        "jwk",
-        kp.privateKey,
-      )) as JsonWebKey;
-      const kekForWrite = this.#getKek();
-      this.ctx.storage.sql.exec(
-        "INSERT INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', ?, ?, ?, ?)",
-        await serialiseJwkForStorage(
-          privateJwk,
-          kekForWrite ? await kekForWrite : null,
-        ),
-        publicSpkiB64,
-        keyId,
-        startEpoch,
-      );
-      // Re-import as non-extractable — JWK is stored, no need to keep extractable
-      this.#signingKey = await crypto.subtle.importKey(
-        "jwk",
-        privateJwk,
-        ED25519,
-        false,
-        ["sign"],
-      );
-      this.#verifyKey = kp.publicKey;
+        storedPrivate: "",
+      };
     }
-
-    await this.scheduleNextRefresh();
-    return { signingKey: this.#signingKey, verifyKey: this.#verifyKey, keyId };
+    const privateJwk = (await crypto.subtle.exportKey("jwk", kp.privateKey)) as JsonWebKey;
+    const kek = this.#getKek();
+    const storedPrivate = await serialiseJwkForStorage(privateJwk, kek ? await kek : null);
+    // Re-import as non-extractable — the JWK is what gets stored.
+    const signingKey = await crypto.subtle.importKey("jwk", privateJwk, ED25519, false, ["sign"]);
+    return { signingKey, verifyKey: kp.publicKey, publicSpkiB64, keyId, storedPrivate };
   }
 
   /**
@@ -983,8 +1073,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * wrong start date is exactly the defect this exists to prevent.
    *
    * Every write that keeps a key keeps its created_at: re-sealing under a KEK
-   * and the key_id backfill are UPDATEs of other columns, and the only
-   * INSERT OR REPLACE is the ephemeral mode, whose key is genuinely new on
+   * and the key_id backfill are UPDATEs of other columns, and the only row
+   * a cold start deletes is an ephemeral one, whose key is genuinely new on
    * each start.
    */
   #keyStart(): Date | null {
@@ -1053,7 +1143,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         key_id TEXT NOT NULL
       )
     `);
-    const currentKeyId = this.#getKeyId();
+    // The key FIRST, then its id (notme-7aa6dd). Read the other way round, a
+    // fresh authority cached its first root under the id of a key that did
+    // not exist yet ("unknown"), and the next call saw the mismatch and
+    // re-issued: same key and subject, new serial â a root that changed
+    // bytes once at boot under anything pinning it. Its start comes from
+    // the same row, so a first issue's notBefore is the key's own start.
+    const { signingKey, verifyKey, keyId: currentKeyId } = await this.#getOrCreateSigningKey();
     // The root's validity window belongs to the KEY, not to the moment the
     // root happens to be (re-)issued (notme-0c494f). See keyStart below.
     const keyStart = this.#keyStart();
@@ -1104,7 +1200,6 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       }
     }
 
-    const { signingKey, verifyKey } = await this.#getOrCreateSigningKey();
     // notBefore = when this key began signing. Nothing it signed predates
     // that, so no re-issue under the same key can leave an earlier signature
     // outside the anchor's window. The 1b1db4 heal used `now` and called it
@@ -1151,11 +1246,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Return the raw 32-byte Ed25519 public key as base64 (for CABundle.keys).
   async getPublicKeyRawB64(): Promise<string> {
     const { verifyKey } = await this.#getOrCreateSigningKey();
-    const raw = (await crypto.subtle.exportKey(
-      "raw",
-      verifyKey,
-    )) as ArrayBuffer;
-    return btoa(String.fromCharCode(...new Uint8Array(raw)));
+    return rawPublicKeyB64(verifyKey);
   }
 
   // `sign(data: ArrayBuffer)` — "sign arbitrary data with the authority key" —
@@ -1923,20 +2014,31 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return { ok: false, reason: "unknown_proof_kind" };
     }
 
-    const { signingKey } = await this.#getOrCreateSigningKey();
-    const state = await this.getAuthorityState();
-    const { mintGHABridgeCert } = await import("./cert-authority");
-    const result = await mintGHABridgeCert(
-      subject,
-      publicKeyPem,
-      signingKey,
-      ttlMs,
-    );
-    return {
-      ok: true,
-      ...result,
-      authority: { epoch: state.epoch, key_id: state.keyId },
-    };
+    // The proof may already be SPENT here (the gha-oidc jti, notme-f850f2),
+    // so a rotate() or revokeEpoch() landing between the capture and the
+    // re-check must neither burn it for nothing nor escape as an RPC
+    // exception from a refusal-or-result method (security review F5). One
+    // retry under a fresh capture, then a refusal result (review L2).
+    try {
+      return await this.#withMintRetry(async (cap) => {
+        const { mintGHABridgeCert } = await import("./cert-authority");
+        this.#refuseIfMintStateMoved(cap);
+        const result = await mintGHABridgeCert(
+          subject,
+          publicKeyPem,
+          cap.signingKey,
+          ttlMs,
+        );
+        return {
+          ok: true as const,
+          ...result,
+          authority: { epoch: cap.epoch, key_id: cap.keyId },
+        };
+      });
+    } catch (e) {
+      if (!(e instanceof MintStateMovedError)) throw e;
+      return { ok: false, reason: "authority_state_changed" };
+    }
   }
 
   // Mint a bridge cert PAIR (P-256 mTLS + Ed25519 signing) — 008 PoP exchange.
@@ -1954,50 +2056,54 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       authority: { epoch: number; key_id: string };
     }
   > {
-    const { signingKey, keyId: signingKeyId } = await this.#getOrCreateSigningKey();
-    // Bridge pairs are root-issued: the default issuer, no issuerName. The
-    // CT chain's issuer is read HERE, right after the key that signs the
-    // pair, and handed to #mintLogged — so the chain names the root of the
-    // key that signed rather than whatever a later, independent read returns.
-    // Read only when a log is bound: unbound, minting does no extra work.
-    const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
-    const state = await this.getAuthorityState();
-    const { mintBridgeCertPair } = await import("./cert-authority");
-    const ttlMs = params.ttlMs ?? 5 * 60 * 1000;
-    const notBefore = new Date();
-    const result = await this.#mintLogged({
-      pin: {
-        serialMtls: randomSerialHex(),
-        serialSigning: randomSerialHex(),
-        notBefore,
-        notAfter: new Date(notBefore.getTime() + ttlMs),
-      },
-      mint: (pin, ct) =>
-        mintBridgeCertPair(
-          params.subject,
-          params.identity,
-          params.mtlsPublicKeyPem,
-          params.signingPublicKeyPem,
-          signingKey,
-          {
-            scopes: params.scopes,
-            epoch: state.epoch,
-            authMethod: params.authMethod,
-            ttlMs: params.ttlMs,
-            pin,
-            // Per cert: each certificate carries its OWN SCT. Order matches
-            // `pems` below — 0 is mTLS, 1 is signing.
-            perCertExtensions: { mtls: ct(0), signing: ct(1) },
-          },
-        ),
-      pems: (r) => [r.certificates.mtls, r.certificates.signing],
-      issuerPem,
-      captured: { keyId: signingKeyId, epoch: state.epoch },
+    // Key, kid and epoch in ONE synchronous read (notme-b54368); #mintLogged
+    // re-checks them immediately before every signature, and a refusal is
+    // retried once under a fresh capture (#withMintRetry, review L2).
+    return this.#withMintRetry(async (cap) => {
+      // Bridge pairs are root-issued: the default issuer, no issuerName. The
+      // CT chain's issuer is read HERE, right after the key that signs the
+      // pair, and handed to #mintLogged — so the chain names the root of the
+      // key that signed rather than whatever a later, independent read returns
+      // (and if a rotate lands in between, the re-check refuses the mint).
+      // Read only when a log is bound: unbound, minting does no extra work.
+      const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
+      const { mintBridgeCertPair } = await import("./cert-authority");
+      const ttlMs = params.ttlMs ?? 5 * 60 * 1000;
+      const notBefore = new Date();
+      const result = await this.#mintLogged({
+        pin: {
+          serialMtls: randomSerialHex(),
+          serialSigning: randomSerialHex(),
+          notBefore,
+          notAfter: new Date(notBefore.getTime() + ttlMs),
+        },
+        mint: (pin, ct) =>
+          mintBridgeCertPair(
+            params.subject,
+            params.identity,
+            params.mtlsPublicKeyPem,
+            params.signingPublicKeyPem,
+            cap.signingKey,
+            {
+              scopes: params.scopes,
+              epoch: cap.epoch,
+              authMethod: params.authMethod,
+              ttlMs: params.ttlMs,
+              pin,
+              // Per cert: each certificate carries its OWN SCT. Order matches
+              // `pems` below — 0 is mTLS, 1 is signing.
+              perCertExtensions: { mtls: ct(0), signing: ct(1) },
+            },
+          ),
+        pems: (r) => [r.certificates.mtls, r.certificates.signing],
+        issuerPem,
+        captured: cap,
+      });
+      return {
+        ...result,
+        authority: { epoch: cap.epoch, key_id: cap.keyId },
+      };
     });
-    return {
-      ...result,
-      authority: { epoch: state.epoch, key_id: state.keyId },
-    };
   }
 
   /**
@@ -2040,6 +2146,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     /** The key id and epoch `mint` signs with, re-checked after the log await. */
     captured: { keyId: string; epoch: number };
   }): Promise<R> {
+    // Every path signs only after this re-check (notme-b54368): the caller
+    // captured key and epoch, then awaited (the root read, a module import),
+    // and the no-log and no-issuer paths below used to sign unchecked.
+    this.#refuseIfMintStateMoved(p.captured);
     const log = this.env.CT_LOG;
     if (!log) return p.mint(undefined, () => []);
     if (p.issuerPem === null) {
@@ -2076,6 +2186,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return this.#mintUnloggedAndBacklog(p, rootB64);
     }
 
+    // Past the #ctShards await: re-check before the precertificate signature.
+    this.#refuseIfMintStateMoved(p.captured);
     const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
     // Each certificate goes to the shard whose temporal interval holds ITS
     // notAfter (notme-afa9d8). One that no shard covers is not submitted to
@@ -2172,12 +2284,57 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   /**
+   * The signing key, its kid and the current epoch, read together in one
+   * synchronous run (notme-b54368). Every cert mint captures with this right
+   * after loading the key and passes the result to #refuseIfMintStateMoved
+   * immediately before each signature. rotate() switches the stored row and
+   * the in-memory key in one synchronous block, so the three always agree.
+   */
+  #captureMintState(): { signingKey: CryptoKey; keyId: string; epoch: number } {
+    const signingKey = this.#signingKey;
+    if (!signingKey) {
+      throw new Error("mint refused: the authority key is not loaded; retry the request");
+    }
+    const keyId = this.#getKeyId();
+    const [row] = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    return { signingKey, keyId, epoch: row?.epoch ?? 1 };
+  }
+
+  /**
+   * Run `mint` under a fresh capture; if a re-check refuses it, capture again
+   * and run it ONCE more (review L2). A refusal means the key or epoch moved
+   * after the capture — an operator rotate() or revokeEpoch() — and nothing
+   * was delivered, so minting again under the new state is what the caller
+   * asked for. Callers whose proof is already spent by then (the gha-oidc
+   * jti, a /cert/gha or /token jti, a renewal generation) would otherwise
+   * lose it to an event they did not cause. A second refusal propagates.
+   */
+  async #withMintRetry<T>(
+    mint: (cap: { signingKey: CryptoKey; keyId: string; epoch: number }) => Promise<T>,
+  ): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      await this.#getOrCreateSigningKey();
+      const cap = this.#captureMintState();
+      try {
+        return await mint(cap);
+      } catch (e) {
+        if (!(e instanceof MintStateMovedError) || attempt >= 1) throw e;
+        console.warn({ event: "mint.retry_after_state_change", captured: { keyId: cap.keyId, epoch: cap.epoch } });
+      }
+    }
+  }
+
+  /**
    * Throw unless the authority's signing key id and epoch are still the ones
    * a mint captured (notme-b52d7c). Synchronous storage reads only, so the
-   * answer is current at the instant the caller goes on to sign.
+   * answer is current at the instant the caller goes on to sign. Applied on
+   * every cert mint path before every signature (notme-b54368), not only
+   * after the CT log await.
    *
-   * Mid-rotate() the keys row is briefly absent and #getKeyId() returns
-   * "unknown", which also differs from any captured id, so that refuses too.
+   * With no key row #getKeyId() returns "unknown", which differs from any
+   * captured id, so that refuses too.
    */
   #refuseIfMintStateMoved(captured: { keyId: string; epoch: number }): void {
     const keyId = this.#getKeyId();
@@ -2188,11 +2345,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     if (keyId === captured.keyId && epoch === captured.epoch) return;
     console.warn({
       event: "ct.mint_refused_state_changed",
-      captured,
+      captured: { keyId: captured.keyId, epoch: captured.epoch },
       current: { keyId, epoch },
     });
-    throw new Error(
-      `mint refused: the authority's signing key or epoch changed while the CT log was consulted ` +
+    throw new MintStateMovedError(
+      `mint refused: the authority's signing key or epoch changed while the mint was in flight ` +
         `(key ${captured.keyId} -> ${keyId}, epoch ${captured.epoch} -> ${epoch}); retry the request`,
     );
   }
@@ -2603,44 +2760,46 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         `issuing tier ttl capped at 24h, got ${params.ttlMs}ms`,
       );
     }
-    const { signingKey, keyId: signingKeyId } = await this.#getOrCreateSigningKey();
-    // Root PEM read right after the key that signs the tier — see
-    // mintBridgeCertPair. Read only when a log is bound.
-    const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
-    const state = await this.getAuthorityState();
-    const { mintIssuingCaCert } = await import("./cert-authority");
-    const ttlMs = params.ttlMs ?? 60 * 60 * 1000;
-    const notBefore = new Date();
-    const result = await this.#mintLogged({
-      pin: {
-        serial: randomSerialHex(),
-        notBefore,
-        notAfter: new Date(notBefore.getTime() + ttlMs),
-      },
-      mint: (pin, ct) =>
-        mintIssuingCaCert(
-          params.subject,
-          params.identity,
-          params.publicKeyPem,
-          signingKey,
-          {
-            scopes: params.scopes,
-            epoch: state.epoch,
-            authMethod: params.authMethod,
-            ttlMs: params.ttlMs,
-            pin,
-            extraExtensions: ct(0),
-            ...(params.criteria ? { criteria: params.criteria } : {}),
-          },
-        ),
-      pems: (r) => [r.certificate],
-      issuerPem,
-      captured: { keyId: signingKeyId, epoch: state.epoch },
+    // One synchronous capture, re-checked before every signature and
+    // retried once on a refusal — see mintBridgeCertPair (notme-b54368).
+    return this.#withMintRetry(async (cap) => {
+      // Root PEM read right after the key that signs the tier — see
+      // mintBridgeCertPair. Read only when a log is bound.
+      const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
+      const { mintIssuingCaCert } = await import("./cert-authority");
+      const ttlMs = params.ttlMs ?? 60 * 60 * 1000;
+      const notBefore = new Date();
+      const result = await this.#mintLogged({
+        pin: {
+          serial: randomSerialHex(),
+          notBefore,
+          notAfter: new Date(notBefore.getTime() + ttlMs),
+        },
+        mint: (pin, ct) =>
+          mintIssuingCaCert(
+            params.subject,
+            params.identity,
+            params.publicKeyPem,
+            cap.signingKey,
+            {
+              scopes: params.scopes,
+              epoch: cap.epoch,
+              authMethod: params.authMethod,
+              ttlMs: params.ttlMs,
+              pin,
+              extraExtensions: ct(0),
+              ...(params.criteria ? { criteria: params.criteria } : {}),
+            },
+          ),
+        pems: (r) => [r.certificate],
+        issuerPem,
+        captured: cap,
+      });
+      return {
+        ...result,
+        authority: { epoch: cap.epoch, key_id: cap.keyId },
+      };
     });
-    return {
-      ...result,
-      authority: { epoch: state.epoch, key_id: state.keyId },
-    };
   }
 
   // ── Session-bound PoP nonces (notme-486e8a) ────────────────────────────
@@ -2742,6 +2901,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // { name, version }. NULL is a pre-phase-2 enrollment: its tiers carry
       // no .1.10, at collect and at every renewal, so its tasks stay legacy.
       "criteria TEXT",
+      // The in-flight collect (notme-d06b7b): who holds the claim and since
+      // when. Set while status is 'collecting', between the proof check and
+      // the activation that follows a successful mint.
+      "collect_claim TEXT",
+      "collect_started_at INTEGER",
     ]) {
       try {
         this.ctx.storage.sql.exec(`ALTER TABLE tier_enrolments ADD COLUMN ${col}`);
@@ -2796,12 +2960,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // irrelevant to it, and pruning it would silently end renewal ten minutes
     // after collection.
     sql.exec(
-      "DELETE FROM tier_enrolments WHERE expires_at <= ? AND status IN ('pending', 'approved')",
+      "DELETE FROM tier_enrolments WHERE expires_at <= ? AND status IN ('pending', 'approved', 'collecting')",
       now,
     );
     const [{ n }] = [
       ...sql.exec<{ n: number }>(
-        "SELECT COUNT(*) AS n FROM tier_enrolments WHERE status IN ('pending', 'approved')",
+        "SELECT COUNT(*) AS n FROM tier_enrolments WHERE status IN ('pending', 'approved', 'collecting')",
       ),
     ];
     if (n >= TIER_ENROLMENT_CAP) return { ok: false, reason: "busy" };
@@ -2901,7 +3065,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * key recorded at start, over `"notme/tier-enrol/v1\0" || SPKI ||
    * SHA-256(device_code)`. A bad proof does not consume the enrolment — a
    * thief holding the device code but not the key must not be able to burn
-   * the real holder's approval. A good one consumes it before minting.
+   * the real holder's approval.
+   *
+   * A good proof CLAIMS the enrolment ('collecting') before minting and
+   * activates it only after the mint returns (notme-d06b7b). It used to be
+   * marked 'active' first, so a mint that threw stranded it: every retry got
+   * invalid_grant and the machine had to go back to a human. Now a failed
+   * mint hands the claim back ('approved') and the retry mints; a collect
+   * arriving while a mint is in flight is told authorization_pending; and a
+   * claim abandoned by an evicted isolate is reclaimable after
+   * TIER_COLLECT_RECLAIM_S. Exactly one collect ever DELIVERS a tier: the
+   * activation is a compare-and-swap on the claim id, so a minter whose
+   * claim was taken over discards its certificate and gets invalid_grant.
    */
   async collectTierEnrolment(params: { deviceCode: string; proof: string }): Promise<
     | ({
@@ -2948,6 +3123,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           key_fingerprint: string;
           clone_policy: string;
           criteria: string | null;
+          collect_started_at: number | null;
         }
       | undefined;
     if (!row) return { ok: false, reason: "invalid_grant" };
@@ -2955,7 +3131,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return { ok: false, reason: "expired_token" };
     }
     if (row.status === "pending") return { ok: false, reason: "authorization_pending" };
-    if (row.status !== "approved") return { ok: false, reason: "invalid_grant" };
+    const staleBefore = Math.floor(Date.now() / 1000) - TIER_COLLECT_RECLAIM_S;
+    const claimable =
+      row.status === "approved" ||
+      (row.status === "collecting" && (row.collect_started_at ?? 0) <= staleBefore);
+    // Another collect is minting this enrolment right now. Poll again: it
+    // either delivers (and this device code is then spent) or hands back.
+    if (row.status === "collecting" && !claimable) {
+      return { ok: false, reason: "authorization_pending" };
+    }
+    if (!claimable) return { ok: false, reason: "invalid_grant" };
 
     const { importPublicKey } = await import("./cert-authority");
     const key = await importPublicKey(row.public_key_pem);
@@ -2971,8 +3156,57 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const enrollmentId = hex(await tierEnrolmentId(codeHashBytes));
     const v3On = this.env.RENEWAL_BINDING_V3 === "on";
 
-    // Consume first, atomically: of two concurrent collects with a valid
-    // proof, exactly one sees changes() = 1.
+    const criteria = storedCriteria(row.criteria);
+    const { criteriaId } = await import("./criteria");
+
+    // CLAIM, atomically: of two concurrent collects with a valid proof,
+    // exactly one sees changes() = 1. The claim id is what the activation
+    // compares against, so a claim that was taken over is never the one
+    // that delivers (notme-d06b7b).
+    const claim = b64url(crypto.getRandomValues(new Uint8Array(16)));
+    this.ctx.storage.sql.exec(
+      `UPDATE tier_enrolments SET status = 'collecting', collect_claim = ?, collect_started_at = ?
+        WHERE device_code_hash = ?
+          AND (status = 'approved' OR (status = 'collecting' AND COALESCE(collect_started_at, 0) <= ?))`,
+      claim,
+      Math.floor(Date.now() / 1000),
+      deviceCodeHash,
+      staleBefore,
+    );
+    const [claimed] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+    if (claimed.n !== 1) {
+      // Lost the race to a concurrent collect: poll while it mints.
+      const now = this.ctx.storage.sql
+        .exec("SELECT status FROM tier_enrolments WHERE device_code_hash = ?", deviceCodeHash)
+        .toArray()[0] as { status: string } | undefined;
+      return now?.status === "collecting"
+        ? { ok: false, reason: "authorization_pending" }
+        : { ok: false, reason: "invalid_grant" };
+    }
+
+    let result: Awaited<ReturnType<SigningAuthority["mintIssuingCa"]>>;
+    try {
+      result = await this.mintIssuingCa({
+        subject: row.principal_id,
+        identity: row.identity,
+        publicKeyPem: row.public_key_pem,
+        scopes: JSON.parse(row.granted_scopes),
+        authMethod: row.auth_method,
+        ...(criteria ? { criteria } : {}),
+      });
+    } catch (err) {
+      // Hand the claim back: nothing was delivered and the human's approval
+      // still holds, so the machine's retry mints rather than re-enrolling.
+      // Only OUR claim — one taken over in the meantime is not ours to undo.
+      this.ctx.storage.sql.exec(
+        "UPDATE tier_enrolments SET status = 'approved', collect_claim = NULL, collect_started_at = NULL WHERE device_code_hash = ? AND status = 'collecting' AND collect_claim = ?",
+        deviceCodeHash,
+        claim,
+      );
+      throw err;
+    }
+
+    // ACTIVATE, in one transaction straight after the mint returns.
     //
     // Binding version (notme-c9fc8c). A key collected for the first time
     // speaks v2 or v3: the v2 binding does not name the enrollment, but no
@@ -2982,59 +3216,57 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // speaks v3 only: a v2 request signed for the earlier enrollment could
     // otherwise claim, or fork, this one. Same synchronous block as the
     // activation, so no collect interleaves between the check and the write.
-    const reEnrolled =
-      this.ctx.storage.sql
-        .exec(
-          "SELECT 1 FROM tier_enrolments WHERE key_fingerprint = ? AND device_code_hash != ? AND status IN ('active', 'superseded') LIMIT 1",
-          row.key_fingerprint,
-          deviceCodeHash,
-        )
-        .toArray().length > 0;
-    this.ctx.storage.sql.exec(
-      // 'active', not 'consumed': the enrollment lives on as the record a
-      // machine renews against (notme-337d82). Single use still holds — a
-      // second collect finds status 'active' and is refused.
-      // A collected enrollment starts at generation 0 (notme-747cc7).
-      "UPDATE tier_enrolments SET status = 'active', generation = 0, binding_version = ? WHERE device_code_hash = ? AND status = 'approved'",
-      // While v3 is off no client can learn an id, so a v3-only row would
-      // strand it: re-enrolled keys collect at v2 too (M4 stays open for
-      // them until v3 is turned on).
-      reEnrolled && v3On ? 3 : 2,
-      deviceCodeHash,
-    );
-    const [change] = [
-      ...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n"),
-    ];
-    if (change.n !== 1) return { ok: false, reason: "invalid_grant" };
-    // At most one ACTIVE enrollment per key (notme-747cc7). Re-enrolling a
-    // key retires its earlier enrollments, revoked or not — kept as
-    // 'superseded' for the record. Otherwise renewal (which looks up by key)
-    // could keep counting the old enrollment's generation and read the new
-    // one's generation 0 as a fork; and a revoked old enrollment would hide
-    // the new one, though re-enrolling is how a machine recovers from a fork.
-    // Same synchronous block as the activation: no request sees two.
-    this.ctx.storage.sql.exec(
-      "UPDATE tier_enrolments SET status = 'superseded' WHERE key_fingerprint = ? AND status = 'active' AND device_code_hash != ?",
-      row.key_fingerprint,
-      deviceCodeHash,
-    );
-    // A re-enrolled key starts its generations over: digests recorded under
-    // an earlier enrollment of the same key must not read as this one's.
-    this.ctx.storage.sql.exec(
-      "DELETE FROM tier_renewal_digests WHERE key_fingerprint = ?",
-      row.key_fingerprint,
-    );
-
-    const criteria = storedCriteria(row.criteria);
-    const { criteriaId } = await import("./criteria");
-    const result = await this.mintIssuingCa({
-      subject: row.principal_id,
-      identity: row.identity,
-      publicKeyPem: row.public_key_pem,
-      scopes: JSON.parse(row.granted_scopes),
-      authMethod: row.auth_method,
-      ...(criteria ? { criteria } : {}),
+    const activated = this.ctx.storage.transactionSync(() => {
+      const reEnrolled =
+        this.ctx.storage.sql
+          .exec(
+            "SELECT 1 FROM tier_enrolments WHERE key_fingerprint = ? AND device_code_hash != ? AND status IN ('active', 'superseded') LIMIT 1",
+            row.key_fingerprint,
+            deviceCodeHash,
+          )
+          .toArray().length > 0;
+      this.ctx.storage.sql.exec(
+        // 'active', not 'consumed': the enrollment lives on as the record a
+        // machine renews against (notme-337d82). Single use still holds — a
+        // later collect finds status 'active' and is refused.
+        // A collected enrollment starts at generation 0 (notme-747cc7).
+        `UPDATE tier_enrolments
+            SET status = 'active', generation = 0, binding_version = ?,
+                collect_claim = NULL, collect_started_at = NULL
+          WHERE device_code_hash = ? AND status = 'collecting' AND collect_claim = ?`,
+        // While v3 is off no client can learn an id, so a v3-only row would
+        // strand it: re-enrolled keys collect at v2 too (M4 stays open for
+        // them until v3 is turned on).
+        reEnrolled && v3On ? 3 : 2,
+        deviceCodeHash,
+        claim,
+      );
+      const [change] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+      // Our claim was reclaimed while we minted (we looked abandoned), and
+      // the reclaimer delivers. This certificate is discarded undelivered.
+      if (change.n !== 1) return false;
+      // At most one ACTIVE enrollment per key (notme-747cc7). Re-enrolling a
+      // key retires its earlier enrollments, revoked or not — kept as
+      // 'superseded' for the record. Otherwise renewal (which looks up by key)
+      // could keep counting the old enrollment's generation and read the new
+      // one's generation 0 as a fork; and a revoked old enrollment would hide
+      // the new one, though re-enrolling is how a machine recovers from a fork.
+      // Same transaction as the activation: no request sees two.
+      this.ctx.storage.sql.exec(
+        "UPDATE tier_enrolments SET status = 'superseded' WHERE key_fingerprint = ? AND status = 'active' AND device_code_hash != ?",
+        row.key_fingerprint,
+        deviceCodeHash,
+      );
+      // A re-enrolled key starts its generations over: digests recorded under
+      // an earlier enrollment of the same key must not read as this one's.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM tier_renewal_digests WHERE key_fingerprint = ?",
+        row.key_fingerprint,
+      );
+      return true;
     });
+    if (!activated) return { ok: false, reason: "invalid_grant" };
+
     return {
       ok: true,
       principalId: row.principal_id,
@@ -3525,8 +3757,30 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Generate a signed CABundle for the revocation verifier.
   // Caller writes this to CA_BUNDLE_CACHE KV.
   async generateBundle(): Promise<CABundle> {
-    const { signingKey, keyId } = await this.#getOrCreateSigningKey();
-    const pubKeyB64 = await this.getPublicKeyRawB64();
+    // Restart once if a rotate() committed during the export (review L4),
+    // as cold start and #withMintRetry retry a moved state; a second move
+    // in a row is refused rather than looped on.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const bundle = await this.#generateBundleOnce();
+      if (bundle) return bundle;
+    }
+    throw new Error(
+      "bundle refused: the authority key changed twice while the bundle was built; retry",
+    );
+  }
+
+  /** One attempt; null when the key moved under the export await. */
+  async #generateBundleOnce(): Promise<CABundle | null> {
+    const { signingKey, verifyKey, keyId } = await this.#getOrCreateSigningKey();
+    // The public half of the SAME key that signs below — not a second
+    // #getOrCreateSigningKey() read, which could name a key a rotate()
+    // committed in between.
+    const pubKeyB64 = await rawPublicKeyB64(verifyKey);
+    // Past that await, before the synchronous seqno and prev-key reads: a
+    // rotate() that committed meanwhile would otherwise get a bundle naming
+    // the retired key as current, with its own prev record dropped
+    // (prevKeyId === keyId) and a seqno above the rotation's (review L4).
+    if (this.#getKeyId() !== keyId) return null;
 
     this.#ensureSchema();
 
@@ -3546,10 +3800,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // `keys` and `prevKeyId`, so consumers can resolve the prev key AND the
     // revocation check (token.keyId === bundle.prevKeyId) sees it.
     const keys: Record<string, string> = { [keyId]: pubKeyB64 };
-    const prevKeyId =
-      (await this.ctx.storage.get<string>("prevKeyId")) ?? undefined;
-    const prevPubKey =
-      (await this.ctx.storage.get<string>("prevPubKey")) ?? undefined;
+    // Synchronous KV (same `__cf_kv` store the async API wrote before
+    // notme-b54368), so rotate() can write both inside its transaction.
+    const prevKeyId = this.ctx.storage.kv.get<string>("prevKeyId") ?? undefined;
+    const prevPubKey = this.ctx.storage.kv.get<string>("prevPubKey") ?? undefined;
     const hasPrev = !!prevKeyId && prevKeyId !== keyId && !!prevPubKey;
     if (hasPrev) keys[prevKeyId] = prevPubKey;
 
@@ -3600,78 +3854,99 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    */
   async rotate(): Promise<{ newKeyId: string; epoch: number }> {
     this.#ensureSchema();
-    const oldKeyId = this.#getKeyId();
-    // Capture the old PUBLIC key BEFORE deleting it. The grace window needs it
-    // published (generateBundle above) so tokens the old key signed still verify
-    // until they expire; storing only the id (prevKeyId) left the pubkey gone
-    // and the grace window broken (notme-54f84b).
-    const oldPubKeyB64 = await this.getPublicKeyRawB64();
+    // ATOMIC (notme-b54368). This used to archive the old key, DELETE it,
+    // generate the new one across several awaits and then write prevKeyId
+    // and prevPubKey with two separately awaited puts. A throw or eviction
+    // anywhere after the DELETE left the authority with NO key row — the next
+    // call silently generated an unrelated key — and with no grace record.
+    // Cloudflare's SQLite storage API: transactionSync "rolls back" if its
+    // callback throws, and "only synchronous storage operations can be part
+    // of the transaction". So every await happens first, then every write
+    // commits together in one transactionSync, and the in-memory key switches
+    // in the same synchronous run — nothing can interleave between storage
+    // naming the new key and this isolate signing with it.
 
-    // Archive the outgoing PUBLIC key by epoch BEFORE the delete (ADR-014).
-    //
-    // Ordering is the whole point: after the DELETE below there is nothing
-    // left to archive, and the prevPubKey slot written further down holds
-    // exactly one generation. Receipts must stay verifiable for arbitrary
-    // later audit (RECEIPTS.md §2.3), so the key that signed epoch N has to
-    // survive epochs N+2, N+3, … — otherwise the actor voids its own evidence
-    // by rotating twice.
-    //
-    // INSERT OR IGNORE, not REPLACE: an epoch's public key is immutable once
-    // recorded. Overwriting one would rewrite history, which is precisely the
-    // capability an audit trail exists to deny.
-    //
-    // The span, not one epoch: this key may have signed across a
-    // `revokeEpoch()`, so `from_epoch` is where it started and `until_epoch`
-    // is the generation current as it retires. `INSERT OR IGNORE` still
-    // guards immutability — now of one KEY's record, where before it silently
-    // discarded a second key retired inside the same epoch.
-    const oldEpochRows = this.ctx.storage.sql
-      .exec(
-        "SELECT s.epoch AS epoch, k.from_epoch AS from_epoch FROM state s, keys k WHERE s.id = 'authority' AND k.id = 'authority'",
-      )
-      .toArray() as Array<{ epoch: number; from_epoch: number }>;
-    const untilEpoch = oldEpochRows[0]!.epoch;
-    this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO retired_keys (key_id, public_raw, from_epoch, until_epoch, retired_at) VALUES (?, ?, ?, ?, ?)",
-      oldKeyId,
-      oldPubKeyB64,
-      oldEpochRows[0]!.from_epoch,
-      untilEpoch,
-      Math.floor(Date.now() / 1000),
-    );
+    // ── Async half: the outgoing key (loaded, or created on a fresh
+    // authority), its public bytes, and the new key. No storage writes. ──
+    const old = await this.#getOrCreateSigningKey();
+    // The grace window needs the old PUBLIC key published (generateBundle)
+    // so tokens it signed still verify until they expire; storing only the
+    // id left the pubkey gone and the grace window broken (notme-54f84b).
+    const oldPubKeyB64 = await rawPublicKeyB64(old.verifyKey);
+    const fresh = await this.#generateKeyMaterial();
 
-    // Delete old key
-    this.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");
-    this.#signingKey = null;
-    this.#verifyKey = null;
+    // ── Synchronous half: one transaction. ──
+    const epoch = this.ctx.storage.transactionSync(() => {
+      // The key captured above must still be the live one. A concurrent
+      // rotate() that committed during the awaits would otherwise have its
+      // key deleted unarchived — and that key may already have signed.
+      const cur = this.#readKeyRow();
+      if (!cur || cur.key_id !== old.keyId || this.#signingKey !== old.signingKey) {
+        throw new Error(
+          "rotate refused: the authority key changed while this rotation was prepared " +
+            "(a concurrent rotate?); nothing was written — retry",
+        );
+      }
+      const [{ epoch: untilEpoch }] = this.ctx.storage.sql
+        .exec("SELECT epoch FROM state WHERE id = 'authority'")
+        .toArray() as Array<{ epoch: number }>;
 
-    // seqno only. The epoch belongs to revokeEpoch().
-    this.ctx.storage.sql.exec(
-      "UPDATE state SET seqno = seqno + 1 WHERE id = 'authority'",
-    );
-
-    // Generate new key (#getOrCreateSigningKey will create since we deleted)
-    const { keyId: newKeyId } = await this.#getOrCreateSigningKey();
-
-    // Store prevKeyId + prevPubKey for the transition window (both needed so
-    // generateBundle can republish the previous key for grace-window verify).
-    await this.ctx.storage.put("prevKeyId", oldKeyId);
-    await this.ctx.storage.put("prevPubKey", oldPubKeyB64);
+      // Archive the outgoing PUBLIC key BEFORE the delete (ADR-014).
+      //
+      // Receipts must stay verifiable for arbitrary later audit (RECEIPTS.md
+      // §2.3), so the key that signed epoch N has to survive epochs N+2,
+      // N+3, … — otherwise the actor voids its own evidence by rotating
+      // twice. The prevPubKey slot below holds exactly one generation.
+      //
+      // INSERT OR IGNORE, not REPLACE: a key's public record is immutable
+      // once written. Overwriting one would rewrite history, which is
+      // precisely the capability an audit trail exists to deny.
+      //
+      // The span, not one epoch: this key may have signed across a
+      // `revokeEpoch()`, so `from_epoch` is where it started and
+      // `until_epoch` is the generation current as it retires.
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO retired_keys (key_id, public_raw, from_epoch, until_epoch, retired_at) VALUES (?, ?, ?, ?, ?)",
+        old.keyId,
+        oldPubKeyB64,
+        cur.from_epoch,
+        untilEpoch,
+        Math.floor(Date.now() / 1000),
+      );
+      this.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");
+      // The new key INHERITS the current epoch (notme-77a024).
+      this.ctx.storage.sql.exec(
+        "INSERT INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', ?, ?, ?, ?)",
+        fresh.storedPrivate,
+        fresh.publicSpkiB64,
+        fresh.keyId,
+        untilEpoch,
+      );
+      // seqno only. The epoch belongs to revokeEpoch().
+      this.ctx.storage.sql.exec(
+        "UPDATE state SET seqno = seqno + 1 WHERE id = 'authority'",
+      );
+      // The grace record — both halves, written together (generateBundle
+      // republishes the previous key from them). The synchronous KV API is
+      // the same `__cf_kv` store the async put() used, so existing
+      // deployments' records read back unchanged, and unlike put() it can
+      // be part of this transaction.
+      this.ctx.storage.kv.put("prevKeyId", old.keyId);
+      this.ctx.storage.kv.put("prevPubKey", oldPubKeyB64);
+      return untilEpoch;
+    });
+    this.#signingKey = fresh.signingKey;
+    this.#verifyKey = fresh.verifyKey;
 
     // Publish straight away, as revokeEpoch() does (notme-ed6114, re-review
     // NEW-1). The KV bundle is what verifiers and the trust-anchor gates
     // read the CURRENT key from; left alone it named the old key until the
     // next alarm or its staleness window, while the edge also still served
     // the old root — so the two agreed and a release could sign it. After
-    // the new key and prevKey/prevPubKey are stored, so the bundle carries
-    // the grace-window key too.
+    // the commit, so the bundle carries the grace-window key too.
     await this.#publishBundle();
 
-    const rows = this.ctx.storage.sql
-      .exec("SELECT epoch FROM state WHERE id = 'authority'")
-      .toArray() as Array<{ epoch: number }>;
-
-    return { newKeyId, epoch: rows[0]!.epoch };
+    return { newKeyId: fresh.keyId, epoch };
   }
 
   /**

@@ -1082,27 +1082,55 @@ export async function mintTaskCertPair(
   return minted;
 }
 
-/** Scopes at OID_SCOPES — a local reader so this module has no import cycle with verify-chain. */
+/**
+ * Scopes at OID_SCOPES: SEQUENCE OF UTF8String, or null when the extension is
+ * absent OR malformed. A local reader so this module has no import cycle with
+ * verify-chain, held to the same rules as its certScopes (notme-2098f4):
+ * every length is bounds-checked, the SEQUENCE must span the extension
+ * exactly (no trailing bytes), and each element must end inside it. The old
+ * reader checked none of that, so a truncated or overlong .1.3 decoded to
+ * garbage scope strings — and criteria.ts's scope ceiling read them.
+ */
 export function readScopes(cert: { getExtension(oid: string): { value: ArrayBuffer } | null }): string[] | null {
   const ext = cert.getExtension(OID_SCOPES);
   if (!ext) return null;
   const der = new Uint8Array(ext.value);
-  if (der[0] !== 0x30) return null;
-  let at = 2;
-  if (der[1]! & 0x80) at = 2 + (der[1]! & 0x7f);
+  const seq = readBoundedTlv(der, 0, der.length);
+  if (!seq || seq.tag !== 0x30 || seq.end !== der.length) return null;
   const out: string[] = [];
-  while (at < der.length) {
-    if (der[at] !== 0x0c) return null;
-    let len = der[at + 1]!;
-    let hdr = 2;
-    if (len & 0x80) {
-      const n = len & 0x7f;
-      len = 0;
-      for (let i = 0; i < n; i++) len = len * 256 + der[at + 2 + i]!;
-      hdr = 2 + n;
-    }
-    out.push(new TextDecoder().decode(der.subarray(at + hdr, at + hdr + len)));
-    at += hdr + len;
+  let at = seq.contentStart;
+  while (at < seq.end) {
+    const s = readBoundedTlv(der, at, seq.end);
+    if (!s || s.tag !== 0x0c) return null; // UTF8String
+    out.push(new TextDecoder().decode(der.subarray(s.contentStart, s.end)));
+    at = s.end;
   }
   return out;
+}
+
+/**
+ * One DER TLV starting at `at` that must end at or before `limit`, or null.
+ * Short and one- or two-byte long-form lengths only — what certScopes
+ * accepts; an extension longer than 64 KiB is not one this CA writes.
+ */
+function readBoundedTlv(
+  der: Uint8Array,
+  at: number,
+  limit: number,
+): { tag: number; contentStart: number; end: number } | null {
+  if (at + 2 > limit) return null;
+  const tag = der[at]!;
+  let len = der[at + 1]!;
+  let headerLen = 2;
+  if (len & 0x80) {
+    const lenBytes = len & 0x7f;
+    if (lenBytes === 0 || lenBytes > 2 || at + 2 + lenBytes > limit) return null;
+    len = 0;
+    for (let i = 0; i < lenBytes; i++) len = len * 256 + der[at + 2 + i]!;
+    headerLen = 2 + lenBytes;
+  }
+  const contentStart = at + headerLen;
+  const end = contentStart + len;
+  if (end > limit) return null;
+  return { tag, contentStart, end };
 }
