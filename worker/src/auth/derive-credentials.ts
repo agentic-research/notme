@@ -152,7 +152,16 @@ async function verifyAgainstCA(
   caPublicKey: CryptoKey,
   what: string,
 ): Promise<X509Certificate> {
-  const cert = new X509Certificate(certPem);
+  // A caller's bytes, so a parse failure is the caller's fault and says so by
+  // name. @peculiar/x509 3.x refuses DER with trailing bytes (1.14.3 accepted
+  // it and kept them in rawData); its message names ASN.1 internals, which
+  // are the library's business, not the caller's (notme-3ee3b0).
+  let cert: X509Certificate;
+  try {
+    cert = new X509Certificate(certPem);
+  } catch {
+    throw new Error(`${what} cert is not a well-formed DER certificate`);
+  }
 
   // `signatureOnly` matters. peculiar's verify() checks the validity window
   // as well by default, so an EXPIRED cert comes back as `false` — reported as

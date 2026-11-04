@@ -21,6 +21,8 @@
  * parsed certificate and of its SPKI — never over file bytes, whose framing
  * (a trailing newline) differs between the endpoint and the committed file.
  */
+// FIRST: @peculiar/x509 3.x needs a Reflect polyfill loaded before it (notme-3ee3b0).
+import "reflect-metadata";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as x509 from "@peculiar/x509";

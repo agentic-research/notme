@@ -1,6 +1,6 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
-import { baseMiniflare, NO_NETWORK_SETUP_FILES, REKOR_SUITES, WARM_SETUP_FILES, x509Dir } from "./vitest.workers.config.mts";
+import { baseMiniflare, NO_NETWORK_SETUP_FILES, REFLECT_SETUP_FILES, REKOR_SUITES, WARM_SETUP_FILES, x509Dir } from "./vitest.workers.config.mts";
 
 // Pool config for the suites that revoke WITH Rekor submission on
 // (notme-8befcc). Separate from vitest.workers.config.mts for the reason the
@@ -28,6 +28,6 @@ export default defineConfig({
   ],
   test: {
     include: REKOR_SUITES,
-    setupFiles: [...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],
+    setupFiles: [...REFLECT_SETUP_FILES, ...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],
   },
 });

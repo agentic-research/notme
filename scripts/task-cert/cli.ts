@@ -45,6 +45,8 @@
  * certs as you until it expires (≤24h). It is protected by file permissions
  * only.
  */
+// FIRST: @peculiar/x509 3.x needs a Reflect polyfill loaded before it (notme-3ee3b0).
+import "reflect-metadata";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";

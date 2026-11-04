@@ -1,6 +1,11 @@
 // notme.bot — minimal Worker shell
 // Static assets served via ASSETS binding. Add routes here as needed.
 
+// FIRST, before any module that reaches @peculiar/x509 (notme-3ee3b0).
+// x509 2.0+ no longer loads a Reflect polyfill itself (PR #130); its tsyringe
+// container throws at module evaluation without one. ESM evaluates imports in
+// source order, so this line runs before the re-exports below pull in x509.
+import "reflect-metadata";
 export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
 import type { MintBridgeCertProof } from "./src/signing-authority";

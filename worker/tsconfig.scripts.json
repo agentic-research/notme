@@ -13,7 +13,12 @@
     // is `any` rather than `never` and the scripts stop type-checking
     // (notme-430ad1).
     "types": ["node", "@cloudflare/workers-types"],
-    "paths": { "@peculiar/x509": ["./node_modules/@peculiar/x509"] },
+    // scripts/ resolves from the repo root, where neither is hoisted; both
+    // are worker dependencies (reflect-metadata: notme-3ee3b0).
+    "paths": {
+      "@peculiar/x509": ["./node_modules/@peculiar/x509"],
+      "reflect-metadata": ["./node_modules/reflect-metadata"]
+    },
     "noEmit": true
   },
   "include": [

@@ -3,6 +3,7 @@ import { defineConfig } from "vitest/config";
 import {
   baseMiniflare,
   CT_LIVE_SUITES,
+  REFLECT_SETUP_FILES,
   x509Dir,
 } from "./vitest.workers.config.mts";
 
@@ -85,6 +86,7 @@ export default defineConfig({
   ],
   test: {
     include: CT_LIVE_SUITES,
+    setupFiles: [...REFLECT_SETUP_FILES],
     // A real log sequences on an interval; give each step room.
     testTimeout: 120_000,
   },

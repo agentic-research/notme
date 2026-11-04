@@ -1,7 +1,14 @@
 import { createHash, createPublicKey } from "node:crypto";
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
-import { baseMiniflare, CT_BOUND_SUITES, NO_NETWORK_SETUP_FILES, WARM_SETUP_FILES, x509Dir } from "./vitest.workers.config.mts";
+import {
+  baseMiniflare,
+  CT_BOUND_SUITES,
+  NO_NETWORK_SETUP_FILES,
+  REFLECT_SETUP_FILES,
+  WARM_SETUP_FILES,
+  x509Dir,
+} from "./vitest.workers.config.mts";
 
 // Pool config for the suites that mint WITH a transparency log bound
 // (notme-1b46a8). Separate from vitest.workers.config.mts on purpose: that
@@ -256,6 +263,6 @@ export default defineConfig({
   ],
   test: {
     include: CT_BOUND_SUITES,
-    setupFiles: [...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],
+    setupFiles: [...REFLECT_SETUP_FILES, ...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],
   },
 });
