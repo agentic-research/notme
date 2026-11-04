@@ -21,7 +21,7 @@ set -uo pipefail
 ANCHOR="a2e571d8834225781873fa621ead03393d57dc05ff8379c64755d709018d36a4"
 AUTHORITY="https://auth.notme.bot"
 REPO="agentic-research/signet"
-TAG="v0.3.0"
+TAG="v0.3.1"
 ASSET="signet-linux-amd64.signet.crt.pem"
 PAUSE=0
 [ "${1:-}" = "--pause" ] && PAUSE=1
