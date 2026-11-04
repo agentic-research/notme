@@ -1,5 +1,7 @@
 # DPoP Package Documentation Implementation Plan
 
+**Status (2026-11-03):** executed. `packages/dpop/README.md` and the four guides under `packages/dpop/docs/` exist; bead notme-1c93bc is closed. Kept as the historical plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship a useful npm landing README and renderer-neutral package-local MDX guides, with an automated check proving the documentation and built SDK are present in the packed artifact.

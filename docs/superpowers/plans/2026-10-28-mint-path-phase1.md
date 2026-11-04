@@ -1,5 +1,7 @@
 # Mint Path Phase 1 — Generation Counter and Clone Policy — Implementation Plan
 
+**Status (2026-11-03):** executed. Phase 1 (generation counter, fork detection at renewal, clone policy) shipped; bead notme-747cc7 is closed. Branches are the follow-up, notme-be1ecd (open). Kept as the historical plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A copied tier key is detected at its next renewal and the enrollment is shut off, while an honest machine that loses a renewal response is never mistaken for a copy.

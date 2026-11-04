@@ -2,7 +2,7 @@
 
 **Bead:** notme-83706a
 **Date:** 2026-07-28
-**Status:** approved
+**Status:** approved; implemented (notme-83706a, closed). `release.yml` publishes both images to ghcr (`.github/workflows/release.yml:173`).
 
 ## Problem
 
