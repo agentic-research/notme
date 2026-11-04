@@ -4700,6 +4700,11 @@ export default {
     }
 
     // ── Static assets ──
+    // _api-docs is a template whose authority host is a placeholder that
+    // /api/docs fills (notme-131c8e). Served raw it would show the token.
+    if (url.pathname === "/_api-docs" || url.pathname === "/_api-docs.html") {
+      return new Response("Not found", { status: 404 });
+    }
     // Check CF edge cache first — avoids re-invoking ASSETS.fetch on cache hit.
     const cached = await cacheMatch(request);
     if (cached) return cached;

@@ -62,3 +62,18 @@ describe("/api/docs fills the authority host from the environment", () => {
     expect(await res.text()).toContain("https://id.example.org/cert/gha");
   });
 });
+
+describe("the raw template is not served", () => {
+  it("/_api-docs and /_api-docs.html are 404, never the unfilled placeholder", async () => {
+    for (const path of ["/_api-docs", "/_api-docs.html"]) {
+      for (const origin of ["https://notme.bot", "https://auth.notme.bot"]) {
+        const res = await worker.fetch(
+          new Request(`${origin}${path}?case=${n++}`, { headers: { host: new URL(origin).host } }),
+          { ...env, ASSETS: assets, SITE_URL: "https://notme.bot", SIGNET_AUTHORITY_URL: "https://auth.notme.bot" } as any,
+        );
+        expect(res.status, `${origin}${path}`).toBe(404);
+        expect(await res.text()).not.toContain(AUTHORITY_HOST_TOKEN);
+      }
+    }
+  });
+});
