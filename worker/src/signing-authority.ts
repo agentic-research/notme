@@ -2019,6 +2019,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // re-check must neither burn it for nothing nor escape as an RPC
     // exception from a refusal-or-result method (security review F5). One
     // retry under a fresh capture, then a refusal result (review L2).
+    // The issuer is the root's subject (notme-7ec6fb). Read once, before the
+    // capture: the subject is the authority's name, not a property of the
+    // key, and a rotate re-issues the root under the same one. (No CT chain
+    // rides on this path, so nothing key-bound is read here.)
+    const root = await this.#rootForMint({ ct: false });
     try {
       return await this.#withMintRetry(async (cap) => {
         const { mintGHABridgeCert } = await import("./cert-authority");
@@ -2028,6 +2033,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
           publicKeyPem,
           cap.signingKey,
           ttlMs,
+          root.subject,
         );
         return {
           ok: true as const,
@@ -2060,13 +2066,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // re-checks them immediately before every signature, and a refusal is
     // retried once under a fresh capture (#withMintRetry, review L2).
     return this.#withMintRetry(async (cap) => {
-      // Bridge pairs are root-issued: the default issuer, no issuerName. The
-      // CT chain's issuer is read HERE, right after the key that signs the
-      // pair, and handed to #mintLogged — so the chain names the root of the
-      // key that signed rather than whatever a later, independent read returns
-      // (and if a rotate lands in between, the re-check refuses the mint).
-      // Read only when a log is bound: unbound, minting does no extra work.
-      const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
+      // Bridge pairs are root-issued, so the issuer name is the ROOT's
+      // subject — which on a non-production authority is not the production
+      // literal (notme-7ec6fb). The root is read HERE, right after the key
+      // that signs the pair, and its PEM handed to #mintLogged — so the CT
+      // chain names the root of the key that signed rather than whatever a
+      // later, independent read returns (and if a rotate lands in between,
+      // the re-check refuses the mint).
+      const root = await this.#rootForMint();
+      const issuerPem = root.ctPem;
       const { mintBridgeCertPair } = await import("./cert-authority");
       const ttlMs = params.ttlMs ?? 5 * 60 * 1000;
       const notBefore = new Date();
@@ -2089,6 +2097,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
               epoch: cap.epoch,
               authMethod: params.authMethod,
               ttlMs: params.ttlMs,
+              issuerName: root.subject,
               pin,
               // Per cert: each certificate carries its OWN SCT. Order matches
               // `pems` below — 0 is mTLS, 1 is signing.
@@ -2372,6 +2381,50 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       this.#ctShardCache = { k, v: await parseShards(this.env) };
     }
     return this.#ctShardCache.v;
+  }
+
+  /**
+   * The root a root-issued mint names as issuer (notme-7ec6fb), and its PEM
+   * for the CT chain when a log is bound and the path logs (`ct`, default
+   * true; the legacy GHA cert is not logged).
+   *
+   * The issuer name is the STORED root's subject, not caSubjectForEnv(): the
+   * root is created once, so an authority older than notme-1532eb keeps the
+   * production-shaped subject it was born with, and naming the env-derived
+   * one would break its chains in the other direction. On production both
+   * are the literal "CN=signet-authority,O=notme", so its bytes do not move.
+   *
+   * If the root cannot be read, the mint is not refused for it (the log
+   * never is, and neither is the name): the env-derived subject is what any
+   * root this code creates carries.
+   */
+  async #rootForMint(
+    opts: { ct?: boolean } = {},
+  ): Promise<{ subject: string; ctPem: string | null }> {
+    const ct = (opts.ct ?? true) && Boolean(this.env.CT_LOG);
+    let pem: string | null;
+    if (ct) {
+      pem = await this.#readRootForCt();
+    } else {
+      try {
+        pem = await this.getCACertificatePem();
+      } catch (err) {
+        console.error({ event: "mint.root_unreadable", error: String(err) });
+        pem = null;
+      }
+    }
+    let subject = caSubjectForEnv(this.env);
+    if (pem) {
+      const { X509Certificate } = await import("@peculiar/x509");
+      try {
+        subject = new X509Certificate(pem).subject;
+      } catch (err) {
+        // An unparseable root is the CT path's to report (#mintLogged counts
+        // it unloggable); the name falls back like an unreadable root's.
+        console.error({ event: "mint.root_unparseable", error: String(err) });
+      }
+    }
+    return { subject, ctPem: ct ? pem : null };
   }
 
   /**
@@ -2763,9 +2816,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // One synchronous capture, re-checked before every signature and
     // retried once on a refusal — see mintBridgeCertPair (notme-b54368).
     return this.#withMintRetry(async (cap) => {
-      // Root PEM read right after the key that signs the tier — see
-      // mintBridgeCertPair. Read only when a log is bound.
-      const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
+      // Root read right after the key that signs the tier — see
+      // mintBridgeCertPair: its subject names the issuer, its PEM the chain.
+      const root = await this.#rootForMint();
+      const issuerPem = root.ctPem;
       const { mintIssuingCaCert } = await import("./cert-authority");
       const ttlMs = params.ttlMs ?? 60 * 60 * 1000;
       const notBefore = new Date();
@@ -2786,6 +2840,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
               epoch: cap.epoch,
               authMethod: params.authMethod,
               ttlMs: params.ttlMs,
+              issuerName: root.subject,
               pin,
               extraExtensions: ct(0),
               ...(params.criteria ? { criteria: params.criteria } : {}),
