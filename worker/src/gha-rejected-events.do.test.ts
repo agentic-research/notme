@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * gha-rejected-events.do.test.ts — a GitHub Actions token minted for a
  * `pull_request` or `pull_request_target` run buys nothing (notme-fbb00e).

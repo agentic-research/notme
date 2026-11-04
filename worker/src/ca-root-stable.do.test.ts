@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * ca-root-stable.do.test.ts — the root a fresh authority serves first is
  * the root it keeps serving (notme-7aa6dd).

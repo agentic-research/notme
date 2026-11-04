@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * sign-scopes.do.test.ts — the advertised signing scopes are reachable
  * (notme-486e8a follow-on: "if it advertises it should work").

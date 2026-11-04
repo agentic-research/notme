@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * error-status-conformance.do.test.ts — every route @notme/contract's
  * ERROR_STATUS names answers the status the contract says (notme-778cbf).

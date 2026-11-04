@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * admin-alarm-route.do.test.ts — /admin/alarm-health must be reachable by an
  * admin and by nobody else (notme-77a024).

@@ -60,8 +60,10 @@ const config :Workerd.Config = (
 
 # ── notme Worker: full identity authority ──
 const notmeWorker :Workerd.Worker = (
-  compatibilityDate = "2026-07-21",
-  compatibilityFlags = ["nodejs_compat"],
+  compatibilityDate = "2026-10-19",
+  # No compatibilityFlags: from 2026-08-04 the date enables nodejs_compat
+  # (and _v2), and workerd REFUSES to start with the redundant flag listed
+  # (notme-430ad1). Node.js compat is still on, as it always was here.
 
   modules = [
     ( name = "worker",
@@ -108,7 +110,10 @@ const notmeWorker :Workerd.Worker = (
 
 # ── Agent Worker: network-isolated, service binding only ──
 const agentWorker :Workerd.Worker = (
-  compatibilityDate = "2026-07-21",
+  # From 2026-08-04 this date turns Node.js compat on for the agent too. It
+  # gives the agent no new reach: node:net/node:http still go through
+  # globalOutbound, which it does not have (notme-430ad1).
+  compatibilityDate = "2026-10-19",
 
   modules = [
     ( name = "agent",

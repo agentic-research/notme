@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * version-id-disclosure.do.test.ts — /.well-known/version names the
  * Cloudflare version id ONLY to a request that already pins it

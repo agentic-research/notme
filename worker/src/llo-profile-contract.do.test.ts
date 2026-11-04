@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * llo-profile-contract.do.test.ts — `.1.1`/`.1.2` are a CROSS-REPO CONTRACT,
  * not spare metadata (notme-6070fa, relayed from ley-line-open-9ac66d / LLO

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * receipt-signer.do.test.ts — receipt signing against a REAL SigningAuthority
  * in REAL workerd (ADR-014).

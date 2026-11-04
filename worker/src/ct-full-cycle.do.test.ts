@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * ct-full-cycle.do.test.ts — mint, log, embed, and emit for verification
  * (notme-1b46a8).

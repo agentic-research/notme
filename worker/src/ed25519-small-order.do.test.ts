@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * ed25519-small-order.do.test.ts — what workerd does with small-order Ed25519
  * public keys, and that every caller-supplied key path refuses them

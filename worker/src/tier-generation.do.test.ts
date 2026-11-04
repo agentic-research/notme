@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * tier-generation.do.test.ts — a copied machine key renewing is a fork
  * (notme-747cc7, mint path phase 1).

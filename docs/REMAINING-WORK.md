@@ -98,6 +98,20 @@ them.
    and promote, and turn it on after 100%. Never roll back past this release
    with it on. A rollback is recoverable only within about 58 minutes; after
    that, renewing machines must re-enroll.
+   **Deploy note (compat date, notme-430ad1):** the live `worker/wrangler.toml`
+   is gitignored, so copy the template's change by hand before this deploy:
+   set the top-level `compatibility_date = "2026-10-19"`, and check that no
+   `[env.*]` block sets its own date. Do NOT add `nodejs_compat`, and remove
+   it if present: the date enables it, workerd refuses to start with the
+   redundant flag, and Cloudflare's docs say to omit it. Nor add
+   `no_nodejs_compat`. This turns Node.js compatibility on for deployed
+   staging and production for the first time. The DO test gate and
+   `config.capnp` already ran with it, and the bundle is byte-identical.
+   Rehearse with `task ship-staging` first, then check that the staging
+   `/.well-known/ca-bundle.json` still verifies. Its signature is over cbor-x
+   output, and cbor-x allocates with `Buffer` once `Buffer` exists. The
+   canonical encoders already pin `tagUint8Array: false` and normalise the
+   output, and the plain unit suite runs with `Buffer` present.
 11. **notme-bed754** closes when 1–10 are closed.
 
 Waiting on someone else: **notme-bc4cd2** (adopt LLO v0.21.0) waits for LLO

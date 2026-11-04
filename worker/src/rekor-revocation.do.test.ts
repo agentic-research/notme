@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * rekor-revocation.do.test.ts — every POST /admin/revoke-epoch is submitted,
  * once, to Rekor as a root-signed DSSE statement, AFTER the revocation

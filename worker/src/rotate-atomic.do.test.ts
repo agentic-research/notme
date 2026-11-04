@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * rotate-atomic.do.test.ts — rotate() and cold-start key creation are atomic
  * (notme-b54368, audit 2026-11-03 M3).

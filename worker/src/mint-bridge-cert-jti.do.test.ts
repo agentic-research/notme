@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * mint-bridge-cert-jti.do.test.ts — a GitHub Actions token buys ONE thing,
  * through the service binding as well as the routes (notme-f850f2).

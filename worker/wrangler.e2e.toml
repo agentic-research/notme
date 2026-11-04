@@ -18,7 +18,9 @@
 # See .github/workflows/bootstrap-e2e.yml.
 name = "notme-bootstrap-e2e"
 main = "worker.ts"
-compatibility_date = "2026-07-21"
+compatibility_date = "2026-10-19"
+# Same date as wrangler.toml.example, and for the same reason no
+# nodejs_compat flag: the date enables it (notme-430ad1).
 workers_dev = false
 
 [assets]

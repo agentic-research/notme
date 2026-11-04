@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * invite-page.do.test.ts — GET /invites must reach an admin and nobody else
  * (notme-4838ae).

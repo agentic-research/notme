@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * key-sealing-migration.do.test.ts — the transition an operator actually
  * performs (notme-41d0d3).

@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * mint-state-retry.do.test.ts — a re-check refusal after a spent proof is
  * retried once, then answered, never thrown (notme-b54368, review L2).

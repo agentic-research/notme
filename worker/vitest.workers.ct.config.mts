@@ -1,5 +1,5 @@
 import { createHash, createPublicKey } from "node:crypto";
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 import { baseMiniflare, CT_BOUND_SUITES, NO_NETWORK_SETUP_FILES, WARM_SETUP_FILES, x509Dir } from "./vitest.workers.config.mts";
 

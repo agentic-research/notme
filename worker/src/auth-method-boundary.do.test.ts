@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * auth-method-boundary.do.test.ts — a session whose authMethod does not parse
  * is not a session, on every route that reads one (notme-32003c).

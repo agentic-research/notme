@@ -1,4 +1,4 @@
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import { configDefaults, defineConfig } from "vitest/config";
@@ -27,15 +27,17 @@ export const x509Dir = dirname(createRequire(import.meta.url).resolve("@peculiar
 // Exported so vitest.workers.ct.config.mts boots the SAME worker with the same
 // bindings plus CT_LOG, instead of a hand-copied second set that can drift.
 export const baseMiniflare = {
-  // Keep in sync with wrangler.toml `compatibility_date` (line 4) — the
+  // Keep in sync with wrangler.toml `compatibility_date` (line 5) — the
   // isolate must behave identically to production for the code under
   // test. Not imported from wrangler.toml on purpose: this config declares
   // bindings inline precisely to avoid loading wrangler.toml (see above),
   // so the date is duplicated here. If you bump it there, bump it here.
-  // The ceiling is the pinned workerd's own date (workerd 1.20260721.x
-  // supports up to 2026-07-21): a later date could not be exercised by this
-  // gate, so bumping past it waits for a workerd bump (notme-05324c).
-  compatibilityDate: "2026-07-21",
+  // The ceiling is the pinned workerd's own date (workerd 1.20261019.x, via
+  // wrangler 4.151.3 and vitest-plugin 1.4.6, supports up to 2026-10-19): a
+  // later date could not be exercised by this gate, so bumping past it waits
+  // for a toolchain bump (notme-05324c, notme-430ad1). No compatibilityFlags:
+  // the date enables nodejs_compat, as in production.
+  compatibilityDate: "2026-10-19",
   bindings: {
     // The operator-set admin-recovery secret (notme-4838ae). Bound here
     // so the recovery path can be exercised at all — it is the ONLY way

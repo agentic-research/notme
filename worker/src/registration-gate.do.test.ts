@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * registration-gate.do.test.ts — an authority does not admit strangers
  * (notme-2c4209, ADR-021; Goal Zero criterion B's registration clause).

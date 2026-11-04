@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * registration-mark-reset.do.test.ts — a reset revokes in-flight
  * registration marks too (security review F4 of notme-a2e75d).

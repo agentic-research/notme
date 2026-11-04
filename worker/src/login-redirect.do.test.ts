@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * login-redirect.do.test.ts — "sign in first" sends you somewhere that exists
  * (notme-486e8a).

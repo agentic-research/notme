@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * bootstrap-trigger.do.test.ts — an unauthenticated stranger must not be able
  * to make the authority MINT a credential (notme-addef9).

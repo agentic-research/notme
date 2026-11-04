@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * tier-enrolment.do.test.ts — a machine can actually obtain a delegation tier
  * (notme-486e8a).

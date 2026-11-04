@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * threat-model-cors-limits.do.test.ts — the THREAT_MODEL rows that named a
  * test which existed NOWHERE, under any name (notme-8eed12).

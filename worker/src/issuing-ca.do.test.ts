@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * issuing-ca.do.test.ts — POST /cert/issuing-ca mints the MIDDLE tier, and
  * only for a session that holds certMint (notme-acc822, ADR-019 D4).

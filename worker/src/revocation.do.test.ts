@@ -1,8 +1,8 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 //
 // revocation.do.test.ts — tests for the APAS edge revocation module.
 //
-// Runs in the Workerd runtime via @cloudflare/vitest-pool-workers, which
+// Runs in the Workerd runtime via @cloudflare/vitest-plugin, which
 // provides real WebCrypto (Ed25519) and Durable Object support.
 //
 // Runs under vitest.workers.config.mts (the vitest-pool-workers pool), NOT the

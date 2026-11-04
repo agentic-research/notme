@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * cert-exchange-scopes.do.test.ts — POST /cert must not mint what
  * /cert/passkey forbids (notme-18dfd0).

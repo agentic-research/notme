@@ -8,7 +8,7 @@
  *   session.hmac.integrity
  *   session.expiry
  *
- * Runs in Workerd runtime via @cloudflare/vitest-pool-workers.
+ * Runs in Workerd runtime via @cloudflare/vitest-plugin.
  */
 
 import { describe, expect, it } from "vitest";
