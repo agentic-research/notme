@@ -4481,11 +4481,17 @@ export default {
       // answers here.
       if (env.VPC_AUTH) {
         const originUrl = `http://localhost${pathname}${url.search}`;
+        // No cookies cross to the origin (security review F3 of
+        // notme-a2e75d). The registration cookie is Path=/ and the session
+        // cookie always was, so both rode on every passthrough. signet reads
+        // no cookies, and nothing behind this tunnel should hold either.
+        const forwarded = new Headers(request.headers);
+        forwarded.delete("cookie");
         try {
           return await env.VPC_AUTH.fetch(
             new Request(originUrl, {
               method: request.method,
-              headers: request.headers,
+              headers: forwarded,
               body: request.body,
             }),
           );
