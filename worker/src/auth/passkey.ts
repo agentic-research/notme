@@ -121,12 +121,13 @@ export async function verifyRegistration(
    * where the caller decides whether this registration was authorized — an
    * invite reservation consumed, a claim marked — so the decision and the
    * credential it admits cannot be separated (notme-3dfe15). It also decides
-   * whether the registrant is the ADMIN (review L2): `isFirstUser` is only
-   * "passkey_users is empty", which is not the same as "nobody administers
-   * this authority". The default keeps the old count-based answer for
-   * callers with no gate of their own.
+   * whether the registrant is the ADMIN (review L2) — from the caller's own
+   * first-user mark, never from "passkey_users is empty", which is not the
+   * same as "nobody administers this authority". Required, with no
+   * argument: the count-based default it replaced admitted any verified
+   * registration and made the first one admin (notme-a2e75d).
    */
-  admit: (isFirstUser: boolean) => false | { isAdmin: boolean } = (f) => ({ isAdmin: f }),
+  admit: () => false | { isAdmin: boolean },
   /**
    * Wraps admit AND the stores in one transaction (review L1). In a Durable
    * Object pass `fn => ctx.storage.transactionSync(fn)`: a throwing insert
@@ -191,13 +192,7 @@ export async function verifyRegistration(
   const { credential } = verification.registrationInfo;
 
   return transact(() => {
-    // Check if first user (auto-admin)
-    const users = sql
-      .exec("SELECT COUNT(*) as count FROM passkey_users")
-      .toArray() as Array<{ count: number }>;
-    const isFirstUser = (users[0]?.count ?? 0) === 0;
-
-    const decision = admit(isFirstUser);
+    const decision = admit();
     if (!decision) {
       return { verified: false, isAdmin: false, refused: true as const };
     }

@@ -170,8 +170,10 @@ describe("internal CA bundle endpoint", () => {
     );
 
     expect(response.status).toBe(503);
+    // A constant body: the authority's message is logged, not returned
+    // (notme-b567c9).
     await expect(response.json()).resolves.toEqual({
-      error: "authority unavailable: boom",
+      error: "authority unavailable",
     });
   });
 });

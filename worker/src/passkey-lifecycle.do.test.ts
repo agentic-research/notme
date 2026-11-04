@@ -72,7 +72,7 @@ async function register(
   };
   // An invited registration is bound to the browser that reserved it
   // (review M1): carry the reservation cookie options set, as a browser would.
-  const rsv = /notme_invite_reservation=[^;,\s]+/.exec(opts.headers.get("set-cookie") ?? "")?.[0];
+  const rsv = /__Host-notme_registration=[^;,\s]+/.exec(opts.headers.get("set-cookie") ?? "")?.[0];
   const verify = await post(
     "/auth/passkey/register/verify",
     { userId, response: await auth.register(options.challenge) },

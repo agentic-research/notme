@@ -55,7 +55,7 @@ type Opts = {
 /** The `name=value` of the invite-reservation cookie a response set, if any. */
 function rsvCookie(res: Response): string | undefined {
   const sc = res.headers.get("set-cookie") ?? "";
-  const m = /notme_invite_reservation=[^;,\s]+/.exec(sc);
+  const m = /__Host-notme_registration=[^;,\s]+/.exec(sc);
   return m?.[0];
 }
 
@@ -104,7 +104,8 @@ beforeAll(async () => {
     bootstrapCode: (env as { BOOTSTRAP_CODE?: string }).BOOTSTRAP_CODE,
   });
   expect(res.status, await res.clone().text()).toBe(200);
-  const o = (await res.json()) as Opts;
+  // The first-user mark is bound to this browser too (notme-a2e75d).
+  const o = await asOpts(res);
   const v = await verify(admin, o);
   expect(v.status).toBe(200);
   adminCookie = v.headers.get("set-cookie")!.split(";")[0]!;
@@ -154,7 +155,8 @@ describe("invite reserve-then-consume (notme-3dfe15 parts 4/5)", () => {
 
     const late = await verify(a, oa);
     expect(late.status).toBe(403);
-    expect(late.headers.get("set-cookie")).toBeNull();
+    // No session — only the registration cookie being cleared (notme-a2e75d).
+    expect(late.headers.get("set-cookie") ?? "").not.toMatch(/notme_session=[^;]+/);
     // No principal, and no credential that a later LOGIN could turn into a
     // bridgeCert principal via ensurePasskeyPrincipal.
     expect(await authority().getPrincipalScopes(oa.userId)).toEqual([]);
@@ -266,7 +268,7 @@ describe("a reservation belongs to the browser that made it (review M1)", () => 
     const res = await post("/join", { token: inv.token });
     expect(res.status).toBe(200);
     const sc = res.headers.get("set-cookie") ?? "";
-    expect(sc).toMatch(/notme_invite_reservation=/);
+    expect(sc).toMatch(/__Host-notme_registration=/);
     expect(sc).toMatch(/HttpOnly/i);
     expect(sc).toMatch(/Secure/i);
     expect(sc).toMatch(/SameSite=Strict/i);

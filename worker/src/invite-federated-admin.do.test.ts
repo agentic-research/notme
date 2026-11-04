@@ -46,7 +46,7 @@ function post(path: string, body: unknown, cookie?: string) {
 }
 
 const rsvCookie = (res: Response) =>
-  /notme_invite_reservation=[^;,\s]+/.exec(res.headers.get("set-cookie") ?? "")?.[0];
+  /__Host-notme_registration=[^;,\s]+/.exec(res.headers.get("set-cookie") ?? "")?.[0];
 
 beforeAll(async () => {
   // An administrator who authenticates by OIDC alone: grants plus a linked

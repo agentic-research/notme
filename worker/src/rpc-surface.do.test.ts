@@ -376,6 +376,9 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       //             the route). It moves the admin decision OFF the
       //             passkey_users count, which any stub-issued challenge on
       //             an authority with no passkey user used to satisfy.
+      //             Since notme-a2e75d it (and markClaimRegistration)
+      //             returns the mark's fresh secret, as reserve does — the
+      //             caller's own, binding only the mark it just made.
       //
       // 65 → 66: loginWithFederated (review F1, notme-3dfe15 part 1).
       // Reviewed: it returns the principal and scopes for an identity the
