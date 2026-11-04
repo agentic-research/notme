@@ -67,7 +67,7 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
 
 ### M2 (Medium): a CT-bound mint can sign with a key or epoch that changed during its log round-trip
 
-**Fixed in 1a91149** (notme-b52d7c): after the add-pre-chain await the key id and epoch are re-read and the mint is refused if either moved. Since e687734 (notme-b54368) the same re-check runs before every signature on every cert mint path, not only after the log await. Since 1d42837 (notme-d06b7b) a refused or failed tier mint at collect gives the enrolment back, so a retry can still collect it.
+**Fixed in 1a91149** (notme-b52d7c): after the add-pre-chain await the key id and epoch are re-read and the mint is refused if either moved. Since e687734 (notme-b54368) the same re-check runs before every signature on every cert mint path, not only after the log await. Since review L2, a refusal is retried once under a fresh capture, because the caller's proof may already be spent; only a second refusal propagates. mintBridgeCert returns `authority_state_changed` instead of throwing. The retry never signs under the captured state. Since 1d42837 (notme-d06b7b) a refused or failed tier mint at collect gives the enrolment back, so a retry can still collect it.
 
 - **Location:**
   - `signing-authority.ts:1803-1810` (mintBridgeCertPair) and `2266-2270` (mintIssuingCa) capture `signingKey` and `state.epoch/keyId`.

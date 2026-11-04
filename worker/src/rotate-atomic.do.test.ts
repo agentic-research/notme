@@ -183,8 +183,13 @@ describe("cold-start key creation converges (notme-b54368)", () => {
  * (notme-b54368's comment). The no-log path signed with no re-check: a
  * revokeEpoch() landing between the capture and the signature was minted
  * into a certificate carrying the revoked epoch. The interleave is simulated
- * by bumping the epoch on the SECOND "SELECT epoch FROM state" read — the
- * first is the capture, the second is the pre-signature re-check.
+ * by bumping the epoch on a re-check read: capture and re-check each read
+ * "SELECT epoch FROM state" once, capture first, so the re-checks are the
+ * even-numbered reads.
+ *
+ * A refusal is retried once under a fresh capture (review L2): one move
+ * mints under the MOVED epoch, never the captured one; a state that moves
+ * again on the retry is refused.
  */
 describe("every mint path refuses if key or epoch moved before signing (notme-b54368)", () => {
   const spkiPem = async (k: CryptoKey) => {
@@ -203,57 +208,80 @@ describe("every mint path refuses if key or epoch moved before signing (notme-b5
       ).publicKey,
     );
 
-  async function epochMovesAfterCapture<T>(name: string, mint: (a: SigningAuthority) => Promise<T>) {
+  async function epochMovesAfterCapture(
+    name: string,
+    moves: "once" | "always",
+    mint: (a: SigningAuthority) => Promise<{ authority: { epoch: number } }>,
+  ) {
     const stub = stubFor(name);
     return runInDurableObject(stub, async (inst, state) => {
       const auth = inst as SigningAuthority;
-      await auth.getAuthorityState(); // key loaded before the fault is armed
+      const start = (await auth.getAuthorityState()).epoch; // key loaded before the fault is armed
       const sql = state.storage.sql as unknown as Sql;
       const orig = sql.exec.bind(sql);
       let reads = 0;
       sql.exec = (q: string, ...a: unknown[]) => {
-        if (q === "SELECT epoch FROM state WHERE id = 'authority'" && ++reads === 2) {
-          orig("UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'");
+        if (q === "SELECT epoch FROM state WHERE id = 'authority'") {
+          reads++;
+          if (reads % 2 === 0 && (moves === "always" || reads === 2)) {
+            orig("UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'");
+          }
         }
         return orig(q, ...a);
       };
       try {
-        return await mint(auth).then(
-          () => ({ ok: true as const }),
+        const r = await mint(auth).then(
+          (v) => ({ ok: true as const, epoch: v.authority.epoch }),
           (e: Error) => ({ ok: false as const, e: e.message }),
         );
+        return { r, start };
       } finally {
         delete (sql as Partial<Sql>).exec;
       }
     });
   }
 
-  it("mintIssuingCa (no CT log bound)", async () => {
-    const pem = await newPem("Ed25519");
-    const r = await epochMovesAfterCapture("uniform-refuse-tier", (a) =>
-      a.mintIssuingCa({
-        subject: "tier",
-        identity: "wimse://notme.bot/principal/tier",
-        publicKeyPem: pem,
-        scopes: ["bridgeCert"],
-        authMethod: "passkey",
-      }),
-    );
-    expect(r.ok ? "minted" : r.e).toMatch(/changed while the mint was in flight/);
-  });
+  const paths: Array<[string, () => Promise<(a: SigningAuthority) => Promise<{ authority: { epoch: number } }>>]> = [
+    [
+      "mintIssuingCa",
+      async () => {
+        const pem = await newPem("Ed25519");
+        return (a) =>
+          a.mintIssuingCa({
+            subject: "tier",
+            identity: "wimse://notme.bot/principal/tier",
+            publicKeyPem: pem,
+            scopes: ["bridgeCert"],
+            authMethod: "passkey",
+          });
+      },
+    ],
+    [
+      "mintBridgeCertPair",
+      async () => {
+        const [mtls, signing] = [await newPem("P-256"), await newPem("Ed25519")];
+        return (a) =>
+          a.mintBridgeCertPair({
+            subject: "pair",
+            identity: "wimse://notme.bot/principal/pair",
+            mtlsPublicKeyPem: mtls,
+            signingPublicKeyPem: signing,
+            scopes: ["bridgeCert"],
+            authMethod: "gha-oidc",
+          });
+      },
+    ],
+  ];
 
-  it("mintBridgeCertPair (no CT log bound)", async () => {
-    const [mtls, signing] = [await newPem("P-256"), await newPem("Ed25519")];
-    const r = await epochMovesAfterCapture("uniform-refuse-pair", (a) =>
-      a.mintBridgeCertPair({
-        subject: "pair",
-        identity: "wimse://notme.bot/principal/pair",
-        mtlsPublicKeyPem: mtls,
-        signingPublicKeyPem: signing,
-        scopes: ["bridgeCert"],
-        authMethod: "gha-oidc",
-      }),
-    );
-    expect(r.ok ? "minted" : r.e).toMatch(/changed while the mint was in flight/);
-  });
+  for (const [label, make] of paths) {
+    it(`${label} (no CT log bound): one move is retried under the moved epoch, never the captured one`, async () => {
+      const { r, start } = await epochMovesAfterCapture(`uniform-once-${label}`, "once", await make());
+      expect(r.ok ? r.epoch : r.e).toBe(start + 1);
+    });
+
+    it(`${label} (no CT log bound): a state still moving on the retry is refused`, async () => {
+      const { r } = await epochMovesAfterCapture(`uniform-always-${label}`, "always", await make());
+      expect(r.ok ? `minted at epoch ${r.epoch}` : r.e).toMatch(/changed while the mint was in flight/);
+    });
+  }
 });

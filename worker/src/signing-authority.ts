@@ -312,7 +312,13 @@ export type BridgeCertRefusal =
   | "gha_token_reused"
   | "invalid_session"
   | "invalid_access_token"
-  | "unknown_proof_kind";
+  | "unknown_proof_kind"
+  /**
+   * The signing key or epoch changed between capture and signature twice
+   * running (a rotate or revokeEpoch in flight). The proof may be spent;
+   * retry with a fresh one (notme-b54368, review L2).
+   */
+  | "authority_state_changed";
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
@@ -550,6 +556,13 @@ function randomUserCode(): string {
   }
   return `${out.slice(0, 4).join("")}-${out.slice(4).join("")}`;
 }
+
+/**
+ * Thrown by #refuseIfMintStateMoved: the key or epoch a mint captured moved
+ * before it signed. Its own class so #withMintRetry retries exactly this and
+ * nothing else (notme-b54368, review L2).
+ */
+class MintStateMovedError extends Error {}
 
 /** Raw 32-byte Ed25519 public key, base64 (the CABundle.keys encoding). */
 async function rawPublicKeyB64(verifyKey: CryptoKey): Promise<string> {
@@ -2001,21 +2014,31 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return { ok: false, reason: "unknown_proof_kind" };
     }
 
-    await this.#getOrCreateSigningKey();
-    const cap = this.#captureMintState();
-    const { mintGHABridgeCert } = await import("./cert-authority");
-    this.#refuseIfMintStateMoved(cap);
-    const result = await mintGHABridgeCert(
-      subject,
-      publicKeyPem,
-      cap.signingKey,
-      ttlMs,
-    );
-    return {
-      ok: true,
-      ...result,
-      authority: { epoch: cap.epoch, key_id: cap.keyId },
-    };
+    // The proof may already be SPENT here (the gha-oidc jti, notme-f850f2),
+    // so a rotate() or revokeEpoch() landing between the capture and the
+    // re-check must neither burn it for nothing nor escape as an RPC
+    // exception from a refusal-or-result method (security review F5). One
+    // retry under a fresh capture, then a refusal result (review L2).
+    try {
+      return await this.#withMintRetry(async (cap) => {
+        const { mintGHABridgeCert } = await import("./cert-authority");
+        this.#refuseIfMintStateMoved(cap);
+        const result = await mintGHABridgeCert(
+          subject,
+          publicKeyPem,
+          cap.signingKey,
+          ttlMs,
+        );
+        return {
+          ok: true as const,
+          ...result,
+          authority: { epoch: cap.epoch, key_id: cap.keyId },
+        };
+      });
+    } catch (e) {
+      if (!(e instanceof MintStateMovedError)) throw e;
+      return { ok: false, reason: "authority_state_changed" };
+    }
   }
 
   // Mint a bridge cert PAIR (P-256 mTLS + Ed25519 signing) — 008 PoP exchange.
@@ -2033,53 +2056,54 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       authority: { epoch: number; key_id: string };
     }
   > {
-    await this.#getOrCreateSigningKey();
     // Key, kid and epoch in ONE synchronous read (notme-b54368); #mintLogged
-    // re-checks them immediately before every signature.
-    const cap = this.#captureMintState();
-    // Bridge pairs are root-issued: the default issuer, no issuerName. The
-    // CT chain's issuer is read HERE, right after the key that signs the
-    // pair, and handed to #mintLogged — so the chain names the root of the
-    // key that signed rather than whatever a later, independent read returns
-    // (and if a rotate lands in between, the re-check refuses the mint).
-    // Read only when a log is bound: unbound, minting does no extra work.
-    const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
-    const { mintBridgeCertPair } = await import("./cert-authority");
-    const ttlMs = params.ttlMs ?? 5 * 60 * 1000;
-    const notBefore = new Date();
-    const result = await this.#mintLogged({
-      pin: {
-        serialMtls: randomSerialHex(),
-        serialSigning: randomSerialHex(),
-        notBefore,
-        notAfter: new Date(notBefore.getTime() + ttlMs),
-      },
-      mint: (pin, ct) =>
-        mintBridgeCertPair(
-          params.subject,
-          params.identity,
-          params.mtlsPublicKeyPem,
-          params.signingPublicKeyPem,
-          cap.signingKey,
-          {
-            scopes: params.scopes,
-            epoch: cap.epoch,
-            authMethod: params.authMethod,
-            ttlMs: params.ttlMs,
-            pin,
-            // Per cert: each certificate carries its OWN SCT. Order matches
-            // `pems` below — 0 is mTLS, 1 is signing.
-            perCertExtensions: { mtls: ct(0), signing: ct(1) },
-          },
-        ),
-      pems: (r) => [r.certificates.mtls, r.certificates.signing],
-      issuerPem,
-      captured: cap,
+    // re-checks them immediately before every signature, and a refusal is
+    // retried once under a fresh capture (#withMintRetry, review L2).
+    return this.#withMintRetry(async (cap) => {
+      // Bridge pairs are root-issued: the default issuer, no issuerName. The
+      // CT chain's issuer is read HERE, right after the key that signs the
+      // pair, and handed to #mintLogged — so the chain names the root of the
+      // key that signed rather than whatever a later, independent read returns
+      // (and if a rotate lands in between, the re-check refuses the mint).
+      // Read only when a log is bound: unbound, minting does no extra work.
+      const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
+      const { mintBridgeCertPair } = await import("./cert-authority");
+      const ttlMs = params.ttlMs ?? 5 * 60 * 1000;
+      const notBefore = new Date();
+      const result = await this.#mintLogged({
+        pin: {
+          serialMtls: randomSerialHex(),
+          serialSigning: randomSerialHex(),
+          notBefore,
+          notAfter: new Date(notBefore.getTime() + ttlMs),
+        },
+        mint: (pin, ct) =>
+          mintBridgeCertPair(
+            params.subject,
+            params.identity,
+            params.mtlsPublicKeyPem,
+            params.signingPublicKeyPem,
+            cap.signingKey,
+            {
+              scopes: params.scopes,
+              epoch: cap.epoch,
+              authMethod: params.authMethod,
+              ttlMs: params.ttlMs,
+              pin,
+              // Per cert: each certificate carries its OWN SCT. Order matches
+              // `pems` below — 0 is mTLS, 1 is signing.
+              perCertExtensions: { mtls: ct(0), signing: ct(1) },
+            },
+          ),
+        pems: (r) => [r.certificates.mtls, r.certificates.signing],
+        issuerPem,
+        captured: cap,
+      });
+      return {
+        ...result,
+        authority: { epoch: cap.epoch, key_id: cap.keyId },
+      };
     });
-    return {
-      ...result,
-      authority: { epoch: cap.epoch, key_id: cap.keyId },
-    };
   }
 
   /**
@@ -2279,6 +2303,30 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   /**
+   * Run `mint` under a fresh capture; if a re-check refuses it, capture again
+   * and run it ONCE more (review L2). A refusal means the key or epoch moved
+   * after the capture — an operator rotate() or revokeEpoch() — and nothing
+   * was delivered, so minting again under the new state is what the caller
+   * asked for. Callers whose proof is already spent by then (the gha-oidc
+   * jti, a /cert/gha or /token jti, a renewal generation) would otherwise
+   * lose it to an event they did not cause. A second refusal propagates.
+   */
+  async #withMintRetry<T>(
+    mint: (cap: { signingKey: CryptoKey; keyId: string; epoch: number }) => Promise<T>,
+  ): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      await this.#getOrCreateSigningKey();
+      const cap = this.#captureMintState();
+      try {
+        return await mint(cap);
+      } catch (e) {
+        if (!(e instanceof MintStateMovedError) || attempt >= 1) throw e;
+        console.warn({ event: "mint.retry_after_state_change", captured: { keyId: cap.keyId, epoch: cap.epoch } });
+      }
+    }
+  }
+
+  /**
    * Throw unless the authority's signing key id and epoch are still the ones
    * a mint captured (notme-b52d7c). Synchronous storage reads only, so the
    * answer is current at the instant the caller goes on to sign. Applied on
@@ -2300,7 +2348,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       captured: { keyId: captured.keyId, epoch: captured.epoch },
       current: { keyId, epoch },
     });
-    throw new Error(
+    throw new MintStateMovedError(
       `mint refused: the authority's signing key or epoch changed while the mint was in flight ` +
         `(key ${captured.keyId} -> ${keyId}, epoch ${captured.epoch} -> ${epoch}); retry the request`,
     );
@@ -2712,46 +2760,46 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         `issuing tier ttl capped at 24h, got ${params.ttlMs}ms`,
       );
     }
-    await this.#getOrCreateSigningKey();
-    // One synchronous capture, re-checked before every signature — see
-    // mintBridgeCertPair (notme-b54368).
-    const cap = this.#captureMintState();
-    // Root PEM read right after the key that signs the tier — see
-    // mintBridgeCertPair. Read only when a log is bound.
-    const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
-    const { mintIssuingCaCert } = await import("./cert-authority");
-    const ttlMs = params.ttlMs ?? 60 * 60 * 1000;
-    const notBefore = new Date();
-    const result = await this.#mintLogged({
-      pin: {
-        serial: randomSerialHex(),
-        notBefore,
-        notAfter: new Date(notBefore.getTime() + ttlMs),
-      },
-      mint: (pin, ct) =>
-        mintIssuingCaCert(
-          params.subject,
-          params.identity,
-          params.publicKeyPem,
-          cap.signingKey,
-          {
-            scopes: params.scopes,
-            epoch: cap.epoch,
-            authMethod: params.authMethod,
-            ttlMs: params.ttlMs,
-            pin,
-            extraExtensions: ct(0),
-            ...(params.criteria ? { criteria: params.criteria } : {}),
-          },
-        ),
-      pems: (r) => [r.certificate],
-      issuerPem,
-      captured: cap,
+    // One synchronous capture, re-checked before every signature and
+    // retried once on a refusal — see mintBridgeCertPair (notme-b54368).
+    return this.#withMintRetry(async (cap) => {
+      // Root PEM read right after the key that signs the tier — see
+      // mintBridgeCertPair. Read only when a log is bound.
+      const issuerPem = this.env.CT_LOG ? await this.#readRootForCt() : null;
+      const { mintIssuingCaCert } = await import("./cert-authority");
+      const ttlMs = params.ttlMs ?? 60 * 60 * 1000;
+      const notBefore = new Date();
+      const result = await this.#mintLogged({
+        pin: {
+          serial: randomSerialHex(),
+          notBefore,
+          notAfter: new Date(notBefore.getTime() + ttlMs),
+        },
+        mint: (pin, ct) =>
+          mintIssuingCaCert(
+            params.subject,
+            params.identity,
+            params.publicKeyPem,
+            cap.signingKey,
+            {
+              scopes: params.scopes,
+              epoch: cap.epoch,
+              authMethod: params.authMethod,
+              ttlMs: params.ttlMs,
+              pin,
+              extraExtensions: ct(0),
+              ...(params.criteria ? { criteria: params.criteria } : {}),
+            },
+          ),
+        pems: (r) => [r.certificate],
+        issuerPem,
+        captured: cap,
+      });
+      return {
+        ...result,
+        authority: { epoch: cap.epoch, key_id: cap.keyId },
+      };
     });
-    return {
-      ...result,
-      authority: { epoch: cap.epoch, key_id: cap.keyId },
-    };
   }
 
   // ── Session-bound PoP nonces (notme-486e8a) ────────────────────────────
