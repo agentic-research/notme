@@ -56,7 +56,12 @@ beforeAll(async () => {
   const verify = await worker.fetch(
     new Request(`${ORIGIN}/auth/passkey/register/verify`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      // The first-user mark is bound to the browser that ran options
+      // (notme-a2e75d): carry its cookie, as a browser would.
+      headers: {
+        "content-type": "application/json",
+        cookie: /__Host-notme_registration=[^;,\s]+/.exec(opts.headers.get("set-cookie") ?? "")?.[0] ?? "",
+      },
       body: JSON.stringify({ userId, response: await admin.register(options.challenge) }),
     }),
     { ...env, ...LOCAL_ENV },
@@ -95,7 +100,7 @@ describe("registration is gated (notme-2c4209)", () => {
     };
     const user = await SoftwareAuthenticator.create("localhost", ORIGIN);
     // The reservation cookie options set (review M1), carried as a browser would.
-    const rsv = /notme_invite_reservation=[^;,\s]+/.exec(res.headers.get("set-cookie") ?? "")?.[0] ?? "";
+    const rsv = /__Host-notme_registration=[^;,\s]+/.exec(res.headers.get("set-cookie") ?? "")?.[0] ?? "";
     const verify = await worker.fetch(
       new Request(`${ORIGIN}/auth/passkey/register/verify`, {
         method: "POST",

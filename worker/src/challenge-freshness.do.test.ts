@@ -84,6 +84,7 @@ async function verifyClassified(
         "notme.bot",
         "https://notme.bot",
         sql,
+        () => false,
       );
       return "other" as const; // past the lookup — not the freshness path
     } catch (e: any) {

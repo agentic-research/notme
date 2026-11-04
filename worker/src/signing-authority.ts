@@ -518,6 +518,17 @@ function b64url(b: Uint8Array): string {
   return btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+/**
+ * A registration-mark secret (review M1, notme-a2e75d): `secret` goes to the
+ * reserving browser in an HttpOnly cookie and is required at verify; only
+ * `hash` (SHA-256 hex) is stored with the mark. One generator for all three
+ * marks — invite reservation, first-user, claim — so they cannot drift.
+ */
+async function newMarkSecret(): Promise<{ secret: string; hash: string }> {
+  const secret = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  return { secret, hash: await sha256Hex(secret) };
+}
+
 function randomUserCode(): string {
   // Rejection-free: 20 symbols, so take each byte mod 20 only when it falls
   // below 240 (the largest multiple of 20 under 256), avoiding modulo bias.
@@ -3736,20 +3747,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #admitRegistration(userId: string, secretHash: string): false | { isAdmin: boolean } {
     const sql = this.ctx.storage.sql;
     const now = Math.floor(Date.now() / 1000);
+    // Every mark is bound to the browser that earned it (review M1 for the
+    // invite, notme-a2e75d for these two): the userId comes back in the same
+    // body as the challenge, so knowing it must not be enough. A wrong or
+    // missing secret matches nothing — and deletes nothing, so a caller who
+    // merely knows the userId can neither use a mark nor cancel it. A mark
+    // with no hash ('' — a pre-column row) can never be admitted.
+    if (!secretHash) return false;
     this.#ensureFirstUserSchema();
     sql.exec(
-      "DELETE FROM first_user_registrations WHERE user_id = ? AND expires_at > ?",
+      "DELETE FROM first_user_registrations WHERE user_id = ? AND expires_at > ? AND secret_hash = ?",
       userId,
       now,
+      secretHash,
     );
     const [first] = [...sql.exec<{ n: number }>("SELECT changes() AS n")];
     if (first!.n === 1) return { isAdmin: true };
     this.#ensureClaimSchema();
     const [{ n }] = [
       ...sql.exec<{ n: number }>(
-        "SELECT COUNT(*) AS n FROM bootstrap_claim_registrations WHERE user_id = ? AND expires_at > ?",
+        "SELECT COUNT(*) AS n FROM bootstrap_claim_registrations WHERE user_id = ? AND expires_at > ? AND secret_hash = ?",
         userId,
-        Math.floor(Date.now() / 1000),
+        now,
+        secretHash,
       ),
     ];
     if (n > 0) return { isAdmin: false };
@@ -3767,10 +3787,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #ensureFirstUserSchema(): void {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS first_user_registrations (
-        user_id    TEXT PRIMARY KEY,
-        expires_at INTEGER NOT NULL
+        user_id     TEXT PRIMARY KEY,
+        expires_at  INTEGER NOT NULL,
+        secret_hash TEXT NOT NULL DEFAULT ''
       )
     `);
+    // secret_hash binds the mark to the reserving browser (notme-a2e75d).
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE first_user_registrations ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* column exists */
+    }
   }
 
   /**
@@ -3808,21 +3835,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   /**
    * Start a first-user registration for `userId`: still first-user, and the
    * bootstrap code is valid (consumed). Marks the registration so verify
-   * admits it as the admin — and nothing else does.
+   * admits it as the admin — and nothing else does. Returns the mark's
+   * secret for the reserving browser's HttpOnly cookie (notme-a2e75d), or
+   * null when refused; only its hash is stored.
    */
-  async beginFirstUserRegistration(code: string, userId: string): Promise<boolean> {
+  async beginFirstUserRegistration(code: string, userId: string): Promise<{ secret: string } | null> {
     const { ensurePasskeySchema } = await import("./auth/passkey");
-    if (!this.#isFirstUserRegistration(ensurePasskeySchema)) return false;
-    if (typeof code !== "string" || !(await this.consumeBootstrapCode(code))) return false;
+    if (!this.#isFirstUserRegistration(ensurePasskeySchema)) return null;
+    if (typeof code !== "string" || !(await this.consumeBootstrapCode(code))) return null;
     this.#ensureFirstUserSchema();
+    const { secret, hash } = await newMarkSecret();
     const now = Math.floor(Date.now() / 1000);
     this.ctx.storage.sql.exec("DELETE FROM first_user_registrations WHERE expires_at <= ?", now);
     this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO first_user_registrations (user_id, expires_at) VALUES (?, ?)",
+      "INSERT OR REPLACE INTO first_user_registrations (user_id, expires_at, secret_hash) VALUES (?, ?, ?)",
       userId,
       now + FIRST_USER_REGISTRATION_TTL_S,
+      hash,
     );
-    return true;
+    return { secret };
   }
 
   async passkeyAuthenticationOptions(rpId: string): Promise<any> {
@@ -3893,8 +3924,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   ): Promise<{ scopes: string[]; secret: string } | null> {
     // The secret goes to the reserving browser in an HttpOnly cookie and is
     // required at verify (review M1); only its hash is stored here.
-    const secret = b64url(crypto.getRandomValues(new Uint8Array(32)));
-    const invite = reserveInvite(this.ctx.storage.sql, token, userId, await sha256Hex(secret));
+    const { secret, hash } = await newMarkSecret();
+    const invite = reserveInvite(this.ctx.storage.sql, token, userId, hash);
     return invite ? { scopes: invite.scopes, secret } : null;
   }
 
@@ -4391,10 +4422,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #ensureClaimSchema(): void {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap_claim_registrations (
-        user_id    TEXT PRIMARY KEY,
-        expires_at INTEGER NOT NULL
+        user_id     TEXT PRIMARY KEY,
+        expires_at  INTEGER NOT NULL,
+        secret_hash TEXT NOT NULL DEFAULT ''
       )
     `);
+    // secret_hash binds the mark to the reserving browser (notme-a2e75d).
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE bootstrap_claim_registrations ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* column exists */
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS bootstrap_claims (
         code         TEXT PRIMARY KEY,
@@ -4428,10 +4466,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   /**
    * Mark a registration (by its WebAuthn user id) as a claim, so verify knows
    * not to grant it anything. Bounded: an open endpoint that writes rows is a
-   * storage-exhaustion vector.
+   * storage-exhaustion vector. Returns the mark's secret for the reserving
+   * browser's HttpOnly cookie (notme-a2e75d); only its hash is stored.
    */
-  async markClaimRegistration(userId: string): Promise<{ ok: true } | { ok: false; reason: "unavailable" | "busy" }> {
+  async markClaimRegistration(
+    userId: string,
+  ): Promise<{ ok: true; secret: string } | { ok: false; reason: "unavailable" | "busy" }> {
     if (!(await this.claimAvailable())) return { ok: false, reason: "unavailable" };
+    // Hashed BEFORE the cap check, so check-and-insert stays one synchronous block.
+    const { secret, hash } = await newMarkSecret();
     this.#ensureClaimSchema();
     const now = Math.floor(Date.now() / 1000);
     const sql = this.ctx.storage.sql;
@@ -4440,11 +4483,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const [{ n }] = [...sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM bootstrap_claim_registrations")];
     if (n >= CLAIM_CAP) return { ok: false, reason: "busy" };
     sql.exec(
-      "INSERT OR REPLACE INTO bootstrap_claim_registrations (user_id, expires_at) VALUES (?, ?)",
+      "INSERT OR REPLACE INTO bootstrap_claim_registrations (user_id, expires_at, secret_hash) VALUES (?, ?, ?)",
       userId,
       now + CLAIM_REGISTRATION_TTL_S,
+      hash,
     );
-    return { ok: true };
+    return { ok: true, secret };
   }
 
   /**
