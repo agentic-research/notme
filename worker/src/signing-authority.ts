@@ -1847,7 +1847,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       if (kv) {
         // KV's floor is 60 s; kept past exp for the same leeway reason as the DO key.
         const ttl = claims.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS - Math.floor(Date.now() / 1000);
-        await kv.put(kvKey, "1", { expirationTtl: Math.max(60, ttl) });
+        // The DO key above is the authoritative spend; KV only narrows the
+        // window for the KV-only routes. A failed write is logged, not
+        // thrown: the token is already spent, and a refusal-or-result method
+        // must not turn that into an RPC exception (security review F5).
+        try {
+          await kv.put(kvKey, "1", { expirationTtl: Math.max(60, ttl) });
+        } catch (e) {
+          console.error({ event: "mint.gha_jti_kv_write_failed", detail: (e as Error)?.message });
+        }
       }
       subject = claims.sub;
     } else if (proof?.kind === "session-cookie") {

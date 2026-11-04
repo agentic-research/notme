@@ -17,8 +17,8 @@
  * AuthService.mintBridgeCert is a pass-through to this DO method, so the DO
  * is called directly — on the "default" authority the routes use.
  */
-import { env } from "cloudflare:test";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { env, runInDurableObject } from "cloudflare:test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import worker from "../worker";
 import { type GhaSigner, ghaPopBody, installGhaSigner, spkiPem } from "./__tests__/helpers/gha-token";
 import { ADMIN_SCOPES } from "./auth/admin-scopes";
@@ -123,6 +123,35 @@ describe("mintBridgeCert({kind:'gha-oidc'}) spends the token's jti (notme-f850f2
     if (!r.ok) throw new Error("unreachable");
     // expires_at is unix seconds.
     expect(r.expires_at - Math.floor(Date.now() / 1000)).toBeLessThanOrEqual(5 * 60 + 5);
+  });
+
+  it("mint.gha.jti.kv-write-fails — a failing KV write after the consume still returns the mint, not a thrown RPC error", async () => {
+    // Security review F5. The DO key is the authoritative spend; KV only
+    // shortens the window for the KV-only routes, so its failure must not
+    // turn a spent token into an exception.
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("kv-put-fails"));
+    const token = await gha.token();
+    const [first, second] = await runInDurableObject(stub, async (inst: any) => {
+      const kv = inst.env.CA_BUNDLE_CACHE;
+      inst.env.CA_BUNDLE_CACHE = {
+        get: (k: string) => kv.get(k),
+        put: async () => {
+          throw new Error("KV PUT failed: 429 Too Many Requests");
+        },
+      };
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const a = await inst.mintBridgeCert({ kind: "gha-oidc", token }, pem);
+        const b = await inst.mintBridgeCert({ kind: "gha-oidc", token }, pem);
+        return [a, b];
+      } finally {
+        inst.env.CA_BUNDLE_CACHE = kv;
+        vi.restoreAllMocks();
+      }
+    });
+    expect(first.ok).toBe(true);
+    // And the DO key still made it single-use.
+    expect(second).toEqual({ ok: false, reason: "gha_token_reused" });
   });
 
   it("mint.gha.jti.required — a token with no jti is refused, as /cert/gha refuses it", async () => {
