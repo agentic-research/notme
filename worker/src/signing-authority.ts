@@ -3111,21 +3111,39 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     if (!row) return { ok: false, reason: "not_found" };
     if (row.expires_at <= now) return { ok: false, reason: "expired" };
     if (row.status !== "pending") return { ok: false, reason: "not_pending" };
-    this.ctx.storage.sql.exec(
+    const epoch = (await this.getAuthorityState()).epoch;
+    // The checks above ran before that await, and a revoke, a second approval
+    // or the expiry deadline can land in it (notme-052431). The UPDATE repeats
+    // both guards, and its changed-row count, not the earlier read, decides
+    // the answer: an approve that matched nothing must not report success.
+    const writeAt = Math.floor(Date.now() / 1000);
+    const written = this.ctx.storage.sql.exec(
       `UPDATE tier_enrolments
           SET status = 'approved', principal_id = ?, identity = ?, auth_method = ?, granted_scopes = ?,
               renew_until = ?, approved_epoch = ?, clone_policy = ?, criteria = ?
-        WHERE user_code = ? AND status = 'pending'`,
+        WHERE user_code = ? AND status = 'pending' AND expires_at > ?`,
       params.principalId,
       params.identity,
       params.authMethod,
       JSON.stringify(params.scopes),
       now + params.renewDays * 86400,
-      (await this.getAuthorityState()).epoch,
+      epoch,
       params.clonePolicy,
       JSON.stringify(params.criteria.map(({ name, version }) => ({ name, version }))),
       params.userCode,
-    );
+      writeAt,
+    ).rowsWritten;
+    if (written === 0) {
+      // Say why, from the row as it is now.
+      const after = this.ctx.storage.sql
+        .exec("SELECT status, expires_at FROM tier_enrolments WHERE user_code = ?", params.userCode)
+        .toArray()[0] as { status: string; expires_at: number } | undefined;
+      if (!after) return { ok: false, reason: "not_found" };
+      if (after.status === "pending" && after.expires_at <= writeAt) {
+        return { ok: false, reason: "expired" };
+      }
+      return { ok: false, reason: "not_pending" };
+    }
     return { ok: true };
   }
 
