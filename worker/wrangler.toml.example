@@ -82,6 +82,12 @@ GHA_ALLOWED_OWNERS = "your-org"
 # invalid_proof). Off, v3 requests are still accepted: turning it off later
 # strands nobody.
 RENEWAL_BINDING_V3 = "off"
+# Google as an OIDC issuer (notme-0a1ee8): the OAuth client id Google ID tokens
+# are issued to, <id>.apps.googleusercontent.com. Set, it adds
+# https://accounts.google.com to the trusted issuers at /cert (oidc), /join,
+# /auth/oidc/login and /connections, and a Google token is accepted only when
+# its aud is exactly this. Unset or blank leaves Google untrusted.
+# GOOGLE_CLIENT_ID = "<id>.apps.googleusercontent.com"
 # Base path of the log behind the CT_LOG service binding (below). Default is
 # /logs/notme; set it only if the shard is named differently in
 # ct/config.notme.json. Has no effect while CT_LOG is unbound.

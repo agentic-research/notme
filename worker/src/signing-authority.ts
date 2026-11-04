@@ -456,6 +456,39 @@ export type ReceiptSignResult =
     };
 
 /**
+ * Why `ReceiptSigner.epochPublicKey` resolved nothing (notme-a0cff4).
+ * Neither is retryable: an unknown epoch stays unknown, and an invalid one
+ * means the caller must change what it sent. A transport failure is a REJECTED
+ * call, never one of these, so an auditor can tell "notme does not have this
+ * key" apart from "the question did not arrive".
+ */
+export type EpochPublicKeyErrorCode =
+  | "EPOCH_UNKNOWN" // a valid epoch no key of this authority served
+  | "EPOCH_INVALID"; // not a non-negative safe integer
+
+/**
+ * Every key that served one epoch, PUBLIC material only (ADR-016 rule 5).
+ *
+ * A SET, not the single key notme-a0cff4 first sketched: since notme-77a024
+ * rotations no longer move the epoch, so several keys can sign under one
+ * generation. The receipt's `actor_fp` = SHA-256(publicRawB64 bytes) picks
+ * the one that signed it.
+ */
+export type EpochPublicKeyResult =
+  | {
+      ok: true;
+      epoch: number;
+      keys: Array<{
+        /** Raw 32-byte Ed25519 public key, base64 — what `actor_fp` hashes. */
+        publicRawB64: string;
+        kid: string;
+        /** Epoch ms the key was retired, or null while it is still serving. */
+        retiredAt: number | null;
+      }>;
+    }
+  | { ok: false; code: EpochPublicKeyErrorCode; message: string };
+
+/**
  * Outcome of a delegated JWT signing attempt (ADR-015).
  *
  * Union rather than throw, for the reasons on ReceiptSignResult: an RPC

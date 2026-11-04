@@ -42,7 +42,7 @@ import {
   parseDestinationAllowlist,
   urlForLog,
 } from "../destination-policy";
-import { ED25519 } from "../platform";
+import { verifyEd25519 } from "../ed25519-small-order";
 
 /** The credentials a session holds, all of them DERIVED by authenticate(). */
 export type HeldCerts = {
@@ -411,7 +411,10 @@ export class AuthSession extends RpcTarget {
     let verified = false;
     if (signature) {
       try {
-        verified = await crypto.subtle.verify(ED25519, held.signingPublicKey, signature, bytes);
+        // verifyEd25519 refuses a small-order key, under which workerd
+        // verifies keyless forgeries (notme-48226d). authenticate() already
+        // refuses one at import; this holds even for a session made otherwise.
+        verified = await verifyEd25519(held.signingPublicKey, signature, bytes);
       } catch {
         verified = false;
       }

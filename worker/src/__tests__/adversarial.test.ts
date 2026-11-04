@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { validateGHAToken } from "../gha-oidc";
 import { mintAccessToken, verifyAccessToken } from "../auth/token";
 import { timingSafeEqual } from "../auth/timing-safe";
-import { verifyOIDC } from "../auth/verify-proof";
+import { issuerAudiences, verifyOIDC } from "../auth/verify-proof";
 import { validateDpopProof } from "../auth/dpop";
 import { MemoryCache, detectKeyStorage, validateKeyStorageConfig } from "../platform";
 import { narrowScopes, verifyScopeChain } from "../auth/scope-chain";
@@ -434,7 +434,7 @@ describe("adversarial: confused deputy", () => {
     })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
 
     await expect(
-      verifyOIDC(`${header}.${payload}.AAAA`, "notme.bot"),
+      verifyOIDC(`${header}.${payload}.AAAA`, issuerAudiences({})),
     ).rejects.toThrow(/audience/i);
   });
 
@@ -472,7 +472,7 @@ describe("adversarial: untrusted issuer", () => {
     // verifyOIDC fetches JWKS from the issuer URL — it should either reject
     // the untrusted issuer or fail on JWKS fetch. Either way, it must not succeed.
     await expect(
-      verifyOIDC(`${header}.${payload}.AAAA`, "notme.bot"),
+      verifyOIDC(`${header}.${payload}.AAAA`, issuerAudiences({})),
     ).rejects.toThrow();
   });
 });

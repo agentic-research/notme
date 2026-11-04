@@ -89,7 +89,10 @@ async function fixtureBinding(): Promise<{
       false,
       ["verify"],
     ),
-    signingKey: await crypto.subtle.importKey("spki", signingSpki, ED25519, false, [
+    // Extractable, as importPublicKey imports it: the verifier reads the
+    // key's raw bytes to refuse a small-order point, and fails CLOSED on a
+    // key it cannot read (notme-48226d).
+    signingKey: await crypto.subtle.importKey("spki", signingSpki, ED25519, true, [
       "verify",
     ]),
   };

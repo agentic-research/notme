@@ -51,7 +51,7 @@ vi.mock("cloudflare:workers", () => ({
 import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
 import { AuthService } from "../../worker";
 import { validateRedirectUri } from "../auth/redirect-uri";
-import { verifyOIDC } from "../auth/verify-proof";
+import { issuerAudiences, verifyOIDC } from "../auth/verify-proof";
 import { fakeIssuer } from "./helpers/oidc-issuer";
 import { validateDpopProof } from "../auth/dpop";
 import {
@@ -205,7 +205,7 @@ describe("contract.oidc.audience-identity", () => {
       aud: "other-service",
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, issuerAudiences({}))).rejects.toThrow(
       /wrong audience/,
     );
   });
@@ -217,7 +217,7 @@ describe("contract.oidc.audience-identity", () => {
       aud: ["other-a", "other-b"],
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, issuerAudiences({}))).rejects.toThrow(
       /wrong audience/,
     );
   });
@@ -230,7 +230,7 @@ describe("contract.oidc.audience-identity", () => {
     // from the fixture.
     const issuer = await fakeIssuer("https://auth.notme.bot");
     const token = await issuer.token({ sub: "test", aud: "notme.bot" });
-    await expect(verifyOIDC(token, "notme.bot")).resolves.toMatchObject({ subject: "test" });
+    await expect(verifyOIDC(token, issuerAudiences({}))).resolves.toMatchObject({ subject: "test" });
     expect(issuer.requests).toContain("https://auth.notme.bot/.well-known/jwks");
   });
 });
@@ -246,8 +246,9 @@ describe("contract.oidc.trusted-issuers", () => {
       .replace(/=+$/, "");
   const HEADER = ENC({ alg: "RS256", typ: "JWT", kid: "test" });
 
-  // Issuer check runs in fetchJWKS, AFTER audience check passes. So we must
-  // pass audience to reach the issuer guard.
+  // The issuer check runs FIRST since notme-0a1ee8: the token's own iss
+  // selects its audience pin, so an issuer with no pin is refused before the
+  // audience is looked at, and before any JWKS fetch.
   it("rejects an untrusted issuer even when audience matches", async () => {
     const body = ENC({
       iss: "https://attacker.example",
@@ -255,7 +256,7 @@ describe("contract.oidc.trusted-issuers", () => {
       aud: "notme.bot",
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, issuerAudiences({}))).rejects.toThrow(
       /untrusted issuer/,
     );
   });
@@ -265,7 +266,7 @@ describe("contract.oidc.trusted-issuers", () => {
   it("accepts a known issuer (GHA) past the trust check", async () => {
     const issuer = await fakeIssuer("https://token.actions.githubusercontent.com");
     const token = await issuer.token({ sub: "repo:agentic-research/notme", aud: "notme.bot" });
-    await expect(verifyOIDC(token, "notme.bot")).resolves.toMatchObject({
+    await expect(verifyOIDC(token, issuerAudiences({}))).resolves.toMatchObject({
       issuer: "https://token.actions.githubusercontent.com",
     });
     expect(issuer.requests).toContain("https://token.actions.githubusercontent.com/.well-known/jwks");
@@ -274,7 +275,7 @@ describe("contract.oidc.trusted-issuers", () => {
   it("accepts auth.notme.bot as a trusted self-issuer", async () => {
     const issuer = await fakeIssuer("https://auth.notme.bot");
     const token = await issuer.token({ sub: "test", aud: "notme.bot" });
-    await expect(verifyOIDC(token, "notme.bot")).resolves.toMatchObject({ issuer: "https://auth.notme.bot" });
+    await expect(verifyOIDC(token, issuerAudiences({}))).resolves.toMatchObject({ issuer: "https://auth.notme.bot" });
     expect(issuer.requests).toContain("https://auth.notme.bot/.well-known/jwks");
   });
 
