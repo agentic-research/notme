@@ -382,7 +382,8 @@ up means the timeout, not the log, is the problem.
 |---|---|
 | `backlog` | unlogged rows still being retried |
 | `oldestUnloggedAgeS` | age of the oldest such row, `null` when none |
-| `gaveUp` | unlogged rows that hit 24 attempts; still retried, at most once per 24 h per row, and counted here until logged |
+| `gaveUp` | unlogged rows that hit 24 attempts; still retried, at most once per 24 h per row, and counted here until logged or, 30 days after their mint, abandoned |
+| `abandoned` | `{count, lastAt}`: backlog rows given up on for good — gaveUp and minted over 30 days ago. Never retried again: those certificates are **permanently unlogged**. Monotonic |
 | `lastError` / `lastErrorAt` | last submission failure, with the reason: `HTTP <status>`, `timeout`, `invalid SCT`, `network error`, `wrong log` (SCT id is not `CT_LOG_ID`), `bad signature` (does not verify under `CT_LOG_KEY`), `no shard covers notAfter <time>` (no configured shard's interval holds the cert's `notAfter`; nothing was submitted); or `config: ...` from a mint that found the pin invalid and backlogged its chains. A drain fire skipped for an invalid pin does not overwrite it |
 | `unloggable` | `{count, lastAt, reason}`: mints that went out with no SCT and **no backlog row**: the root could not be read or parsed, or the backlog INSERT failed. (An invalid pin is not counted here: those mints are backlogged.) |
 | `embedFailed` | `{count, lastAt}`: mints whose SCTs verified but could not be embedded; they were backlogged instead |
@@ -417,7 +418,23 @@ Alert on:
   the healthiest-looking number during the worst outage. `gaveUp` rows are
   retried at most once per 24 h each (normal rows first, still at most 20 rows
   per fire), so once the cause is fixed they drain within a day; `gaveUp`
-  counts them until they do.
+  counts them until they do. The slow retry is bounded: 30 days after its
+  mint a gaveUp row is **abandoned** (`abandoned.count`), so fix the cause
+  within that window.
+- **`abandoned.count` increasing.** Certificates the log will never record.
+  Same severity as `unloggable`.
+- **Catch-up rate.** The drain does at most 20 rows per 4-minute fire, about
+  **300 rows an hour**. An outage that backlogged N certificates takes about
+  N/300 hours to drain once the log is back (a bridge pair is 2 rows). Near
+  a shard's end that matters only if the shard set does not cover the
+  certificates' `notAfter`; with both shards configured (step 6) each row
+  still goes to the shard its `notAfter` names, however late it drains.
+
+Backlog retention: a row is deleted 7 days after it was logged, or 7 days
+after it was abandoned (the week is for looking at what an outage
+backlogged; the log itself is the record of what was logged). A row that is
+neither logged nor abandoned is never deleted, and a row that was never
+tried (minted while the pin was broken) is never abandoned.
 - **`unloggable.count` increasing, or `> 0`.** Those certificates are not in the
   backlog and cannot be recovered by the drain.
 - **`backlog` growing** (or `oldestUnloggedAgeS` climbing toward the 5-minute

@@ -71,6 +71,7 @@ interface CtHealthView {
   lastErrorAt: number;
   unloggable: { count: number; lastAt: number; reason: string };
   embedFailed: { count: number; lastAt: number };
+  abandoned: { count: number; lastAt: number };
   configError: string | null;
   shardEndsAt: string | null;
   shardEndsInDays: number | null;
@@ -1005,7 +1006,7 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
       a.ctx.storage.sql.exec("DROP TABLE ct_backlog");
       await expect(a.alarm()).resolves.toBeUndefined();
       a.ctx.storage.sql.exec(
-        "CREATE TABLE ct_backlog (id INTEGER PRIMARY KEY, chain_json TEXT NOT NULL, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, logged_at INTEGER)",
+        "CREATE TABLE ct_backlog (id INTEGER PRIMARY KEY, chain_json TEXT NOT NULL, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, logged_at INTEGER, last_attempt_at INTEGER, abandoned_at INTEGER)",
       );
       const h = await a.getAlarmHealth();
       expect(h.failureCount).toBe(0);
@@ -1205,12 +1206,105 @@ describe("ct.drain — rows past the attempt cap are retried once per 24 h", () 
         (c) => c.name,
       );
       expect(cols).toContain("last_attempt_at");
+      expect(cols).toContain("abandoned_at");
       expect(sql.exec("SELECT last_attempt_at FROM ct_backlog").toArray()).toEqual([{ last_attempt_at: null }]);
       const idx = sql
         .exec("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ct_backlog_drain'")
         .toArray() as Array<{ sql: string }>;
       expect(idx).toHaveLength(1);
       expect(idx[0]!.sql).toMatch(/\(logged_at, attempts, created_at\)/);
+    });
+  });
+});
+
+// ── notme-1b46a8 (2026-11-03 cost review): the backlog does not grow forever ─
+
+type HygieneRow = {
+  id: number;
+  attempts: number;
+  logged_at: number | null;
+  abandoned_at: number | null;
+};
+const allRows = (a: DrainAuth) =>
+  a.ctx.storage.sql
+    .exec("SELECT id, attempts, logged_at, abandoned_at FROM ct_backlog ORDER BY id")
+    .toArray() as HygieneRow[];
+
+describe("ct.drain — logged rows are pruned, and the gaveUp retry is bounded in total", () => {
+  it("a logged row is kept for 7 days after it was logged, then deleted", async () => {
+    await withBacklog(2, async (a) => {
+      const sql = a.ctx.storage.sql;
+      const [r1, r2] = rowsOf(a);
+      sql.exec("UPDATE ct_backlog SET logged_at = ? WHERE id = ?", nowS() - 7 * DAY_S - 60, r1!.id);
+      sql.exec("UPDATE ct_backlog SET logged_at = ? WHERE id = ?", nowS() - 7 * DAY_S + 3600, r2!.id);
+      await a.alarm();
+      expect(allRows(a).map((r) => r.id)).toEqual([r2!.id]);
+    });
+    // Logged rows are not re-submitted.
+    expect(await received()).toEqual([]);
+  });
+
+  it("a gaveUp row 30 days old is abandoned: never retried again, counted in health, no longer in gaveUp", async () => {
+    await withBacklog(1, async (a) => {
+      const sql = a.ctx.storage.sql;
+      // Due for its daily slow retry, but minted 30 days and a minute ago.
+      sql.exec(
+        "UPDATE ct_backlog SET attempts = 40, created_at = ?, last_attempt_at = ?",
+        nowS() - 30 * DAY_S - 60,
+        nowS() - DAY_S - 60,
+      );
+      expect((await a.getAlarmHealth()).ct.gaveUp).toBe(1);
+      await a.alarm();
+      const [row] = allRows(a);
+      expect(row!.abandoned_at, "abandoned, not deleted").not.toBeNull();
+      expect(row!.logged_at).toBeNull();
+      let h = (await a.getAlarmHealth()).ct;
+      expect(h.gaveUp).toBe(0);
+      expect(h.backlog).toBe(0);
+      expect(h.abandoned.count).toBe(1);
+      expect(h.abandoned.lastAt).toBeGreaterThan(0);
+      // A second fire neither retries it nor counts it again.
+      await a.alarm();
+      h = (await a.getAlarmHealth()).ct;
+      expect(h.abandoned.count).toBe(1);
+    });
+    expect(await received(), "an abandoned row is never submitted").toEqual([]);
+  });
+
+  it("an abandoned row is deleted 7 days after it was abandoned, not before", async () => {
+    await withBacklog(2, async (a) => {
+      const sql = a.ctx.storage.sql;
+      const [r1, r2] = rowsOf(a);
+      sql.exec("UPDATE ct_backlog SET attempts = 40, abandoned_at = ? WHERE id = ?", nowS() - 7 * DAY_S - 60, r1!.id);
+      sql.exec("UPDATE ct_backlog SET attempts = 40, abandoned_at = ? WHERE id = ?", nowS() - 7 * DAY_S + 3600, r2!.id);
+      await a.alarm();
+      expect(allRows(a).map((r) => r.id)).toEqual([r2!.id]);
+    });
+    expect(await received()).toEqual([]);
+  });
+
+  it("a row that is neither logged nor abandoned is never deleted, however old", async () => {
+    await withBacklog(3, async (a) => {
+      const sql = a.ctx.storage.sql;
+      const [r1, r2, r3] = rowsOf(a);
+      // A year old but never tried (minted while the pin was broken): not
+      // gaveUp, so not abandoned — it is recoverable.
+      sql.exec("UPDATE ct_backlog SET created_at = ? WHERE id = ?", nowS() - 365 * DAY_S, r1!.id);
+      // gaveUp, 29 days old: still inside the bounded retry.
+      sql.exec(
+        "UPDATE ct_backlog SET attempts = 40, created_at = ?, last_attempt_at = ? WHERE id = ?",
+        nowS() - 29 * DAY_S, nowS() - 60, r2!.id,
+      );
+      // Fresh, failing.
+      await setMode("500");
+      for (let i = 0; i < 3; i++) await a.alarm();
+      const rows = allRows(a);
+      expect(rows.map((r) => r.id)).toEqual([r1!.id, r2!.id, r3!.id]);
+      expect(rows.every((r) => r.logged_at === null && r.abandoned_at === null)).toBe(true);
+      const h = (await a.getAlarmHealth()).ct;
+      expect(h.abandoned.count).toBe(0);
+      expect(h.backlog).toBe(2);
+      expect(h.gaveUp).toBe(1);
     });
   });
 });

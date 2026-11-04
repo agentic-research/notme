@@ -331,7 +331,8 @@ export interface CtHealth {
   /**
    * Unlogged rows that hit 24 attempts. Still retried, at most once per 24 h
    * per row (a root rotation or shard roll can strand them for longer than
-   * the fast retries last), and counted here until they are logged.
+   * the fast retries last), and counted here until they are logged — or, 30
+   * days after their mint, abandoned (then counted in `abandoned` instead).
    */
   gaveUp: number;
   /** Last failure: what failed and why — "HTTP 503", "timeout", "invalid SCT", "wrong log", "bad signature". */
@@ -347,6 +348,12 @@ export interface CtHealth {
   unloggable: { count: number; lastAt: number; reason: string };
   /** Mints whose SCTs verified but could not be embedded; backlogged instead. */
   embedFailed: { count: number; lastAt: number };
+  /**
+   * Backlog rows given up on for good: gaveUp and minted over 30 days ago
+   * (CT_ABANDON_AFTER_S). Never retried again; permanently unlogged.
+   * Monotonic, like `unloggable`.
+   */
+  abandoned: { count: number; lastAt: number };
   /**
    * Why CT_LOG_ID / CT_LOG_KEY, or CT_LOG_SHARDS, cannot be trusted; null when
    * bound and valid, or unbound. While set, mints are backlogged and the drain submits
@@ -2166,6 +2173,26 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   static readonly CT_SLOW_RETRY_S = 24 * 60 * 60;
 
   /**
+   * A gaveUp row is abandoned once it is this old (counted from its mint):
+   * no more retries, counted in health `abandoned` (notme-1b46a8 cost
+   * review). 30 days = the 96-minute fast window plus ~30 daily retries, so
+   * any fix an operator makes after a monthly review of `gaveUp` (a root
+   * appended to the log, a shard configured, an outage over) still drains
+   * the row; past that, retrying daily forever only costs requests.
+   * Only gaveUp rows (attempts ≥ CT_MAX_ATTEMPTS) qualify: a row that was
+   * never tried — minted while the pin was broken — is not abandoned.
+   */
+  static readonly CT_ABANDON_AFTER_S = 30 * 24 * 60 * 60;
+
+  /**
+   * Logged and abandoned rows are deleted this long after logged_at /
+   * abandoned_at. Not at once: a week is the window to look at what an
+   * outage backlogged and how it drained (the log itself is the durable
+   * record of what was logged). A row that is neither is never deleted.
+   */
+  static readonly CT_RETENTION_S = 7 * 24 * 60 * 60;
+
+  /**
    * ct_backlog, its last_attempt_at column (added the way the keys table's
    * columns are), and the drain's index. Idempotent; called from init and
    * from #ensureCtSchema.
@@ -2192,6 +2219,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       sql.exec("SELECT last_attempt_at FROM ct_backlog LIMIT 0");
     } catch {
       sql.exec("ALTER TABLE ct_backlog ADD COLUMN last_attempt_at INTEGER");
+    }
+    // Migration: abandoned_at, set when a gaveUp row passes CT_ABANDON_AFTER_S
+    // (notme-1b46a8 cost review). NULL on old rows: still being retried.
+    try {
+      sql.exec("SELECT abandoned_at FROM ct_backlog LIMIT 0");
+    } catch {
+      sql.exec("ALTER TABLE ct_backlog ADD COLUMN abandoned_at INTEGER");
     }
     sql.exec(
       "CREATE INDEX IF NOT EXISTS ct_backlog_drain ON ct_backlog (logged_at, attempts, created_at)",
@@ -2220,6 +2254,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       ["unloggable_reason", "TEXT NOT NULL DEFAULT ''"],
       ["embed_failed_count", "INTEGER NOT NULL DEFAULT 0"],
       ["embed_failed_last_at", "INTEGER NOT NULL DEFAULT 0"],
+      ["abandoned_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["abandoned_last_at", "INTEGER NOT NULL DEFAULT 0"],
     ] as const) {
       try {
         sql.exec(`SELECT ${col} FROM ct_health LIMIT 0`);
@@ -2284,6 +2320,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const log = this.env.CT_LOG;
     if (!log) return;
     this.#ensureCtSchema();
+    // Before the pin check: bounding the table must not wait on the config.
+    this.#ctBacklogHygiene();
     const shardSet = await this.#ctShards();
     if ("error" in shardSet) {
       // health.configError already reports this on every read. Writing it to
@@ -2297,7 +2335,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const rows = this.ctx.storage.sql
       .exec(
         `SELECT id, chain_json FROM ct_backlog
-           WHERE logged_at IS NULL
+           WHERE logged_at IS NULL AND abandoned_at IS NULL
              AND (attempts < ? OR last_attempt_at IS NULL OR last_attempt_at <= ?)
            ORDER BY (attempts >= ?), created_at, id
            LIMIT ?`,
@@ -2366,6 +2404,46 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     );
   }
 
+  /**
+   * Keep ct_backlog bounded (notme-1b46a8 cost review). Two statements, both
+   * synchronous storage writes:
+   *   1. abandon gaveUp rows minted over CT_ABANDON_AFTER_S ago, counting
+   *      them in ct_health (health `abandoned`);
+   *   2. delete rows logged, or abandoned, over CT_RETENTION_S ago.
+   * A row that is neither logged nor abandoned is never deleted.
+   */
+  #ctBacklogHygiene(): void {
+    const sql = this.ctx.storage.sql;
+    const now = Math.floor(Date.now() / 1000);
+    const abandoned = sql
+      .exec(
+        `UPDATE ct_backlog SET abandoned_at = ?
+           WHERE logged_at IS NULL AND abandoned_at IS NULL
+             AND attempts >= ? AND created_at <= ?
+           RETURNING id`,
+        now,
+        SigningAuthority.CT_MAX_ATTEMPTS,
+        now - SigningAuthority.CT_ABANDON_AFTER_S,
+      )
+      .toArray().length;
+    if (abandoned > 0) {
+      console.error({ event: "ct.backlog_abandoned", rows: abandoned });
+      sql.exec(
+        "UPDATE ct_health SET abandoned_count = abandoned_count + ?, abandoned_last_at = ? WHERE id = 'ct'",
+        abandoned,
+        now,
+      );
+    }
+    const cutoff = now - SigningAuthority.CT_RETENTION_S;
+    sql.exec(
+      `DELETE FROM ct_backlog
+         WHERE (logged_at IS NOT NULL AND logged_at <= ?)
+            OR (abandoned_at IS NOT NULL AND abandoned_at <= ?)`,
+      cutoff,
+      cutoff,
+    );
+  }
+
   async #readCtHealth(): Promise<CtHealth> {
     this.#ensureCtSchema();
     const pin = this.env.CT_LOG ? await this.#ctShards() : null;
@@ -2373,19 +2451,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const max = SigningAuthority.CT_MAX_ATTEMPTS;
     const b = sql
       .exec(
-        "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM ct_backlog WHERE logged_at IS NULL AND attempts < ?",
+        "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM ct_backlog WHERE logged_at IS NULL AND abandoned_at IS NULL AND attempts < ?",
         max,
       )
       .toArray()[0] as { n: number; oldest: number | null };
     const g = sql
       .exec(
-        "SELECT COUNT(*) AS n FROM ct_backlog WHERE logged_at IS NULL AND attempts >= ?",
+        "SELECT COUNT(*) AS n FROM ct_backlog WHERE logged_at IS NULL AND abandoned_at IS NULL AND attempts >= ?",
         max,
       )
       .toArray()[0] as { n: number };
     const h = sql
       .exec(
-        "SELECT unloggable_count, unloggable_last_at, unloggable_reason, embed_failed_count, embed_failed_last_at, last_error, last_error_at FROM ct_health WHERE id = 'ct'",
+        "SELECT unloggable_count, unloggable_last_at, unloggable_reason, embed_failed_count, embed_failed_last_at, abandoned_count, abandoned_last_at, last_error, last_error_at FROM ct_health WHERE id = 'ct'",
       )
       .toArray()[0] as {
       unloggable_count: number;
@@ -2393,6 +2471,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       unloggable_reason: string;
       embed_failed_count: number;
       embed_failed_last_at: number;
+      abandoned_count: number;
+      abandoned_last_at: number;
       last_error: string;
       last_error_at: number;
     };
@@ -2409,6 +2489,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         reason: h.unloggable_reason,
       },
       embedFailed: { count: h.embed_failed_count, lastAt: h.embed_failed_last_at },
+      abandoned: { count: h.abandoned_count, lastAt: h.abandoned_last_at },
       configError: pin && "error" in pin ? pin.error : null,
       ...(pin && "shards" in pin
         ? shardEndHealth(pin.shards, Date.now())
