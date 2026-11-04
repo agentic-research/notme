@@ -80,3 +80,31 @@ export function versionId(env: { CF_VERSION_METADATA?: { id?: unknown } }): stri
   const id = env.CF_VERSION_METADATA?.id;
   return typeof id === "string" && VERSION_ID_RE.test(id.toLowerCase()) ? id.toLowerCase() : "unknown";
 }
+
+/**
+ * The version id to PUBLISH on this request, or undefined to omit it
+ * (notme-325916, re-review N2).
+ *
+ * Cloudflare honours `Cloudflare-Workers-Version-Overrides` for any client.
+ * Version ids are random UUIDs, so before this endpoint served one an outsider
+ * could not pin; serving it unconditionally would let anyone collect both ids
+ * during a canary and pin themselves to either — including staying on the OLD
+ * build through the canary of a security fix. So the id is served only when
+ * the request's own override header already names it: the caller proves it
+ * knows the id, and learns only that its pin landed. worker-verify.sh always
+ * sends the pin, so verification is unaffected.
+ *
+ * This is the one deliberate exception to "never omit a field": an omitted
+ * version_id means "not disclosed to you", which the verifier treats as
+ * "not proven" rather than as a match.
+ */
+export function disclosedVersionId(
+  env: { CF_VERSION_METADATA?: { id?: unknown } },
+  overrideHeader: string | null,
+): string | undefined {
+  const id = versionId(env);
+  if (id === "unknown" || !overrideHeader) return undefined;
+  // Dictionary values are quoted strings; compare exact values, not substrings.
+  const named = [...overrideHeader.matchAll(/=\s*"([^"]*)"/g)].map((m) => m[1].toLowerCase());
+  return named.includes(id) ? id : undefined;
+}

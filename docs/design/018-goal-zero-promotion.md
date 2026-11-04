@@ -174,6 +174,17 @@ disposable by design (its CA is not trusted by anything).
 > says which (`version_id_checked`). Each pinned run first deletes any earlier
 > record for that version, so a failed re-soak leaves no stale pass behind.
 >
+> The id is served **only to a request whose override header already names
+> it** (re-review N2): Cloudflare honours the header for any client, and a
+> public id would let an outsider pin themselves to either side of a canary —
+> for instance, stay on the old build through the canary of a security fix.
+> The verifier always sends the pin, so under it the new version (when bound)
+> names itself on every probe. A run in which some probes name the version
+> and others name none therefore fails, in either order (re-review N1): part
+> of it was answered by another version. A run where no probe names it passes
+> on commit plus the deployment listing, records `version_id_checked:false`,
+> and promote warns.
+>
 > **Not yet measured against Cloudflare.** The pinned path has not run against
 > a real split since this change. The first run should be a staging
 > rehearsal — `task worker:canary NEW=<id> OLD=<cur> ENV=staging`, then

@@ -48,6 +48,8 @@ interface Version {
   id: string;
   commit: string;
   brokenToken: boolean;
+  /** This version has the version-metadata binding (overrides the global \`versionMeta\`). */
+  meta?: boolean;
 }
 
 /** Mutable per test: which versions are deployed, at what split, and who is broken. */
@@ -107,8 +109,12 @@ function handle(req: IncomingMessage, res: ServerResponse) {
       return send(200, caPem, "application/x-pem-file");
     case "/.well-known/jwks.json":
       return json(200, { keys: [{ kty: "OKP", crv: "Ed25519", x: "AA" }] });
-    case "/.well-known/version":
-      return json(200, { commit: v.commit, stamped: true, version_id: versionMeta ? v.id : "unknown" });
+    case "/.well-known/version": {
+      // Mirrors the Worker (review N2): version_id only when the version has the
+      // binding AND the request's override header already names this id.
+      const named = String(req.headers["cloudflare-workers-version-overrides"] ?? "").includes(`"${v.id}"`);
+      return json(200, { commit: v.commit, stamped: true, ...((v.meta ?? versionMeta) && named ? { version_id: v.id } : {}) });
+    }
     case "/api/docs":
       return send(200, `docs for http://${host}`);
     case "/auth/passkey/status":
@@ -136,7 +142,7 @@ interface Run {
  * stub lives in this process, so a synchronous spawn would block the event
  * loop that has to answer the requests.
  */
-function verify(vars: Record<string, string>, evidenceDir: string): Promise<Run> {
+function verify(vars: Record<string, string>, evidenceDir: string, exported: Record<string, string> = {}): Promise<Run> {
   const args = [
     "-d",
     ROOT,
@@ -152,7 +158,10 @@ function verify(vars: Record<string, string>, evidenceDir: string): Promise<Run>
   return new Promise((resolve) => {
     const p = spawn("task", args, {
       env: {
-        ...process.env,
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(([k]) => !["ENV", "VERSION", "EXPECT", "AUTH_BASE", "SITE_BASE"].includes(k)),
+        ),
+        ...exported,
         VERIFY_MAX_ATTEMPTS: "1",
         VERIFY_RETRY_DELAY_SECONDS: "0",
         NOTME_EVIDENCE_DIR: evidenceDir,
@@ -315,6 +324,11 @@ describe("pinned soak — security review fixes (M4, M5)", () => {
 
   it("M5: with version metadata, an ignored pin fails on the version id even when Cloudflare lists NEW", async () => {
     honour = false; // listed in the deployment, but the override did not apply
+    // Random routing lands some probes on NEW (which names itself under the
+    // pin) and some on OLD (which, not being named by the header, names
+    // nothing — review N2). Either order must fail.
+    let k = 0;
+    sample = () => (k++ % 3 === 0 ? 0.05 : 0.5);
     deployment = [{ version: sameCommitNew(), pct: 10 }, { version: old(), pct: 90 }];
     const r = await verify(pinnedArgs, evidence);
     expect(r.code).not.toBe(0);
@@ -336,5 +350,60 @@ describe("pinned soak — security review fixes (M4, M5)", () => {
     const r = await verify({ VERSION: NEW.id, EXPECT: NEW.commit, ENV: "production" }, evidence);
     expect(r.code).not.toBe(0);
     expect(existsSync(record())).toBe(false);
+  });
+});
+
+describe("pinned soak — re-review N1 (version id must not fail open)", () => {
+  it("NEW reports its id, OLD (no binding, same commit) answers when the pin is ignored → the soak FAILS", async () => {
+    const newWithMeta: Version = { id: NEW.id, commit: OLD.commit, brokenToken: false, meta: true };
+    const oldNoMeta: Version = { ...OLD, brokenToken: false, meta: false };
+    honour = false;
+    // Half the unpinned traffic each way, so both versions answer probes.
+    let k = 0;
+    sample = () => (k++ % 2 === 0 ? 0.25 : 0.75);
+    deployment = [{ version: newWithMeta, pct: 50 }, { version: oldNoMeta, pct: 50 }];
+    const r = await verify({ VERSION: NEW.id, EXPECT: OLD.commit, ENV: "production" }, evidence);
+    expect(served).toContain(OLD.id);
+    expect(served).toContain(NEW.id);
+    expect(r.code, r.out).not.toBe(0);
+    expect(existsSync(join(evidence, "production", `${NEW.id}.json`))).toBe(false);
+  });
+
+  it("…in either order: OLD answers first (no id), NEW names itself later → still FAILS", async () => {
+    const newWithMeta: Version = { id: NEW.id, commit: OLD.commit, brokenToken: false, meta: true };
+    const oldNoMeta: Version = { ...OLD, brokenToken: false, meta: false };
+    honour = false;
+    let k = 0;
+    sample = () => (k++ % 2 === 0 ? 0.75 : 0.25);
+    deployment = [{ version: newWithMeta, pct: 50 }, { version: oldNoMeta, pct: 50 }];
+    const r = await verify({ VERSION: NEW.id, EXPECT: OLD.commit, ENV: "production" }, evidence);
+    expect(served[0]).toBe(OLD.id);
+    expect(r.code, r.out).not.toBe(0);
+    expect(existsSync(join(evidence, "production", `${NEW.id}.json`))).toBe(false);
+  });
+
+  it("…and a run where EVERY probe was answered without an id records version_id_checked:false", async () => {
+    versionMeta = false;
+    const sameCommitNew: Version = { id: NEW.id, commit: OLD.commit, brokenToken: false };
+    deployment = [{ version: sameCommitNew, pct: 10 }, { version: old(), pct: 90 }];
+    const r = await verify({ VERSION: NEW.id, EXPECT: OLD.commit, ENV: "production" }, evidence);
+    expect(r.code, r.out).toBe(0);
+    expect(JSON.parse(readFileSync(join(evidence, "production", `${NEW.id}.json`), "utf8")).version_id_checked).toBe(false);
+  });
+});
+
+describe("worker:verify refuses targets that came from the shell (re-review N5)", () => {
+  it("an exported VERSION/ENV is refused, not silently used to pin", async () => {
+    deployment = [{ version: healthyNew(), pct: 10 }, { version: old(), pct: 90 }];
+    const r = await verify({}, evidence, { VERSION: NEW.id, ENV: "production", EXPECT: NEW.commit });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toMatch(/exported in your shell/);
+    expect(existsSync(join(evidence, "production", `${NEW.id}.json`))).toBe(false);
+  });
+
+  it("an explicit command-line value different from the exported one is used", async () => {
+    deployment = [{ version: old(), pct: 100 }];
+    const r = await verify({ ENV: "production" }, evidence, { ENV: "staging" });
+    expect(r.code, r.out).toBe(0);
   });
 });

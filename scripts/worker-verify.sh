@@ -29,11 +29,13 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 FAIL=0
-# Targets are ARGUMENTS (`task worker:verify` passes them), never read from
-# the environment: an exported AUTH_BASE/ENV/VERSION/EXPECT in the operator's
-# shell must not redirect a caller that stated its target — ship-prod's
-# verify of production stayed production with ENV=staging exported only
-# because of this (review M6).
+# Targets are ARGUMENTS (`task worker:verify` passes them); this script does
+# not read them from the environment, so an exported AUTH_BASE/ENV/VERSION/
+# EXPECT cannot redirect a caller that stated its target — ship-prod's verify
+# of production stays production with ENV=staging exported (review M6).
+# But Task itself fills a bare `task worker:verify`'s template vars from the
+# environment, so an argument EQUAL to an exported variable of the same name
+# most likely came from the shell, and is refused (re-review N5).
 AUTH_BASE="https://auth.notme.bot"
 SITE_BASE="https://notme.bot"
 VERSION=""
@@ -50,6 +52,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$AUTH_BASE" ] && [ -n "$SITE_BASE" ] || { echo "✗ worker-verify: empty --auth-base/--site-base"; exit 2; }
+# shellcheck source=scripts/lib/selectors.sh
+. scripts/lib/selectors.sh
+refuse_exported ENV "$ENV_NAME"
+refuse_exported VERSION "$VERSION"
+refuse_exported EXPECT "$EXPECT"
+refuse_exported AUTH_BASE "$AUTH_BASE"
+refuse_exported SITE_BASE "$SITE_BASE"
 # http:// as well, for a local Worker; the api-docs check wants a bare host.
 AUTH_HOST="${AUTH_BASE#http*://}"
 VERIFY_NONCE="$(date +%s)"
@@ -112,6 +121,14 @@ pcurl() { curl ${PIN[@]+"${PIN[@]}"} "$@"; }
 
 PIN_BROKEN=0
 VERSION_ID_CHECKED=false
+# Probes that named the pinned version id, and probes that named none. The
+# Worker serves version_id only when it has the [version_metadata] binding and
+# the request's own override header names that id (review N2), so under a pin
+# the NEW version — if it has the binding — names itself on EVERY probe. Once
+# one probe has, a probe without an id was answered by some other version,
+# whichever came first (review N1: this used to pass on the commit alone).
+ID_SEEN=0
+ID_MISSING=0
 # Prove the pin held for the request about to be checked: ask the same base,
 # pinned, which build AND which version is answering. The commit must equal
 # EXPECT; the version id (from the version-metadata binding) must equal
@@ -124,9 +141,14 @@ assert_pinned() {
     body=$(pcurl -sS --max-time 10 "${base}/.well-known/version" 2>/dev/null)
     got=$(printf '%s' "$body" | grep -o '"commit":"[0-9a-f]*"' | cut -d'"' -f4)
     vid=$(printf '%s' "$body" | grep -o '"version_id":"[^"]*"' | cut -d'"' -f4)
-    if [ "$got" = "$EXPECT" ] && { [ -z "$vid" ] || [ "$vid" = unknown ] || [ "$vid" = "$VERSION" ]; }; then
-      [ "$vid" = "$VERSION" ] && VERSION_ID_CHECKED=true
-      return 0
+    [ "$vid" = unknown ] && vid=""
+    if [ "$got" = "$EXPECT" ]; then
+      if [ "$vid" = "$VERSION" ] && [ "$ID_MISSING" -eq 0 ]; then
+        ID_SEEN=$((ID_SEEN + 1)); VERSION_ID_CHECKED=true; return 0
+      fi
+      if [ -z "$vid" ] && [ "$ID_SEEN" -eq 0 ]; then
+        ID_MISSING=$((ID_MISSING + 1)); return 0
+      fi
     fi
     # Only the opening probe retries: Cloudflare notes a deployment change can
     # take a couple of seconds to propagate. Mid-run, a miss is a miss.
@@ -135,6 +157,8 @@ assert_pinned() {
   done
   if [ "$got" != "$EXPECT" ]; then
     echo "✗ pin not honoured before '$label': answered by build '${got:-none}', expected ${EXPECT:0:12} — ${VERSION} is not in the current deployment, or the override was ignored"
+  elif [ -z "$vid" ] || [ "$vid" = "$VERSION" ]; then
+    echo "✗ pin not honoured before '$label': answered by version '${vid:-none}' — some probes named ${VERSION} and some named no version, so a different version answered part of this run (same commit — the override was ignored)"
   else
     echo "✗ pin not honoured before '$label': answered by version '${vid}', not ${VERSION} (same commit — the override was ignored)"
   fi
