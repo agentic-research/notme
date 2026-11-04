@@ -68,7 +68,7 @@ SIGNET_AUTHORITY_URL = "https://auth.notme.bot"
 # Comma-separated list of GitHub org/user names allowed to exchange GHA OIDC tokens
 # for bridge certs at auth.notme.bot/cert/gha.
 GHA_ALLOWED_OWNERS = "your-org"
-# Where AuthService.proxy() may send an agent's requests (ADR-009,
+# Where an AuthSession's proxy() may send an agent's requests (ADR-009,
 # notme-baea8c): comma-separated hosts, `*.suffix` for subdomains, https only.
 # Unset allows NOTHING — proxy() refuses every destination until it is set.
 # List only what agents need, and never a wildcard over this authority's own
