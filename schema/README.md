@@ -167,18 +167,18 @@ It is a regex parser, ~280 LOC. Handles the subset we use, silently skips the re
 - ❌ No groups, no generics, no `interface`, no `Float32`/`Float64`/`Int8`/`Int16`/`Int32`/`UInt8`/`UInt16`, no `AnyPointer`, no `Map`-style entries
 - ❌ Unknown types fall through to `unknown` / `z.unknown()` — silent rather than fatal
 
-This is fine for what `identity.capnp` currently uses (the schema sticks to the supported subset on purpose). It is **not** fine for the cross-language-byte-equality claim — see the open issue at the top.
+This is fine for what `identity.capnp` currently uses (the schema sticks to the supported subset on purpose). Cross-language byte equality does not depend on it: signing input is canonical CBOR (ADR-010, "alignment shipped" above), not capnp.
 
 ## toolchain pin status
 
-Currently **not pinned**. The RTFM recommends pinning the capnp compiler, every generator (`capnpc-go`, `capnp-to-ts.ts`), and every consumer-side runtime by exact version, plus a cross-runtime fixture suite that asserts byte-for-byte equality on a known input. notme has neither.
+Currently **not pinned**. The RTFM recommends pinning the capnp compiler, every generator (`capnpc-go`, `capnp-to-ts.ts`), and every consumer-side runtime by exact version, plus a cross-runtime fixture suite that asserts byte-for-byte equality on a known input. The toolchain pins do not exist. A byte-equality fixture suite does, for the canonical CBOR signing input rather than capnp: `fixtures/`, pinned by `fixtures/SHA256SUMS` and checked by `task docs:check` (notme-1629fe).
 
-Tracked as a Tier 2 fix in `notme-803923`.
+This was tracked as a Tier 2 fix in `notme-803923`, which is now closed; no open bead tracks the toolchain pins.
 
 ## related
 
 - **`../gen/`** — generated TS + Go output, both committed.
-- **`../worker/src/revocation.ts`** — consumes `gen/ts/identity.ts`. `bundleCanonical()` at line 159 is the JSON-canonicalization site that diverges from real capnp.
+- **`../worker/src/revocation.ts`** — consumes `gen/ts/identity.ts`. `bundleCanonical()` at line 218 produces the canonical CBOR signing input (ADR-010).
 - **`../worker/src/cert-exchange.ts`** — consumes `BridgeCertPair` / `CertPairRequest` / `CertPairPoP` for the 008 PoP exchange.
 - **`../docs/design/008-bridge-cert-csr-wimse.md`** — what `BridgeCertPair` represents.
 - **`../docs/design/006-dpop-tokens.md`** — DPoP wire format (TS-only, separate file at `packages/dpop`).
