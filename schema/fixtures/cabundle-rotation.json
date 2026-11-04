@@ -1,0 +1,11 @@
+{
+  "epoch": 3,
+  "seqno": 17,
+  "keys": {
+    "9408457aefd071cec127c1f985399308": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "417e5d372f6f9878e01d729c499b2d01": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+  },
+  "keyId": "417e5d372f6f9878e01d729c499b2d01",
+  "prevKeyId": "9408457aefd071cec127c1f985399308",
+  "issuedAt": 1767225600
+}

@@ -155,6 +155,28 @@ describe("bundleCanonical (CBOR canonical, RFC 8949 §4.2)", () => {
     const { bundle, expected } = loadFixture("cabundle-multikey");
     expect(bundleCanonical(bundle)).toEqual(expected);
   });
+
+  it("sorts equal-length kids bytewise: the branch production takes (notme-32270b)", () => {
+    // Real kids are lowercasehex(SHA-256(SPKI)[:16]) (key-id.ts): ALWAYS 32
+    // chars. cabundle-multikey ("ab" vs "b") is decided on the LENGTH branch of
+    // sortStringKeysCanonical, which a real bundle never reaches; this fixture
+    // is decided only by the bytewise tiebreak. It is also the rotation-grace
+    // state generateBundle emits: two keys, prevKeyId set, a 32-byte key value.
+    const { bundle, expected } = loadFixture("cabundle-rotation");
+    const kids = Object.keys(bundle.keys);
+
+    // Shape pins, so the fixture cannot quietly stop exercising the branch.
+    expect(kids).toHaveLength(2);
+    expect(kids.every((k) => /^[0-9a-f]{32}$/.test(k))).toBe(true);
+    expect(bundle.prevKeyId).toMatch(/^[0-9a-f]{32}$/);
+    expect(kids).toContain(bundle.prevKeyId);
+    expect(kids).toContain(bundle.keyId);
+    expect(bundle.keyId).not.toBe(bundle.prevKeyId);
+    // JSON order is the REVERSE of canonical, so only sorting can pass.
+    expect(kids).not.toEqual([...kids].sort());
+
+    expect(bundleCanonical(bundle)).toEqual(expected);
+  });
 });
 
 // --- notme-1629fe: the fixture gate's integrity anchor -----------------------
@@ -185,6 +207,7 @@ describe("fixture integrity anchor (notme-1629fe)", () => {
   it("accepts the committed fixtures", () => {
     expect(() => loadFixture("cabundle-basic")).not.toThrow();
     expect(() => loadFixture("cabundle-multikey")).not.toThrow();
+    expect(() => loadFixture("cabundle-rotation")).not.toThrow();
   });
 
   it("refuses a fixture whose .bin was edited (the file a Go/Rust consumer reads)", () => {
@@ -295,8 +318,8 @@ function prng(seed: number): () => number {
 }
 
 describe("independent RFC 8949 §4.2 derivation (notme-1629fe)", () => {
-  it("re-derives both golden vectors from their .json without bundleCanonical", () => {
-    for (const name of ["cabundle-basic", "cabundle-multikey"]) {
+  it("re-derives every golden vector from their .json without bundleCanonical", () => {
+    for (const name of ["cabundle-basic", "cabundle-multikey", "cabundle-rotation"]) {
       const { bundle, expected } = loadFixture(name);
       expect(refCanonical(bundle), name).toEqual(expected);
     }
