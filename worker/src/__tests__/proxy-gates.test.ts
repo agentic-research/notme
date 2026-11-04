@@ -1,5 +1,5 @@
 /**
- * proxy-gates.test.ts — the gates ADR-009 promises `AuthService.proxy()`
+ * proxy-gates.test.ts — the gates ADR-009 promises `AuthSession.proxy()` (once `AuthService.proxy()`, notme-153f03)
  * has, and the audit record that says which of them refused (notme-baea8c).
  *
  * proxy() used to permit every destination not on the metadata denylist,

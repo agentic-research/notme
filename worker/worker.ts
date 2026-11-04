@@ -261,6 +261,15 @@ const AUTH_CHALLENGE_TTL_S = 60;
  */
 const AUTH_CHALLENGE_FALLBACK_LIMITER = new IsolateRateLimiter({ limit: 10, periodSeconds: 60 });
 
+/**
+ * The cap shared by EVERY props-less caller in this isolate (review M1):
+ * 60 / 60 s, six identities' worth. Props-less callers are bucketed per
+ * claimed identity so one cannot drain another's budget; this bounds how
+ * many nonce rows they can make the authority write between them, since
+ * the identity is the caller's to choose. Per-isolate, like the fallback.
+ */
+const AUTH_CHALLENGE_NOPROPS_SHARED_CAP = new IsolateRateLimiter({ limit: 60, periodSeconds: 60 });
+
 export class AuthService extends WorkerEntrypoint<any> {
   // NO credential state on this class (notme-153f03). Each top-level binding
   // call gets a fresh `this`, so a field here cannot carry anything from
@@ -400,8 +409,17 @@ export class AuthService extends WorkerEntrypoint<any> {
     // is whatever the caller types — keyed on it, a flood rotates names and
     // never meets the limit. `props` is set per binding by the operator, so
     // the caller cannot change its own bucket, and a noisy binding exhausts
-    // only its own budget. Bindings with no props share the `null` bucket;
-    // an operator that wants them separated gives each one props.
+    // only its own budget. EVERY agent binding should set props.
+    //
+    // Without props (review M1) a single `null` bucket let one agent lock
+    // out every peer. Props-less calls are bucketed per CLAIMED identity
+    // instead (`authchallenge:null:id:<identity>`, on the same limiter), so
+    // identity A draining its budget does not refuse identity B, AND they
+    // spend AUTH_CHALLENGE_NOPROPS_SHARED_CAP, so rotating identities cannot
+    // make the authority write rows without bound. The identity bucket is
+    // checked first: a caller hammering its own exhausted identity never
+    // reaches the shared cap. A rotating flood can still exhaust the shared
+    // cap and, with it, every props-less caller — which is why props matter.
     //
     // CERT_LIMITER (10 / 60 s per key, wrangler.toml.example) is reused under
     // its own `authchallenge:` prefix, as TOKEN_LIMITER carries `token:` and
@@ -415,11 +433,17 @@ export class AuthService extends WorkerEntrypoint<any> {
     // memory. That is per-isolate — each isolate counts on its own — which
     // on one workerd process is the whole service.
     const limiter = this.env.CERT_LIMITER ?? AUTH_CHALLENGE_FALLBACK_LIMITER;
-    const { success } = await limiter.limit({
-      key: `authchallenge:${JSON.stringify(this.#props() ?? null)}`,
-    });
-    if (!success) {
-      throw new Error("rate limited — too many authChallenge() calls from this binding; retry in a minute");
+    const props = this.#props();
+    const refused = () =>
+      new Error("rate limited — too many authChallenge() calls from this binding; retry in a minute");
+    if (props !== undefined && props !== null) {
+      const { success } = await limiter.limit({ key: `authchallenge:${JSON.stringify(props)}` });
+      if (!success) throw refused();
+    } else {
+      const { success } = await limiter.limit({ key: `authchallenge:null:id:${identity}` });
+      if (!success) throw refused();
+      const shared = await AUTH_CHALLENGE_NOPROPS_SHARED_CAP.limit({ key: "authchallenge:null" });
+      if (!shared.success) throw refused();
     }
     const issuedAt = Math.floor(Date.now() / 1000);
     const { nonce } = await this.#getAuthority().issuePopNonce(this.#challengeKey(identity, issuedAt));
@@ -477,19 +501,12 @@ export class AuthService extends WorkerEntrypoint<any> {
     challenge: string;
     proofs: { mtls: string; signing: string };
   }): Promise<AuthSession> {
-    const { deriveCredentialsFromCerts } =
-      await import("./src/auth/derive-credentials");
-    const authority = this.#getAuthority();
-    const caPublicKeyPem = await authority.getPublicKeyPem();
-
-    const derived = await deriveCredentialsFromCerts(
-      creds.signingCert,
-      creds.mtlsCert,
-      caPublicKeyPem,
-    );
-
     // The challenge: present, well-formed, and young. Its age is checked
     // here; that the timestamp is genuine is checked by the consume below.
+    // FIRST, because it is free (review I3): it reads only the caller's own
+    // string, so a junk call is refused before it costs a DO RPC or an X.509
+    // parse. Safe to move: nothing it decides depends on the certs, and the
+    // challenge is still spent only after every other check passes.
     const m = /^(\d{1,12})\.([A-Za-z0-9_-]{16,128})$/.exec(
       typeof creds.challenge === "string" ? creds.challenge : "",
     );
@@ -501,6 +518,17 @@ export class AuthService extends WorkerEntrypoint<any> {
     if (age < 0 || age > AUTH_CHALLENGE_TTL_S) {
       throw new Error("challenge expired — request a new one");
     }
+
+    const { deriveCredentialsFromCerts } =
+      await import("./src/auth/derive-credentials");
+    const authority = this.#getAuthority();
+    const caPublicKeyPem = await authority.getPublicKeyPem();
+
+    const derived = await deriveCredentialsFromCerts(
+      creds.signingCert,
+      creds.mtlsCert,
+      caPublicKeyPem,
+    );
 
     // Possession, against the keys the CERTS carry.
     const { X509Certificate } = await import("@peculiar/x509");

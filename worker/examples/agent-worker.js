@@ -5,20 +5,31 @@
 // V8 isolate boundary prevents reading notme's keys or memory.
 //
 // Usage:
-//   1. Add this to config.capnp as a second Worker
+//   1. Add this to config.capnp as a second Worker (examples/config-colocated.capnp
+//      does; note the `props` on its NOTME binding — every agent binding needs
+//      its own, see below)
 //   2. workerd serve config.capnp --experimental
 //   3. Agent code runs in this isolate, calls env.NOTME for everything
 //
 // Credentials: env.NOTME.authenticate() returns a SESSION (notme-153f03).
 // proxy(), sign() and identity() are methods of that session, not of
-// env.NOTME. Each top-level binding call is its own RPC session with a fresh
-// AuthService, so nothing authenticate() verified could be found by a later
-// env.NOTME.proxy() call; the session object is what holds it. The caller
-// gets a stub, and notme keeps the verified certs exactly as long as that
-// stub lives: until it is disposed (`using`, or session[Symbol.dispose]()),
-// or until this Worker's request handler finishes, when workerd disposes
-// every stub the request created
-// (https://developers.cloudflare.com/workers/runtime-apis/rpc/lifecycle/).
+// env.NOTME. The caller gets a stub, and notme keeps the verified certs
+// exactly as long as that stub lives: until it is disposed (`using`, or
+// session[Symbol.dispose]()), until the certs expire, or until this Worker's
+// request handler finishes, when workerd disposes every stub the request
+// created (https://developers.cloudflare.com/workers/runtime-apis/rpc/lifecycle/).
+//
+// AUTHENTICATE ONCE, REUSE THE SESSION. A session costs an authChallenge(),
+// which is rate limited (10 / 60 s per binding props), plus a proof and a DO
+// round trip. So this Worker opens at most ONE session per unit of work and
+// does all of that work's proxy() and sign() calls on it:
+//   - `/health` does not authenticate at all;
+//   - `/proxy` and `/sign` open the session lazily, only if they get that far;
+//   - `/batch` runs a list of operations on one session.
+// A session cannot be cached across requests: the runtime disposes it when
+// the request that opened it ends (lifecycle docs above). A long-running agent
+// should therefore do its work inside one long request or job, not as many
+// short ones that each re-authenticate.
 //
 // authenticate() holds a pair only after the holder PROVES possession of
 // both private keys (notme-fbbfbc):
@@ -35,12 +46,12 @@
 // calls back to it here with the payload, and returns the signature only if
 // it verifies under the signing cert
 // (https://developers.cloudflare.com/workers/runtime-apis/rpc/#send-functions-as-parameters-of-rpc-methods).
+// Signing needs a sign:git or sign:attestation scope on the cert, whatever
+// `format` is claimed.
 //
-// The challenge is single-use, good for 60 s, and authChallenge() is rate
-// limited per binding `props` (set props on this Worker's NOTME binding to
-// get a budget of its own). `openSession` below stands for that sequence;
-// where the cert pair and keys come from (a launcher's /cert/gha exchange,
-// say) is the deployment's choice, not this example's.
+// Where the cert pair and keys come from (a launcher's /cert/gha exchange,
+// say) is the deployment's choice, not this example's: `env.BRIDGE_CREDENTIALS`
+// is a placeholder for it.
 
 /**
  * authChallenge -> prove -> authenticate, returning the session stub.
@@ -59,29 +70,53 @@ async function openSession(env) {
   });
 }
 
+/**
+ * One session per unit of work, opened on first use. `get()` authenticates
+ * the first time and returns the same stub after; `[Symbol.dispose]` drops it.
+ */
+function lazySession(env) {
+  let session = null;
+  return {
+    async get() {
+      session ??= await openSession(env);
+      return session;
+    },
+    [Symbol.dispose]() {
+      session?.[Symbol.dispose]();
+      session = null;
+    },
+  };
+}
+
+/** Sign with this Worker's own key; the key never leaves this isolate. */
+const signer = (env) => (bytes) => env.BRIDGE_CREDENTIALS.sign(bytes);
+
+async function signOp(session, env, { payload, format }) {
+  const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
+  const result = await session.sign(bytes.buffer, format || "raw", signer(env));
+  return {
+    signature: btoa(String.fromCharCode(...new Uint8Array(result.signature))),
+    certificate: result.certificate,
+    identity: result.identity,
+  };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Health check
+    // Health check: this Worker is up. It does not authenticate, so probes
+    // never spend the binding's authChallenge budget.
     if (url.pathname === "/health") {
-      using session = await openSession(env);
-      const id = await session.identity();
-      return Response.json({
-        status: "ok",
-        authenticated: id.authenticated,
-        identity: id.identity,
-        scopes: id.scopes,
-      });
+      return Response.json({ status: "ok" });
     }
 
     // Proxy an external request through notme
     if (url.pathname === "/proxy" && request.method === "POST") {
       const body = await request.json();
+      using work = lazySession(env);
       try {
-        using session = await openSession(env);
-        const result = await session.proxy(body);
-        return Response.json(result);
+        return Response.json(await (await work.get()).proxy(body));
       } catch (e) {
         return Response.json({ error: e.message }, { status: 403 });
       }
@@ -91,20 +126,31 @@ export default {
     // runs here); notme gates, verifies against the cert, and audits.
     if (url.pathname === "/sign" && request.method === "POST") {
       const body = await request.json();
+      using work = lazySession(env);
       try {
-        const payload = Uint8Array.from(atob(body.payload), c => c.charCodeAt(0));
-        using session = await openSession(env);
-        const result = await session.sign(payload.buffer, body.format || "raw", (bytes) =>
-          env.BRIDGE_CREDENTIALS.sign(bytes),
-        );
-        return Response.json({
-          signature: btoa(String.fromCharCode(...new Uint8Array(result.signature))),
-          certificate: result.certificate,
-          identity: result.identity,
-        });
+        return Response.json(await signOp(await work.get(), env, body));
       } catch (e) {
         return Response.json({ error: e.message }, { status: 403 });
       }
+    }
+
+    // Several operations, ONE authentication:
+    //   { "ops": [ { "proxy": { "url": ... } }, { "sign": { "payload": ..., "format": ... } } ] }
+    if (url.pathname === "/batch" && request.method === "POST") {
+      const { ops = [] } = await request.json();
+      using work = lazySession(env);
+      const results = [];
+      for (const op of ops) {
+        try {
+          const session = await work.get();
+          if (op.proxy) results.push({ ok: true, proxy: await session.proxy(op.proxy) });
+          else if (op.sign) results.push({ ok: true, sign: await signOp(session, env, op.sign) });
+          else results.push({ ok: false, error: "unknown op" });
+        } catch (e) {
+          results.push({ ok: false, error: e.message });
+        }
+      }
+      return Response.json({ results });
     }
 
     // Demonstrate that fetch() is disabled

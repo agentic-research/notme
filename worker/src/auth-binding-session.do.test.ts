@@ -180,14 +180,14 @@ describe("AuthService session over a real service binding (notme-153f03)", () =>
     expect(audit.filter((l) => l.type === "sign").at(-1)).toMatchObject({
       allowed: true,
       identity: creds.identity,
-      format: "git-commit",
+      claimed_format: "git-commit",
     });
     session[Symbol.dispose]();
   });
 
   it("auth.session.sign.wrong-key — a signer that signs with a key other than the cert's is refused and audited", async () => {
     const audit = captureAudit();
-    const creds = await realCreds("binding-mismatch");
+    const creds = await realCreds("binding-mismatch", ["bridgeCert", "sign:attestation"]);
     const other = await realCreds("binding-mismatch-other");
     const session = await sessionOver(creds);
     const payload = new TextEncoder().encode("hello");
@@ -209,7 +209,7 @@ describe("AuthService session over a real service binding (notme-153f03)", () =>
 
   it("auth.session.sign.signer-throws — a signer that throws is refused and audited", async () => {
     const audit = captureAudit();
-    const creds = await realCreds("binding-signer-throws");
+    const creds = await realCreds("binding-signer-throws", ["bridgeCert", "sign:attestation"]);
     const session = await sessionOver(creds);
 
     const message = await refusal(() =>
@@ -242,16 +242,18 @@ describe("AuthService session over a real service binding (notme-153f03)", () =>
   it("auth.session.isolation — a session acts only as the identity it proved, whatever else authenticates", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("pong")));
     const audit = captureAudit();
-    const alice = await realCreds("binding-alice", ["bridgeCert"]);
+    const alice = await realCreds("binding-alice", ["bridgeCert", "sign:attestation"]);
     const bob = await realCreds("binding-bob", ["bridgeCert", "sign:git"]);
+    const carol = await realCreds("binding-carol", ["bridgeCert"]);
 
     const a = await sessionOver(alice);
     const b = await sessionOver(bob);
+    const c = await sessionOver(carol);
     const signerFor = (key: CryptoKey) => (bytes: ArrayBuffer) => crypto.subtle.sign({ name: "Ed25519" }, key, bytes);
 
     // A, after B authenticated, is still A — in identity, audit and signature.
     expect((await a.identity()).identity).toBe(alice.identity);
-    expect((await a.identity()).scopes).toEqual(["bridgeCert"]);
+    expect((await a.identity()).scopes).toEqual(["bridgeCert", "sign:attestation"]);
     expect((await b.identity()).identity).toBe(bob.identity);
 
     await a.proxy({ url: PROXY_DEST });
@@ -269,13 +271,15 @@ describe("AuthService session over a real service binding (notme-153f03)", () =>
     expect(await refusal(() => a.sign(payload.buffer, "raw", signerFor(bob.signingKey)))).toMatch(
       /signature does not verify/,
     );
-    // A cannot borrow B's scope: git-commit needs sign:git, which only B holds.
-    expect(await refusal(() => a.sign(payload.buffer, "git-commit", signerFor(alice.signingKey)))).toMatch(
+    // C cannot borrow A's or B's scope: C holds no sign:* scope, so even raw
+    // signing with C's own key is refused, however many signers are around.
+    expect(await refusal(() => c.sign(payload.buffer, "raw", signerFor(carol.signingKey)))).toMatch(
       /scope insufficient/,
     );
 
     a[Symbol.dispose]();
     b[Symbol.dispose]();
+    c[Symbol.dispose]();
   });
 
   it("auth.session.no-top-level — the entrypoint no longer offers proxy/sign/identity to hold state it cannot keep", async () => {

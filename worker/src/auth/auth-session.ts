@@ -68,9 +68,20 @@ export type AuthSessionDeps = {
   authorityState: () => Promise<{ epoch: number }>;
 };
 
+/**
+ * The scopes that permit sign() at all, for any claimed format (review L2).
+ * The scope vocabulary's signing family (ADMIN_SCOPES, scopes_supported).
+ */
+const SIGNING_SCOPES = ["sign:git", "sign:attestation"];
+
+/** How long sign() waits for the caller's signer before refusing (review L1). */
+export const SIGNER_TIMEOUT_MS = 10_000;
+
 export class AuthSession extends RpcTarget {
   #held: HeldCerts | null;
   #deps: AuthSessionDeps;
+  /** Why #held was dropped, and whose it was, for the refusals and audit after. */
+  #ended: { why: "disposed" | "expired"; identity: string } | null = null;
 
   constructor(held: HeldCerts, deps: AuthSessionDeps) {
     super();
@@ -87,11 +98,38 @@ export class AuthSession extends RpcTarget {
    * returns, and the client does not wait for it.
    */
   [Symbol.dispose](): void {
-    const identity = this.#held?.identity ?? null;
+    const identity = this.#held?.identity ?? this.#ended?.identity ?? null;
+    if (this.#held) this.#ended = { why: "disposed", identity: this.#held.identity };
     this.#held = null;
     console.log(
       JSON.stringify({ ts: new Date().toISOString(), type: "session", event: "disposed", identity }),
     );
+  }
+
+  /**
+   * The held credentials if they are still usable. Expired ones are DROPPED
+   * here, exactly as dispose drops them (review L3): an expired session holds
+   * no certs, and identity() stops saying it is authenticated. One
+   * `{"type":"session","event":"expired"}` line marks the drop.
+   */
+  #live(): HeldCerts | null {
+    const held = this.#held;
+    if (held && held.expiresAt <= Math.floor(Date.now() / 1000)) {
+      this.#held = null;
+      this.#ended = { why: "expired", identity: held.identity };
+      console.log(
+        JSON.stringify({ ts: new Date().toISOString(), type: "session", event: "expired", identity: held.identity }),
+      );
+      return null;
+    }
+    return held;
+  }
+
+  /** The refusal for a session with nothing live: why it ended. */
+  #endedRefusal(): [reason: string, message: string] {
+    return this.#ended?.why === "expired"
+      ? ["credentials_expired", "credentials expired — re-authenticate"]
+      : ["not_authenticated", "not authenticated — this session was disposed; call authenticate() again"];
   }
 
   /**
@@ -129,14 +167,15 @@ export class AuthSession extends RpcTarget {
   }> {
     const start = Date.now();
     const method = request.method || "GET";
-    const held = this.#held;
+    const held = this.#live();
+    const identity = held?.identity ?? this.#ended?.identity ?? null;
     const audit = (fields: Record<string, unknown>) =>
       // Structured JSON, feeds into APAS attestations.
       console.log(
         JSON.stringify({
           ts: new Date().toISOString(),
           type: "proxy",
-          identity: held?.identity ?? null,
+          identity,
           // Redacted and bounded (review F8): no userinfo, no query values.
           destination: urlForLog(request.url),
           method: String(method).slice(0, 16),
@@ -151,10 +190,7 @@ export class AuthSession extends RpcTarget {
     };
 
     if (!held) {
-      return deny("not_authenticated", "not authenticated — this session was disposed; call authenticate() again");
-    }
-    if (held.expiresAt <= Math.floor(Date.now() / 1000)) {
-      return deny("credentials_expired", "credentials expired — re-authenticate");
+      return deny(...this.#endedRefusal());
     }
 
     // Destination: parseable, then the hard denylist, then the configured
@@ -240,6 +276,14 @@ export class AuthSession extends RpcTarget {
   /**
    * Sign `payload` as this session's identity, with the CALLER's key.
    *
+   * WHAT THIS IS: a verify-gate-audit wrapper around the caller's own key,
+   * NOT a format-binding signer (review L2). The signature is over the
+   * payload bytes exactly as given — git and DSSE verifiers need a signature
+   * over their own bytes, so nothing is prefixed or domain-separated — which
+   * means `format` cannot be enforced: it is the caller's CLAIM, recorded in
+   * the audit as `claimed_format`, and no scope depends on it. Every format,
+   * raw included, needs a signing scope (sign:git or sign:attestation).
+   *
    * notme holds no private key for the session (notme-153f03): private keys
    * are never exported, and a CryptoKey cannot cross a binding anyway. The
    * caller passes `signer`, a function that signs bytes with its Ed25519
@@ -251,17 +295,19 @@ export class AuthSession extends RpcTarget {
    * signer is an RpcTarget passes `(bytes) => target.sign(bytes)`.
    *
    * Gates, in order, each refusing with an audit line naming it:
-   *   1. credentials held (not disposed) and unexpired;
-   *   2. scope: `raw` needs none, `dsse` / `git-commit` need sign:git or
-   *      sign:attestation;
-   *   3. a signer was given;
-   *   4. the held certs' epoch equals the authority's (the revocation lever,
-   *      as proxy()); an RPC failure refuses;
-   * then the signer is called over a private copy of the payload, and its
-   * output is returned ONLY if it verifies under the signing CERT's public
-   * key over that same payload (`signer_failed` / `signature_invalid`
-   * otherwise). So the returned signature, certificate and identity always
-   * agree, and the audit line records what was actually produced.
+   *   1. credentials live: not disposed, not expired (an expired session is
+   *      dropped, as dispose drops it);
+   *   2. payload binary, claimed format one of raw / dsse / git-commit;
+   *   3. a signing scope held;
+   *   4. a signer was given;
+   *   5. the held certs' epoch equals the authority's (an RPC failure refuses);
+   * then the signer is called over a private copy of the payload, bounded by
+   * SIGNER_TIMEOUT_MS (`signer_timeout`; a throw is `signer_failed`). AFTER
+   * it returns, the session is re-checked live — disposed or expired while
+   * the signer ran refuses, and the epoch is read again (`revoked_during_sign`)
+   * — so a signer cannot stall past a revocation and still be endorsed
+   * (review L1). Its output is returned ONLY if it verifies under the signing
+   * CERT's public key over the original payload (`signature_invalid`).
    */
   async sign(
     payload: ArrayBuffer | ArrayBufferView,
@@ -272,8 +318,8 @@ export class AuthSession extends RpcTarget {
     certificate: string;
     identity: string;
   }> {
-    const held = this.#held;
-    const signingScopes = ["sign:git", "sign:attestation"];
+    const held = this.#live();
+    const identity = held?.identity ?? this.#ended?.identity ?? null;
     const bytes = toBytes(payload);
     const payloadHash = bytes
       ? Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)))
@@ -285,11 +331,11 @@ export class AuthSession extends RpcTarget {
         JSON.stringify({
           ts: new Date().toISOString(),
           type: "sign",
-          identity: held?.identity ?? null,
-          format: String(format).slice(0, 16),
+          identity,
+          // The caller's claim, not something the signature binds (see above).
+          claimed_format: String(format).slice(0, 16),
           payload_hash: payloadHash ? `sha256:${payloadHash}` : null,
-          scope_checked:
-            format === "raw" ? "none" : (signingScopes.find((s) => held?.scopes.includes(s)) ?? null),
+          scope_checked: SIGNING_SCOPES.find((s) => held?.scopes.includes(s)) ?? null,
           ...fields,
         }),
       );
@@ -297,12 +343,24 @@ export class AuthSession extends RpcTarget {
       audit({ allowed: false, reason });
       throw new Error(message);
     };
+    /** The authority's epoch, or a refusal naming `mismatch` if it moved. */
+    const checkEpoch = async (h: HeldCerts, mismatch: string) => {
+      let epoch: number;
+      try {
+        ({ epoch } = await this.#deps.authorityState());
+      } catch {
+        return deny("authority_unavailable", "authority unavailable — cannot check the credentials' epoch");
+      }
+      if (h.epoch !== epoch) {
+        return deny(
+          mismatch,
+          `credentials revoked — cert epoch ${h.epoch} is not the authority's epoch ${epoch}; re-authenticate`,
+        );
+      }
+    };
 
     if (!held) {
-      return deny("not_authenticated", "not authenticated — this session was disposed; call authenticate() again");
-    }
-    if (held.expiresAt <= Math.floor(Date.now() / 1000)) {
-      return deny("credentials_expired", "credentials expired — re-authenticate");
+      return deny(...this.#endedRefusal());
     }
     if (!bytes) {
       return deny("payload_invalid", "payload must be an ArrayBuffer or a typed array");
@@ -310,9 +368,8 @@ export class AuthSession extends RpcTarget {
     if (format !== "raw" && format !== "dsse" && format !== "git-commit") {
       return deny("format_invalid", "format must be raw, dsse or git-commit");
     }
-    const hasSignScope = format === "raw" || held.scopes.some((s) => signingScopes.includes(s));
-    if (!hasSignScope) {
-      return deny("scope_insufficient", `scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`);
+    if (!held.scopes.some((s) => SIGNING_SCOPES.includes(s))) {
+      return deny("scope_insufficient", `scope insufficient — signing requires one of: ${SIGNING_SCOPES.join(", ")}`);
     }
     if (typeof signer !== "function") {
       return deny(
@@ -320,27 +377,36 @@ export class AuthSession extends RpcTarget {
         "signer required — pass a function that signs the payload with the signing cert's Ed25519 key",
       );
     }
-    let epoch: number;
-    try {
-      ({ epoch } = await this.#deps.authorityState());
-    } catch {
-      return deny("authority_unavailable", "authority unavailable — cannot check the credentials' epoch");
-    }
-    if (held.epoch !== epoch) {
-      return deny(
-        "epoch_mismatch",
-        `credentials revoked — cert epoch ${held.epoch} is not the authority's epoch ${epoch}; re-authenticate`,
-      );
-    }
+    await checkEpoch(held, "epoch_mismatch");
 
     // The signer gets its own copy: whatever it does to it, verification
-    // below is over the bytes this method was given.
+    // below is over the bytes this method was given. Bounded, so a stalled
+    // signer neither pins this call open nor outwaits a revocation.
     let produced: unknown;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      produced = await signer(bytes.slice().buffer);
-    } catch {
+      produced = await Promise.race([
+        Promise.resolve().then(() => signer(bytes.slice().buffer)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new SignerTimeout()), SIGNER_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (e) {
+      if (e instanceof SignerTimeout) {
+        return deny("signer_timeout", `signer timed out — no signature within ${SIGNER_TIMEOUT_MS / 1000} s`);
+      }
       return deny("signer_failed", "signer failed — the caller's signer threw");
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
+
+    // Re-check: the signer ran for as long as it liked (up to the bound).
+    const after = this.#live();
+    if (!after) {
+      return deny(...this.#endedRefusal());
+    }
+    await checkEpoch(after, "revoked_during_sign");
+
     const signature = toBytes(produced as ArrayBuffer | ArrayBufferView);
     let verified = false;
     if (signature) {
@@ -365,7 +431,10 @@ export class AuthSession extends RpcTarget {
     };
   }
 
-  /** The identity and capabilities this session holds. */
+  /**
+   * The identity and capabilities this session holds — unauthenticated once
+   * it has been disposed or its certs have expired (expiry drops them).
+   */
   async identity(): Promise<{
     identity: string;
     scopes: string[];
@@ -373,7 +442,7 @@ export class AuthSession extends RpcTarget {
     expires_at: number;
     authenticated: boolean;
   }> {
-    const held = this.#held;
+    const held = this.#live();
     if (!held) {
       return {
         identity: "",
@@ -392,6 +461,9 @@ export class AuthSession extends RpcTarget {
     };
   }
 }
+
+/** The signer did not answer within SIGNER_TIMEOUT_MS. */
+class SignerTimeout extends Error {}
 
 /**
  * A private copy of `v` as bytes, or null if it is not binary. Copies so a

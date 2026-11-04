@@ -28,14 +28,16 @@ export class IsolateRateLimiter {
   async limit({ key }: { key: string }): Promise<{ success: boolean }> {
     const now = Date.now();
     let w = this.#windows.get(key);
-    if (w && now - w.start >= this.#periodMs) {
+    // A window that started in the "future" (the clock stepped back) is stale
+    // too: holding it would refuse the key until the clock caught up.
+    if (w && (now - w.start >= this.#periodMs || now < w.start)) {
       this.#windows.delete(key);
       w = undefined;
     }
     if (!w) {
       if (this.#windows.size >= this.#maxKeys) {
         for (const [k, v] of this.#windows) {
-          if (now - v.start >= this.#periodMs) this.#windows.delete(k);
+          if (now - v.start >= this.#periodMs || now < v.start) this.#windows.delete(k);
         }
         if (this.#windows.size >= this.#maxKeys) return { success: false };
       }

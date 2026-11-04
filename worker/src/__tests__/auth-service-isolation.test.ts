@@ -86,7 +86,9 @@ describe("Threat: a bound Worker asserts its own identity (notme-6ad276)", () =>
       { attackerCA: true },
     );
 
-    await expect(svc.authenticate(forged as never)).rejects.toThrow(/signature|CA|trusted/i);
+    // With a real challenge and proofs from the forged keys, so the refusal is
+    // the CA check and not the (now earlier) challenge check.
+    await expect(authenticateWithPop(svc, forged)).rejects.toThrow(/signature|CA|trusted/i);
   });
 });
 

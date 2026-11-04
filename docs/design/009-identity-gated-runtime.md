@@ -339,9 +339,15 @@ below runs on the session's `proxy()` unchanged: the destination denylist and
 allowlist, the self-host rule, the `bridgeCert` scope, the per-call epoch
 check, header stripping, `redirect: "manual"`, and one truthful audit line
 per outcome. The epoch is read through `env` on each call, not through the
-DO stub of the `authenticate()` call that created the session. `sign()`
-keeps its scope check and audit line, and now also refuses expired certs and
-a moved epoch (see "Signing" below).
+DO stub of the `authenticate()` call that created the session. `sign()` gains
+expiry, epoch and post-signer re-checks (see "Signing" below).
+
+**Expiry ends a session as dispose does.** Once its certs expire, any call
+drops the held credentials, exactly as dispose drops them, and writes one
+`{"type":"session","event":"expired"}` audit line. After that,
+`identity()` returns `authenticated: false` and `proxy()` and `sign()`
+refuse with `credentials_expired`. Turning the clock back does not revive
+the session, because the certs are no longer held (`auth.session.expiry-drops`).
 
 **No cross-identity use.** A session is one proven identity for its whole
 life. It has no method that re-authenticates or swaps what it holds. A caller
@@ -349,8 +355,20 @@ that wants a second identity calls `authenticate()` again and gets a second
 session. The two do not share state, which `auth.session.isolation` pins over
 the binding.
 
-**Signing: the caller's key, notme's gates.** Private keys are never
-exported, and workerd does not serialize a `CryptoKey` anyway
+**A session stub is a capability, and forwarding it delegates.** RPC stubs
+can be passed on: "A stub received over RPC from one Worker can be forwarded
+over RPC to another Worker"
+([Forwarding RPC stubs](https://developers.cloudflare.com/workers/runtime-apis/rpc/#forwarding-rpc-stubs)).
+A holder that sends its session stub to another Worker gives that Worker
+everything the session can do, and the receiver's `proxy()` and `sign()`
+calls are gated, audited and attributed as the identity that authenticated.
+That is capability semantics: possession of the stub is the authority. It
+grants nothing the holder could not already give away, since the holder
+already has the keys. The audit cannot tell the original holder from a
+forwardee, so a caller that must not delegate must not forward the stub.
+
+**Signing: verify, gate and audit around the caller's key.** Private keys
+are never exported, and workerd does not serialize a `CryptoKey` anyway
 (`rpc.cryptokey.isolation`). So no private key crosses the binding in either
 direction, and the session holds none: it keeps the signing cert's PUBLIC
 key. `session.sign(payload, format, signer)` takes a `signer`, a function
@@ -377,64 +395,107 @@ documentation says how that crosses a binding:
   of the two it was handed. An agent whose signer is an `RpcTarget` passes
   `(bytes) => target.sign(bytes)`.
 
-`sign()` runs its gates before it calls the signer. It needs credentials held
-(not disposed) and unexpired, the scope (`dsse` and `git-commit` need
-`sign:git` or `sign:attestation`), a signer, and the held certs' epoch equal
-to the authority's. The epoch is the same revocation lever `proxy()` pulls,
-which supersedes the earlier "`sign()` does not run the epoch check" note
-below. It then hands the signer a private copy of the payload. It returns the
-result only if the result verifies with the signing CERT's public key over
-the original payload. A signer that throws is refused as `signer_failed`, and
-a signature from another key or over other bytes is refused as
-`signature_invalid`. Every outcome writes one `type: "sign"` audit line with
-`allowed`, and a `reason` on refusal. So the signature, certificate and
-identity `sign()` returns always agree, and the audit line records what was
-actually produced. `authenticate()` takes no key in any form; an earlier
-draft of this change took PKCS#8 bytes and was withdrawn.
+**What `sign()` is not: a format-binding signer.** The signature is over
+the payload bytes exactly as given. git and DSSE verifiers need a signature
+over their own bytes, so nothing is prefixed and nothing is
+domain-separated. That means `format` cannot be enforced. A raw signature
+over a git commit object is the same bytes as a `git-commit` one. So
+`format` is recorded for what it is, the caller's claim, as
+`claimed_format` in the audit line, and no scope depends on it. **Every
+format, raw included, needs a signing scope (`sign:git` or
+`sign:attestation`).** The audit's `scope_checked` names the one held. An
+earlier version gated `dsse` and `git-commit` on those scopes and let `raw`
+through with none. That gate stopped nothing, because the same signature
+could always be had as `raw`.
 
-**The old top-level methods.** `AuthService.proxy()`, `sign()` and
-`identity()` are removed rather than kept as refusals. A name whose only
-behaviour is to point somewhere else is surface with nothing behind it, and
-workerd already refuses a call to a missing method ("The RPC receiver does
-not implement …"). `rpc-surface.do.test.ts` pins both lists:
-`AuthService` is `authChallenge`, `authenticate`, `getAuthorityState`,
+**The gates, and the re-check after the signer.** Before calling the signer,
+`sign()` needs credentials that are live (held and unexpired), a binary
+payload, a claimed format that is one of `raw`, `dsse` or `git-commit`, a
+signing scope, a signer, and the held certs' epoch equal to the authority's.
+That epoch check is the revocation lever `proxy()` pulls. It then hands the
+signer a private copy of the payload, bounded by a **10 s timeout**
+(`signer_timeout`; a throw is `signer_failed`), so a stalled signer cannot pin
+the call open. **After the signer returns, the session is checked again.** If
+it was disposed or its certs expired meanwhile, `sign()` refuses, and it
+re-reads the epoch, refusing a move as `revoked_during_sign`. So a signer
+that stalls past a `revokeEpoch()` or an expiry gets no endorsement and no
+`allowed: true` line dated after it. Last, the result is returned only if it
+verifies with the signing CERT's public key over the original payload
+(`signature_invalid` otherwise). Every outcome writes one `type: "sign"`
+audit line with `allowed`, and a `reason` on refusal. The signature,
+certificate and identity `sign()` returns therefore always agree, and the
+audit line records what was actually produced. `authenticate()` takes no key
+in any form; an earlier draft of this change took PKCS#8 bytes and was
+withdrawn.
+
+**The old top-level methods moved to the session.** `AuthService.proxy()`,
+`sign()` and `identity()` are removed rather than kept as refusals: they are
+`AuthSession` methods now, and none of them could work over a binding before.
+A name whose only behaviour is to point somewhere else is surface with
+nothing behind it, and workerd already refuses a call to a missing method
+("The RPC receiver does not implement …"). `rpc-surface.do.test.ts` pins both
+lists. `AuthService` is `authChallenge`, `authenticate`, `getAuthorityState`,
 `getCACertificatePem`, `getPublicKeyPem`, `mintBridgeCert` and
-`verifySession`, and `AuthSession` is `identity`, `proxy` and `sign`, plus
-the `Symbol.dispose` disposer.
+`verifySession`. `AuthSession` is `identity`, `proxy` and `sign`, plus the
+`Symbol.dispose` disposer.
 
-**`authChallenge()` is rate limited.** Any binding holder can call it
-without authenticating, and each call writes one PoP-nonce row in the
-authority. It now spends the `CERT_LIMITER` binding (10 per 60 s per key)
-under its own `authchallenge:` key prefix before it touches the DO. The key is
-the calling binding's `props`, which the operator sets per binding. It is not
-the requested identity, because the caller types that and could rotate it to
-dodge a per-identity limit. **Bindings without `props` share one bucket.** A
-caller that wants its own budget needs its binding to set `props` (in
-`config.capnp`, `props = (json = "...")` on the service binding; a Worker
-calling a loopback entrypoint passes `ctx.exports.AuthService({ props })`).
+**`authChallenge()` is rate limited; every agent binding must set
+`props`.** Any binding holder can call it without authenticating, and each
+call writes one PoP-nonce row in the authority. It is throttled before the DO
+is touched, on the `CERT_LIMITER` binding (10 per 60 s per key) under its own
+`authchallenge:` key prefix. Within `authenticate()`, the free challenge
+format and age checks also run before any DO call or X.509 parse, so a junk
+call is refused for nothing (`auth.pop.cheap-first`).
+
+- **With `props`** (the normal case), the key is the binding's `props`, which
+  the operator sets per binding and the caller cannot change. Each agent
+  binding gets its own budget. Every agent's binding must set distinct
+  `props`: `props = (json = "...")` on the service binding in
+  `config.capnp`, as `worker/examples/config-colocated.capnp` does, or
+  `ctx.exports.AuthService({ props })` from a Worker calling a loopback
+  entrypoint.
+- **Without `props`** all callers look the same, so a single shared bucket
+  would let one agent lock out every peer (security review M1). Instead each
+  props-less call spends two budgets, checked in this order:
+  - a bucket per **claimed identity** (`authchallenge:null:id:<identity>`, on
+    the same limiter), so identity A draining its budget does not refuse
+    identity B;
+  - a **shared per-isolate cap** of 60 per 60 s over all props-less callers,
+    because the identity is the caller's to choose, and rotating it must not
+    buy unlimited nonce rows.
+
+  The identity bucket is checked first, so a caller hammering its own
+  exhausted identity never touches the shared cap. A caller that rotates
+  identities can still exhaust the shared cap, and with it every props-less
+  peer. That remaining lever is why every binding should set `props`.
 
 If `CERT_LIMITER` is not bound, as in a self-hosted workerd config without
 it, `authChallenge()` does not fail open the way the HTTP routes' limiters
 do. A fallback limiter enforces the same 10 per 60 s per key
-(`worker/src/isolate-rate-limiter.ts`). **That fallback is per-isolate**:
-its counts live in one isolate's memory, so each isolate (each Cloudflare
-location, each workerd process, each restart) counts from zero. On a single
-self-hosted workerd process that is a real bound. A Cloudflare deployment
-binds `CERT_LIMITER` (`[[ratelimits]]`), so the fallback is not used there,
-and it would be a weak substitute if it were. Its memory is capped at 1024 live
-keys. Once all of them are in their window, a new key is refused rather than
-admitted.
+(`worker/src/isolate-rate-limiter.ts`). **The fallback and the props-less
+shared cap are per-isolate.** Their counts live in one isolate's memory, so
+each isolate (each Cloudflare location, each workerd process, each restart)
+counts from zero. On a single self-hosted workerd process that is a real
+bound. A Cloudflare deployment binds `CERT_LIMITER` (`[[ratelimits]]`), so
+the fallback is not used there, and it would be a weak substitute if it
+were. Each limiter's memory is capped at 1024 live keys. Once all of them
+are in their window, a new key is refused rather than admitted.
 
 Covered by `auth.session.proxy`, `auth.session.sign`,
 `auth.session.sign.wrong-key`, `auth.session.sign.signer-throws`,
 `auth.session.disposed`, `auth.session.isolation`,
 `auth.session.no-top-level` and `auth.session.challenge-throttled`
 (`worker/src/auth-binding-session.do.test.ts`, over a real loopback binding
-specialised with `props`), and by `auth.session.dispose`, `auth.sign.epoch`,
-`auth.sign.expired`, `auth.sign.scope`, `auth.sign.verified`,
+specialised with `props`), and by `auth.pop.cheap-first`,
+`auth.session.dispose`, `auth.session.expiry-drops`, `auth.sign.epoch`,
+`auth.sign.expired`, `auth.sign.scope`, `auth.sign.claimed-format`,
+`auth.sign.verified`, `auth.sign.timeout`, `auth.sign.expired-during`,
+`auth.sign.revoked-during`, `auth.sign.disposed-during`,
 `auth.challenge.throttled`, `auth.challenge.keyed-by-binding`,
-`auth.challenge.fallback` and `auth.challenge.per-binding`
-(`worker/src/__tests__/auth-pop.test.ts`).
+`auth.challenge.fallback`, `auth.challenge.per-binding`,
+`auth.challenge.noprops-per-identity`,
+`auth.challenge.noprops-per-identity-bound` and
+`auth.challenge.noprops-shared-cap` (`worker/src/__tests__/auth-pop.test.ts`).
 
 ## Enforcement guarantees
 
@@ -525,8 +586,9 @@ specialised with `props`), and by `auth.session.dispose`, `auth.sign.epoch`,
 >   by `revokeEpoch()` (which stops every cert of its epoch) or by expiry;
 > - (fixed, `notme-153f03`) `sign()` did not run the epoch check, on the
 >   ground that every verifier checks the cert's epoch itself
->   (`verifyX509`). It now runs the same epoch check as `proxy()` and
->   refuses expired certs too, since a session can outlive them;
+>   (`verifyX509`). It now runs the same epoch check as `proxy()`, before
+>   AND after the caller's signer, and refuses expired certs too, since a
+>   session can outlive them;
 > - (fixed, `notme-bad2e5`) the IPv6 gap in the denylist: `new URL()` keeps
 >   brackets on IPv6 hostnames, so the old `startsWith("fd00:")` test never
 >   fired and IPv4-mapped literals slipped through. The policy now lives in

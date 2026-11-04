@@ -117,9 +117,21 @@ const agentWorker :Workerd.Worker = (
   ],
 
   bindings = [
-    # The ONLY way the agent can interact with the outside world
+    # The ONLY way the agent can interact with the outside world.
+    #
+    # `props` names THIS agent to notme, and every agent's NOTME binding
+    # must set distinct props (notme-153f03, review M1). authChallenge() is
+    # rate limited per binding props (10 / 60 s), so a binding with its own
+    # props has its own budget. Bindings WITHOUT props are limited per
+    # claimed identity plus one cap they all share, so one props-less agent
+    # can still crowd out its props-less peers. Give a second agent Worker
+    # its own value, e.g. "{\"agent\":\"reviewer\"}".
     ( name = "NOTME",
-      service = (name = "notme", entrypoint = "AuthService"),
+      service = (
+        name = "notme",
+        entrypoint = "AuthService",
+        props = (json = "{\"agent\":\"example-agent\"}"),
+      ),
     ),
   ],
 

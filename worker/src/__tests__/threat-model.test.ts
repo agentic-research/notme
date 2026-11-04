@@ -135,7 +135,7 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    const alice = await makeCreds("wimse://notme.bot/gha/alice");
+    const alice = await mintCreds(TM_CA, "wimse://notme.bot/gha/alice", ["bridgeCert", "sign:attestation"]);
     const sessA = await authenticateWithPop(a, alice);
     await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
 
