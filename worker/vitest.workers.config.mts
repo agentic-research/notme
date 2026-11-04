@@ -99,12 +99,26 @@ export const CT_LIVE_SUITES = ["src/ct-acceptance.do.test.ts"];
  */
 export const WARM_SETUP_FILES = ["./src/__tests__/setup/warm-worker-modules.ts"];
 
+/**
+ * The Durable Object suite is hermetic, like the plain one (notme-73202e): a
+ * fetch to any non-loopback host is refused and fails the test that made it,
+ * naming the URL. The SAME module the plain suite loads, installed in the
+ * pool's isolate. FIRST in setupFiles, so everything loaded after it (the
+ * warm-up, and any fixture that wraps fetch, such as helpers/gha-token.ts and
+ * helpers/oidc-issuer.ts) wraps the guard and falls through to it. The tests
+ * serve their own hosts; nothing here reaches production.
+ *
+ * Not applied to vitest.workers.ct-live.config.mts: that suite exists to talk
+ * to a real transparency log, from the proxy worker, by design.
+ */
+export const NO_NETWORK_SETUP_FILES = ["./src/__tests__/setup/no-network.ts"];
+
 export default defineConfig({
   resolve: { alias: { "@peculiar/x509": x509Dir } },
   plugins: [cloudflareTest({ main: "./worker.ts", miniflare: baseMiniflare })],
   test: {
     include: ["src/**/*.do.test.ts"],
-    setupFiles: WARM_SETUP_FILES,
+    setupFiles: [...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],
     exclude: [...configDefaults.exclude, ...CT_BOUND_SUITES, ...CT_LIVE_SUITES],
   },
 });

@@ -180,6 +180,25 @@ describe("RevocationAuthority", () => {
     });
   });
 
+  it("revocation.seqno.monotonic — rejects a non-positive, non-finite or non-numeric seqno", async () => {
+    // A null/undefined/NaN seqno compares false against everything, so without
+    // this guard it would slip past the rollback check. JSON turns NaN and
+    // Infinity into null, which is what a hostile caller can actually send.
+    const id = env.REVOCATION.idFromName("test-reject-invalid");
+    const stub = env.REVOCATION.get(id);
+    await runInDurableObject(stub, async (instance: RevocationAuthority) => {
+      await seqnoCheck(instance, "test", 100);
+      for (const bad of [0, -1, null, "101", undefined] as unknown as number[]) {
+        const result = await seqnoCheck(instance, "test", bad);
+        expect(result.ok, `seqno ${JSON.stringify(bad)}`).toBe(false);
+        expect(result.reason, `seqno ${JSON.stringify(bad)}`).toBe("invalid_seqno");
+      }
+      // ...and none of them disturbed the stored high-water mark.
+      expect((await seqnoCheck(instance, "test", 99)).reason).toBe("rollback");
+      expect((await seqnoCheck(instance, "test", 100)).ok).toBe(true);
+    });
+  });
+
   it("isolates seqno state per issuer", async () => {
     const id = env.REVOCATION.idFromName("test-isolation");
     const stub = env.REVOCATION.get(id);

@@ -39,7 +39,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 // Each case runs the real Taskfile + curl against the stub: seconds, not ms.
 vi.setConfig({ testTimeout: 30_000 });
 
-const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const ROOT = fileURLToPath(new URL("../../../", import.meta.url).href);
 
 const OLD = { id: "01d00000-0000-4000-8000-000000000000", commit: "1".repeat(40) };
 const NEW = { id: "4e700000-0000-4000-8000-000000000000", commit: "2".repeat(40) };

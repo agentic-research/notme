@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const ROOT = fileURLToPath(new URL("../../../", import.meta.url).href);
 const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 // worker:verify's checks moved out of the Taskfile into a script so they can
 // run against a stub and a local Worker (notme-325916, notme-6ae724). The

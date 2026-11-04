@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const config = readFileSync(
-  fileURLToPath(new URL("../../wrangler.toml.example", import.meta.url)),
+  fileURLToPath(new URL("../../wrangler.toml.example", import.meta.url).href),
   "utf8",
 );
 

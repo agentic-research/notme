@@ -34,6 +34,13 @@ Per fixture `<name>`:
 purpose — a consumer can only pass by sorting (RFC 8949 §4.2:
 length-then-bytewise, not alphabetical), never by insertion order.
 
+`cabundle-rotation.json` is the production-shaped multi-key case: two real
+32-hex-char kids (`lowercasehex(SHA-256(SPKI)[:16])`, from raw keys `00..1f`
+and `20..3f`), 32-byte key values, a present `prevKeyId`, and `keys` listed
+in non-canonical order. Equal-length kids are decided by the bytewise
+tiebreak, not the length rule `cabundle-multikey` exercises, and a populated
+`prevKeyId` with two keys is the rotation-grace state `generateBundle` emits.
+
 ## Integrity anchor (notme-1629fe)
 
 The golden bytes are the encoder's own output written to a file, so by

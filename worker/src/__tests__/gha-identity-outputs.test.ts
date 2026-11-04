@@ -21,7 +21,7 @@ import { describe, expect, it } from "vitest";
 
 function loadYaml(relPath: string): any {
   return parse(
-    readFileSync(fileURLToPath(new URL(relPath, import.meta.url)), "utf8"),
+    readFileSync(fileURLToPath(new URL(relPath, import.meta.url).href), "utf8"),
   );
 }
 
@@ -30,7 +30,7 @@ const action = loadYaml("../../../action/action.yml");
 
 // `on:` parses as the boolean true in YAML 1.1 unless quoted — GitHub accepts
 // both, so read whichever key is present rather than assuming.
-const on = workflow.on ?? workflow[true];
+const on = workflow.on ?? workflow["true"];
 const workflowCallOutputs: Record<string, { value?: string }> =
   on.workflow_call.outputs;
 const jobOutputs: Record<string, string> = workflow.jobs.exchange.outputs;
@@ -68,7 +68,7 @@ describe("gha-identity.yml output contract", () => {
     // was written for, one file over. An external consumer wiring
     // steps.<id>.outputs.github_token would silently get "".
     const src = readFileSync(
-      fileURLToPath(new URL("../../../action/src/index.ts", import.meta.url)),
+      fileURLToPath(new URL("../../../action/src/index.ts", import.meta.url).href),
       "utf8",
     );
     const setOutputs = new Set(
@@ -84,7 +84,7 @@ describe("gha-identity.yml output contract", () => {
 
   it("action.yml declares every output the action source sets", () => {
     const src = readFileSync(
-      fileURLToPath(new URL("../../../action/src/index.ts", import.meta.url)),
+      fileURLToPath(new URL("../../../action/src/index.ts", import.meta.url).href),
       "utf8",
     );
     const setOutputs = [

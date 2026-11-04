@@ -61,6 +61,9 @@ export async function installGhaSigner(opts: {
     if (url.startsWith(GHA_ISSUER)) {
       return new Response(jwks, { headers: { "content-type": "application/json" } });
     }
+    // Anything that is not the GHA JWKS goes to the prior fetch, which in the
+    // DO suite is the no-network guard (setup/no-network.ts, notme-73202e): a
+    // test that needs another host serves it (helpers/oidc-issuer.ts).
     return realFetch(input as RequestInfo, init);
   }) as typeof fetch;
 

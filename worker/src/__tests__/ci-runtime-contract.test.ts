@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const ROOT = fileURLToPath(new URL("../../../", import.meta.url).href);
 const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 
 /** The text of one top-level job in a workflow (two-space-indented key). */

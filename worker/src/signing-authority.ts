@@ -5041,7 +5041,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * MUST gate runaway alerts on `warmupComplete === true` before treating
    * `driftRatio > 1` as an anomaly. After warmup, sustained driftRatio
    * above ~1.2 indicates the alarm is firing faster than the
-   * BUNDLE_REFRESH_MS cadence prescribes.
+   * BUNDLE_REFRESH_MS cadence prescribes; a driftRatio far BELOW 1, or
+   * totalFires 0 with warmupComplete false long after deploy, means the alarm
+   * is slow or dead (the 130-day failure, notme-4896d8).
+   *
+   * Who reads it (notme-e992ad): the only consumer is an operator, through
+   * `GET /admin/alarm-health` (authorityManage-gated, worker.ts). Nothing
+   * alerts on it automatically, deliberately: the unauthenticated, outcome-
+   * level probe is the bundle's own age (`/internal/ca-bundle` issuedAt,
+   * checked by scripts/check-authority.sh), which catches a dead alarm
+   * whatever its cause. The derived fields are pinned by
+   * alarm-health.do.test.ts so what the operator reads is correct.
    */
   async getAlarmHealth(): Promise<{
     totalFires: number;

@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { AUTHORITY_GRANT_TYPES } from "../as-metadata";
 
-const root = fileURLToPath(new URL("../../", import.meta.url));
+const root = fileURLToPath(new URL("../../", import.meta.url).href);
 const docs = readFileSync(`${root}public/_api-docs.html`, "utf8");
 // _auth.html is the authority's OWN landing page and carried the same stale
 // claims — the same /exchange-token and /api/cert/register rows, and a
