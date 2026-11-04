@@ -71,7 +71,10 @@ GHA_ALLOWED_OWNERS = "your-org"
 # Where AuthService.proxy() may send an agent's requests (ADR-009,
 # notme-baea8c): comma-separated hosts, `*.suffix` for subdomains, https only.
 # Unset allows NOTHING — proxy() refuses every destination until it is set.
-# PROXY_ALLOWED_DESTINATIONS = "api.github.com,*.notme.bot"
+# List only what agents need, and never a wildcard over this authority's own
+# zone: its own host (SIGNET_AUTHORITY_URL, SITE_URL) is refused unless it
+# is listed exactly, and nothing of the admin surface should be.
+# PROXY_ALLOWED_DESTINATIONS = "api.github.com"
 # Renewal binding v3 (notme-c9fc8c): "on" hands out enrollment ids, so
 # task-cert clients start signing v3. Leave it "off" through canary and
 # promote; set "on" only once the release is at 100%. With it on, never roll

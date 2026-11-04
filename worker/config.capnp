@@ -70,9 +70,11 @@ const notmeWorker :Workerd.Worker = (
     # Where AuthService.proxy() may send an agent's requests (ADR-009,
     # notme-baea8c): comma-separated hosts, `*.suffix` for subdomains, https
     # only. Unset allows NOTHING, so proxy() refuses every destination until
-    # this is set, e.g.:
+    # this is set. List only what agents need; never a wildcard over the
+    # authority's own zone. The authority's own host (SIGNET_AUTHORITY_URL,
+    # SITE_URL) is refused unless listed exactly. E.g.:
     # ( name = "PROXY_ALLOWED_DESTINATIONS",
-    #   text = "api.github.com,*.notme.bot",
+    #   text = "api.github.com",
     # ),
     # Key storage mode — ephemeral for local dev (no private key on disk)
     ( name = "NOTME_KEY_STORAGE",

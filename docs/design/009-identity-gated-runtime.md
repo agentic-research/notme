@@ -283,14 +283,18 @@ export default {
 > 2. Refuses (`credentials_expired`) if the held certs have expired. Nothing
 >    re-authenticates transparently; the caller must call `authenticate()`
 >    again.
-> 3. Refuses (`destination_denied`) if `isDeniedDestination(url)` is true:
->    the hard metadata denylist in `worker/src/destination-policy.ts`
+> 3. Refuses (`destination_invalid`) if the URL does not parse, then
+>    (`destination_denied`) if `isDeniedDestination(url)` is true: the hard
+>    metadata denylist in `worker/src/destination-policy.ts`
 >    (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`,
->    169.254.0.0/16, fc00::/7, fe80::/10, IPv4-mapped forms of those, and
->    unparseable URLs). No configuration overrides it.
+>    169.254.0.0/16, fc00::/7, fe80::/10, IPv4-mapped forms of those). No
+>    configuration overrides it.
 > 4. Refuses (`destination_not_allowed`) unless the URL is https and its host
 >    is on `PROXY_ALLOWED_DESTINATIONS` — see "Destination allowlist" below.
->    **Unset or empty allows nothing.**
+>    **Unset or empty allows nothing.** Then refuses (`destination_self`) the
+>    authority's own host — the hosts of `SIGNET_AUTHORITY_URL` and
+>    `SITE_URL` — unless the allowlist names it exactly; a wildcard over the
+>    authority's zone does not admit its admin surface.
 > 5. Refuses (`scope_insufficient`) unless the held cert's scopes include
 >    `bridgeCert`. This is a single capability check. The request carries no
 >    scopes, so there is no `request.scopes ⊆ cert.scopes` relation to check.
@@ -299,16 +303,24 @@ export default {
 >    authority's current epoch (`getAuthorityState()`, one DO RPC per call).
 >    `revokeEpoch()` and `rotate()` both move the epoch, so either stops held
 >    certs at once instead of when they expire. Strict equality: a cert from a
->    later epoch than the authority's is refused too.
-> 7. Calls plain `fetch(url, { method, headers, body, redirect: "manual" })`.
+>    later epoch than the authority's is refused too. If that RPC fails, the
+>    request is refused (`authority_unavailable`), not sent.
+> 7. Calls plain `fetch(url, { method, headers, body, redirect: "manual" })`,
+>    with the caller's `Host`, `cf-*`, `x-forwarded-*`, `forwarded`,
+>    `x-real-ip` and hop-by-hop headers (and any header its `Connection`
+>    names) removed: on Cloudflare a `Host` or `cf-*` header can steer a
+>    subrequest to a hostname the allowlist did not name.
 >    A redirect is returned to the agent, not followed, so a listed host
 >    cannot forward the request to one the allowlist refuses. The held P-256
 >    cert is not attached; there is no mTLS on this path. (mTLS with the
 >    bridge key is what the Rust proxy in `proxy/` does; that is a different
 >    code path.)
 > 8. Logs a JSON line with `allowed: true` and `response_status`, or, if the
->    fetch itself throws, `allowed: true` and `error`. Every refusal above
->    logs `allowed: false` with `reason` naming its gate.
+>    fetch or the response body read throws, `allowed: true` and `error`.
+>    Every refusal above logs `allowed: false` with `reason` naming its gate.
+>    The logged `destination` drops userinfo and the fragment, replaces the
+>    query with `?<redacted>`, and is capped at 512 characters; `method` at
+>    16.
 >
 > Covered by `worker/src/__tests__/proxy-gates.test.ts` (`proxy.allowlist.*`,
 > `proxy.epoch.*`, `proxy.audit.*`).
@@ -415,10 +427,18 @@ Cloud metadata endpoints are hard-denied (same approach as [nono](https://nono.s
 > `PROXY_ALLOWED_DESTINATIONS` is a comma-separated list of hosts — not the
 > JSON above — read on every call from the Worker's environment (a wrangler
 > var, or a `text` binding in `config.capnp`). An entry is an exact host
-> (`api.github.com`) or `*.` plus a suffix (`*.notme.bot`), which matches
+> (`api.github.com`) or `*.` plus a suffix (`*.example.com`), which matches
 > subdomains and not the apex. It is matched against the URL's host
-> including any non-default port, and only https is proxied. A bare `*`, or
-> a `*` anywhere but the leading label, is dropped. **Unset or empty allows
+> including any non-default port, and only https is proxied. Each entry is
+> normalised by the WHATWG URL parser (a Unicode entry becomes its
+> punycode). Dropped: a bare `*`, or a `*` anywhere but the leading label;
+> anything that is not a bare host; a wildcard over an IP literal
+> (`*.0.0.1`); and a wildcard over a single label or a known public suffix
+> (`*.com`, `*.co.uk`) — that list is short and hand-kept, not the Public
+> Suffix List. The JSON example above lists `*.notme.bot`; do not copy it:
+> a wildcard over the authority's own zone would put its admin surface
+> behind its own egress, which is why `proxy()` refuses the authority's own
+> host unless it is listed exactly. **Unset or empty allows
 > nothing** — this ADR did not say which way an unset list should fail, and
 > an authority that has not said where its agents may go should send them
 > nowhere, as an unset `GHA_ALLOWED_OWNERS` trusts no one (`notme-1532eb`).
@@ -447,8 +467,11 @@ Every proxied request and signing operation is logged as structured JSON:
 > **Updated 2026-11-03 (`notme-baea8c`).** For `type: "proxy"` entries,
 > `allowed` is the decision: a refused request logs `allowed: false` with a
 > `reason` naming the gate (`not_authenticated`, `credentials_expired`,
-> `destination_denied`, `destination_not_allowed`, `scope_insufficient`,
+> `destination_invalid`, `destination_denied`, `destination_not_allowed`,
+> `destination_self`, `scope_insufficient`, `authority_unavailable`,
 > `epoch_mismatch`) before it throws, and has no `response_status`.
+> `destination` is redacted (no userinfo or fragment, query replaced by
+> `?<redacted>`, at most 512 characters).
 > `identity` is `null` when nothing is held. `scope_checked` is still the
 > constant `bridgeCert`, the only scope `proxy()` checks.
 

@@ -64,7 +64,14 @@ import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/crit
 import { buildInfo, disclosedVersionId } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
 import { clientIpBucket } from "./src/client-ip-key";
-import { isAllowedDestination, isDeniedDestination, parseDestinationAllowlist } from "./src/destination-policy";
+import {
+  authoritySelfHosts,
+  forwardableHeaders,
+  isAllowedDestination,
+  isDeniedDestination,
+  parseDestinationAllowlist,
+  urlForLog,
+} from "./src/destination-policy";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -456,15 +463,18 @@ export class AuthService extends WorkerEntrypoint<any> {
    * Proxy an HTTP request for the agent Worker, which calls this instead of
    * fetch() (which is disabled). Gates, in order (notme-baea8c):
    *   1. held certs present and unexpired;
-   *   2. destination not on the metadata denylist;
-   *   3. destination on PROXY_ALLOWED_DESTINATIONS — unset allows nothing;
+   *   2. destination parses, and is not on the metadata denylist;
+   *   3. destination on PROXY_ALLOWED_DESTINATIONS — unset allows nothing —
+   *      and not the authority's own host unless that is listed exactly;
    *   4. `bridgeCert` scope held;
    *   5. the held certs' epoch equals the authority's current epoch, so a
-   *      revokeEpoch() or rotate() stops them before they expire.
+   *      revokeEpoch() or rotate() stops them before they expire (an RPC
+   *      failure here refuses).
    * Every outcome writes one audit line whose `allowed` is the decision and,
-   * on a refusal, `reason` names the gate. Redirects are returned, not
-   * followed: a followed redirect would let a listed host send the request
-   * to one the allowlist refuses.
+   * on a refusal, `reason` names the gate; the logged URL is redacted.
+   * Redirects are returned, not followed: a followed redirect would let a
+   * listed host send the request to one the allowlist refuses. Host, cf-*,
+   * x-forwarded-* and hop-by-hop headers are not forwarded.
    *
    * The outbound request is a plain fetch — the held P-256 cert is NOT
    * attached (no mTLS on this path). Workers present a client certificate
@@ -491,8 +501,9 @@ export class AuthService extends WorkerEntrypoint<any> {
           ts: new Date().toISOString(),
           type: "proxy",
           identity: this.#heldCerts?.identity ?? null,
-          destination: request.url,
-          method,
+          // Redacted and bounded (review F8): no userinfo, no query values.
+          destination: urlForLog(request.url),
+          method: String(method).slice(0, 16),
           scope_checked: "bridgeCert",
           ...fields,
           duration_ms: Date.now() - start,
@@ -511,14 +522,28 @@ export class AuthService extends WorkerEntrypoint<any> {
       return deny("credentials_expired", "credentials expired — re-authenticate");
     }
 
-    // Destination: the hard denylist first, then the configured allowlist.
+    // Destination: parseable, then the hard denylist, then the configured
+    // allowlist, then never the authority itself unless listed exactly.
+    let destHost: string;
+    try {
+      destHost = new URL(request.url).host.toLowerCase();
+    } catch {
+      return deny("destination_invalid", "destination invalid — not a parseable URL");
+    }
     if (isDeniedDestination(request.url)) {
       return deny("destination_denied", "destination denied — cloud metadata endpoints are blocked");
     }
-    if (!isAllowedDestination(request.url, parseDestinationAllowlist(this.env.PROXY_ALLOWED_DESTINATIONS))) {
+    const allowlist = parseDestinationAllowlist(this.env.PROXY_ALLOWED_DESTINATIONS);
+    if (!isAllowedDestination(request.url, allowlist)) {
       return deny(
         "destination_not_allowed",
         "destination not allowed — not on PROXY_ALLOWED_DESTINATIONS (https only; an unset allowlist allows nothing)",
+      );
+    }
+    if (authoritySelfHosts(this.env).has(destHost) && !allowlist.has(destHost)) {
+      return deny(
+        "destination_self",
+        "destination not allowed — the authority's own host is proxied only when PROXY_ALLOWED_DESTINATIONS lists it exactly",
       );
     }
 
@@ -529,7 +554,12 @@ export class AuthService extends WorkerEntrypoint<any> {
 
     // Epoch: the revocation lever. Last, because it is the one gate that
     // costs an authority RPC.
-    const { epoch } = await this.#getAuthority().getAuthorityState();
+    let epoch: number;
+    try {
+      ({ epoch } = await this.#getAuthority().getAuthorityState());
+    } catch {
+      return deny("authority_unavailable", "authority unavailable — cannot check the credentials' epoch");
+    }
     if (held.epoch !== epoch) {
       return deny(
         "epoch_mismatch",
@@ -542,7 +572,8 @@ export class AuthService extends WorkerEntrypoint<any> {
     try {
       res = await fetch(request.url, {
         method,
-        headers: request.headers || {},
+        // Host, cf-*, x-forwarded-* and hop-by-hop headers stripped (F6).
+        headers: forwardableHeaders(request.headers),
         body: request.body,
         redirect: "manual",
       });
@@ -556,7 +587,14 @@ export class AuthService extends WorkerEntrypoint<any> {
     res.headers.forEach((v, k) => {
       responseHeaders[k] = v;
     });
-    const body = await res.text();
+    let body: string;
+    try {
+      body = await res.text();
+    } catch (e) {
+      // Sent and answered, but the body failed: still one line (review F7).
+      audit({ allowed: true, response_status: res.status, error: (e as Error)?.message ?? String(e) });
+      throw e;
+    }
 
     audit({ allowed: true, response_status: res.status });
 
