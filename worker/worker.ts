@@ -644,17 +644,10 @@ function getConfig(env: any) {
  * config said nothing (notme-1532eb). An authority that has not declared
  * whose workflows it trusts must trust none.
  */
-export function getAllowedOwners(env: {
-  GHA_ALLOWED_OWNERS?: string;
-}): Set<string> {
-  const raw: string = env.GHA_ALLOWED_OWNERS ?? "";
-  return new Set(
-    raw
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean),
-  );
-}
+// Lives in src/gha-oidc.ts so the DO's mintBridgeCert applies the SAME
+// allowlist (security review F7); re-exported for the routes and tests.
+export { getAllowedOwners } from "./src/gha-oidc";
+import { getAllowedOwners } from "./src/gha-oidc";
 
 const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 

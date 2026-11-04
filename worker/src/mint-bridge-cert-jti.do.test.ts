@@ -100,6 +100,31 @@ describe("mintBridgeCert({kind:'gha-oidc'}) spends the token's jti (notme-f850f2
     expect(await viaBinding(token)).toEqual({ ok: false, reason: "gha_token_reused" });
   });
 
+  it("mint.gha.owner.allowlist — a token from an owner not in GHA_ALLOWED_OWNERS is refused via the binding, and its jti is not spent", async () => {
+    // Pre-existing gap (security review F7): /cert/gha and /token refuse an
+    // owner outside the allowlist; the binding minted for any GitHub repo
+    // whose token said aud=notme.bot.
+    const token = await gha.token({
+      repository: "someone-else/notme",
+      repository_owner: "someone-else",
+      sub: "repo:someone-else/notme:ref:refs/heads/main",
+    });
+    expect(await viaBinding(token)).toEqual({ ok: false, reason: "invalid_gha_token" });
+    // Refused BEFORE the consume: a refusal burns nothing.
+    expect(await env.CA_BUNDLE_CACHE.get(`jti:${jtiOf(token).jti}`)).toBeNull();
+    // And the allowlist check is case-insensitive, as the routes' is.
+    const upper = await gha.token({ repository_owner: OWNER.toUpperCase() });
+    expect((await viaBinding(upper)).ok).toBe(true);
+  });
+
+  it("mint.gha.ttl.clamped — a caller-chosen ttlMs cannot exceed the /cert/gha bound (GHA_CERT_TTL_MS, 5 min)", async () => {
+    const r = await authority().mintBridgeCert({ kind: "gha-oidc", token: await gha.token() }, pem, 24 * 3600_000);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    // expires_at is unix seconds.
+    expect(r.expires_at - Math.floor(Date.now() / 1000)).toBeLessThanOrEqual(5 * 60 + 5);
+  });
+
   it("mint.gha.jti.required — a token with no jti is refused, as /cert/gha refuses it", async () => {
     const token = await gha.token({ jti: undefined });
     expect(await viaBinding(token)).toEqual({ ok: false, reason: "invalid_gha_token" });

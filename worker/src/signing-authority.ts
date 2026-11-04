@@ -64,6 +64,10 @@ interface SigningAuthorityEnv {
    * default as the route's `getConfig` so the two cannot disagree.
    */
   GHA_CERT_AUDIENCE?: string;
+  /** Owner allowlist for the gha-oidc proof — the same var /cert/gha reads (security review F7). */
+  GHA_ALLOWED_OWNERS?: string;
+  /** Upper bound on a gha-oidc bridge cert's lifetime — /cert/gha's bound (rig-e3549f). */
+  GHA_CERT_TTL_MS?: string;
   NOTME_KEY_STORAGE?: string;
   NOTME_KEK_SECRET?: string;
   /**
@@ -1786,7 +1790,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     if (proof?.kind === "gha-oidc") {
       // Audience from OUR env, never the envelope (notme-51ccd7).
       const expectedAudience = this.env.GHA_CERT_AUDIENCE ?? "notme.bot";
-      const { validateGHAToken } = await import("./gha-oidc");
+      const { validateGHAToken, getAllowedOwners } = await import("./gha-oidc");
       let claims: Awaited<ReturnType<typeof validateGHAToken>>;
       try {
         claims = await validateGHAToken(proof.token, expectedAudience);
@@ -1805,6 +1809,22 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         console.warn({ event: "mint.gha_proof_rejected", detail: "jti claim required" });
         return { ok: false, reason: "invalid_gha_token" };
       }
+      // OWNER ALLOWLIST (security review F7, pre-existing): /cert/gha and the
+      // /token exchange refuse a repository owner outside GHA_ALLOWED_OWNERS,
+      // and this path did not — any GitHub repo's aud=notme.bot token handed
+      // to a binding holder bought a cert. Checked BEFORE the jti consume, so
+      // a refusal spends nothing.
+      if (!getAllowedOwners(this.env).has(String(claims.repository_owner).toLowerCase())) {
+        console.warn({ event: "mint.gha_proof_rejected", detail: "repository owner not permitted" });
+        return { ok: false, reason: "invalid_gha_token" };
+      }
+      // The caller's ttlMs is capped at /cert/gha's bound (rig-e3549f): the
+      // binding must not mint a longer-lived workload cert than the route.
+      const ghaTtlBound = Number(this.env.GHA_CERT_TTL_MS ?? 300_000);
+      ttlMs =
+        typeof ttlMs === "number" && Number.isFinite(ttlMs) && ttlMs > 0
+          ? Math.min(ttlMs, ghaTtlBound)
+          : ghaTtlBound;
       // Spent in BOTH keyspaces the routes use. KV `jti:<jti>` is the one
       // /cert/gha, /cert, /token and /join share — eventually consistent, so
       // read here and written after. The DO's `oidc:<iss>#<jti>` is the

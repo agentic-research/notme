@@ -39,6 +39,24 @@ export const GHAClaimsSchema = z.object({
 
 export type GHAClaims = z.infer<typeof GHAClaimsSchema>;
 
+/**
+ * GHA_ALLOWED_OWNERS (CSV, case-insensitive) as a set. Empty or absent means
+ * NO owner is allowed. One parser for every GitHub-token path: /cert/gha,
+ * the /token exchange, and the AUTH binding's mintBridgeCert gha-oidc proof,
+ * which skipped the check until security review F7.
+ */
+export function getAllowedOwners(env: {
+  GHA_ALLOWED_OWNERS?: string;
+}): Set<string> {
+  const raw: string = env.GHA_ALLOWED_OWNERS ?? "";
+  return new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
 interface JWK {
   kty: string;
   kid: string;

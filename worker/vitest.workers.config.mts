@@ -44,6 +44,10 @@ export const baseMiniflare = {
     // rather than from the request, so a caller cannot name itself the
     // subject permitted to bootstrap.
     BOOTSTRAP_GHA_SUBJECT: "repo:agentic-research/notme:ref:refs/heads/main",
+    // The owner allowlist the DO's own mintBridgeCert gha-oidc path reads
+    // (security review F7): the DO env is THIS binding set, not the
+    // LOCAL_ENV a route test spreads into worker.fetch.
+    GHA_ALLOWED_OWNERS: "agentic-research",
     // Renewal binding v3 handed out (notme-c9fc8c, review M1): the suites
     // test the state AFTER the release is promoted and the var turned on.
     // Production and e2e default it off (wrangler.toml.example,
