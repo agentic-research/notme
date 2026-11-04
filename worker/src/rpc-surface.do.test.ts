@@ -386,7 +386,15 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
       // already read both (findPrincipalByOIDC, getPrincipalScopes) and mint
       // a session with getSessionSecret; the only write is a dpop_jtis row,
       // which at worst pre-spends a token whose jti the holder already knows.
-    ).toBe(66);
+      //
+      // 66 → 67: spendOidcJti (notme-b0d10f). The DO spend for /cert/gha,
+      // /cert (oidc proof), /token and /bootstrap/claim, which spent in KV
+      // alone. Reviewed: it takes no token, returns a boolean, and its only
+      // write is one dpop_jtis row under the `oidc:` prefix, kept to
+      // exp + 300s. A stub holder can pre-spend a token whose issuer and jti
+      // it already knows — the same reach loginWithFederated already gives,
+      // and a denial of service against one token, not a credential.
+    ).toBe(67);
   });
 });
 

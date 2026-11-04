@@ -1291,8 +1291,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * on purpose: SQLite's PRIMARY KEY, not a read-then-write, decides the
    * winner, and a caller can put it inside the same block as the write the
    * identifier licenses. Shared by DPoP proofs (`mintDPoPTokenOnce`) and
-   * OIDC proofs (`joinInviteWithFederated`, `loginWithFederated`, and the
-   * `gha-oidc` proof of `mintBridgeCert`), which all spend the one
+   * OIDC proofs (`joinInviteWithFederated`, `loginWithFederated`, the
+   * `gha-oidc` proof of `mintBridgeCert`, and `spendOidcJti` for /cert/gha,
+   * /cert and /token), which all spend the one
    * `oidc:<issuer>#<jti>` key from `#oidcJtiKey`.
    */
   #consumeJti(key: string, expiresAt: number): boolean {
@@ -4343,6 +4344,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    */
   static #oidcJtiKey(issuer: string, jti: string): string {
     return `oidc:${issuer}#${jti}`;
+  }
+
+  /**
+   * Spend a VERIFIED OIDC token's jti in the shared `oidc:<issuer>#<jti>`
+   * key: true the first time, false on every later call (notme-b0d10f).
+   * For the routes that mint without another DO block to put the consume
+   * in — /cert/gha, /cert with an `oidc` proof, and the /token exchange.
+   * They used to spend in KV `jti:<jti>` alone, which is eventually
+   * consistent, so the same token could win at two of them, or at one of
+   * them and a DO leg, inside KV's propagation window. Same key and same
+   * `exp + 300s` retention as /join, /auth/oidc/login and mintBridgeCert.
+   * The caller verifies the token and makes every refusal it can BEFORE
+   * calling, so a refusal spends nothing. Fails closed: a missing jti or a
+   * non-positive exp cannot be retained, so it is reported as spent.
+   */
+  async spendOidcJti(issuer: string, jti: string, exp: number): Promise<boolean> {
+    if (!issuer || !jti || !Number.isFinite(exp) || exp <= 0) return false;
+    this.#ensureSchema();
+    return this.#consumeJti(SigningAuthority.#oidcJtiKey(issuer, jti), exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS);
   }
 
   /**

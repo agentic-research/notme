@@ -90,7 +90,7 @@ export async function handleCertExchange(
   let authMethod: AuthMethod;
   // Set only for OIDC proofs: the token the PoP binds, and its jti/exp for
   // single-use accounting after the proofs verify.
-  let oidc: { token: string; jti: string; exp: number } | null = null;
+  let oidc: { token: string; issuer: string; jti: string; exp: number } | null = null;
 
   // ── Resolve proof to principal ──
 
@@ -161,7 +161,7 @@ export async function handleCertExchange(
     // LIVE grants — there is no cookie here to mistake for the source.
     grantedScopes = await authority.getPrincipalScopes(found);
     authMethod = oidcAuthMethod(identity.issuer);
-    oidc = { token: body.proof.token, jti: claims.jti, exp: Number(claims.exp) || 0 };
+    oidc = { token: body.proof.token, issuer: identity.issuer, jti: claims.jti, exp: Number(claims.exp) || 0 };
   } else if (body.proof.type === "bootstrap") {
     // Bootstrap code — deployer only
     const valid = await authority.consumeBootstrapCode(body.proof.code);
@@ -310,6 +310,11 @@ export async function handleCertExchange(
       }
       const key = `jti:${oidc.jti}`;
       if (await platform.cache.get(key)) {
+        return Response.json({ error: "token already used" }, { status: 401 });
+      }
+      // The authoritative spend (notme-b0d10f): the DO key every OIDC route
+      // shares. KV is the cross-check, not the guard.
+      if (!(await authority.spendOidcJti(oidc.issuer, oidc.jti, oidc.exp))) {
         return Response.json({ error: "token already used" }, { status: 401 });
       }
       const ttl = Math.max(60, oidc.exp - Math.floor(Date.now() / 1000));

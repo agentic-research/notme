@@ -698,17 +698,11 @@ async function handleCertGHA(
   if (!claims.jti) {
     return jsonErr("jti claim required for replay protection", 400);
   }
-  {
-    const jtiKey = `jti:${claims.jti}`;
-    const seen = await platform.cache.get(jtiKey);
-    if (seen) {
-      return jsonErr("token already used", 401);
-    }
-    const ttl = Math.max(
-      cfg.jtiMinTtlSeconds,
-      claims.exp - Math.floor(Date.now() / 1000),
-    );
-    await platform.cache.put(jtiKey, "1", { expirationTtl: ttl });
+  // KV first, as the cheap cross-check: a token KV already knows is spent is
+  // refused without charging the repository's rate-limit budget.
+  const jtiKey = `jti:${claims.jti}`;
+  if (await platform.cache.get(jtiKey)) {
+    return jsonErr("token already used", 401);
   }
 
   // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
@@ -718,6 +712,19 @@ async function handleCertGHA(
       return jsonErr("rate limit exceeded", 429);
     }
   }
+
+  // The authoritative spend (notme-b0d10f): the DO's `oidc:<iss>#<jti>`, the
+  // key /join, /auth/oidc/login, /cert, /token, /bootstrap/claim and the AUTH
+  // binding share. KV alone is eventually consistent, so it let one token
+  // win here and at another route at once. After the limiter, which must
+  // run before any DO RPC (notme-ed6114) — so a 429 no longer spends the
+  // token either.
+  if (!(await authority.spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
+    return jsonErr("token already used", 401);
+  }
+  await platform.cache.put(jtiKey, "1", {
+    expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+  });
 
   try {
     // Ensure CA bundle is published to KV (lazy init — first request
@@ -3580,6 +3587,11 @@ export default {
         // Same keyspace as /cert/gha, /cert and /token: one token, one spend.
         const jtiKey = `jti:${claims.jti}`;
         if (await platform.cache.get(jtiKey)) return jsonErr("token already used", 401);
+        // The authoritative spend (notme-b0d10f), in the DO key every OIDC
+        // route shares; KV above is the cross-check.
+        if (!(await authorityStub(env).spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
+          return jsonErr("token already used", 401);
+        }
         await platform.cache.put(jtiKey, "1", {
           expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
         });
@@ -4033,7 +4045,7 @@ export default {
               let sessionSecret: string | null = null;
               // Set for token exchange: the subject token's jti and exp, spent
               // only after the DPoP proof verifies.
-              let exchanged: { jti: string; exp: number } | null = null;
+              let exchanged: { iss: string; jti: string; exp: number } | null = null;
 
               if (grantType === TOKEN_EXCHANGE_GRANT) {
                 // RFC 8693, a GitHub Actions OIDC token as the subject
@@ -4072,7 +4084,7 @@ export default {
                 // (rig's notme-access-token proof), nothing more.
                 principalId = claims.sub;
                 scopes = ["bridgeCert"];
-                exchanged = { jti: claims.jti, exp: Number(claims.exp) || 0 };
+                exchanged = { iss: String(claims.iss), jti: claims.jti, exp: Number(claims.exp) || 0 };
                 // GitHub-signed, so the subject is known (and not the
                 // caller's to vary) without asking the DO.
                 if (await rateLimited(`token:${principalId}`)) return tooMany();
@@ -4187,6 +4199,11 @@ export default {
                 // and /cert's oidc proof use: one GitHub token, one spend.
                 const key = `jti:${exchanged.jti}`;
                 if (await platform.cache.get(key)) {
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                // The authoritative spend (notme-b0d10f): the DO key every
+                // OIDC route shares; KV above is the cross-check.
+                if (!(await authority.spendOidcJti(exchanged.iss, exchanged.jti, exchanged.exp))) {
                   return Response.json({ error: "invalid_grant" }, { status: 400 });
                 }
                 await platform.cache.put(key, "1", {
