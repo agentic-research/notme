@@ -385,40 +385,13 @@ describe("contract.cabundle.signing-canonical", () => {
 });
 
 // ── 4. Revocation seqno monotonicity ───────────────────────────────────────
-
-describe("contract.revocation.seqno-monotonic", () => {
-  // NOTE: applySeqnoRule below is a copy of the rule, defined in this file;
-  // these assertions do not reach RevocationAuthority. The real DO's seqno
-  // handling is tested against workerd in revocation.do.test.ts (the pool
-  // config notme-c38bb6 waited on has existed since 2026-07-22). This block is
-  // kept only until it is repointed or removed (notme-8fb37f).
-  function applySeqnoRule(last: number, incoming: number): "advance" | "noop" | "rollback" {
-    if (typeof incoming !== "number" || !Number.isFinite(incoming) || incoming < 1) {
-      return "rollback";
-    }
-    if (incoming < last) return "rollback";
-    if (incoming > last) return "advance";
-    return "noop";
-  }
-
-  it("advances when seqno strictly increases", () => {
-    expect(applySeqnoRule(100, 101)).toBe("advance");
-  });
-
-  it("is a no-op when seqno equals the last-seen value", () => {
-    expect(applySeqnoRule(100, 100)).toBe("noop");
-  });
-
-  it("rejects a rollback (seqno < last)", () => {
-    expect(applySeqnoRule(100, 99)).toBe("rollback");
-  });
-
-  it("rejects a non-positive or NaN seqno", () => {
-    expect(applySeqnoRule(100, 0)).toBe("rollback");
-    expect(applySeqnoRule(100, -1)).toBe("rollback");
-    expect(applySeqnoRule(100, NaN)).toBe("rollback");
-  });
-});
+//
+// Not asserted here. This block used to define its own `applySeqnoRule` and
+// test that copy, never RevocationAuthority.handleSeqno (notme-8fb37f). The
+// rule is tested against the real DO under workerd in
+// src/revocation.do.test.ts ("RevocationAuthority": first / same / higher
+// seqno accepted, rollback refused, per-issuer isolation, and non-positive or
+// non-numeric seqno refused).
 
 // ── 5. DPoP proof shape ────────────────────────────────────────────────────
 
