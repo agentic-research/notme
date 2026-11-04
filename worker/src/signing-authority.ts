@@ -605,6 +605,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * Cached per DO instance because HKDF runs on every call otherwise and
    * `ensureKeys` is on the hot path for every sign. Null is a real answer, not
    * a failure: `cf-managed` and `ephemeral` both legitimately have no KEK.
+   * A failed derivation is not cached; see #getKek.
    */
   #kekPromise: Promise<CryptoKey> | null = null;
   /**
@@ -618,7 +619,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #getKek(): Promise<CryptoKey> | null {
     const secret = this.env.NOTME_KEK_SECRET;
     if (!secret) return null;
-    this.#kekPromise ??= deriveKek(secret);
+    if (!this.#kekPromise) {
+      // Cache only a success (notme-051544). The promise is shared while it
+      // is in flight, so concurrent loads still derive once, but a rejection
+      // clears the cache: a transient failure, such as the secret briefly
+      // unavailable at deploy, must not poison every later key load for the
+      // life of this instance. The identity check keeps a late rejection from
+      // clearing a newer attempt.
+      const attempt = deriveKek(secret);
+      this.#kekPromise = attempt;
+      attempt.catch(() => {
+        if (this.#kekPromise === attempt) this.#kekPromise = null;
+      });
+    }
     return this.#kekPromise;
   }
 
