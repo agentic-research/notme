@@ -61,7 +61,7 @@ graph TD
     Signet --> F2["5-minute Ephemeral Credentials<br/>(re-issued, never extended)"]:::feature
     Signet --> F3["Secretless Authority<br/>(private keys never exported)"]:::feature
 
-    F1 & F2 & F3 --> End((Stolen Token or Cert = 5 Minutes Max<br/>Private Keys = Never Exported)):::signet
+    F1 & F2 & F3 --> End((Stolen Token or Cert = 5 Minutes Max<br/>a machine tier: 1 h per renewal<br/>Private Keys = Never Exported)):::signet
 ```
 
 ## how it works

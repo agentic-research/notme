@@ -8,11 +8,11 @@ Same code runs in three environments:
 
 ```
 Local dev    →  workerd serve config.capnp                      →  localhost:8788
-Container    →  docker run ghcr.io/agentic-research/notme:0.1.0  →  localhost:8788
+Container    →  docker run ghcr.io/agentic-research/notme:0.2.0  →  localhost:8788
 CF Workers   →  wrangler deploy                                  →  auth.notme.bot
 ```
 
-Key storage differs by environment: ephemeral (in-memory only, local/CI), cf-managed (CF handles encryption, production). See `NOTME_KEY_STORAGE` in `docs/design/007-secretless-local-proxy.md`.
+Key storage differs by environment: ephemeral (in-memory only, local/CI), cf-managed (CF handles encryption, production), or encrypted (the CA key KEK-sealed in DO SQLite when `NOTME_KEK_SECRET` is set; built, not yet on in production, `notme-41d0d3`). See `NOTME_KEY_STORAGE` in `docs/design/007-secretless-local-proxy.md` and `SECURITY.md`.
 
 ## Subsystems
 
@@ -42,7 +42,6 @@ graph TD
 
     PX["proxy/src/main.rs<br/>Rust mTLS forward proxy —<br/>holds the bridge key in memory"]:::sep
     AC["action/src/index.ts<br/>GHA action, zero secrets"]:::sep
-    VA["vault/<br/>separate Worker — HKDF + AES-GCM"]:::sep
     SDK["packages/dpop<br/>shared SDK"]:::sep
     SCH["schema/identity.capnp → gen/go/<br/>Cap'n Proto + Go bindings"]:::sep
 
@@ -69,7 +68,7 @@ graph TD
     SCH -.-> RA
 ```
 
-The DOs are the security kernel: private keys are generated inside `SigningAuthority` and never leave it. Everything else is routing, validation, or encoding.
+The DOs are the security kernel: the authority's private keys are generated inside `SigningAuthority` and never leave it. (The credential vault that used to sit beside them was retired in ADR-012; its KEK/DEK code now seals the CA key, `worker/src/key-encryption.ts`.) Everything else is routing, validation, or encoding.
 
 ## Data flow
 
@@ -115,7 +114,7 @@ graph LR
 
 ### Delegation chain — the target shape
 
-`ADR-008` specifies three tiers. Only the outer two are built; the middle tier is unimplemented, which is why task-scoped revocation has no unit (`notme-600df1`, `notme-77a024`).
+`ADR-008` specifies three tiers. All three are built: the middle tier landed 2026-08-27 (`mintIssuingCaCert`, `POST /cert/issuing-ca`, `worker/src/cert-authority.ts:686`), and the task tier is minted offline by the machine (`mintTaskCertPair`, used by `scripts/task-cert`). The revocation unit is the grant (`POST /principals/:id/revoke`; `notme-77a024`, closed). The bridge cert pair issued directly by the root is still the `/cert/gha` path.
 
 ```mermaid
 graph TD
@@ -123,13 +122,13 @@ graph TD
     classDef gap fill:#ffebee,stroke:#c62828,stroke-width:2px,stroke-dasharray:5 4,color:#000
 
     ROOT["<b>root CA</b><br/>CA=true, pathlen=1<br/>keyCertSign, cRLSign"]:::built
-    BRIDGE["<b>orchestrator bridge</b> — the MACHINE<br/>CA=true, pathlen=0, keyCertSign<br/><i>NOT BUILT — every mint stamps CA=false</i>"]:::gap
-    TASK["<b>agent session</b> — the TASK<br/>CA=false (leaf), digitalSignature<br/><i>no producer until the tier above exists</i>"]:::gap
+    BRIDGE["<b>Issuing CA tier</b> — the MACHINE<br/>CA=true, pathlen=0, keyCertSign<br/><i>POST /cert/issuing-ca</i>"]:::built
+    TASK["<b>task cert pair</b> — the TASK<br/>CA=false (leaf), digitalSignature<br/><i>mintTaskCertPair, offline, tier-signed</i>"]:::built
     LEAF["<b>bridge cert pair</b> (today)<br/>CA=false — mTLS + signing<br/>issued directly by the root"]:::built
 
     ROOT -->|"issues today"| LEAF
-    ROOT -.->|"pathlen budget<br/>allocated, unspent"| BRIDGE
-    BRIDGE -.->|"machine delegates<br/>to each task"| TASK
+    ROOT -->|"issues the tier"| BRIDGE
+    BRIDGE -->|"machine delegates<br/>to each task"| TASK
 
     SCOPES["auth/scope-chain.ts<br/>scopes ⊆ parent<br/><b>AUTHORITY</b> bound (cooperative)"]:::built
     PATH["pathLenConstraint<br/>RFC 5280 §6.1.4<br/><b>DEPTH</b> bound (intrinsic)"]:::built
@@ -186,7 +185,7 @@ where.
 Because the agent has no `globalOutbound` (ADR-009) and the proxy performs every outbound request, the proxy is a chokepoint the agent cannot route around — which is what lets it stamp an unforgeable correlation key, the way journald attaches `_SYSTEMD_UNIT` rather than trusting a process to report its own.
 
 **Secretless invariants** (verified by adversarial tests):
-1. No plaintext private key on disk
+1. No plaintext private key on disk (ephemeral mode; `cf-managed` stores the CA key as a JWK in DO SQLite, `encrypted` seals it)
 2. `crypto.subtle.exportKey()` on signing key throws
 3. `NOTME_KEY_STORAGE=encrypted` without KEK = hard startup error
 4. No private key material in any response or error message
@@ -212,20 +211,22 @@ Detection is automatic via `NOTME_KEY_STORAGE` env var and `detectKeyStorage()`.
 
 | File | Lines | What |
 |------|-------|------|
-| `worker/worker.ts` | ~3350 | HTTP fetch handler (monolith — split planned via notme-9f51fa) |
-| `worker/src/signing-authority.ts` | ~2110 | SigningAuthority DO — the security kernel |
+| `worker/worker.ts` | ~4750 | HTTP fetch handler (still one file; notme-9f51fa, the public/private service-binding split, is closed) |
+| `worker/src/signing-authority.ts` | ~5570 | SigningAuthority DO — the security kernel |
 | `proxy/src/main.rs` | ~1030 | mTLS forward proxy (TCP + UDS listen) |
 | `packages/dpop/src/index.ts` | ~1100 | Shared JWT/crypto SDK |
-| `worker/src/platform.ts` | ~210 | Platform abstraction + MemoryCache + ED25519 typing constant |
+| `worker/src/platform.ts` | ~250 | Platform abstraction + MemoryCache + ED25519 typing constant |
 | `action/src/index.ts` | ~190 | GHA action |
 
 ## Testing
 
 ```bash
-cd worker && npx vitest run    # 526 tests, 38 files (unit + adversarial + shared-SDK)
-cd worker && npm run test:do   # 122 real-Durable-Object tests, 15 files (vitest-pool-workers)
-bash test-local.sh             # workerd smoke test (endpoints + invariant #1)
-bash test-e2e.sh               # Playwright e2e with virtual authenticator (contract tests)
+task worker:check             # tsc + all three suites below; counts as of 2026-11-03:
+cd worker && npx vitest run    #   1042 tests, 71 files (unit + adversarial + shared-SDK)
+cd worker && npm run test:do   #   638 real-Durable-Object tests, 70 files (vitest-pool-workers)
+                               #   + 56 CT-bound tests (vitest.workers.ct.config.mts)
+bash worker/test-local.sh      # workerd smoke test (endpoints + invariant #1)
+bash worker/test-e2e.sh        # Playwright e2e with virtual authenticator (contract tests)
 cd ../proxy && cargo test      # Rust tests (listen-addr parser, UDS bind, perms, round-trip)
 task worker:verify             # live endpoint checks against production or staging
 task worker:contract           # the same checks against the real Worker booted locally (CI, no account)
@@ -239,7 +240,7 @@ Test categories (worker):
 
 Two conventions worth knowing before reading the suite:
 
-- **`it.fails` marks a gap, not a bug.** `delegation-depth.do.test.ts` asserts the middle delegation tier is still missing, so it goes red the moment someone builds it — that is the signal to delete the `.fails`. A `todo` would sit inert and tell nobody. These show as "expected fail" in the DO run.
+- **`it.fails` marks a gap, not a bug.** `delegation-depth.do.test.ts` used to assert the middle delegation tier was still missing; the tier landed 2026-08-27, the test went red on cue, and the `.fails` came off. `receipt-signer.do.test.ts` does the same today for the receipt `delegation` producer (`notme-d3b763`). A `todo` would sit inert and tell nobody. These show as "expected fail" in the DO run.
 - **Some fixtures are deliberately foreign.** `pop-preimage.test.ts` and the hand-encoder in `receipt-commitment.test.ts` build inputs WITHOUT the code under test, because a fixture built by the encoder it validates is a fixed point rather than a conformance check. Both existing bugs of that shape — the double-hashed PoP and the float64 CBOR timestamp — survived review precisely because their tests were self-consistent.
 
 Threat-model coverage is enumerated in `worker/THREAT_MODEL.md` — each row links to the test that defends it.

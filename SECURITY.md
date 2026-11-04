@@ -28,22 +28,22 @@ notme is an identity authority that issues ephemeral bridge certificates. Securi
 
 ## Design Principles
 
-- **Secretless** — private keys exist only in process memory (`extractable: false` CryptoKey). No key material on disk, in `$GITHUB_OUTPUT`, or crossing the wire. See `docs/design/007-secretless-local-proxy.md`.
+- **Secretless** — client private keys exist only in process memory (`extractable: false` CryptoKey). No key material in `$GITHUB_OUTPUT` or crossing the wire. The authority's own CA key is the exception: it is stored in DO SQLite, as a plaintext JWK in `cf-managed` mode or KEK-sealed in `encrypted` mode (see Key Storage Modes). See `docs/design/007-secretless-local-proxy.md`.
 - **Two enforcement planes** — local workerd holds credentials and enforces scope; CF edge validates independently. Neither trusts the other.
 - **Proof-of-possession over bearer tokens** — DPoP binding makes stolen tokens useless without the proof key.
-- **Ephemeral by default** — 5-minute token/cert TTL, no renewal, just expire.
+- **Short-lived by default** — 5-minute workload certs (`GHA_CERT_TTL_MS`, default 300 000) that are not renewed, just expire. Machine tier certs are the exception: they renew, and each renewal is a proof of the machine's key.
 - **Zero stored secrets** — CA key born in Durable Object, session secrets auto-generated. In ephemeral mode (local/CI), the private JWK is never written to SQLite.
-- **Minimal blast radius** — epoch-based revocation (one KV write revokes all certs from an epoch).
+- **Minimal blast radius** — epoch-based revocation: `POST /admin/revoke-epoch` advances the epoch, and every cert from an older epoch is refused.
 
 ## Key Storage Modes
 
 | Mode | When | Private key on disk? |
 |---|---|---|
 | `ephemeral` | Local dev, CI | No — in-memory only, dies with process |
-| `encrypted` | Self-hosted (not yet implemented) | Wrapped with HKDF-derived KEK |
+| `encrypted` | Any deployment with `NOTME_KEK_SECRET` set (built, `worker/src/key-encryption.ts`; not yet enabled in production, `notme-41d0d3`) | Wrapped with HKDF-derived KEK |
 | `cf-managed` | Production CF Workers | CF manages DO SQLite encryption |
 
-Set via `NOTME_KEY_STORAGE` env var. Default: `cf-managed`. Local workerd config sets `ephemeral`.
+Set via `NOTME_KEY_STORAGE` env var. Default: `cf-managed`, unless `NOTME_KEK_SECRET` is set, which selects `encrypted` (`worker/src/platform.ts:46-55`). Local workerd config sets `ephemeral`.
 
 ## Threat Model & Tests
 
@@ -53,8 +53,8 @@ Set via `NOTME_KEY_STORAGE` env var. Default: `cf-managed`. Local workerd config
 ## Known Limitations
 
 - WebAuthn implementation has not been independently audited
-- DPoP token endpoint does not yet implement nonce mechanism (defense-in-depth)
-- `encrypted` key storage mode is designed but not yet implemented (startup error if configured)
+- DPoP nonces on `/token` (RFC 9449 §8) are implemented but off by default; `DPOP_REQUIRE_NONCE=true` turns them on (`worker/src/auth/dpop-nonce.ts`)
+- `encrypted` key storage mode is implemented but not yet turned on in production; that waits on the KEK rehearsal (`scripts/kek-rehearsal.sh`, `notme-41d0d3`, open). Selecting `encrypted` without `NOTME_KEK_SECRET` is a startup error
 - Older design-time threat tables live in `docs/design/007-secretless-local-proxy.md`; canonical threat model is `worker/THREAT_MODEL.md`.
 
 ## Ed25519 typing workaround
