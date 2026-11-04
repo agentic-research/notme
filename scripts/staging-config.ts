@@ -69,6 +69,43 @@ export function stagingPlaceholders(config: string): string[] {
   return hits;
 }
 
+/** Host part of a route pattern: `auth.notme.bot/*` → `auth.notme.bot`. */
+const routeHost = (pattern: string) => pattern.replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
+
+/** `pattern = "…"` values of every table named exactly `name`. */
+function patternsIn(config: string, name: string): string[] {
+  const out: string[] = [];
+  let table: string | null = null;
+  for (const line of config.split("\n")) {
+    table = tableOf(line) ?? table;
+    if (table !== name) continue;
+    const m = line.match(/^\s*pattern\s*=\s*"([^"]*)"/);
+    if (m) out.push(m[1]);
+  }
+  return out;
+}
+
+/**
+ * wrangler INHERITS top-level `routes` into an environment that declares none
+ * (re-review N7). Drop the staging routes from the template and a staging
+ * deploy would try to claim notme.bot/* and auth.notme.bot/* — and the
+ * placeholder scan would not notice, because those values are not
+ * placeholders. So staging must declare its own routes, and none may be a
+ * production host or a wildcard that could cover one.
+ */
+export function stagingRouteProblems(config: string): string[] {
+  const staging = patternsIn(config, "env.staging.routes");
+  const production = new Set(["notme.bot", "auth.notme.bot", ...patternsIn(config, "routes").map(routeHost)]);
+  const problems: string[] = [];
+  if (staging.length === 0) problems.push("[env.staging] declares no routes, so it would inherit production's");
+  for (const p of staging) {
+    const host = routeHost(p);
+    if (production.has(host)) problems.push(`staging route "${p}" is a production host`);
+    if (host.includes("*")) problems.push(`staging route "${p}" is a wildcard, which can cover production hosts`);
+  }
+  return problems;
+}
+
 export function renderStagingConfig(template: string, env: Record<string, string | undefined>): string {
   const keys = stagingVarKeys(template);
   if (keys.length === 0) throw new Error("template has no [env.staging.vars] — refusing to guess");
@@ -86,11 +123,18 @@ export function renderStagingConfig(template: string, env: Record<string, string
       if (m) return `${m[1]}${m[2]}${m[3]}${JSON.stringify(env[`STAGING_${m[2]}`]!.trim())}`;
     }
     if (isStaging(table) && line.includes(KV_PLACEHOLDER)) {
-      return line.replace(`"${KV_PLACEHOLDER}"`, JSON.stringify(env.STAGING_KV_NAMESPACE_ID!.trim()));
+      // A replacer FUNCTION: a replacement STRING would expand `$&`, `` $` ``
+      // and `$'` inside the value (re-review N4).
+      return line.replace(`"${KV_PLACEHOLDER}"`, () => JSON.stringify(env.STAGING_KV_NAMESPACE_ID!.trim()));
     }
     return line;
   });
   const config = out.join("\n");
+
+  const routeProblems = stagingRouteProblems(config);
+  if (routeProblems.length) {
+    throw new Error(`staging routes are unsafe — refusing to deploy:\n  ${routeProblems.join("\n  ")}`);
+  }
 
   const left = stagingPlaceholders(config);
   if (left.length) {

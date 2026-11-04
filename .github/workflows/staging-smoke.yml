@@ -21,6 +21,15 @@
 #   - every job here also checks `github.ref == 'refs/heads/main'`, so a
 #     workflow_dispatch from another ref runs nothing;
 #   - the token is in the env of the deploy step only (review M1).
+#     KNOWN LIMIT (re-review N6): that scoping is weaker than it looks. The
+#     steps before the deploy (`worker:install`, `dpop:build`) run dependency
+#     code in the same job, and can write $GITHUB_ENV (e.g. NODE_OPTIONS=
+#     --require …) or $GITHUB_PATH, or replace node_modules/.bin/wrangler —
+#     all of which the deploy step then runs with the token. Installs use
+#     --ignore-scripts, which stops lifecycle hooks but not code those steps
+#     run on purpose. The real fix is a separate deploy job that receives only
+#     a built artifact and installs nothing; tracked in docs/REMAINING-WORK.md,
+#     not built yet.
 # The only real isolation is a separate Cloudflare account for staging.
 #
 # ── IT DOES NOT RUN UNTIL THE OWNER CONFIGURES IT ──

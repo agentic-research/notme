@@ -15,7 +15,12 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { renderStagingConfig, stagingPlaceholders, stagingVarKeys } from "../../../scripts/staging-config";
+import {
+  renderStagingConfig,
+  stagingPlaceholders,
+  stagingRouteProblems,
+  stagingVarKeys,
+} from "../../../scripts/staging-config";
 
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const template = readFileSync(join(ROOT, "worker/wrangler.toml.example"), "utf8");
@@ -128,5 +133,31 @@ describe("staging-smoke.yml fences the token (H2, M1, L4)", () => {
     expect(job("staging-smoke")).toMatch(/needs: configured/);
     expect(job("staging-smoke")).toMatch(/needs\.configured\.outputs\.ready == 'true'/);
     expect(job("configured")).toMatch(/::warning/);
+  });
+});
+
+describe("staging config — re-review N4, N7", () => {
+  it("N4: a \$& / \$\` / \$' in the KV id is written literally, not expanded", () => {
+    for (const v of ["ab$&cd", "ab$\`cd", "ab$'cd"]) {
+      const out = renderStagingConfig(template, { ...fullEnv(), STAGING_KV_NAMESPACE_ID: v });
+      expect(out, v).toContain(`id = ${JSON.stringify(v)}`);
+    }
+  });
+
+  it("N7: the template's staging routes are its own, not production's", () => {
+    expect(stagingRouteProblems(template)).toEqual([]);
+  });
+
+  it("N7: no staging routes → refused (it would inherit production's notme.bot/* and auth.notme.bot/*)", () => {
+    const noRoutes = template.replace(/\[\[env\.staging\.routes\]\]\npattern = "[^"]*"\ncustom_domain = true\n/g, "");
+    expect(noRoutes).not.toContain("[[env.staging.routes]]");
+    expect(() => renderStagingConfig(noRoutes, fullEnv())).toThrow(/declares no routes/);
+  });
+
+  it("N7: a staging route naming a production host, or a wildcard, is refused", () => {
+    const prod = template.replace('pattern = "auth-staging.notme.bot"', 'pattern = "auth.notme.bot"');
+    expect(() => renderStagingConfig(prod, fullEnv())).toThrow(/production host/);
+    const wild = template.replace('pattern = "staging.notme.bot"', 'pattern = "*.notme.bot/*"');
+    expect(() => renderStagingConfig(wild, fullEnv())).toThrow(/wildcard/);
   });
 });

@@ -157,7 +157,14 @@ to publish the tag.
   not match `site_base` (L1); a check retry after its bracket is not re-bracketed
   (L2); there is no staging `deploy-preview` and no staging `worker:rollback`, so
   owner action 4 needs one raw `wrangler versions upload --env staging` (L5); the
-  override log is local only (L7).
+  override log is local only (L7). And from the re-review (N6): in
+  `staging-smoke.yml` the steps before the deploy (`worker:install`,
+  `dpop:build`) run dependency code in the token-holding job. They can plant
+  `$GITHUB_ENV` (e.g. `NODE_OPTIONS`), `$GITHUB_PATH` or
+  `node_modules/.bin/wrangler`, and the deploy step then runs those with the
+  token. The fix is a separate deploy job that receives only a built artifact
+  and installs nothing. Not built yet; until then, the step-level token scope
+  only keeps the token out of logs and simple reads.
 - The alarm epic **notme-5c2511**, with notme-e992ad and notme-5d358a.
 
 **H3, correctness and hygiene.** Doesn't gate the tag.
