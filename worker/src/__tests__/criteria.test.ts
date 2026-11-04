@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import * as x509 from "@peculiar/x509";
-import { OID_CRITERIA, OID_SCOPES, derTlv, derUtf8String } from "../cert-authority";
+import { OID_CRITERIA, OID_SCOPES, derTlv, derUtf8String, readScopes } from "../cert-authority";
 import { CERT_ELIGIBLE_SCOPES } from "../auth/passkey-cert-scopes";
 import {
   CRITERIA,
@@ -264,6 +264,44 @@ describe("checkCriteria rules", () => {
     });
     // An absent .1.3 is unchanged.
     expect(checkCriteria(tier, await mk({ criteria: [AS] }))).toEqual({ ok: true, criteria: AS, legacy: false });
+  });
+
+  // notme-2098f4: readScopes did no bounds checking, so each of these decoded
+  // to a non-null scope list — and the overlong and trailing ones PASSED the
+  // ceiling. The strict readers that grant authority already refuse them.
+  describe("rule 11: a truncated, overlong or trailing .1.3 is malformed (notme-2098f4)", () => {
+    const bridge = [...derUtf8String("bridgeCert")]; // 0c 0a "bridgeCert"
+    const vectors: Array<[string, Uint8Array]> = [
+      // The element claims 10 bytes; 3 are present.
+      ["truncated element", new Uint8Array([0x30, 0x05, 0x0c, 0x0a, 0x62, 0x72, 0x69])],
+      // The element's length byte itself is missing.
+      ["truncated header", new Uint8Array([0x30, 0x01, 0x0c])],
+      // The SEQUENCE claims 127 bytes; 12 follow.
+      ["overlong SEQUENCE length", new Uint8Array([0x30, 0x7f, ...bridge])],
+      // Long-form SEQUENCE length running past the end.
+      ["overlong long-form length", new Uint8Array([0x30, 0x82, 0x01, 0x00, ...bridge])],
+      // A well-formed SEQUENCE, then a UTF8String outside it.
+      ["trailing bytes", new Uint8Array([...scopesDer(["bridgeCert"]), ...derUtf8String("sign:git")])],
+      // The element runs past the end of its SEQUENCE.
+      ["element overruns its SEQUENCE", new Uint8Array([0x30, 0x02, ...bridge])],
+    ];
+    for (const [name, der] of vectors) {
+      it(name, async () => {
+        const tier = await mk({ criteria: [AS] });
+        const leaf = await mk({ criteria: [AS], scopes: der });
+        expect(readScopes(leaf)).toBeNull();
+        expect(checkCriteria(tier, leaf)).toEqual({ ok: false, reason: "malformed scopes on leaf" });
+      });
+    }
+
+    it("well-formed vectors are unchanged", async () => {
+      for (const scopes of [[], ["bridgeCert"], ["bridgeCert", "sign:git"], ["x".repeat(200)]]) {
+        const leaf = await mk({ scopes });
+        expect(readScopes(leaf)).toEqual(scopes);
+      }
+      const tier = await mk({ criteria: [AS] });
+      expect(checkCriteria(tier, await mk({ criteria: [AS], scopes: ["bridgeCert", "sign:git"] })).ok).toBe(true);
+    });
   });
 
   it("rule 12: llo-run requires .1.7", async () => {
