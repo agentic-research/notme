@@ -3757,11 +3757,30 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Generate a signed CABundle for the revocation verifier.
   // Caller writes this to CA_BUNDLE_CACHE KV.
   async generateBundle(): Promise<CABundle> {
+    // Restart once if a rotate() committed during the export (review L4),
+    // as cold start and #withMintRetry retry a moved state; a second move
+    // in a row is refused rather than looped on.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const bundle = await this.#generateBundleOnce();
+      if (bundle) return bundle;
+    }
+    throw new Error(
+      "bundle refused: the authority key changed twice while the bundle was built; retry",
+    );
+  }
+
+  /** One attempt; null when the key moved under the export await. */
+  async #generateBundleOnce(): Promise<CABundle | null> {
     const { signingKey, verifyKey, keyId } = await this.#getOrCreateSigningKey();
     // The public half of the SAME key that signs below — not a second
     // #getOrCreateSigningKey() read, which could name a key a rotate()
     // committed in between.
     const pubKeyB64 = await rawPublicKeyB64(verifyKey);
+    // Past that await, before the synchronous seqno and prev-key reads: a
+    // rotate() that committed meanwhile would otherwise get a bundle naming
+    // the retired key as current, with its own prev record dropped
+    // (prevKeyId === keyId) and a seqno above the rotation's (review L4).
+    if (this.#getKeyId() !== keyId) return null;
 
     this.#ensureSchema();
 
