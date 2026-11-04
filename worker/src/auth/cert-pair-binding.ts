@@ -21,7 +21,35 @@ export async function certPairBinding(
   signingSpki: Uint8Array,
   nonce: string,
 ): Promise<Uint8Array> {
-  const tag = new TextEncoder().encode(CERT_PAIR_TAG);
+  return taggedPairBinding(CERT_PAIR_TAG, mtlsSpki, signingSpki, nonce);
+}
+
+/**
+ * What a bound Worker signs, with BOTH held private keys, to have
+ * `AuthService.authenticate()` hold its certs (notme-fbbfbc):
+ *
+ *   "notme/authservice-authenticate/v1\0" || mtlsSPKI || signingSPKI || SHA-256(challenge)
+ *
+ * The challenge comes from `AuthService.authChallenge()`. Its own tag, so a
+ * proof made for /cert cannot be presented here or the reverse.
+ */
+export const AUTHENTICATE_TAG = "notme/authservice-authenticate/v1\0";
+
+export async function authenticateBinding(
+  mtlsSpki: Uint8Array,
+  signingSpki: Uint8Array,
+  challenge: string,
+): Promise<Uint8Array> {
+  return taggedPairBinding(AUTHENTICATE_TAG, mtlsSpki, signingSpki, challenge);
+}
+
+async function taggedPairBinding(
+  tagText: string,
+  mtlsSpki: Uint8Array,
+  signingSpki: Uint8Array,
+  nonce: string,
+): Promise<Uint8Array> {
+  const tag = new TextEncoder().encode(tagText);
   const nonceHash = new Uint8Array(
     await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce)),
   );

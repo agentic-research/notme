@@ -38,8 +38,9 @@ import { ED25519, type Platform } from "./src/platform";
 type HeldCerts = {
   mtlsCert: string;
   signingCert: string;
-  mtlsKey: CryptoKey;
-  signingKey: CryptoKey;
+  /** Absent when authenticated over a binding: CryptoKey does not serialize. */
+  mtlsKey: CryptoKey | null;
+  signingKey: CryptoKey | null;
   identity: string;
   scopes: string[];
   expiresAt: number;
@@ -268,6 +269,9 @@ export class JwtSigner extends WorkerEntrypoint<any> {
   }
 }
 
+/** How long an authChallenge() challenge is good for (notme-fbbfbc). */
+const AUTH_CHALLENGE_TTL_S = 60;
+
 export class AuthService extends WorkerEntrypoint<any> {
   // RPC-session-scoped credentials. WorkerEntrypoint creates a fresh `this`
   // per RPC session in workerd, so this field is naturally per-caller.
@@ -390,56 +394,75 @@ export class AuthService extends WorkerEntrypoint<any> {
   // ── 009: Identity-gated runtime methods ──────────────────────────────────
 
   /**
-   * Store credentials for proxy/sign operations.
-   * Called after a successful 008 PoP exchange. Keys must be CryptoKey objects
-   * (non-extractable). Certs are PEM strings (public data).
+   * Issue a challenge for authenticate() (notme-fbbfbc): single-use, bound to
+   * the identity the caller says it will prove and to the calling binding's
+   * `props` (when the binding sets any), and good for AUTH_CHALLENGE_TTL_S.
    *
-   * `identity`, `scopes` and `expiresAt` are NOT parameters, deliberately.
-   * This method is reachable by any Worker holding an `AUTH` service binding,
-   * and it used to accept all three as caller-supplied fields and assign them
-   * verbatim — so a bound Worker could name itself any WIMSE principal and
-   * grant itself any scope, while `proxy()` gated on those scopes and the
-   * audit log recorded that identity as fact (notme-6ad276).
+   * Built on the authority's existing PoP-nonce store (issuePopNonce /
+   * consumePopNonce, the /cert/nonce primitive): a random 32-byte nonce kept
+   * in the DO, spent atomically, only for the principal key it was issued
+   * under. That key embeds the issue time, so the `<issuedAt>.` prefix of
+   * the challenge is authenticated by the row itself — editing it names a
+   * key no row has — and the 60 s bound needs no new secret. The `authsvc:`
+   * prefix keeps these rows out of /cert's principal-id space.
+   */
+  async authChallenge(identity: string): Promise<{ challenge: string; expires_in: number }> {
+    if (typeof identity !== "string" || !identity || identity.length > 1024) {
+      throw new Error("identity required — the WIMSE identity of the certs you will present");
+    }
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const { nonce } = await this.#getAuthority().issuePopNonce(this.#challengeKey(identity, issuedAt));
+    return { challenge: `${issuedAt}.${nonce}`, expires_in: AUTH_CHALLENGE_TTL_S };
+  }
+
+  /** The PoP-nonce principal key a challenge lives under. */
+  #challengeKey(identity: string, issuedAt: number): string {
+    // ctx.props is set per binding by the operator; absent in-isolate.
+    const props = (this.ctx as { props?: unknown } | null | undefined)?.props;
+    return `authsvc:v1:${issuedAt}:${JSON.stringify(props ?? null)}:${identity}`;
+  }
+
+  /**
+   * Hold a bridge cert pair for proxy()/sign(), once the caller has PROVED it
+   * holds both private keys (notme-fbbfbc).
    *
-   * The certs are the only unforgeable thing a caller can present: they are
-   * CA-signed and already carry the subject and granted scopes. So the
-   * principal is DERIVED from them here and the caller's opinion of who it is
-   * never enters. Extra fields on the argument are structurally ignored.
+   * `identity`, `scopes` and `expiresAt` are NOT parameters, deliberately
+   * (notme-6ad276): they are DERIVED from the CA-signed certs.
    *
-   * @throws if either cert fails CA verification, is outside its validity
-   *         window, or names a different principal than its partner. On throw
-   *         the session stays unauthenticated — a failed authenticate() must
-   *         not leave stale creds from a previous successful one.
+   * Possession: this used to check only that the certs chained to the CA.
+   * Bridge certs are public — returned to clients, CT-logged when CT_LOG is
+   * bound — so any AUTH-binding holder could present a victim's pair and have
+   * proxy() audit its traffic as the victim. Now the caller first calls
+   * authChallenge(identity), then signs
+   * `authenticateBinding(mtlsSPKI, signingSPKI, challenge)`
+   * (src/auth/cert-pair-binding.ts) with EACH private key, and passes the
+   * proofs here. They are checked with the same verifyPopProofs /cert uses,
+   * against the public keys IN THE CERTS; the challenge is then spent.
    *
-   * CALLING CONVENTION, measured (notme-bcbd74): this signature cannot be
-   * satisfied over a service binding today. workerd's RPC serializer refuses
-   * `CryptoKey` — the whole argument fails with a DataCloneError before the
-   * method runs, nested or not (`rpc.cryptokey.isolation`). Every caller in
-   * this repo constructs an AuthService directly, in-isolate, where that does
-   * not apply.
+   * `mtlsKey` / `signingKey` are optional: workerd cannot serialize a
+   * CryptoKey over RPC (`rpc.cryptokey.isolation`), so a binding caller
+   * cannot send them. Without `signingKey`, sign() refuses.
    *
-   * The reachability reasoning above still holds and the derivation is still
-   * required: a bound Worker CAN reach this method, and can pass the cert
-   * strings — which serialize fine — with the key fields absent. That call
-   * would set credentials whose identity and scopes came from certs, which is
-   * the point; it simply could not then sign. Do not read "unreachable in
-   * practice" into a serializer limitation.
+   * @throws on a CA, validity, pairing or epoch failure; on a missing,
+   *         malformed, expired, replayed or wrongly-bound challenge; or on a
+   *         failed proof. On throw the session holds nothing.
    */
   async authenticate(creds: {
     mtlsCert: string;
     signingCert: string;
-    mtlsKey: CryptoKey;
-    signingKey: CryptoKey;
+    challenge: string;
+    proofs: { mtls: string; signing: string };
+    mtlsKey?: CryptoKey;
+    signingKey?: CryptoKey;
   }) {
+    // Clear first: a failed authenticate() must not leave the previous
+    // identity in place looking like it succeeded.
+    this.#heldCerts = null;
+
     const { deriveCredentialsFromCerts } =
       await import("./src/auth/derive-credentials");
     const authority = this.#getAuthority();
     const caPublicKeyPem = await authority.getPublicKeyPem();
-
-    // Clear first: if verification throws, the session must not keep whatever
-    // it held before. Re-authenticating with a bad cert would otherwise leave
-    // the previous identity in place and look like it succeeded.
-    this.#heldCerts = null;
 
     const derived = await deriveCredentialsFromCerts(
       creds.signingCert,
@@ -447,11 +470,51 @@ export class AuthService extends WorkerEntrypoint<any> {
       caPublicKeyPem,
     );
 
+    // The challenge: present, well-formed, and young. Its age is checked
+    // here; that the timestamp is genuine is checked by the consume below.
+    const m = /^(\d{1,12})\.([A-Za-z0-9_-]{16,128})$/.exec(
+      typeof creds.challenge === "string" ? creds.challenge : "",
+    );
+    if (!m) {
+      throw new Error("challenge required — call authChallenge(identity) and prove both keys over it");
+    }
+    const issuedAt = Number(m[1]);
+    const age = Math.floor(Date.now() / 1000) - issuedAt;
+    if (age < 0 || age > AUTH_CHALLENGE_TTL_S) {
+      throw new Error("challenge expired — request a new one");
+    }
+
+    // Possession, against the keys the CERTS carry.
+    const { X509Certificate } = await import("@peculiar/x509");
+    const { importPublicKey } = await import("./src/cert-authority");
+    const { authenticateBinding } = await import("./src/auth/cert-pair-binding");
+    const spkiOf = (pem: string) => new Uint8Array(new X509Certificate(pem).publicKey.rawData);
+    const toPem = (der: Uint8Array) =>
+      `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...der))}\n-----END PUBLIC KEY-----`;
+    const mtlsSpki = spkiOf(creds.mtlsCert);
+    const signingSpki = spkiOf(creds.signingCert);
+    const pop = await verifyPopProofs(
+      await authenticateBinding(mtlsSpki, signingSpki, creds.challenge),
+      await importPublicKey(toPem(mtlsSpki)),
+      await importPublicKey(toPem(signingSpki)),
+      creds.proofs ?? {},
+    );
+    if (!pop.ok) {
+      throw new Error(`${pop.algorithm} proof-of-possession failed`);
+    }
+
+    // Spent only after the proofs verify (as /cert), so a forged attempt
+    // cannot burn the holder's challenge. Bound to the DERIVED identity: a
+    // challenge asked for one identity does not authenticate another.
+    if (!(await authority.consumePopNonce(m[2]!, this.#challengeKey(derived.identity, issuedAt)))) {
+      throw new Error("challenge unknown, already used, or issued for another identity");
+    }
+
     this.#heldCerts = {
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
-      mtlsKey: creds.mtlsKey,
-      signingKey: creds.signingKey,
+      mtlsKey: creds.mtlsKey ?? null,
+      signingKey: creds.signingKey ?? null,
       identity: derived.identity,
       scopes: derived.scopes,
       expiresAt: derived.expiresAt,
@@ -629,6 +692,9 @@ export class AuthService extends WorkerEntrypoint<any> {
       );
     }
 
+    if (!this.#heldCerts.signingKey) {
+      throw new Error("no signing key held — authenticate() in-isolate with signingKey to sign");
+    }
     const signature = await crypto.subtle.sign(
       ED25519,
       this.#heldCerts.signingKey,

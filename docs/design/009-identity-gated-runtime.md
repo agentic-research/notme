@@ -279,7 +279,23 @@ export default {
 > `proxy()` does now, in order — every step that refuses throws, and writes an
 > audit line first:
 >
-> 1. Refuses (`not_authenticated`) if no certs are held.
+> 1. Refuses (`not_authenticated`) if no certs are held. Certs are held
+>    only after `authenticate()` has verified them against the CA AND the
+>    caller has proved it holds both private keys (`notme-fbbfbc`): it calls
+>    `authChallenge(identity)` for a challenge — single-use, at most 60 s
+>    old, bound to that identity and to the calling binding's `props` when
+>    set, spent in the authority's PoP-nonce store — signs
+>    `authenticateBinding(mtlsSPKI, signingSPKI, challenge)`
+>    (`worker/src/auth/cert-pair-binding.ts`, tag
+>    `notme/authservice-authenticate/v1`) with each key, and passes certs,
+>    challenge and proofs. Before this, any binding holder could present
+>    another principal's public certs and be audited as them. Measured over a
+>    real binding (`auth-binding-session.do.test.ts`): each top-level binding
+>    call is its own session, so held certs do not survive from
+>    `authenticate()` to the next call — `proxy()` and `sign()` work only
+>    in-isolate today, and the attack did not chain end to end. CryptoKeys
+>    do not serialize, so a binding caller passes no keys and `sign()`
+>    refuses without one.
 > 2. Refuses (`credentials_expired`) if the held certs have expired. Nothing
 >    re-authenticates transparently; the caller must call `authenticate()`
 >    again.

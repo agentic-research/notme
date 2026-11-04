@@ -21,7 +21,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
+import { authenticateWithPop, makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
 
 // AuthService lives in worker.ts which imports cloudflare:workers at the
 // top of the module. Mock it so we can construct the class in pure Node
@@ -100,8 +100,8 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    await a.authenticate(await makeCreds("wimse://notme.bot/gha/alice"));
-    await b.authenticate(await makeCreds("wimse://notme.bot/gha/bob"));
+    await authenticateWithPop(a, await makeCreds("wimse://notme.bot/gha/alice"));
+    await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
 
     const idA = await a.identity();
     const idB = await b.identity();
@@ -118,8 +118,7 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     )) as CryptoKeyPair;
 
     const authenticated = newAuthService();
-    await authenticated.authenticate(
-      await makeCreds("wimse://notme.bot/gha/leaked"),
+    await authenticateWithPop(authenticated, await makeCreds("wimse://notme.bot/gha/leaked"),
     );
 
     const fresh = newAuthService();
@@ -139,8 +138,8 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    await a.authenticate(await makeCreds("wimse://notme.bot/gha/alice"));
-    await b.authenticate(await makeCreds("wimse://notme.bot/gha/bob"));
+    await authenticateWithPop(a, await makeCreds("wimse://notme.bot/gha/alice"));
+    await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
 
     const payload = new TextEncoder().encode("hello").buffer as ArrayBuffer;
     const signed = await a.sign(payload, "raw");

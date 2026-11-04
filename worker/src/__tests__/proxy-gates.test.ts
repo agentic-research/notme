@@ -16,7 +16,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeCA, mintCreds, spkiToPem } from "./helpers/mint-creds";
+import { authenticateWithPop, makeCA, mintCreds, stubAuthority } from "./helpers/mint-creds";
 
 vi.mock("cloudflare:workers", () => ({
   WorkerEntrypoint: class WorkerEntrypoint {
@@ -39,17 +39,19 @@ const CA = await makeCA();
 const IDENTITY = "wimse://notme.bot/gha/proxy-gates";
 
 function service(vars: Record<string, unknown>, authorityEpoch: number | "throw" = 1) {
+  // The PoP-nonce store authenticate() spends its challenge in, plus the
+  // epoch proxy() reads (notme-fbbfbc).
+  const authority = stubAuthority(CA, {
+    getAuthorityState: async () => {
+      if (authorityEpoch === "throw") throw new Error("DO unavailable");
+      return { epoch: authorityEpoch, seqno: 1, keyId: "k" };
+    },
+  });
   const env = {
     ...vars,
     SIGNING_AUTHORITY: {
       idFromName: () => "default",
-      get: () => ({
-        getPublicKeyPem: async () => spkiToPem(CA.publicKey),
-        getAuthorityState: async () => {
-          if (authorityEpoch === "throw") throw new Error("DO unavailable");
-          return { epoch: authorityEpoch, seqno: 1, keyId: "k" };
-        },
-      }),
+      get: () => authority,
     },
   };
   return new (AuthService as unknown as new (ctx: unknown, env: unknown) => AuthService)(null, env);
@@ -57,7 +59,7 @@ function service(vars: Record<string, unknown>, authorityEpoch: number | "throw"
 
 async function authed(vars: Record<string, unknown>, opts: { authorityEpoch?: number | "throw"; certEpoch?: number } = {}) {
   const svc = service(vars, opts.authorityEpoch ?? 1);
-  await svc.authenticate(await mintCreds(CA, IDENTITY, ["bridgeCert"], opts.certEpoch ?? 1));
+  await authenticateWithPop(svc, await mintCreds(CA, IDENTITY, ["bridgeCert"], opts.certEpoch ?? 1));
   return svc;
 }
 
