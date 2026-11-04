@@ -4329,6 +4329,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     ensurePrincipalSchema(this.ctx.storage.sql);
     this.ctx.storage.sql.exec("DELETE FROM invites WHERE redeemed_at IS NULL");
     this.ctx.storage.sql.exec("DELETE FROM invite_reservations");
+    // And every in-flight first-user / claim mark, plus claim codes pending
+    // approval (security review F4 of notme-a2e75d). #admitRegistration
+    // trusts a first-user mark without re-checking first-user standing, so a
+    // pre-reset mark let the browser holding its cookie become the admin of
+    // the post-reset authority — the reset did not revoke the very browser
+    // it may have been done to shut out.
+    this.#ensureFirstUserSchema();
+    this.#ensureClaimSchema();
+    this.ctx.storage.sql.exec("DELETE FROM first_user_registrations");
+    this.ctx.storage.sql.exec("DELETE FROM bootstrap_claim_registrations");
+    this.ctx.storage.sql.exec("DELETE FROM bootstrap_claims");
 
     // Rotate the session secret, invalidating every cookie issued before
     // this reset. Without it a reset revoked NOTHING: the secret was minted

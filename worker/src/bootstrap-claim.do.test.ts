@@ -116,6 +116,15 @@ describe("claiming a fresh authority with a passkey and an attested workflow", (
     expect(stolen.status).toBe(403);
     expect(((await stolen.json()) as { claim?: unknown }).claim).toBeUndefined();
     expect(stolen.headers.get("set-cookie") ?? "").not.toMatch(/notme_session=[^;]+/);
+    // Nor with a VALID cookie from the thief's own claim (security review F8).
+    const own = await post("/auth/passkey/register/options", {});
+    expect(own.status).toBe(200);
+    const crossed = await post(
+      "/auth/passkey/register/verify",
+      { userId: o.userId, response: await thief.register(o.options.challenge) },
+      { cookie: regCookie(own) },
+    );
+    expect(crossed.status).toBe(403);
 
     const owner = await SoftwareAuthenticator.create(RP_ID, ORIGIN);
     const ok = await post(

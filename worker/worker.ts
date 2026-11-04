@@ -1049,7 +1049,15 @@ async function handlePasskey(
       // The mark's secret is single-use: whatever verify decides, the browser
       // is told to drop it (notme-a2e75d) rather than carry it on every
       // request for the rest of its Max-Age.
-      const res = await passkeyRegisterVerify(request, authority, host, origin);
+      // A THROW is an outcome too (security review F2): a malformed body or
+      // a failing DO call used to reach the outer catch, which answered
+      // without the clear.
+      let res: Response;
+      try {
+        res = await passkeyRegisterVerify(request, authority, host, origin);
+      } catch (e) {
+        res = opaqueError("passkey", "passkey error", 500, e);
+      }
       res.headers.append("Set-Cookie", CLEAR_REGISTRATION_COOKIE);
       return res;
     }
