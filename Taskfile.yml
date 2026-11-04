@@ -545,7 +545,13 @@ tasks:
     desc: Build the notme OCI image via apko (loads to docker via `docker load < packages/notme.tar`)
     deps: [image:apk]
     vars:
-      TAG: '{{.TAG | default "0.1.0"}}'
+      # The release version has ONE source, the notme-app melange recipe
+      # (`server:check` holds the other recipes and server.json to it). A
+      # literal default here drifted to 0.1.0 while the recipe and the
+      # published tag were 0.2.0 (notme-05324c).
+      RECIPE_VERSION:
+        sh: awk '$1 == "version:" {print $2; exit}' "{{.ROOT_DIR}}/packages/melange-notme-app.yaml"
+      TAG: "{{.TAG | default .RECIPE_VERSION}}"
       ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
     cmds:
@@ -602,7 +608,10 @@ tasks:
     desc: Build the notme-proxy OCI image via apko (local tarball, dev loop)
     deps: [image:proxy:apk]
     vars:
-      TAG: '{{.TAG | default "0.1.0"}}'
+      # Same single source as `image` (notme-05324c).
+      RECIPE_VERSION:
+        sh: awk '$1 == "version:" {print $2; exit}' "{{.ROOT_DIR}}/packages/melange-notme-app.yaml"
+      TAG: "{{.TAG | default .RECIPE_VERSION}}"
       ARCH:
         sh: uname -m | sed 's/arm64/aarch64/'
     cmds:
