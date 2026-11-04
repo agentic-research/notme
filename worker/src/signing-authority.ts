@@ -4404,15 +4404,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   /**
    * Spend a VERIFIED OIDC token's jti in the shared `oidc:<issuer>#<jti>`
    * key: true the first time, false on every later call (notme-b0d10f).
-   * For the routes that mint without another DO block to put the consume
-   * in — /cert/gha, /cert with an `oidc` proof, and the /token exchange.
-   * They used to spend in KV `jti:<jti>` alone, which is eventually
-   * consistent, so the same token could win at two of them, or at one of
-   * them and a DO leg, inside KV's propagation window. Same key and same
-   * `exp + 300s` retention as /join, /auth/oidc/login and mintBridgeCert.
-   * The caller verifies the token and makes every refusal it can BEFORE
-   * calling, so a refusal spends nothing. Fails closed: a missing jti or a
-   * non-positive exp cannot be retained, so it is reported as spent.
+   * For the routes with no other DO block to put the consume in —
+   * /cert/gha, /cert with an `oidc` proof, the /token exchange and
+   * /bootstrap/claim. They used to spend in KV `jti:<jti>` alone, which is
+   * eventually consistent, so the same token could win at two of them, or
+   * at one of them and a DO leg, inside KV's propagation window. Same key
+   * and same `exp + 300s` retention as /join, /auth/oidc/login and
+   * mintBridgeCert. The caller verifies the token and makes every refusal
+   * IT can decide before calling; a refusal only something after the spend
+   * can make (a mint that throws, /token's DPoP-jti consume, the DO's
+   * claim-code lookup) leaves the token spent — THREAT_MODEL lists them.
+   * Fails closed: an empty issuer or jti, or an exp that is not a positive
+   * finite number, cannot be retained, so it is reported as spent.
    */
   async spendOidcJti(issuer: string, jti: string, exp: number): Promise<boolean> {
     if (!issuer || !jti || !Number.isFinite(exp) || exp <= 0) return false;

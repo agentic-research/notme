@@ -758,19 +758,6 @@ async function handleCertGHA(
     }
   }
 
-  // The authoritative spend (notme-b0d10f): the DO's `oidc:<iss>#<jti>`, the
-  // key /join, /auth/oidc/login, /cert, /token, /bootstrap/claim and the AUTH
-  // binding share. KV alone is eventually consistent, so it let one token
-  // win here and at another route at once. After the limiter, which must
-  // run before any DO RPC (notme-ed6114) — so a 429 no longer spends the
-  // token either.
-  if (!(await authority.spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
-    return jsonErr("token already used", 401);
-  }
-  await platform.cache.put(jtiKey, "1", {
-    expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
-  });
-
   try {
     // Ensure CA bundle is published to KV (lazy init — first request
     // bootstraps). AFTER the token, allowlist, jti and limiter checks
@@ -852,6 +839,24 @@ async function handleCertGHA(
   if (!pop.ok) {
     return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
   }
+
+  // The authoritative spend (notme-b0d10f): the DO's `oidc:<iss>#<jti>`, the
+  // key /join, /auth/oidc/login, /cert, /token, /bootstrap/claim and the AUTH
+  // binding share. KV alone is eventually consistent, so it let one token
+  // win here and at another route at once.
+  //
+  // LAST before the mint, as /cert does (security review F1): every refusal
+  // this route can make — token, owner, limiter, CA bundle, body, keys, PoP —
+  // is made first, so a client error or a 503 leaves the token spendable and
+  // a corrected retry with the same token works. Only a mint that throws
+  // after this line burns it (THREAT_MODEL). Still after the limiter, which
+  // must precede any DO RPC (notme-ed6114).
+  if (!(await authority.spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
+    return jsonErr("token already used", 401);
+  }
+  await platform.cache.put(jtiKey, "1", {
+    expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+  });
 
   // Build WIMSE identity URI
   // The identity names the stable subject — the OIDC `sub`, which is also
@@ -3629,28 +3634,50 @@ export default {
           return jsonErr("invalid token", 401);
         }
         if (!claims.jti) return jsonErr("jti claim required for replay protection", 400);
-        // Same keyspace as /cert/gha, /cert and /token: one token, one spend.
-        const jtiKey = `jti:${claims.jti}`;
-        if (await platform.cache.get(jtiKey)) return jsonErr("token already used", 401);
-        // The authoritative spend (notme-b0d10f), in the DO key every OIDC
-        // route shares; KV above is the cross-check.
-        if (!(await authorityStub(env).spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
-          return jsonErr("token already used", 401);
+        // Every refusal the worker can make comes BEFORE the spend (security
+        // review F3), so a wrong workflow, a typo'd code or a 429 does not
+        // burn the token or cost the singleton a DO write. The DO repeats the
+        // subject check as the authority; this copy only orders the refusal.
+        const { bootstrapAttestedSubject } = await import("./src/auth/bootstrap-policy");
+        const expectedSubject = bootstrapAttestedSubject(env);
+        if (expectedSubject === null) {
+          return jsonErr("BOOTSTRAP_GHA_SUBJECT is not set on this deployment", 403);
         }
-        await platform.cache.put(jtiKey, "1", {
-          expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
-        });
+        const { timingSafeEqual } = await import("./src/auth/timing-safe");
+        if (!(await timingSafeEqual(String(claims.sub), expectedSubject))) {
+          return jsonErr("this workflow is not the one BOOTSTRAP_GHA_SUBJECT names", 403);
+        }
         let body: { code?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
         } catch {
           /* empty body */
         }
+        // The shape finalizeClaimRegistration issues: XXXX-XXXX over the
+        // RFC 8628 no-vowel alphabet, case-insensitive (the DO upper-cases).
+        const code = typeof body.code === "string" ? body.code.trim().toUpperCase() : "";
+        if (!/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/.test(code)) {
+          return jsonErr("code must be the XXXX-XXXX claim code /auth/passkey/register/verify returned", 400);
+        }
+        // Same keyspace as /cert/gha, /cert and /token: one token, one spend.
+        const jtiKey = `jti:${claims.jti}`;
+        if (await platform.cache.get(jtiKey)) return jsonErr("token already used", 401);
+        // Limited per repository, as /cert/gha, and before any DO RPC
+        // (notme-ed6114).
+        if (platform.rateLimit && !(await platform.rateLimit(`bootstrap:${claims.repository}`))) {
+          return jsonErr("rate limit exceeded", 429);
+        }
+        // The authoritative spend (notme-b0d10f), in the DO key every OIDC
+        // route shares; KV above is the cross-check. A refusal the DO makes
+        // after this (no_such_claim, governed) has used the token.
+        if (!(await authorityStub(env).spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
+          return jsonErr("token already used", 401);
+        }
+        await platform.cache.put(jtiKey, "1", {
+          expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+        });
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const r = await authority.approveBootstrapClaim(
-          typeof body.code === "string" ? body.code : "",
-          claims.sub,
-        );
+        const r = await authority.approveBootstrapClaim(code, claims.sub);
         if (!r.ok) {
           const map = {
             not_configured: [403, "BOOTSTRAP_GHA_SUBJECT is not set on this deployment"],

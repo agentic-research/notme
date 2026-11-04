@@ -204,29 +204,94 @@ describe("one OIDC token, one spend, across the KV-only routes — with KV laggi
   });
 
   // /bootstrap/claim spent in KV only too, so it shares the DO key now.
-  const bootstrapClaim = (token: string) =>
+  // BOOTSTRAP_GHA_SUBJECT in vitest.workers.config.mts names this workflow.
+  const BOOTSTRAP_SUB = "repo:agentic-research/notme:ref:refs/heads/main";
+  const bootstrapToken = () => signer.token({ sub: BOOTSTRAP_SUB });
+  const bootstrapClaim = (token: string, code: unknown = "BBBB-BBBB", extra: Record<string, unknown> = {}) =>
     worker.fetch(
       new Request(`${ORIGIN}/bootstrap/claim`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-        body: JSON.stringify({ code: "not-a-live-claim-code" }),
+        body: JSON.stringify({ code }),
       }),
-      routeEnv(),
+      { ...routeEnv(), ...extra },
     );
 
   it("oidc-jti.cross-route.bootstrap-claim — spent at /cert/gha, refused at /bootstrap/claim, and back", async () => {
-    const a = await linkedToken();
+    const a = await bootstrapToken();
     expect((await certGha(a)).status).toBe(200);
     const refused = await bootstrapClaim(a);
     expect(refused.status).toBe(401);
     expect(await refused.json()).toMatchObject({ error: "token already used" });
 
-    // /bootstrap/claim spends before the DO judges the claim code (unchanged
-    // ordering), so even its refusal spends the token.
-    const b = await linkedToken();
+    // A well-formed code from the named workflow passes every check the
+    // worker can make, so the token is spent before the DO looks the code
+    // up — and a 404 (no such claim) has still used it.
+    const b = await bootstrapToken();
     const claimed = await bootstrapClaim(b);
-    expect(claimed.status).not.toBe(401);
+    expect(claimed.status).toBe(404);
     await ROUTES[0]!.refused(await certGha(b));
+  });
+
+  it("bootstrap.claim.refusal-spends-nothing — wrong subject, unset subject, malformed code and a 429 leave the token spendable", async () => {
+    // Security review F3. Each of these is decided in the worker, BEFORE
+    // the DO spend; the proof is that the same token then buys a cert.
+    const deny = () => ({ limit: async () => ({ success: false }) });
+    const cases: Array<[string, () => Promise<string>, () => Promise<Response>, number]> = [];
+    const wrong = await signer.token({ sub: "repo:agentic-research/other:ref:refs/heads/main" });
+    cases.push(["subject_mismatch", async () => wrong, () => bootstrapClaim(wrong), 403]);
+    const unset = await bootstrapToken();
+    cases.push(["not_configured", async () => unset, () => bootstrapClaim(unset, "BBBB-BBBB", { BOOTSTRAP_GHA_SUBJECT: "" }), 403]);
+    const badCode = await bootstrapToken();
+    cases.push(["malformed code", async () => badCode, () => bootstrapClaim(badCode, "not-a-claim-code"), 400]);
+    const limited = await bootstrapToken();
+    cases.push(["rate limited", async () => limited, () => bootstrapClaim(limited, "BBBB-BBBB", { CERT_LIMITER: deny() }), 429]);
+    for (const [what, tok, present, status] of cases) {
+      const res = await present();
+      expect(res.status, `${what}: ${await res.clone().text()}`).toBe(status);
+      const after = await certGha(await tok());
+      expect(after.status, `${what}: token was spent by the refusal`).toBe(200);
+    }
+  });
+
+  // /cert/gha refusals that come from the REQUEST (body, keys, proofs) are
+  // decided before the spend (security review F1), so a client bug does not
+  // burn the token: a corrected retry with the SAME token succeeds. Real KV
+  // here, so neither keyspace may be spent by the refusal.
+  const realKvEnv = () => ({ ...env, ...LOCAL_ENV, CA_BUNDLE_CACHE: env.CA_BUNDLE_CACHE });
+  const certGhaRaw = (token: string, body: string) =>
+    worker.fetch(
+      new Request(`${ORIGIN}/cert/gha`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body,
+      }),
+      realKvEnv(),
+    );
+
+  it("cert-gha.refusal-spends-nothing — a malformed body, missing keys or a bad PoP leave the token spendable", async () => {
+    const other = await signer.token();
+    const refusals: Array<[string, (t: string) => Promise<string>, number]> = [
+      ["malformed JSON", async () => "{not json", 400],
+      ["missing keys", async () => JSON.stringify({ proofs: { mtls: "x", signing: "y" } }), 400],
+      [
+        "unimportable key",
+        async (t) => {
+          const b = await ghaPopBody(t);
+          return JSON.stringify({ ...b, public_keys: { ...b.public_keys, mtls: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----" } });
+        },
+        400,
+      ],
+      // Proofs bound to a DIFFERENT token: a forged request with a captured token.
+      ["PoP for another token", async () => JSON.stringify(await ghaPopBody(other)), 401],
+    ];
+    for (const [what, bodyFor, status] of refusals) {
+      const token = await signer.token();
+      const refused = await certGhaRaw(token, await bodyFor(token));
+      expect(refused.status, `${what}: ${await refused.clone().text()}`).toBe(status);
+      const retry = await certGhaRaw(token, JSON.stringify(await ghaPopBody(token)));
+      expect(retry.status, `${what} retry: ${await retry.clone().text()}`).toBe(200);
+    }
   });
 
   it("oidc-jti.cross-route.refusal-spends-nothing — an owner refused at /cert/gha and /token is still spendable", async () => {
