@@ -52,6 +52,7 @@ type HeldCerts = {
 // Implementation in src/allowed-audiences.ts so unit tests can import it
 // without pulling in cloudflare:workers via worker.ts.
 import { getAllowedAudiences } from "./src/allowed-audiences";
+import { opaqueError } from "./src/error-body";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
 import { principalIdentity } from "./src/cert-authority";
@@ -687,7 +688,9 @@ async function handleCertGHA(
   try {
     claims = await validateGHAToken(token, cfg.ghaCertAudience);
   } catch (e: any) {
-    return jsonErr(`invalid token: ${e.message}`, 401);
+    // Constant body (notme-b567c9): the verifier's message names what it
+    // expected (audience, issuer, key id). Logged, not returned.
+    return opaqueError("cert-gha", "invalid token", 401, e);
   }
 
   // Allowlist check — only permitted owners can get certs from this authority
@@ -729,7 +732,7 @@ async function handleCertGHA(
     // read, so an anonymous or rate-limited request paid for it.
     await ensureCurrentCABundle(env, platform);
   } catch (e: any) {
-    return jsonErr("authority unavailable: " + e.message, 503);
+    return opaqueError("cert-gha", "authority unavailable", 503, e);
   }
 
   // ── Bridge cert pair via PoP exchange (008) ──
@@ -767,7 +770,7 @@ async function handleCertGHA(
     mtlsPubKey = await importPublicKey(body.public_keys.mtls);
     signingPubKey = await importPublicKey(body.public_keys.signing);
   } catch (e: any) {
-    return jsonErr(`invalid public key: ${e.message}`, 400);
+    return opaqueError("cert-gha", "invalid public key", 400, e);
   }
 
   // Compute binding payload: SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
@@ -832,7 +835,7 @@ async function handleCertGHA(
       ttlMs: cfg.ghaCertTtlMs,
     });
   } catch (e: any) {
-    return jsonErr(e.message || "cert minting failed", 500);
+    return opaqueError("cert-gha", "cert minting failed", 500, e);
   }
 
   return Response.json({
@@ -2360,7 +2363,7 @@ export default {
             currentEpoch,
           );
         } catch (e: any) {
-          return jsonErr("proof verification failed: " + e.message, 401);
+          return opaqueError("connections", "proof verification failed", 401, e);
         }
 
         // Store the connection (via DO RPC, not the imported function)
@@ -2872,7 +2875,7 @@ export default {
           const result = await authority.resetPasskeyData();
           return Response.json({ ok: true, ...result });
         } catch (e: any) {
-          return jsonErr("reset failed: " + e.message, 500);
+          return opaqueError("passkey-reset", "reset failed", 500, e);
         }
       }
 
@@ -2914,7 +2917,7 @@ export default {
             rpId: request.headers.get("host") || "auth.notme.bot",
           });
         } catch (e: any) {
-          return jsonErr("status unavailable: " + e.message, 503);
+          return opaqueError("status", "status unavailable", 503, e);
         }
       }
 
@@ -3026,7 +3029,7 @@ export default {
             mtlsPubKey = await importPublicKey(body.public_keys.mtls);
             signingPubKey = await importPublicKey(body.public_keys.signing);
           } catch (e: any) {
-            return jsonErr("invalid public key: " + e.message, 400);
+            return opaqueError("cert-passkey", "invalid public key", 400, e);
           }
 
           // Binding = SHA-256(mtls_spki || signing_spki || SHA-256(session
@@ -3132,7 +3135,7 @@ export default {
             auth_method: sessionAuthMethod,
           });
         } catch (e: any) {
-          return jsonErr("passkey cert error: " + e.message, 500);
+          return opaqueError("cert-passkey", "passkey cert error", 500, e);
         }
       }
 
@@ -3496,7 +3499,7 @@ export default {
           try {
             publicKey = await importPublicKey(body.public_key);
           } catch (e: any) {
-            return jsonErr("invalid public key: " + e.message, 400);
+            return opaqueError("issuing-ca", "invalid public key", 400, e);
           }
           if (publicKey.algorithm.name !== "Ed25519") {
             // The tier signs certificates and the chain is Ed25519
@@ -3560,7 +3563,7 @@ export default {
             auth_method: sessionAuthMethod,
           });
         } catch (e: any) {
-          return jsonErr("issuing-ca error: " + e.message, 500);
+          return opaqueError("issuing-ca", "issuing-ca error", 500, e);
         }
       }
 
@@ -3806,7 +3809,7 @@ export default {
             expires_in: expiresAt - Math.floor(Date.now() / 1000),
           });
         } catch (e: any) {
-          return jsonErr("authorize code error: " + e.message, 500);
+          return opaqueError("authorize-code", "authorize code error", 500, e);
         }
       }
 
@@ -3887,7 +3890,7 @@ export default {
             expires_in: 300,
           });
         } catch (e: any) {
-          return jsonErr("authorize redeem error: " + e.message, 500);
+          return opaqueError("authorize-redeem", "authorize redeem error", 500, e);
         }
       }
 
@@ -3954,10 +3957,7 @@ export default {
             expires_in: 300,
           });
         } catch (e: any) {
-          return Response.json(
-            { error: "authorize token error: " + e.message },
-            { status: 500 },
-          );
+          return opaqueError("authorize-token", "authorize token error", 500, e);
         }
       }
 
@@ -4244,7 +4244,7 @@ export default {
                 { headers: successHeaders },
               );
             } catch (e: any) {
-              return jsonErr("token endpoint error: " + e.message, 500);
+              return opaqueError("token", "token endpoint error", 500, e);
             }
           })(),
         );
