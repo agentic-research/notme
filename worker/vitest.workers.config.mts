@@ -117,9 +117,10 @@ export const WARM_SETUP_FILES = ["./src/__tests__/setup/warm-worker-modules.ts"]
  * The Durable Object suite is hermetic, like the plain one (notme-73202e): a
  * fetch to any non-loopback host is refused and fails the test that made it,
  * naming the URL. The SAME module the plain suite loads, installed in the
- * pool's isolate. FIRST in setupFiles, so everything loaded after it (the
- * warm-up, and any fixture that wraps fetch, such as helpers/gha-token.ts and
- * helpers/oidc-issuer.ts) wraps the guard and falls through to it. The tests
+ * pool's isolate. First after the Reflect polyfill (which wraps no fetch),
+ * so everything loaded after it (the warm-up, and any fixture that wraps
+ * fetch, such as helpers/gha-token.ts and helpers/oidc-issuer.ts) wraps the
+ * guard and falls through to it. The tests
  * serve their own hosts; nothing here reaches production.
  *
  * Not applied to vitest.workers.ct-live.config.mts: that suite exists to talk
@@ -127,12 +128,20 @@ export const WARM_SETUP_FILES = ["./src/__tests__/setup/warm-worker-modules.ts"]
  */
 export const NO_NETWORK_SETUP_FILES = ["./src/__tests__/setup/no-network.ts"];
 
+/**
+ * The Reflect polyfill @peculiar/x509 3.x requires, loaded before anything
+ * imports x509 (notme-3ee3b0). FIRST in every pool's setupFiles, ahead of the
+ * no-network guard: the warm-up imports x509, and a test file reaches it
+ * without going through worker.ts, whose first import is the same.
+ */
+export const REFLECT_SETUP_FILES = ["./src/__tests__/setup/reflect-metadata.ts"];
+
 export default defineConfig({
   resolve: { alias: { "@peculiar/x509": x509Dir } },
   plugins: [cloudflareTest({ main: "./worker.ts", miniflare: baseMiniflare })],
   test: {
     include: ["src/**/*.do.test.ts"],
-    setupFiles: [...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],
+    setupFiles: [...REFLECT_SETUP_FILES, ...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],
     exclude: [...configDefaults.exclude, ...CT_BOUND_SUITES, ...CT_LIVE_SUITES],
   },
 });

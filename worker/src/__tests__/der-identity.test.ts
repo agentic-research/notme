@@ -79,7 +79,7 @@ const sha256 = (b: Uint8Array): string => createHash("sha256").update(b).digest(
 
 /**
  * Pinned 2026-11-04 on goalzero 5e35a2e with @peculiar/x509 1.14.3, before
- * the 3.x bump.
+ * the 3.x bump, and reproduced byte for byte by 3.1.0.
  */
 const EXPECTED: Record<string, string> = {
   "root": "9370a0c5b3fd67880eb6402a2d0155dab5516c5330a461dc9d0877ead2fabfc8",
