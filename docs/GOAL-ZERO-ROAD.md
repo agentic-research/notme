@@ -198,7 +198,7 @@ Do these while Phase 0 is out for decision. None touch the contested naming.
 | Ask | Repo | Status |
 |---|---|---|
 | `signet-9dfb44` — bridge naming, one-intermediate rule, stale ADR-004 note | signet | **filed, blocking 0.2** |
-| `cloister-c10ff2` — optional ninth commitment key, and §2.2.1 step-3 ambiguity | cloister | filed; the field is inert until they act |
+| `cloister-c10ff2` — optional ninth commitment key, and §2.2.1 step-3 ambiguity | cloister | filed; notme refuses every nine-key commitment until notme builds a producer, over a wire shape agreed here (notme-c0db9b) |
 | rc.3 confirmation | signet | unblocked — `/.well-known/version` now proves what is deployed |
 
 The step-3 ambiguity in `cloister-c10ff2` matters **whether or not** the field

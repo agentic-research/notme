@@ -391,6 +391,9 @@ export async function mintGHABridgeCert(
   publicKeyPem: string,
   masterKey: string | CryptoKey,
   ttlMs = 5 * 60 * 1000, // 5 minutes — enough for one CI job
+  // The signing CA's subject. Defaults to the production root's; a
+  // non-production authority's root has its own (notme-7ec6fb).
+  issuerName = "CN=signet-authority,O=notme",
 ): Promise<BridgeCertResult> {
   const signingKey =
     typeof masterKey === "string"
@@ -414,7 +417,7 @@ export async function mintGHABridgeCert(
 
   const cert = await X509CertificateGenerator.create({
     subject: `CN=${subject},O=notme`,
-    issuer: `CN=signet-authority,O=notme`,
+    issuer: issuerName,
     notBefore: now,
     notAfter: expires,
     signingAlgorithm: ED25519,
@@ -503,10 +506,11 @@ export async function mintBridgeCertPair(
     authMethod: string;
     ttlMs?: number;
     /**
-     * The signer's SUBJECT name, when the signer is not the root. RFC 5280
-     * §6.1.3 chains by NAME as well as by key: a cert claiming
-     * CN=signet-authority while signed by a tier is rejected by every stock
-     * validator, and by verifyCertChain. mintTaskCertPair passes the tier's.
+     * The signer's SUBJECT name. RFC 5280 §6.1.3 chains by NAME as well as
+     * by key: a cert claiming CN=signet-authority while signed by a tier is
+     * rejected by every stock validator, and by verifyCertChain.
+     * mintTaskCertPair passes the tier's; the DO passes its root's, which on
+     * a non-production authority is not the default (notme-7ec6fb).
      */
     issuerName?: string;
     /** Extra extensions (e.g. the task scope) — appended to both certs. */
@@ -706,7 +710,7 @@ export async function mintIssuingCaCert(
     epoch: number;
     authMethod: string;
     ttlMs?: number;
-    /** Signer's subject name when not the root — see mintBridgeCertPair. */
+    /** Signer's subject name — see mintBridgeCertPair. */
     issuerName?: string;
     /** Defaults to "agent": a tier is a machine, however a human armed it. */
     principalKind?: PrincipalKind;

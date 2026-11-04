@@ -443,9 +443,12 @@ block).
 - `auth/correlation-key.ts` — `<principal>/<bridge>/<task>`, keyed on the
   stable principal and the pair binding (not a serial: a bridge is two certs
   with two independent serials, so no serial names it).
-- `receipts/commitment.ts` — an optional ninth `delegation` field, verified
-  against what the authority derived. Proposed to cloister as
-  `cloister-c10ff2`; inert until adopted.
+- `receipts/commitment.ts` — the VALIDATOR for an optional ninth
+  `delegation` field, verified against what the authority derived. No
+  production path derives one yet, so `signReceipt` refuses every nine-key
+  commitment (notme-c0db9b; ADR-014, "The optional ninth key"). Proposed to
+  cloister as `cloister-c10ff2`, but the next move is notme's: a producer,
+  over a wire shape agreed with cloister.
 
 ## What it requires that is not built
 
