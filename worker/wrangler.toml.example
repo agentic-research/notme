@@ -89,8 +89,8 @@ RENEWAL_BINDING_V3 = "off"
 # holds its notAfter, verified under THAT shard's key; a certificate no shard
 # covers is backlogged and never sent to the wrong shard. Intervals are the
 # shards' `temporal_interval` from ct/config.notme.json, UTC, non-overlapping.
-# Configure the next shard here well before the current one closes
-# (ct/README.md runbook step 6).
+# Configure the next shard here well before the current one closes: health
+# `ct.shardClosingSoon` turns true 60 days ahead (ct/README.md runbook step 6).
 # CT_LOG_SHARDS = '''[
 #   {"path": "/logs/notme", "log_id": "<b64>", "key": "<b64>",
 #    "temporal_interval": {"start_inclusive": "2026-07-01T00:00:00Z", "end_exclusive": "2027-07-01T00:00:00Z"}},

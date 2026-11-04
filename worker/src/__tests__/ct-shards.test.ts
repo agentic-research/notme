@@ -8,7 +8,13 @@
 import { createHash, generateKeyPairSync } from "node:crypto";
 import * as x509 from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
-import { parseShards, selectShard, type CtShard } from "../ct/shards";
+import {
+  parseShards,
+  selectShard,
+  shardEndHealth,
+  SHARD_WARN_DAYS,
+  type CtShard,
+} from "../ct/shards";
 import { notAfterOf } from "../ct/verify-sct";
 
 function logKey(): { log_id: string; key: string } {
@@ -164,5 +170,47 @@ describe("notAfterOf — the certificate's own notAfter", () => {
 
   it("throws on bytes that are not a certificate", () => {
     expect(() => notAfterOf(new Uint8Array([0x30, 0x03, 0x02, 0x01, 0x00]))).toThrow();
+  });
+});
+
+describe("shardEndHealth — warn before the newest shard closes (notme-a806d0)", () => {
+  // A pinned clock: the function takes `now`, so nothing reads the real time.
+  const DAY = 24 * 60 * 60 * 1000;
+  const END = Date.parse("2027-07-01T00:00:00Z");
+  const before = (days: number) => END - days * DAY;
+
+  it("the threshold is 60 days", () => {
+    expect(SHARD_WARN_DAYS).toBe(60);
+  });
+
+  it("reports the NEWEST shard's end, whatever the config order", async () => {
+    const s = await ok({ CT_LOG_SHARDS: [TWO[1], TWO[0]] });
+    const h = shardEndHealth(s, Date.parse("2027-06-01T00:00:00Z"));
+    expect(h.shardEndsAt).toBe("2028-01-01T00:00:00.000Z");
+    expect(h.shardClosingSoon).toBe(false);
+  });
+
+  it("closing soon strictly inside 60 days, not at exactly 60", async () => {
+    const s = await ok({ CT_LOG_SHARDS: [TWO[0]] });
+    expect(shardEndHealth(s, before(60))).toEqual({
+      shardEndsAt: "2027-07-01T00:00:00.000Z",
+      shardEndsInDays: 60,
+      shardClosingSoon: false,
+    });
+    const h = shardEndHealth(s, before(60) + 1);
+    expect(h.shardEndsInDays).toBe(59);
+    expect(h.shardClosingSoon).toBe(true);
+    expect(shardEndHealth(s, before(200))).toMatchObject({ shardEndsInDays: 200, shardClosingSoon: false });
+  });
+
+  it("stays closing-soon, with a zero or negative day count, once the newest shard has closed", async () => {
+    const s = await ok({ CT_LOG_SHARDS: [TWO[0]] });
+    expect(shardEndHealth(s, END)).toMatchObject({ shardEndsInDays: 0, shardClosingSoon: true });
+    expect(shardEndHealth(s, END + 3 * DAY)).toMatchObject({ shardEndsInDays: -3, shardClosingSoon: true });
+  });
+
+  it("the single pin has no interval: null, never closing", async () => {
+    const s = await ok({ CT_LOG_ID: A.log_id, CT_LOG_KEY: A.key });
+    expect(shardEndHealth(s, END)).toEqual({ shardEndsAt: null, shardEndsInDays: null, shardClosingSoon: false });
   });
 });

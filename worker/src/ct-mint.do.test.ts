@@ -72,6 +72,9 @@ interface CtHealthView {
   unloggable: { count: number; lastAt: number; reason: string };
   embedFailed: { count: number; lastAt: number };
   configError: string | null;
+  shardEndsAt: string | null;
+  shardEndsInDays: number | null;
+  shardClosingSoon: boolean;
 }
 
 const ctLog = (): Fetcher => {
@@ -586,6 +589,24 @@ describe("ct.shards — each certificate goes to the shard whose interval holds 
     expectBacklogged(r);
     expect(r.health.configError).toMatch(/CT_LOG_SHARDS: .*overlap/);
     expect(r.health.lastError).toMatch(/^config: CT_LOG_SHARDS/);
+  });
+
+  it("health reports when the NEWEST shard closes, and flags it inside 60 days (notme-a806d0)", async () => {
+    const k = await control("ok");
+    const now = Date.now();
+    const t = now + DAY_MS;
+    const soon = await mint({ envPatch: shardsPatch(k, [EPOCH_2000, t], [t, now + 30 * DAY_MS]) });
+    expect(soon.health.shardEndsAt).toBe(iso(now + 30 * DAY_MS));
+    expect(soon.health.shardEndsInDays).toBe(29); // floor: a little under 30 days by read time
+    expect(soon.health.shardClosingSoon).toBe(true);
+    const later = await mint({ envPatch: shardsPatch(k, [EPOCH_2000, t], [t, now + 100 * DAY_MS]) });
+    expect(later.health.shardEndsInDays).toBe(99);
+    expect(later.health.shardClosingSoon).toBe(false);
+    // The single pin has no interval to report.
+    const single = await mint();
+    expect(single.health.shardEndsAt).toBeNull();
+    expect(single.health.shardEndsInDays).toBeNull();
+    expect(single.health.shardClosingSoon).toBe(false);
   });
 
   it("CT_LOG_SHARDS and the single pin together are a configError, not a silent precedence", async () => {

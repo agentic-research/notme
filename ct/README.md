@@ -387,8 +387,23 @@ up means the timeout, not the log, is the problem.
 | `unloggable` | `{count, lastAt, reason}`: mints that went out with no SCT and **no backlog row**: the root could not be read or parsed, or the backlog INSERT failed. (An invalid pin is not counted here: those mints are backlogged.) |
 | `embedFailed` | `{count, lastAt}`: mints whose SCTs verified but could not be embedded; they were backlogged instead |
 | `configError` | why `CT_LOG_ID` / `CT_LOG_KEY`, or `CT_LOG_SHARDS`, cannot be trusted (bad JSON, a bad key, overlapping intervals, both forms set, ...); `null` when they are valid (or `CT_LOG` is unbound) |
+| `shardEndsAt` | `end_exclusive` of the configured shard that ends **last** (ISO 8601): after it no certificate has a shard and every mint is backlogged. `null` with the single pin (no interval), unbound, or a `configError` |
+| `shardEndsInDays` | whole days until `shardEndsAt`, floored; `0` or negative once it has passed |
+| `shardClosingSoon` | `true` when `shardEndsAt` is less than **60 days** away, or past (notme-a806d0) |
 
 Alert on:
+
+- **`shardClosingSoon` true.** No configured shard covers certificates
+  expiring after `shardEndsAt`. Roll now (step 6): add, provision and pin
+  the next shard, then deploy `CT_LOG_SHARDS` with both. 60 days because the
+  roll is several reviewed steps with lead time (config, provisioning R2 /
+  KV / two secrets, deploy, the key through review and a release, a canary
+  deploy of notme), and an alert read at a monthly review must still leave a
+  full cycle; it is under azul's 3-month minimum production shard span, so
+  a newly added shard does not alert at once. The hard deadline is 24 h
+  before `shardEndsAt` (the longest tier TTL); past it, certificates are
+  backlogged with `lastError` "no shard covers notAfter". The single pin
+  reports no interval, so this alert only works with `CT_LOG_SHARDS`.
 
 - **`configError` not `null`.** The binding is up but nothing is being
   logged; every mint is backlogged and `backlog` grows. Fix `CT_LOG_ID` /
@@ -476,7 +491,7 @@ last hour's tiers their embedded SCT.)
    variables removed (setting both is a `configError`). Do this any time
    before the earliest `notAfter` that can reach the boundary: at the latest
    24 hours before it, the longest tier TTL; in practice, as soon as the new
-   shard is deployed.
+   shard is deployed. `ct.shardClosingSoon` stays `true` until you do.
 5. Watch `/admin/alarm-health`: `configError` stays `null` and `lastError`
    never reads `no shard covers notAfter`.
 6. Keep the old shard serving reads; it stays the record for what it logged.

@@ -44,7 +44,7 @@ import {
   type SubmitResult,
 } from "./ct/log-client";
 import { notAfterOf, precertTbs, spkiOf, verifySct } from "./ct/verify-sct";
-import { parseShards, selectShard, type CtShard } from "./ct/shards";
+import { parseShards, selectShard, shardEndHealth, type CtShard } from "./ct/shards";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 import {
   deriveKek,
@@ -354,6 +354,16 @@ export interface CtHealth {
    * under it overwrites lastError with "config: …; chains backlogged".
    */
   configError: string | null;
+  /**
+   * end_exclusive of the configured shard that ends LAST (notme-a806d0): after
+   * it no certificate has a shard to go to and every mint is backlogged. Null
+   * for the single pin (no interval), unbound, or a configError.
+   */
+  shardEndsAt: string | null;
+  /** Whole days until shardEndsAt, floored; zero or negative once passed. */
+  shardEndsInDays: number | null;
+  /** True inside SHARD_WARN_DAYS (60) of shardEndsAt, and after it: configure the next shard. */
+  shardClosingSoon: boolean;
 }
 
 // Circuit-breaker threshold for the alarm() loop. After this many consecutive
@@ -2400,6 +2410,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       },
       embedFailed: { count: h.embed_failed_count, lastAt: h.embed_failed_last_at },
       configError: pin && "error" in pin ? pin.error : null,
+      ...(pin && "shards" in pin
+        ? shardEndHealth(pin.shards, Date.now())
+        : { shardEndsAt: null, shardEndsInDays: null, shardClosingSoon: false }),
     };
   }
 

@@ -129,6 +129,42 @@ export async function parseShards(
   return { shards: sorted };
 }
 
+/**
+ * Alert threshold for the newest shard's close (notme-a806d0). 60 days because
+ * rolling is several reviewed steps with lead time — add the shard to
+ * config.notme.json, provision it (R2, KV, two secrets), deploy it, record its
+ * key through review plus a release, then deploy notme through the canary
+ * with both shards — and an alert read on a monthly operator review must
+ * still leave a full cycle of slack. It is under azul's minimum production
+ * shard span (3 months), so a newly added shard does not alert on arrival,
+ * and over the 24 h longest tier TTL that is the hard deadline.
+ */
+export const SHARD_WARN_DAYS = 60;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export interface ShardEndHealth {
+  /** end_exclusive of the shard that ends LAST; null for the single pin. */
+  shardEndsAt: string | null;
+  /** Whole days until then, floored; zero or negative once it has closed. */
+  shardEndsInDays: number | null;
+  /** True inside SHARD_WARN_DAYS of that end, and after it. */
+  shardClosingSoon: boolean;
+}
+
+/** When certificates stop having a shard to go to, measured from `nowMs`. */
+export function shardEndHealth(shards: CtShard[], nowMs: number): ShardEndHealth {
+  const end = Math.max(...shards.map((s) => s.endMs));
+  if (!Number.isFinite(end)) {
+    return { shardEndsAt: null, shardEndsInDays: null, shardClosingSoon: false };
+  }
+  return {
+    shardEndsAt: new Date(end).toISOString(),
+    shardEndsInDays: Math.floor((end - nowMs) / DAY_MS),
+    shardClosingSoon: end - nowMs < SHARD_WARN_DAYS * DAY_MS,
+  };
+}
+
 /** The shard whose [start, end) holds `notAfterMs`, or null. */
 export function selectShard(shards: CtShard[], notAfterMs: number): CtShard | null {
   if (Number.isNaN(notAfterMs)) return null;
