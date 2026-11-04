@@ -3,7 +3,9 @@
 The identity triangle is **notme · signet · cloister**. This lays out how their
 open work actually relates, in what order it can proceed, and whose move each
 gate is. Derived 2026-08-27 from the beads' own cross-citations, not from
-theme vibes. Companion to [`GOAL-ZERO-ROAD.md`](GOAL-ZERO-ROAD.md), which
+theme vibes. The counts below are from that date; rows are annotated where a
+bead has since closed (2026-11-03), and the current notme order is in
+[`REMAINING-WORK.md`](REMAINING-WORK.md). Companion to [`GOAL-ZERO-ROAD.md`](GOAL-ZERO-ROAD.md), which
 covered the release that shipped; this is the arc after it.
 
 ## The finding that shapes everything else
@@ -31,7 +33,7 @@ order:
 | A3 | ~~Grant object~~ **BUILT 2026-08-28** — grants are objects with id, granter, timestamps, revoker (`listGrants`); D3's fuller payload (`parent_grant_id`, `goal_hash`, `delegable`) lands with A5 | ADR-019 req #1 | — | done |
 | A4 | ~~Revocation unit = the grant~~ **BUILT 2026-08-28** — `POST /principals/:id/revoke`; every authority gate reads the grant store live; passkey users are principals with grants (criterion C met) | `notme-77a024` | — | done |
 | A5 | ~~Task-credential producer~~ **BUILT 2026-08-28** — `mintTaskCertPair` (offline, tier-signed; enforces namespace-by-construction, scope narrowing, tier-bounded TTL, possession, task scope at `OID_TASK_SCOPE`); `taskCorrelationKey` derives the third segment from the certs; walker now checks issuer-NAME chaining (found the fixtures lying) | `notme-9f84e6` | — | done |
-| A6 | **Delegation in receipts end-to-end** — the ninth commitment key becomes reachable | `notme-c0db9b` + `cloister-c10ff2` | a delegation producer in `signReceipt` (notme), over a wire shape agreed with cloister | notme first |
+| A6 | **Delegation in receipts end-to-end** — the ninth commitment key becomes reachable. `notme-c0db9b` closed by documenting the key as validator-only; the producer is `notme-d3b763` (open) | `notme-d3b763` + `cloister-c10ff2` | a delegation producer in `signReceipt` (notme), over a wire shape agreed with cloister | notme first |
 | A7 | ~~Stable identity~~ **BUILT 2026-08-29** — `wimse://<domain>/principal/<stable-id>`, one builder, `principal_kind` as its own extension; the SPIFFE inversion is gone and criterion B's code half is met | `notme-77438b` | — | done |
 | A7 | Naming follow-through in signet docs (`id-kp-signet-bridge-delegate` is now a misnomer) | `signet-9dfb44` consequence | nothing | signet |
 
@@ -49,7 +51,7 @@ encode the order:
 |---|---|---|---|
 | B1 | ~~Issuance log — compose-decision~~ **DECIDED 2026-08-28: a Static CT API log, composed from Cloudflare's `azul`** (Workers + DO + R2). Real SCTs, so signet's `--ctfe` path is buildable; public Rekor would record issuance but cannot satisfy SCT verification. Checkpoint key pinned out of band (B2) | `notme-907299` | decided |
 | B1a | ~~Ed25519 precondition~~ — azul refused every Ed25519 chain at `add-chain`; **PR submitted upstream 2026-08-28: [cloudflare/azul#281](https://github.com/cloudflare/azul/pull/281)**, patch kept at `docs/design/azul-ed25519.patch` for vendoring if it stalls | `notme-1b46a8` | awaiting review |
-| B1b | **Build `notme-ct`** — scaffold from `ct_worker` with the production root as `roots.notme.pem`, R2 + KV + signing/witness secrets; SCTs at every mint path, plus a submission client for the offline task producer | `notme-1b46a8` | next |
+| B1b | **Build `notme-ct`** — scaffold from `ct_worker` with the production root as `roots.notme.pem`, R2 + KV + signing/witness secrets; SCTs at every mint path, plus a submission client for the offline task producer. **Worker side built (2026-11):** every online mint logs to a `CT_LOG` binding, with a backlog when the log is slow or down, but it is inert until `CT_LOG` is bound and the log is provisioned; the offline task producer has no submission client (`ct/README.md` "Not yet done") | `notme-1b46a8` | provision the log (owner) |
 | B2 | External trust anchor — pipeline-signed trust material, out-of-band pinning discipline | `notme-8e8836` | parallel to B1 |
 | B3 | **SCT enforcement at signet's verifier** — the flag flip that makes B1 compulsory; signet has it measured and filed | `signet-c0d32e` | blocked on B1's build (`notme-1b46a8`) |
 | B4 | **Monitor + mirror** — checkpoints verified against the out-of-band key, alerts on unexpected issuance; tiles mirrored for offline audit. The ids signet's bead cited (`ad4eac`/`ad7b5a`) were never filed; these replace them | `cloister-1b5fa2`, `cloister-1b7013` | B1's build |
@@ -63,13 +65,13 @@ corrections keep this line honest:
 - `cloister-35ccf7` (Interlace-Receipt signing) is **unblocked now**, but its
   plan targets `POST /internal/sign-receipt` — a wire shape ADR-014 retracted.
   The move is a service binding with `entrypoint = "ReceiptSigner"`.
-- `notme-bd133e`: the 404 signpost at that path ships stale integrator
-  instructions and needs its wording fixed.
+- `notme-bd133e` (closed): the 404 signpost at that path shipped stale
+  integrator instructions; its wording is fixed.
 
 `cloister-c10ff2` (ninth commitment key) is optional-field-shaped, but
 cloister adopting it changes nothing yet: `signReceipt` receives no
 credential, so notme derives no delegation and refuses every nine-key
-commitment (notme-c0db9b). A5 supplies the data (`taskCorrelationKey`); the
+commitment (notme-c0db9b; the producer is notme-d3b763). A5 supplies the data (`taskCorrelationKey`); the
 missing piece is notme's producer, wired through a credential-carrying
 `signReceipt` agreed with cloister.
 
@@ -99,7 +101,7 @@ missing piece is notme's producer, wired through a credential-carrying
 - `signet-6d2bcd`, `signet-c07d12` — both were blocked on `notme-28959a`,
   which **closed**; the pin advances are actionable today.
 - The **rc.3 run** — one green run closes the `notme-718ac0` /
-  `signet-71d9d8` pair from both sides.
+  `signet-71d9d8` pair from both sides. (`notme-718ac0` has since closed.)
 - `signet-0454a2` — consume notme's canonical CBOR fixtures instead of
   hand-copied hex.
 - `signet` ADR-004 EKU prose rename (Line A7) — documentation only.

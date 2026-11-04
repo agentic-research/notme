@@ -496,7 +496,9 @@ sequenceDiagram
               Durable Object holds the signing key and the current generation
               number; it keeps no registry of what it has issued, so there is
               nothing to look a serial up in. Issuance transparency is
-              separate, and in progress.
+              separate: the Worker can log every online mint to a Static CT
+              log, but no log is provisioned or bound yet, so today nothing
+              is logged.
             </p>
           </div>
           <div class="flow-step">

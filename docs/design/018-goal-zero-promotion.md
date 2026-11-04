@@ -4,7 +4,7 @@
 -->
 # ADR-018: Goal Zero release promotion — staging → promote → converge → verify
 
-**Status:** accepted; canary phase deleted 2026-08-27 (`notme-9f2f79`) — see the CORRECTION in Phase 2
+**Status:** accepted; canary phase deleted 2026-08-27 (`notme-9f2f79`), then restored 2026-11-03 as a version-pinned soak (`notme-325916`) — see both CORRECTIONs in Phase 2
 **Beads:** notme-cf288e (this plan), notme-bed754 (Goal Zero epic)
 **Audits it serves:** notme-c0a37e (runtime/deployment proof), notme-c0a4f6 (release/package verification), notme-c0a4aa (cross-repo convergence)
 

@@ -7,11 +7,13 @@ generated code from `../schema/`. **don't edit anything in here by hand** — ex
 > a byte-copy instead — cloister and canonical-hours each carried one. It now lives
 > at [`../packages/dpop`](../packages/dpop) as `@agentic-research/dpop` (`notme-18450e`).
 
-## ⚠️ open: TS and Go paths use different toolchains
+## TS and Go paths use different toolchains
 
-**bead `notme-803923`** + see [`../schema/README.md`](../schema/README.md) for full context.
+**bead `notme-803923` (closed)** + see [`../schema/README.md`](../schema/README.md) for full context.
 
-`identity.capnp` claims cap'n proto's deterministic binary format guarantees cross-language byte equality. that's only true on the Go side right now:
+> **Resolved (ADR-010).** `identity.capnp` used to claim cap'n proto's deterministic binary format guaranteed cross-language byte equality. It no longer does: its header now says the file is type sync only, and signing input is canonical CBOR (`../worker/src/revocation.ts` `bundleCanonical`, pinned by `../schema/fixtures/`). The toolchain difference below is still true, and no longer affects byte equality. The text below is kept as the history of the decision.
+
+`identity.capnp` claimed cap'n proto's deterministic binary format guarantees cross-language byte equality. that was only true on the Go side:
 
 - **go**: real `capnpc-go` output → real capnp wire format.
 - **ts**: output of `../schema/codegen/capnp-to-ts.ts` (~280 LOC hand-rolled parser) → TS interfaces + Zod schemas, **not** capnp wire bytes.
@@ -130,7 +132,7 @@ per the workerd / mache RTFM precedent: committing the artifact eliminates versi
 
 > **no Go consumer today.** A cross-repo sweep (`notme-c0a4aa`) found nothing outside this repo importing `gen/go` — no `go.mod` in the ecosystem requires it, signet has no capnp files at all, and `RequireMTLS` has no caller outside notme. `gen/go` and its hand-written `verify/` package are therefore an unconsumed surface; whether to retire, keep as advisory, or recruit the intended consumer is tracked in `notme-ea5c65`. Read the consumer columns below as *intended*, not *observed*. the TS generator is run explicitly via `task schema:ts`; the Go generator via `task schema:go`. neither is wired into a default `build` step.
 
-caveat: the capnp toolchain itself isn't pinned yet. the RTFM recommends pinning compiler + generators + runtimes by exact version with a cross-runtime fixture suite. notme does neither; tracked in `notme-803923` tier 2.
+caveat: the capnp toolchain itself isn't pinned yet. the RTFM recommends pinning compiler + generators + runtimes by exact version with a cross-runtime fixture suite. notme pins no toolchain; the fixture suite exists only for the canonical CBOR signing input (`../schema/fixtures/`), not for capnp. this was `notme-803923` tier 2; that bead is closed and no open bead tracks the pins.
 
 ## related
 

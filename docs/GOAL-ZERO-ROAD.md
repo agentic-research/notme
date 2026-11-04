@@ -1,5 +1,10 @@
 # Goal Zero — the road to done
 
+> **Status (2026-11-03):** historical. This was the ordering in August 2026.
+> Phase 0's decisions are resolved and Phase 1's beads have closed
+> (`notme-600df1`, `notme-addef9`, `notme-9f2f79`); `notme-8e8836` is still
+> open. The current order of work is in [REMAINING-WORK.md](REMAINING-WORK.md).
+
 Companion to [`GOAL-ZERO-STATUS.md`](GOAL-ZERO-STATUS.md), which says where we
 are. This says **what order to do things in, and who has to decide what.**
 

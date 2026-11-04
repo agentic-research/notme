@@ -171,7 +171,10 @@ side effect.
 
 **Gated on "no administrator", not "no credential".** Anyone may open a claim
 while no administrator exists; only the code the named workflow approves
-counts, and approval voids every other pending claim. Under a "first
+counts, and approval voids every other pending claim. A claim also belongs to
+the browser that opened it: registration sets a mark cookie, and the verify
+step must present it (`notme-a2e75d`, `worker/worker.ts:910-920`), as an
+invite reservation does. Under a "first
 credential" gate, a stranger who registered first and was never approved
 would lock the deployer out permanently.
 
@@ -315,7 +318,11 @@ graph LR
 **Two independent refresh paths, and you need both.** The alarm never fired for
 130 days *and* the KV write had no TTL, so the published bundle was four months
 stale — rejected by any conformant verifier. Either safeguard alone would have
-prevented it (`notme-77a024`, `notme-4896d8`).
+prevented it (`notme-77a024`, `notme-4896d8`). The 60 s TTL is on the
+request-path put (`worker/src/internal-ca-bundle.ts:18`); the alarm's put
+(`worker/src/signing-authority.ts:5327`) sets none. What stops a fossil from
+being served is the read: `/internal/ca-bundle` checks `isBundleStale` on the
+cached bundle and regenerates if it is stale (`internal-ca-bundle.ts:46`).
 
 Health: `GET /admin/alarm-health` (`authorityManage`-gated).
 
@@ -331,7 +338,8 @@ task worker:promote NEW=<version-id> ENV=production          # gated; converges,
 ```
 
 `ENV` is required — no environment is reachable by omission. `worker:promote`
-refuses a version with no pinned-verify record unless you type
+refuses a version with no pinned-verify record younger than 24 h
+(`EVIDENCE_TTL_HOURS`, `scripts/worker-promote.sh:63`) unless you type
 `ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>`, which is logged (`notme-16b2d5`).
 `task ship-prod` is the direct path; it does **not** roll back by itself.
 

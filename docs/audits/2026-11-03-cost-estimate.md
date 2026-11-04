@@ -2,6 +2,8 @@
 
 Tracked: rig-ed460e (WAF spend guard never applied; gates deploy), notme-ed6114 (unthrottled DO paths; gates deploy), CT-log cost decisions on notme-1b46a8. Prices are from the Cloudflare pages cited below as fetched on 2026-11-03; line numbers as of goalzero 90297b7.
 
+**Status (2026-11-03, after notme-ed6114 merged in d3a0814 and the CT cost decisions in 89d459d):** the notme-side items below are done. Every unauthenticated path checks a limit before the Durable Object (`/token` included, 0cdde59), `/.well-known/*` cache keys ignore the query string (bfbcb24), `jwks.json` and `ca-bundle.pem` are `max-age=300` (728aca2, `worker/worker.ts:1951`), and the CT shard config is `sequence_interval_millis` 750 with `max_sequence_skips` 1 (`ct/config.notme.json:25-26`). rig-ed460e (the WAF ruleset) and the billing alerts are outside this repo and remain owner actions. The estimate below is as written before those fixes.
+
 
 Month = 30 d = 2,592,000 s. Prices fetched today.
 

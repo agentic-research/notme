@@ -1,5 +1,13 @@
 # Goal Zero — status and orientation
 
+> **Status (2026-11-03):** an orientation snapshot from 2026-08-27, kept for
+> its corrections (§3), defect patterns (§7) and operational notes (§8). For
+> what is open now, read [REMAINING-WORK.md](REMAINING-WORK.md), which tracks
+> the live bead list. Of the beads §5 and §6 list as open, every one is now
+> closed except `notme-8e8836`, `notme-907299`, `notme-1b46a8`,
+> `notme-41d0d3`, `notme-229dc3`, `notme-77ead7` and `notme-bc4cd2`; the
+> state column below is annotated where it changed.
+
 **Epic:** `notme-bed754` · **Branch:** `goalzero` — merged to `main` 2026-08-07
 (PR #72) as one release; the branch continues for the next cycle
 **Production:** version `79e5ba12` at 100%, converged on `473f9268`,
@@ -42,7 +50,7 @@ gate. The first release merged 2026-08-07 (PR #72); `goalzero` continues
 accumulating the next one. Do not open per-feature PRs to `main`.
 
 Consequence worth knowing: anything requiring a change on `main` — notably the
-self-pin in `.github/workflows/gha-identity.yml:137`, which pins
+self-pin in `.github/workflows/gha-identity.yml:144`, which pins
 `agentic-research/notme/action` at a commit SHA — **cannot land until that
 merge**. That constraint forced the migration window in §4.
 
@@ -128,28 +136,29 @@ repository under test.
 
 | Bead | What | Blocked on |
 |---|---|---|
-| `notme-600df1` | **The keystone.** ADR-019 is written and `proposed`. Adopting it = flipping Status | a decision, plus open question 1 (addition vs cut) — **signet has not been asked** |
-| `notme-77438b` | Identity varies with auth ceremony (`worker.ts:2307`) — the code half of (B) | `600df1` open question 1 |
-| `notme-2c4209` | Registration policy | `600df1` |
-| `notme-77a024` | Revocation unit. **Pick a mechanism**: signed revocation epochs, CRL DP, OCSP, or trust-bundle refresh. Today it is TTL-only below an epoch | `600df1` |
+| `notme-600df1` | **The keystone.** ADR-019 is written and `proposed`. Adopting it = flipping Status | **Closed** — ADR-019 is `accepted (2026-08-27)` |
+| `notme-77438b` | Identity varies with auth ceremony — the code half of (B) | **Closed** (criterion B, §1) |
+| `notme-2c4209` | Registration policy | **Closed** — ADR-021 |
+| `notme-77a024` | Revocation unit. **Pick a mechanism**: signed revocation epochs, CRL DP, OCSP, or trust-bundle refresh. Today it is TTL-only below an epoch | **Closed** — the grant is the unit (criterion C, §1) |
 | `notme-8e8836` | Trust root anchored out of band — half done; remainder is signing trust material with the release pipeline's Sigstore identity | — |
 | `notme-907299` | Issuance transparency (Static CT API — **not** RFC 6962, whose logs shut down 2026-02-28) | `8e8836` |
-| `notme-addef9` | Bootstrap: first boot tells the operator to read a code out of Worker logs, and any stranger's request triggers the mint | — (decidable now) |
+| `notme-addef9` | Bootstrap: first boot tells the operator to read a code out of Worker logs, and any stranger's request triggers the mint | **Closed** (criterion E, §1) |
 
 ### P0s outside the structural set
 
 | Bead | State |
 |---|---|
-| `notme-a011d2`, `notme-718ac0` | **Done on notme's side; blocked on signet.** One rc.3 run closes both. Left open deliberately: "we deployed the fix" ≠ "the path works end to end", and notme cannot mint a GitHub OIDC token for its own endpoint |
+| `notme-a011d2`, `notme-718ac0` | **Closed since.** At the time: done on notme's side; blocked on signet. One rc.3 run closes both. Left open deliberately: "we deployed the fix" ≠ "the path works end to end", and notme cannot mint a GitHub OIDC token for its own endpoint |
 | `notme-9f2f79` | **Closed 2026-08-27.** Cause confirmed in Cloudflare docs: overrides apply only to versions in the current deployment, silent fallback otherwise. Canary phase deleted from ADR-018; the pipeline is promote → converge → verify |
-| `notme-acc822` | Scope half enforced at every narrowing site (`narrowScopes`, 2026-08-27). Depth half built: Issuing CA tier, `POST /cert/issuing-ca`. Namespace half remains open (§3.2 / ADR-019 D5) |
-| `notme-28959a` | undici in `action/dist` — parked at owner's direction while signet coordinates |
+| `notme-acc822` | **Closed since.** Scope half enforced at every narrowing site (`narrowScopes`, 2026-08-27). Depth half built: Issuing CA tier, `POST /cert/issuing-ca`. Namespace half remains open (§3.2 / ADR-019 D5) |
+| `notme-28959a` | **Closed since.** At the time: undici in `action/dist`, parked at owner's direction while signet coordinates |
 
 ### Cross-repo, awaiting others
 
 - `cloister-c10ff2` — the optional ninth commitment key `delegation`.
   **Not reachable from production, and the blocker is notme's**
-  (notme-c0db9b): `signReceipt` receives no credential, so no delegation is
+  (notme-c0db9b, closed by documenting `delegation` as validator-only; the
+  producer is notme-d3b763): `signReceipt` receives no credential, so no delegation is
   ever derived and notme refuses every nine-key commitment. The validator
   exists; the producer does not. Building it means `signReceipt` must accept
   the presented credential, a wire change to agree with cloister. Also flags that RECEIPTS.md §2.2.1

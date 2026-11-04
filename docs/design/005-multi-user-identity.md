@@ -304,7 +304,9 @@ The deployer's principal gets all three capability grants:
 > the invite for one WebAuthn user id and returns registration options;
 > `register/verify` consumes the reservation. `POST /join` with an OIDC proof
 > verifies the proof first (bad proof: 403, invite untouched) and refuses an
-> identity already linked to a principal (409).
+> identity already linked to a principal (409). Each OIDC token is accepted
+> once at `/join` (and at `/auth/oidc/login`): its jti is spent in the
+> SigningAuthority DO and kept until 300 s past the token's exp (8aed7ef).
 
 The invite token is the authorization to create an account. It replaces the
 "admin must be present" requirement. The invite is time-limited (default 1 hour),

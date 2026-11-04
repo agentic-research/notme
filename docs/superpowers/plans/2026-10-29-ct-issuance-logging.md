@@ -1,5 +1,7 @@
 # Issuance Logging (Static CT) Implementation Plan
 
+**Status (2026-11-03):** the Worker side is executed and merged: every online mint logs to a `CT_LOG` binding, with a backlog, and nothing changes while `CT_LOG` is unbound. The log itself is not provisioned (notme-1b46a8, open; see `ct/README.md`). Kept as the historical plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Every certificate the online authority mints is recorded in notme's Static CT log. Certificates carry an embedded SCT when the log answers in time; when it doesn't, they are minted anyway and queued for logging.

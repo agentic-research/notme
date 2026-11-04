@@ -28,7 +28,7 @@ The metric that matters is severity, and it moved the other way:
 | | At audit start | 2026-08-06 | 2026-11-03 |
 |---|---|---|---|
 | **P0** | 5 | 4 fixed and deployed, 1 awaiting external confirmation | 0 open: the last one was confirmed against the live trust anchor |
-| Tests | — | 662 (538 unit + 124 real-Durable-Object) | 1661 (1015 unit + 590 real-Durable-Object + 56 against a real CT log) |
+| Tests | — | 662 (538 unit + 124 real-Durable-Object) | 1736 at ccc2cab (1042 unit + 638 real-Durable-Object + 56 CT-bound, against a stub log that signs real SCTs) |
 | Commits | — | 109 | 305 more since the August note |
 
 ---
@@ -192,8 +192,9 @@ What remains is mostly outside the code:
 - **Trust still bottoms out in TLS to the issuer** until the release job
   signs the trust anchor from a tag.
 - **Issuance transparency is built but inert.** Every mint can be logged to a
-  Static CT log, proven against a real log in CI, but nothing is logged until
-  the log is provisioned and bound.
+  Static CT log, proven end to end against a real azul log run locally
+  (`task ct:acceptance`, not part of CI), but nothing is logged until the log
+  is provisioned and `CT_LOG` is bound.
 - **Owner actions gate the release:** branch protection, the KEK rehearsal,
   the staging rehearsal and the production deploy.
 - **Known residuals are documented, not hidden:** for example, three routes

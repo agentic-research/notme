@@ -47,8 +47,10 @@ minted by notme's own `mintBridgeCertPair`:
 with a `CT_LOG` service binding, the online authority logs every bridge pair
 and every tier certificate; certs carry embedded SCTs when the log answers
 within 2000 ms. Otherwise the pair goes to the `ct_backlog` table and the
-refresh alarm drains it through `add-chain` (20 rows per fire, 4 concurrent,
-giving up on a row after 24 attempts). Health is served at
+refresh alarm drains it through `add-chain` (20 rows per fire, 4 concurrent).
+After 24 failed attempts a row is `gaveUp` and retried at most once a day;
+30 days after its mint it is abandoned (`worker/src/signing-authority.ts:2450-2470`
+and the health table below). Health is served at
 `/admin/alarm-health` as a `ct` object. With no binding, behaviour is exactly
 as before. The tests run under `worker/vitest.workers.ct.config.mts` with a
 stub log that signs real SCTs.

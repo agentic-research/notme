@@ -1,5 +1,7 @@
 # Mint Path Phase 2: Criteria in the Certificate — Implementation Plan
 
+**Status (2026-11-03):** executed. Phase 2 (criteria in the cert, `.1.10`, enforced at mint and in `task-cert verify`) merged; bead notme-bdc850 is closed. Kept as the historical plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A certificate says which unit of identity it is (`.1.10` criteria). A

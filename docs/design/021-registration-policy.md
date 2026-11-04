@@ -85,6 +85,10 @@ signs in by OIDC has none. First-user standing means no passkey user and no
 `authorityManage` holder with a linked identity, and it is recorded as a mark
 on the registration when options accepts the bootstrap code; verify makes a
 registrant the administrator only on that mark (review L2, notme-3dfe15).
+The first-user mark and the claim mark are bound to the browser that
+reserved them, as invite reservations are: options sets a mark cookie, and
+verify must present its secret (notme-a2e75d, `worker/worker.ts:910-920`). A
+passkey reset revokes outstanding marks (fbe268a).
 
 **Scopes come from the invite, never from the request.** A caller that could
 name its own scopes would make the gate decorative — the same reason

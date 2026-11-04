@@ -1,6 +1,6 @@
 # Remaining work, in order
 
-**Updated:** 2026-11-02 · **Open beads:** 64 in notme (`rsry status --json` →
+**Updated:** 2026-11-03 · **Open beads:** 43 in notme (`rsry status --json` →
 `repos.notme.open`) · **Tracked as:** rsry decade `notme-zero`, one thread per
 stage. Where an order is a real gate, it is also a bead dependency (`A`
 depends on `B`).
@@ -33,11 +33,14 @@ feel finished rather than merely argued.
   - notme-159805 and notme-ad2a7a: the code was already fixed; the missing
     tests were added (c40a134, a37e4b2).
 - **The doc-drift batch** merged 2026-11-02 (0b584d5). Ten beads closed with
-  their commits. Two stay open, each with what remains:
-  - notme-8fb37f: the alarm tests are weak;
-  - notme-8639dd: one stat tile still has no source.
-  Security promises the code didn't keep became notme-bad2e5 and
-  notme-baea8c.
+  their commits. Of the two left open, notme-8fb37f (weak alarm tests) has
+  since closed (c6aa57a, merged in 3293674). One stays open:
+  - notme-8639dd: the "24 CVEs" stat tile still has no source.
+  Security promises the code didn't keep became notme-bad2e5 (closed) and
+  notme-baea8c (open).
+- **Hardening batches merged 2026-11-03:** auth batch A (df2197b), DO batch B
+  (47269c7), D1 (39c485a) and D2 (3a0407e), plus the test hygiene batch
+  (3293674). Their beads are closed; see stage 2.
 
 ## Stage 1: the release (Goal Zero, notme-bed754)
 
@@ -68,8 +71,12 @@ them.
      anchor.
    - **Owner:** set billing alerts, around $10 and $25, since Workers Paid has
      no hard cap.
-8. **The stage 2 gate:** the release tag waits on the remaining live-path
-   security fixes and the release-pipeline fixes (stage 2 groups H1 and H2).
+8. **The stage 2 gate:** the release tag waited on the live-path security
+   fixes and the release-pipeline fixes (stage 2 groups H1 and H2). Both are
+   merged. What is left of H2 is owner configuration (below). notme-cf288e
+   still lists notme-3dfe15 as a dependency, and that bead stays open for the
+   long-run nonce design (B), so the dependency has to be dropped or B built
+   before cf288e can close.
 9. **notme-34e933 (owner, P1):** turn on branch protection for `main` (PR,
    required CI, code-owner review, no force-push, admins included) and block
    force-push on `goalzero`. Neither is protected today.
@@ -93,19 +100,26 @@ to publish the tag.
 
 ## Stage 2: hardening
 
-**H1, live-path security.** This gates the release tag.
+**H1, live-path security.** This gated the release tag. All merged.
 - notme-3dfe15, **part 1 only:** `/join` has no server-issued OIDC nonce.
   The owner decided (2026-11-03): A now, a single-use jti on `/join`, as
   `/cert/gha` already has. **A is merged (8aed7ef)**, and also covers
   `/auth/oidc/login`, which had been turning replayed tokens into 24 h
   sessions. B is for the long run: a server nonce bound into
   the proof, designed so automated callers keep working (notme-e3dede, stage
-  4). Parts 2 and 4/5 are merged.
-- notme-a2e75d: the first-user and claim marks are bound to the userId only,
-  not to the browser like invite reservations are.
+  4). Parts 2 and 4/5 are merged. The bead stays open only for B.
+- **Done:** notme-a2e75d, the first-user and claim marks are now bound to the
+  reserving browser, as invite reservations are (2d82171, fbe268a).
+- **Done:** notme-f850f2, the AUTH binding's GHA path spends the token's jti,
+  enforces `GHA_ALLOWED_OWNERS` and caps the TTL as `/cert/gha` does
+  (3628964, 1161b3d; merged in df2197b).
+- **Open, P2:** notme-b0d10f. `/cert/gha`, `/cert` with an OIDC proof and
+  `/token` still spend jtis through KV only, which is eventually consistent.
+  `/join`, `/auth/oidc/login` and the binding spend in the Durable Object.
 
-**H2, a trustworthy release pipeline and gates.** This gates the release tag.
-- notme-16b2d5: `worker:promote` had no gate. Fixed on fix/release-pipeline-gates:
+**H2, a trustworthy release pipeline and gates.** This gated the release tag.
+The three beads are closed; the fixes merged in cf1c92b.
+- notme-16b2d5: `worker:promote` had no gate. Fixed:
   ENV is mandatory and must be typed on the command line (a value equal to an
   exported shell variable is refused). Promote needs a fresh (24 h) pinned-verify
   record for that exact version, or a logged `ALLOW_UNVERIFIED` reason. It
@@ -114,15 +128,16 @@ to publish the tag.
   longer claims a rollback it never did, and it verifies production whatever the
   shell exports.
 - notme-325916: the canary soak sampled traffic instead of targeting the new
-  version. Fixed on fix/release-pipeline-gates: `worker:verify VERSION=<id>
+  version. Fixed: `worker:verify VERSION=<id>
   ENV=<env>` pins every probe with the version-override header and brackets each
   check with a pinned `/.well-known/version` (commit, plus `version_id` once the
   binding is live). It also requires `wrangler deployments status` to list the
   version as serving. A pass writes the record promote needs.
-- notme-6ae724: CI had no runtime contract tests. Fixed on
-  fix/release-pipeline-gates: ci.yml `contract` boots the real Worker locally
+- notme-6ae724: CI had no runtime contract tests. Fixed: ci.yml `contract`
+  boots the real Worker locally
   and runs `worker:verify`'s checks on every PR (DO RPC was already covered by
-  the pool suite). The deployed half, `staging-smoke.yml`, is written but is
+  the pool suite). The deployed half, `staging-smoke.yml`, runs after merges
+  to `main` only (every job checks `github.ref == 'refs/heads/main'`), and is
   **skipped until the owner configures the `staging` environment** (below).
 - **Owner actions for H2** (none of these can be done from the repo):
   1. GitHub, Settings, Environments, `staging`: set the deployment-branch
@@ -165,24 +180,41 @@ to publish the tag.
   token. The fix is a separate deploy job that receives only a built artifact
   and installs nothing. Not built yet; until then, the step-level token scope
   only keeps the token out of logs and simple reads.
-- The alarm epic **notme-5c2511**, with notme-e992ad and notme-5d358a.
+- The alarm epic **notme-5c2511** and notme-e992ad are closed: an open
+  circuit breaker leaves no alarm pending (49d9aca). notme-5d358a stays open;
+  it is trigger-based (it matters only if preview deployments are enabled).
 
 **H3, correctness and hygiene.** Doesn't gate the tag.
+
+Still open:
 - notme-baea8c: `proxy()` lacks ADR-009's promised gates.
-- notme-8fb37f: the alarm-defence tests are weak.
-- notme-2098f4: `readScopes` doesn't check lengths. Fix in 701304b.
-- notme-d06b7b: a mint failure during collect strands the enrolment. Fix in
-  1d42837.
-- notme-b54368 and notme-7aa6dd: fixes in e687734 and 4a7f6ac. All four
-  are on branch fix/hardening-do, not merged yet; the beads stay open
-  until it merges.
+- notme-b35676 (P3): CT may log a precert for a tier cert that is never
+  delivered (a refused re-check, a claim takeover, or the one mint retry).
+- notme-d3b763 (P3): nothing produces the receipt `delegation` commitment
+  key yet; the docs call it validator-only (4a3d533).
+- notme-3ee3b0: the deferred dependency major-version bumps.
+- notme-230b40: `activity/v1` waits on APAS 0.4 (signet-ded9d4) merging.
+
+Closed, with the commit that fixed each (all merged into goalzero):
+- notme-2098f4: `readScopes` is bounds-checked (701304b).
+- notme-d06b7b: a failed mint at collect leaves the enrolment collectable
+  (1d42837).
+- notme-b54368: `rotate()` and cold-start key creation are atomic, and every
+  mint re-checks key and epoch with one retry (e687734, 25f098e).
+- notme-7aa6dd: a fresh authority's first root is cached under the real key
+  id (4a7f6ac).
 - From the Durable Objects audit (docs/audits/2026-11-03-durable-objects.md):
-  notme-b54368 (rotate() not atomic), notme-b556a4 (templates use the KV
-  storage backend), notme-b567c9 (error messages reach clients).
-- notme-7aa6dd, notme-7ec6fb, notme-c0db9b, notme-32003c, notme-32270b,
-  notme-c071be, notme-3ee3b0, notme-230b40, notme-131c8e.
-- CT: notme-a806d0 (warn before the shard closes); notme-afa9d8 (per-cert
-  shard by notAfter), which must land **before 2027-06**.
+  notme-b556a4 (templates create RevocationAuthority SQLite-backed, 21ab735)
+  and notme-b567c9 (constant error bodies, b511644).
+- notme-7ec6fb (root-issued certs name their root's subject as issuer,
+  0a77e40), notme-c0db9b (receipt `delegation` documented as validator-only,
+  4a3d533), notme-32003c (AuthMethod parsed at the session boundary, and a
+  session with no numeric exp is refused; a380011, 0490d2b), notme-131c8e
+  (the API docs page is a template, f4b186b, f470abf), notme-32270b,
+  notme-c071be, notme-73202e and notme-8fb37f (test hygiene, 3293674).
+- CT: notme-a806d0 (warn 60 days before the newest shard closes, 77fa09f)
+  and notme-afa9d8 (per-cert shard by notAfter, 0357c33), both merged in
+  bbe2deb.
 
 ## Stage 3: task-based certificates
 
@@ -215,7 +247,7 @@ notme refuses, the criteria protect nobody downstream.
 
 ## Stage 4: after the release
 
-Epic **notme-a93d47** holds about 27 beads that are real notme features or
+Epic **notme-a93d47** holds 27 beads that are real notme features or
 research but not release work: the CAS-attested action release, OAuth/OIDC
 provider work, WIMSE WIT+WPT, CIMD, federation, the gateway and substrate
 threads, the workerd mTLS binding, cloister-facing exports, Socket scanning,
@@ -253,6 +285,11 @@ Listed so the count doesn't creep up unnoticed:
   notme-bdc850, notme-1a5465, notme-2131e8, notme-b51777, notme-b52d7c,
   notme-c9fc8c, notme-c0c9a2, notme-729801 (the P0), notme-1629fe,
   notme-ed6114, notme-070a8f, notme-3fc74b.
+- **Closed by work (2026-11-03):** notme-16b2d5, notme-325916, notme-6ae724,
+  notme-a806d0, notme-afa9d8, notme-f850f2, notme-a2e75d, notme-b567c9,
+  notme-b54368, notme-7aa6dd, notme-2098f4, notme-d06b7b, notme-b556a4,
+  notme-131c8e, notme-32003c, notme-5c2511, notme-e992ad, notme-7ec6fb,
+  notme-c0db9b, notme-8fb37f, notme-73202e, notme-32270b, notme-c071be.
 - **Filed from the doc-drift batch (2026-11-02):**
   - notme-bad2e5 and notme-baea8c (proxy gaps);
   - a gen/go scope-check note, added to notme-ea5c65 rather than filed as a
@@ -282,6 +319,12 @@ Listed so the count doesn't creep up unnoticed:
   protection on main or goalzero; owner action, gates the tag).
 - **From fixing notme-3fc74b (2026-11-03):** notme-73202e (the Durable Object
   test suite has no network guard yet).
+- **From hardening batch A (2026-11-03):** notme-b0d10f (KV-only jti spends
+  on `/cert/gha`, `/cert` and `/token`).
+- **From the hardening-do review (2026-11-03):** notme-b35676 (CT precerts
+  for certs never delivered).
+- **From closing notme-c0db9b (2026-11-03):** notme-d3b763 (produce the
+  receipt `delegation` key).
 - **Not filed:** the signet enforcement bead already existed
   (signet-be49b9). It now has the final encoding and a testable close
   condition, and notme-bdffc7 depends on it.
