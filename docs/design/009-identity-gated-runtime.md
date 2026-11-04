@@ -112,8 +112,9 @@ const config :Workerd.Config = (
 
 const notmeWorker :Workerd.Worker = (
   modules = [( name = "worker", esModule = embed "dist/notme.js" )],
-  compatibilityDate = "2026-03-01",
-  compatibilityFlags = ["nodejs_compat"],
+  compatibilityDate = "2026-10-19",
+  # No nodejs_compat flag: the date enables it from 2026-08-04, and workerd
+  # refuses to start with the redundant flag listed (notme-430ad1).
 
   bindings = [
     ( name = "SITE_URL", text = "http://localhost:8788" ),
@@ -139,7 +140,7 @@ const notmeWorker :Workerd.Worker = (
 
 const agentWorker :Workerd.Worker = (
   modules = [( name = "agent", esModule = embed "dist/agent.js" )],
-  compatibilityDate = "2026-03-01",
+  compatibilityDate = "2026-10-19",
 
   bindings = [
     # The ONLY way the agent can interact with the outside world

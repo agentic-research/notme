@@ -231,6 +231,8 @@ Repo `notme`, branch `goalzero` (HEAD c74f888). Read-only audit: no edits, tests
 
 ### L10 (Low): compatibility_date is 8 months old
 
+**Fixed** (notme-05324c, notme-430ad1): bumped to 2026-07-21, then to 2026-10-19 with the workerd 1.20261019.1 toolchain. The text below is the finding as filed.
+
 - **Location:** `wrangler.toml.example:5` and `wrangler.e2e.toml`, both `2026-03-01`, mirrored in `vitest.workers.config.mts:35`.
 - **Docs:** WBP: "Setting it to today's date on new projects ensures you get the latest behavior." Update it periodically.
 - **Fix:** bump all three together. The vitest comment already requires that.

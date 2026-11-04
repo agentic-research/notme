@@ -2,7 +2,18 @@
 # Copy to wrangler.toml and fill in your CF resource IDs.
 name = "notme-bot"
 main = "worker.ts"
-compatibility_date = "2026-07-21"
+compatibility_date = "2026-10-19"
+# 2026-10-19 is the newest date the pinned workerd (1.20261019.1, via
+# wrangler 4.151.3) supports, so it is the newest the gate can exercise.
+# NODE.JS COMPAT IS ON, by this date (notme-430ad1): from 2026-08-04 the date
+# alone enables nodejs_compat + nodejs_compat_v2, so no flag is listed —
+# Cloudflare's docs say to omit the now-redundant flag, and workerd rejects it
+# outright ("became the default ... does not need to be specified"). Adopted
+# on purpose: the bundle is byte-identical either way (no node: imports, no
+# polyfills), and the DO test pool forces nodejs_compat_v2 for its own
+# runner, so the gate could only ever test Node-on. To turn it off you would
+# need BOTH no_nodejs_compat and no_nodejs_compat_v2 — and an untested config.
+# Environments inherit compatibility_date; do not redeclare it under [env.*].
 
 workers_dev = false
 
