@@ -225,6 +225,7 @@ task worker:check             # tsc + all three suites below; counts as of 2026-
 cd worker && npx vitest run    #   1042 tests, 71 files (unit + adversarial + shared-SDK)
 cd worker && npm run test:do   #   638 real-Durable-Object tests, 70 files (vitest-pool-workers)
                                #   + 56 CT-bound tests (vitest.workers.ct.config.mts)
+                               #   + Rekor-submitting tests (vitest.workers.rekor.config.mts, notme-8befcc)
 bash worker/test-local.sh      # workerd smoke test (endpoints + invariant #1)
 bash worker/test-e2e.sh        # Playwright e2e with virtual authenticator (contract tests)
 cd ../proxy && cargo test      # Rust tests (listen-addr parser, UDS bind, perms, round-trip)

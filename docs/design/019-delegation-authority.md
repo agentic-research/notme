@@ -667,10 +667,82 @@ steps 2, 4 and 5.
 
 **LIMIT.** This only helps signatures that carry a trusted timestamp. Without
 one, *T* is the signer's claim, and the verifier can only check revocation as
-of now (the live bundle's equality test). And the authority could still
-rewrite its own history by signing a new document; making revocation events
-append-only against the authority itself (submitting each one to a public
-transparency log) is the second step on `notme-6a4f23`, not done here.
+of now (the live bundle's equality test). A signature on its own also leaves the
+authority free to rewrite its own history by signing a new document. The next
+paragraph covers that step (`notme-8befcc`).
+
+**EACH REVOCATION IS ALSO IN A LOG THE AUTHORITY CANNOT EDIT (`notme-8befcc`).**
+A root signature stops anyone else forging epochs.json. It does not stop the
+root signing a different past, and the seqno only refuses an *old* copy. So
+each `revokeEpoch()` also produces a root-signed DSSE statement of the event,
+written once to the public sigstore Rekor (v1, `dsse` entry):
+
+- **Payload.** An in-toto Statement v1 (`application/vnd.in-toto+json`), not
+  a custom payload type, for two reasons. The first is D6, which says to
+  compose existing formats rather than invent new ones. The second is that
+  for an in-toto payload, Rekor indexes the subject digests. The subject is
+  the signing root, `notme-authority-root:<keyId>` with sha256 over its 32
+  raw bytes. A verifier can therefore find every revocation a root has
+  logged by searching Rekor for that digest, without the authority pointing
+  at the entries. The predicate,
+  `https://notme.bot/provenance/epoch-revocation/v1`, holds `epoch`,
+  `revokedAt`, `reason`, `historySeqno` and `rootKeyId`. The signing input
+  is DSSE's PAE, which starts with `"DSSEv1 "` and names the payload type,
+  so it can never stand in for the bundle or history CBOR, DER, or a JWT
+  signing input. The root key signs through the existing path: the
+  non-extractable CryptoKey stays in the Durable Object.
+- **`historySeqno` binds the statement to the history.** It is an epochs.json
+  seqno reserved inside the revocation's own transaction. Every document
+  signed after that has a larger seqno and carries the revocation. So "seqno
+  greater than `historySeqno`, and the revocation is missing or different" is
+  a contradiction that can be proven. Rows that predate the column get one
+  seqno reserved for all of them when the schema migrates, which is true by
+  construction.
+- **After commit, never in the way.** The statement is signed after the
+  transaction commits. Submission comes after the bundle publish, as one
+  attempt bounded at 5 s that never throws. A Rekor outage leaves the
+  revocation committed, published and signed, with the row pending
+  (`rekorLogIndex: null`). `alarm()` retries pending rows outside the
+  circuit breaker, as the CT backlog drain does. The backoff starts at
+  4 minutes and doubles up to a 6 h cap. A row is never abandoned: a
+  revocation is rare and its entry is permanent evidence. A 409 is resolved
+  through Rekor's `Location` header, so a retry never makes a second entry.
+  Statements are stored per row and never re-signed, so every retry sends
+  the same bytes.
+- **Published.** Each `revocations[]` entry in epochs.json carries
+  `statement` (the envelope), `rekorLogIndex`, `rekorUuid` and
+  `rekorIntegratedTime`. These fields are outside the CBOR signing input, so
+  the `epochhistory-*` vectors and every vendored verifier are unchanged.
+  The statement carries its own signature. The log fields are pointers that
+  a verifier confirms against the log and never takes on trust.
+- **Configuration.** `REKOR_URL` defaults to `https://rekor.sigstore.dev`.
+  `REKOR_SUBMIT=off` stops submission, for tests and for self-hosters without
+  a log, but the statement is still signed.
+
+**VERIFIER RULE, CONTINUED.** Step 6 applies after step 1. Fetch every Rekor
+entry whose subject digest is a root in *H*.`epochs`, and verify each
+entry's inclusion with a sigstore client against Rekor's key. Then require
+the following for each valid revocation statement *S*:
+- If *H*.`seqno` > *S*.`historySeqno`, *H* carries a revocation for
+  *S*.`epoch` with the same `revokedAt` and `reason`.
+- An older *H* may lack *S*, but must not contradict it.
+- No two logged statements about one epoch disagree.
+
+The reference implementation is `checkRevocationsAgainstLog()` in
+`worker/src/rekor-revocation.ts`. It also reports a wrong `rekorLogIndex`
+pointer. A revocation in *H* with no logged statement is normal while the
+row is pending. It is a failure only for a verifier that requires the log
+(`requireLogged`). Golden vector: `schema/fixtures/revocationstatement-epoch1`,
+signed by the same root as `epochhistory-revoked` and consistent with it.
+
+**WHAT THIS STEP DOES NOT DO.** The worker holds no Rekor key and does not
+verify Rekor's signed entry timestamp. It only checks that the answer
+records its own payload hash and signature, so that a wrong `REKOR_URL`
+cannot mark a row as logged. Trusting the log is the verifier's job.
+signet's verifier supports only v1 `hashedrekord` today, and DSSE support
+there is a separate follow-up. Later, a Rekor-style front end on azul's
+`generic_log_worker` with `mirror_worker` witnesses would remove the
+dependency on the public instance (comments on `notme-6a4f23`).
 
 #### "Offline verification" and "not revoked" cannot both be fully true
 
