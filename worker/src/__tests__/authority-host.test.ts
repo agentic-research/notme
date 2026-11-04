@@ -19,6 +19,8 @@ import { describe, expect, it, vi } from "vitest";
 // WorkerEntrypoint), unavailable in plain vitest. Stub minimal shapes — this
 // file tests a pure host-resolution helper, not runtime integration.
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   DurableObject: class {},
   WorkerEntrypoint: class {
     ctx: unknown;

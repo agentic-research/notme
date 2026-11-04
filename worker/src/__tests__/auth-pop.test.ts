@@ -17,6 +17,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { authenticateWithPop, identityOf, makeCA, mintCreds, popProofs, stubEnv } from "./helpers/mint-creds";
 
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   WorkerEntrypoint: class WorkerEntrypoint {
     ctx: any;
     env: any;
@@ -58,7 +60,6 @@ describe("authenticate() requires proof of possession (notme-fbbfbc)", () => {
     const svc = services()();
     const creds = await mintCreds(CA, IDENTITY);
     await expect(svc.authenticate(creds as never)).rejects.toThrow(/challenge|proof/i);
-    expect((await svc.identity()).authenticated).toBe(false);
     // Cert strings alone, as a binding caller can send them.
     await expect(
       svc.authenticate({ mtlsCert: creds.mtlsCert, signingCert: creds.signingCert } as never),
@@ -78,7 +79,6 @@ describe("authenticate() requires proof of possession (notme-fbbfbc)", () => {
         proofs: await popProofs(victim, challenge, attacker),
       } as never),
     ).rejects.toThrow(/proof-of-possession/);
-    expect((await svc.identity()).authenticated).toBe(false);
   });
 
   it("auth.pop.replay — a challenge is single-use, across instances", async () => {
@@ -87,11 +87,10 @@ describe("authenticate() requires proof of possession (notme-fbbfbc)", () => {
     const a = make();
     const { challenge } = await a.authChallenge(IDENTITY);
     const presented = { mtlsCert: creds.mtlsCert, signingCert: creds.signingCert, challenge, proofs: await popProofs(creds, challenge) };
-    await a.authenticate(presented as never);
-    expect((await a.identity()).authenticated).toBe(true);
+    const session = await a.authenticate(presented as never);
+    expect((await session.identity()).authenticated).toBe(true);
     const b = make();
     await expect(b.authenticate(presented as never)).rejects.toThrow(/challenge/);
-    expect((await b.identity()).authenticated).toBe(false);
   });
 
   it("auth.pop.expired — a challenge older than 60 s is refused", async () => {
@@ -132,9 +131,9 @@ describe("authenticate() requires proof of possession (notme-fbbfbc)", () => {
     vi.spyOn(console, "log").mockImplementation((l: unknown) => void logs.push(String(l)));
     const svc = services()();
     const creds = await mintCreds(CA, IDENTITY);
-    await authenticateWithPop(svc, creds);
-    expect((await svc.identity()).identity).toBe(await identityOf(creds));
-    await svc.proxy({ url: "https://api.github.com/zen" });
+    const session = await authenticateWithPop(svc, creds);
+    expect((await session.identity()).identity).toBe(await identityOf(creds));
+    await session.proxy({ url: "https://api.github.com/zen" });
     const line = JSON.parse(logs.find((l) => l.includes('"type":"proxy"'))!);
     expect(line).toMatchObject({ allowed: true, identity: IDENTITY });
   });
@@ -143,13 +142,106 @@ describe("authenticate() requires proof of possession (notme-fbbfbc)", () => {
     const svc = services()();
     const creds = await mintCreds(CA, IDENTITY);
     const { challenge } = await svc.authChallenge(IDENTITY);
-    await svc.authenticate({
+    const session = await svc.authenticate({
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
       challenge,
       proofs: await popProofs(creds, challenge),
     } as never);
-    expect((await svc.identity()).authenticated).toBe(true);
-    await expect(svc.sign(new Uint8Array([1]).buffer)).rejects.toThrow(/signing key/);
+    expect((await session.identity()).authenticated).toBe(true);
+    await expect(session.sign(new Uint8Array([1]).buffer)).rejects.toThrow(/signing key/);
+  });
+
+  it("auth.pop.key-mismatch — an in-isolate signingKey that is not the signing cert's is refused, and the challenge survives", async () => {
+    const svc = services()();
+    const creds = await mintCreds(CA, IDENTITY);
+    const other = await mintCreds(CA, "wimse://notme.bot/test/other-key");
+    const { challenge } = await svc.authChallenge(IDENTITY);
+    const presented = { mtlsCert: creds.mtlsCert, signingCert: creds.signingCert, challenge, proofs: await popProofs(creds, challenge) };
+    await expect(svc.authenticate({ ...presented, signingKey: other.signingKey } as never)).rejects.toThrow(
+      /signing key does not match/,
+    );
+    // Checked before the challenge is spent: the holder can still use it.
+    const session = await svc.authenticate({ ...presented, signingKey: creds.signingKey } as never);
+    expect((await session.identity()).identity).toBe(IDENTITY);
+  });
+});
+
+describe("AuthSession disposal (notme-153f03)", () => {
+  it("auth.session.dispose — the session's disposer drops the credentials it held", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("ok", { status: 200 })));
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((l: unknown) => void logs.push(String(l)));
+    const svc = services()();
+    const creds = await mintCreds(CA, IDENTITY, ["bridgeCert", "sign:git"]);
+    const session = await authenticateWithPop(svc, creds);
+    expect((await session.identity()).authenticated).toBe(true);
+
+    // What workerd calls once the caller's last stub is disposed.
+    session[Symbol.dispose]();
+
+    expect((await session.identity()).authenticated).toBe(false);
+    await expect(session.proxy({ url: "https://api.github.com/zen" })).rejects.toThrow(/disposed/);
+    await expect(session.sign(new Uint8Array([1]).buffer, "raw")).rejects.toThrow(/disposed/);
+    const records = logs.map((l) => JSON.parse(l));
+    expect(records.find((r) => r.type === "session")).toMatchObject({ event: "disposed", identity: IDENTITY });
+    expect(records.find((r) => r.type === "proxy")).toMatchObject({ allowed: false, reason: "not_authenticated" });
+  });
+});
+
+describe("authChallenge() is throttled (notme-153f03)", () => {
+  /** A stand-in for the CERT_LIMITER binding, which has no test constructor. */
+  function limiter(allow: number) {
+    const keys: string[] = [];
+    return {
+      keys,
+      binding: {
+        limit: async ({ key }: { key: string }) => {
+          keys.push(key);
+          return { success: keys.filter((k) => k === key).length <= allow };
+        },
+      },
+    };
+  }
+  function throttled(rl: ReturnType<typeof limiter>, props?: unknown) {
+    const env = { ...stubEnv(CA), CERT_LIMITER: rl.binding };
+    const authority = env.SIGNING_AUTHORITY.get() as Record<string, unknown>;
+    const issued: string[] = [];
+    const issue = authority.issuePopNonce as (k: string) => Promise<unknown>;
+    authority.issuePopNonce = async (k: string) => {
+      issued.push(k);
+      return issue(k);
+    };
+    const ctx = props === undefined ? null : { props };
+    const make = () => new (AuthService as unknown as new (c: unknown, e: unknown) => AuthService)(ctx, env);
+    return { make, issued };
+  }
+
+  it("auth.challenge.throttled — past the limit authChallenge() refuses, and writes no nonce row", async () => {
+    const rl = limiter(2);
+    const { make, issued } = throttled(rl);
+    await make().authChallenge(IDENTITY);
+    await make().authChallenge(IDENTITY);
+    await expect(make().authChallenge(IDENTITY)).rejects.toThrow(/rate limited/);
+    expect(issued).toHaveLength(2);
+  });
+
+  it("auth.challenge.keyed-by-binding — rotating the claimed identity does not escape the limit", async () => {
+    const rl = limiter(1);
+    const { make, issued } = throttled(rl, { agent: "a" });
+    await make().authChallenge("wimse://notme.bot/test/one");
+    await expect(make().authChallenge("wimse://notme.bot/test/two")).rejects.toThrow(/rate limited/);
+    expect(issued).toHaveLength(1);
+    // The key is the binding's props, and nothing the caller chose.
+    expect(new Set(rl.keys)).toEqual(new Set([`authchallenge:${JSON.stringify({ agent: "a" })}`]));
+  });
+
+  it("auth.challenge.per-binding — one binding's flood does not spend another binding's budget", async () => {
+    const rl = limiter(1);
+    const a = throttled(rl, { agent: "a" });
+    const b = throttled(rl, { agent: "b" });
+    await a.make().authChallenge(IDENTITY);
+    await expect(a.make().authChallenge(IDENTITY)).rejects.toThrow(/rate limited/);
+    await expect(b.make().authChallenge(IDENTITY)).resolves.toMatchObject({ expires_in: 60 });
   });
 });

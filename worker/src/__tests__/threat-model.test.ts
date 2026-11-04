@@ -28,6 +28,8 @@ import { authenticateWithPop, makeCA, mintCreds, stubEnv } from "./helpers/mint-
 // vitest without spinning up workerd. The mock only needs the shape worker.ts
 // references at module-evaluation time (the base classes).
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   WorkerEntrypoint: class WorkerEntrypoint {
     ctx: any;
     env: any;
@@ -100,32 +102,27 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    await authenticateWithPop(a, await makeCreds("wimse://notme.bot/gha/alice"));
-    await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
+    const sessA = await authenticateWithPop(a, await makeCreds("wimse://notme.bot/gha/alice"));
+    const sessB = await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
 
-    const idA = await a.identity();
-    const idB = await b.identity();
+    const idA = await sessA.identity();
+    const idB = await sessB.identity();
 
     expect(idA.identity).toBe("wimse://notme.bot/gha/alice");
     expect(idB.identity).toBe("wimse://notme.bot/gha/bob");
   });
 
-  it("a fresh AuthService instance must report authenticated=false even if another instance authenticated", async () => {
-    const kp = (await crypto.subtle.generateKey(
-      { name: "Ed25519" },
-      false,
-      ["sign", "verify"],
-    )) as CryptoKeyPair;
-
+  it("a fresh AuthService instance holds no credentials to observe — they live on the session (notme-153f03)", async () => {
     const authenticated = newAuthService();
     await authenticateWithPop(authenticated, await makeCreds("wimse://notme.bot/gha/leaked"),
     );
 
-    const fresh = newAuthService();
-    const freshIdentity = await fresh.identity();
-
-    expect(freshIdentity.authenticated).toBe(false);
-    expect(freshIdentity.identity).toBe("");
+    // There is no identity()/proxy()/sign() on the entrypoint any more, so a
+    // fresh instance has nothing that could report another caller's identity.
+    const fresh = newAuthService() as unknown as Record<string, unknown>;
+    expect(fresh.identity).toBeUndefined();
+    expect(fresh.proxy).toBeUndefined();
+    expect(fresh.sign).toBeUndefined();
   });
 
   it("sign() on instance A must use A's identity even after B authenticates", async () => {
@@ -138,11 +135,11 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    await authenticateWithPop(a, await makeCreds("wimse://notme.bot/gha/alice"));
+    const sessA = await authenticateWithPop(a, await makeCreds("wimse://notme.bot/gha/alice"));
     await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
 
     const payload = new TextEncoder().encode("hello").buffer as ArrayBuffer;
-    const signed = await a.sign(payload, "raw");
+    const signed = await sessA.sign(payload, "raw");
     expect(signed.identity).toBe("wimse://notme.bot/gha/alice");
   });
 });
@@ -530,11 +527,11 @@ describe("contract.auth-service.rpc-surface", () => {
       "getCACertificatePem",
       "getAuthorityState",
       "verifySession",
-      // Identity-gated runtime methods
+      // Identity-gated runtime methods. proxy, sign and identity moved to
+      // the AuthSession authenticate() returns (notme-153f03): over a binding
+      // they could not see what authenticate() had verified.
+      "authChallenge",
       "authenticate",
-      "proxy",
-      "sign",
-      "identity",
     ];
     for (const name of expected) {
       expect(methods, `AuthService.${name} must remain a public RPC method`).toContain(

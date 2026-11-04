@@ -26,6 +26,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { AuthService, JwtSigner, ReceiptSigner } from "../worker";
+import { AuthSession } from "./auth/auth-session";
 import { SigningAuthority } from "./signing-authority";
 
 /** What workerd will dispatch to. `constructor` is not callable over RPC. */
@@ -113,18 +114,40 @@ describe("rpc.capability.isolation — RPC surface is an allow-list, not an acci
     // `authsvc:` key, nothing else. A binding holder can already make the DO
     // write PoP-nonce rows (that is what /cert/nonce does for a session); the
     // challenge buys nothing without both private keys for the certs.
+    //
+    // 10 -> 7: proxy, sign and identity MOVED to AuthSession (notme-153f03).
+    // Each top-level binding call is a fresh AuthService, so they read
+    // credentials authenticate() had stored on a `this` that no longer
+    // existed: over a binding proxy() and sign() refused everything and
+    // identity() said "not authenticated". authenticate() now returns the
+    // session that holds the credentials; the methods are pinned below.
+    // Removed rather than kept as refusals, so the entrypoint carries no name
+    // whose only behaviour is to point elsewhere.
     expect(rpcSurface(AuthService)).toEqual([
       "authChallenge",
       "authenticate",
       "getAuthorityState",
       "getCACertificatePem",
       "getPublicKeyPem",
-      "identity",
       "mintBridgeCert",
-      "proxy",
-      "sign",
       "verifySession",
     ]);
+  });
+
+  it("AuthSession's surface is exactly the reviewed set (notme-153f03)", () => {
+    // What a holder of a session STUB reaches. Over RPC a stub reaches the
+    // prototype's methods and its getters and public properties alike, so
+    // the held certs, the signing key and the env are `#private` and absent
+    // here. `Symbol.dispose` is the disposer workerd calls when the last stub
+    // is dropped; it is a symbol, so getOwnPropertyNames does not list it,
+    // and it is asserted separately. There is deliberately no method that
+    // re-authenticates or swaps the held identity.
+    expect(rpcSurface(AuthSession)).toEqual(["identity", "proxy", "sign"]);
+    expect(Object.getOwnPropertySymbols(AuthSession.prototype)).toEqual([Symbol.dispose]);
+    const getters = Object.entries(Object.getOwnPropertyDescriptors(AuthSession.prototype))
+      .filter(([, d]) => d.get || d.set)
+      .map(([n]) => n);
+    expect(getters, "a getter is RPC-reachable as a property").toEqual([]);
   });
 
   it("SigningAuthority's surface is pinned — it is what a leaked stub yields", () => {
@@ -437,6 +460,27 @@ describe("instance fields are private too, not merely TypeScript-private", () =>
       `AuthService instance exposes ${ours.join(", ")} — a TypeScript \`private\` ` +
         `field is erased and stays readable on a stub. Use #private.`,
     ).toEqual([]);
+  });
+
+  it("AuthSession exposes no own state on an instance (notme-153f03)", async () => {
+    // The session holds the verified certs, the signing key and env. Its
+    // instance is what a stub points at, so a TS `private` field here would
+    // be readable as a property over the binding.
+    const session = new AuthSession(
+      {
+        mtlsCert: "m",
+        signingCert: "s",
+        mtlsKey: null,
+        signingKey: null,
+        identity: "wimse://notme.bot/test/fields",
+        scopes: [],
+        expiresAt: 0,
+        epoch: 1,
+      },
+      { env: {}, authorityState: async () => ({ epoch: 1 }) },
+    );
+    expect(Object.getOwnPropertyNames(session)).toEqual([]);
+    expect(Object.getOwnPropertySymbols(session)).toEqual([]);
   });
 });
 

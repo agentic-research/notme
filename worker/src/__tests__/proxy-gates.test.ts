@@ -19,6 +19,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticateWithPop, makeCA, mintCreds, stubAuthority } from "./helpers/mint-creds";
 
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   WorkerEntrypoint: class WorkerEntrypoint {
     ctx: any;
     env: any;
@@ -33,6 +35,7 @@ vi.mock("cloudflare:workers", () => ({
 }));
 
 import { AuthService } from "../../worker";
+import type { AuthSession } from "../auth/auth-session";
 import { isAllowedDestination, parseDestinationAllowlist } from "../destination-policy";
 
 const CA = await makeCA();
@@ -58,9 +61,17 @@ function service(vars: Record<string, unknown>, authorityEpoch: number | "throw"
 }
 
 async function authed(vars: Record<string, unknown>, opts: { authorityEpoch?: number | "throw"; certEpoch?: number } = {}) {
+  // proxy() is a method of the AuthSession authenticate() returns
+  // (notme-153f03), so `authed` hands back the session.
   const svc = service(vars, opts.authorityEpoch ?? 1);
-  await authenticateWithPop(svc, await mintCreds(CA, IDENTITY, ["bridgeCert"], opts.certEpoch ?? 1));
-  return svc;
+  return authenticateWithPop(svc, await mintCreds(CA, IDENTITY, ["bridgeCert"], opts.certEpoch ?? 1));
+}
+
+/** A session whose stub was disposed: it holds nothing any more. */
+async function disposed(vars: Record<string, unknown>) {
+  const session = await authed(vars);
+  session[Symbol.dispose]();
+  return session;
 }
 
 let fetchSpy: ReturnType<typeof vi.fn>;
@@ -183,8 +194,8 @@ describe("proxy.audit — the record says what was decided (notme-baea8c)", () =
 
   it("proxy.audit.denied — each gate names itself", async () => {
     const reasons: string[] = [];
-    const cases: Array<[AuthService, string]> = [
-      [service(ALLOW), "https://api.github.com/"], // never authenticated
+    const cases: Array<[AuthSession, string]> = [
+      [await disposed(ALLOW), "https://api.github.com/"], // credentials dropped
       [await authed(ALLOW), "https://169.254.169.254/"],
       [await authed(ALLOW, { authorityEpoch: 9 }), "https://api.github.com/"],
     ];

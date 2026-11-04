@@ -164,16 +164,17 @@ export async function identityOf(creds: MintedCreds): Promise<string> {
 /**
  * authenticate() as a real caller does it: ask for a challenge, prove both
  * keys over it, present certs + challenge + proofs (+ the keys, in-isolate,
- * so sign() can use them).
+ * so sign() can use them). Returns the AuthSession authenticate() returns
+ * (notme-153f03): proxy(), sign() and identity() are its methods.
  */
-export async function authenticateWithPop(
+export async function authenticateWithPop<S>(
   svc: {
     authChallenge(identity: string): Promise<{ challenge: string }>;
-    authenticate(creds: any): Promise<void>;
+    authenticate(creds: any): Promise<S>;
   },
   creds: MintedCreds,
   extra: Record<string, unknown> = {},
-): Promise<void> {
+): Promise<S> {
   const { challenge } = await svc.authChallenge(await identityOf(creds));
-  await svc.authenticate({ ...creds, challenge, proofs: await popProofs(creds, challenge), ...extra });
+  return svc.authenticate({ ...creds, challenge, proofs: await popProofs(creds, challenge), ...extra });
 }

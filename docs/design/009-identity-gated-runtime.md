@@ -205,9 +205,17 @@ may hold the binding and not at all about WHAT the methods behind it believe.
 
 ### New methods (this spec)
 
+> **CORRECTION (2026-11-04, `notme-153f03`).** These were first written as
+> methods of `AuthService`. They are now methods of the `AuthSession` that
+> `AuthService.authenticate()` returns; see "Authenticated sessions" below for
+> why and how. `AuthService` itself offers `authChallenge()` and
+> `authenticate()` and none of the three methods listed here. The listing keeps
+> its original signatures, which the session's methods match; the
+> `request.method` field is optional and defaults to `GET`.
+
 ```typescript
-export class AuthService extends WorkerEntrypoint {
-  // ... existing methods ...
+export class AuthSession extends RpcTarget {
+  // returned by AuthService.authenticate(); the caller holds a stub
 
   // Proxy an HTTP request with mTLS (agent calls this instead of fetch)
   async proxy(request: {
@@ -244,10 +252,19 @@ export class AuthService extends WorkerEntrypoint {
 // agent.js — runs in the isolated agent Worker
 export default {
   async fetch(request, env) {
-    // env.NOTME is the service binding to the notme Worker
+    // env.NOTME is the service binding to the notme Worker.
+    // Prove possession of the cert pair and get a session (notme-153f03).
+    // `using` disposes the stub at the end of the block, and notme then drops
+    // the credentials the session held.
+    const { challenge } = await env.NOTME.authChallenge(identity);
+    using session = await env.NOTME.authenticate({
+      mtlsCert, signingCert, challenge,
+      proofs,            // both keys over authenticateBinding(..., challenge)
+      signingKeyPkcs8,   // only for sign(): CryptoKey does not cross a binding
+    });
 
-    // Make an authenticated request (notme does mTLS)
-    const response = await env.NOTME.proxy({
+    // Make an authenticated request (no mTLS yet, see "Not yet" below)
+    const response = await session.proxy({
       url: "https://api.github.com/repos/owner/repo",
       method: "GET",
       headers: { "Accept": "application/json" },
@@ -255,10 +272,10 @@ export default {
 
     // Sign a git commit
     const commitData = new TextEncoder().encode("tree abc...\nauthor...\n\ncommit message");
-    const signed = await env.NOTME.sign(commitData, "git-commit");
+    const signed = await session.sign(commitData, "git-commit");
 
     // Check identity
-    const me = await env.NOTME.identity();
+    const me = await session.identity();
     console.log(me.identity); // wimse://notme.bot/agent/dev-agent/dispatch/abc123
 
     // This DOES NOT WORK — agent has no globalOutbound:
@@ -267,20 +284,118 @@ export default {
 };
 ```
 
+## Authenticated sessions (`notme-153f03`)
+
+**The problem.** Each top-level call on a service binding reaches a fresh
+`AuthService` instance; this was measured over a real loopback binding under
+`notme-fbbfbc`. `authenticate()` used to store the certs it had verified on
+`this`, so a later `env.NOTME.proxy()` or `env.NOTME.sign()` call found
+nothing. Neither worked over a binding, which is the only way an agent Worker
+reaches notme, and `identity()` answered "not authenticated" to a caller that
+had just authenticated.
+
+**The design.** `authenticate()` returns an `AuthSession`
+(`worker/src/auth/auth-session.ts`), a class that extends `RpcTarget` from
+`cloudflare:workers`. It holds the verified certs, the derived identity, the
+scopes, the expiry, the epoch and, if one was given, the signing key.
+`proxy()`, `sign()` and `identity()` are its methods. What the Workers RPC
+documentation says makes this work:
+
+- An `RpcTarget` returned from an RPC method "is not serialized, but is
+  instead replaced by a stub … Calling any method on the stub actually makes
+  an RPC back to the original object, where it was created"
+  ([RPC, Class Instances](https://developers.cloudflare.com/workers/runtime-apis/rpc/#class-instances)).
+  So the session's state stays in notme's isolate, and the agent holds only a
+  handle.
+- "As long as the stub still exists on the client, the corresponding object
+  on the server cannot be garbage collected", and the server-side execution
+  context "is implicitly extended until all such stubs are disposed"
+  ([Lifecycle](https://developers.cloudflare.com/workers/runtime-apis/rpc/lifecycle/)).
+  So the authenticated state lives exactly as long as the caller's stub.
+- The stub is disposed explicitly with `stub[Symbol.dispose]()` or a `using`
+  declaration, and automatically when the caller's execution context ends
+  ("When an event handler is 'done', any stubs created as part of the event
+  are automatically disposed"). The session implements `[Symbol.dispose]()`,
+  which "runs after the last stub is disposed". It drops the held credentials
+  and writes one `{"type":"session","event":"disposed"}` audit line. The
+  documentation notes that the client does not wait for it, and that only
+  `Symbol.dispose`, not `Symbol.asyncDispose`, is supported.
+- A stub reaches properties and getters as well as methods ("Properties
+  behave like RPC methods that don't take any arguments"). So every field of
+  the session is ECMAScript `#private`, never TypeScript `private`, which is
+  erased at build time. The session has no getters.
+
+**What carried over.** Every `proxy()` gate in "Enforcement guarantees"
+below runs on the session's `proxy()` unchanged: the destination denylist and
+allowlist, the self-host rule, the `bridgeCert` scope, the per-call epoch
+check, header stripping, `redirect: "manual"`, and one truthful audit line
+per outcome. The epoch is read through `env` on each call, not through the
+DO stub of the `authenticate()` call that created the session. `sign()`
+keeps its scope check and audit line, and now also refuses expired certs.
+
+**No cross-identity use.** A session is one proven identity for its whole
+life. It has no method that re-authenticates or swaps what it holds. A caller
+that wants a second identity calls `authenticate()` again and gets a second
+session. The two do not share state, which `auth.session.isolation` pins over
+the binding.
+
+**Signing over a binding.** workerd does not serialize a `CryptoKey`
+(`rpc.cryptokey.isolation`), so a binding caller cannot pass one. The caller
+instead passes `signingKeyPkcs8`, the Ed25519 private key's PKCS#8 bytes.
+notme imports them as a non-extractable key. An in-isolate caller may still
+pass `signingKey` as a `CryptoKey`. In both cases `authenticate()` signs a
+probe and verifies it with the signing CERT's public key, and refuses a key
+that does not match. Without that check a session could sign under one key
+while its audit line and returned certificate named another. The caller
+already holds this key, since it signed the PoP with it, so handing it to
+notme gives notme nothing the caller could not already do. It also matches
+the model above, in which notme holds the keys.
+
+**The old top-level methods.** `AuthService.proxy()`, `sign()` and
+`identity()` are removed rather than kept as refusals. A name whose only
+behaviour is to point somewhere else is surface with nothing behind it, and
+workerd already refuses a call to a missing method ("The RPC receiver does
+not implement …"). `rpc-surface.do.test.ts` pins both lists:
+`AuthService` is `authChallenge`, `authenticate`, `getAuthorityState`,
+`getCACertificatePem`, `getPublicKeyPem`, `mintBridgeCert` and
+`verifySession`, and `AuthSession` is `identity`, `proxy` and `sign`, plus
+the `Symbol.dispose` disposer.
+
+**`authChallenge()` is rate limited.** Any binding holder can call it
+without authenticating, and each call writes one PoP-nonce row in the
+authority. It now spends the `CERT_LIMITER` binding (10 per 60 s per key)
+under its own `authchallenge:` key prefix before it touches the DO. The key is
+the calling binding's `props`, which the operator sets per binding. It is not
+the requested identity, because the caller types that and could rotate it to
+dodge a per-identity limit. Bindings without `props` share one bucket, and an
+operator that wants them kept apart gives each one `props`. If `CERT_LIMITER`
+is not bound, as in a self-hosted workerd config without it, the limit is not
+enforced. Every other limiter in `worker.ts` fails open the same way.
+
+Covered by `auth.session.proxy`, `auth.session.sign`,
+`auth.session.sign.key-mismatch`, `auth.session.disposed`,
+`auth.session.isolation` and `auth.session.no-top-level`
+(`worker/src/auth-binding-session.do.test.ts`, over a real loopback binding),
+and by `auth.session.dispose`, `auth.pop.key-mismatch`,
+`auth.challenge.throttled`, `auth.challenge.keyed-by-binding` and
+`auth.challenge.per-binding` (`worker/src/__tests__/auth-pop.test.ts`).
+
 ## Enforcement guarantees
 
 > **CORRECTION (2026-11-02, `notme-c72e03`).** The isolation rows in the first
 > table (no `globalOutbound`, V8 isolate boundary, no disk bindings, service
 > binding as the only channel) are properties of the workerd config, not of
 > notme code, and are unchanged by this note. The "Escalate scope" row and the
-> flowchart below describe `AuthService.proxy()` (`worker/worker.ts`), which
-> is listed above as already implemented — and four of its five gates differed
-> from what that method did. **Updated 2026-11-03 (`notme-baea8c`).** What
-> `proxy()` does now, in order — every step that refuses throws, and writes an
-> audit line first:
+> flowchart below describe what was then `AuthService.proxy()` and is now
+> `AuthSession.proxy()` (`worker/src/auth/auth-session.ts`, `notme-153f03`),
+> which is listed above as already implemented — and four of its five gates
+> differed from what that method did. **Updated 2026-11-03 (`notme-baea8c`).**
+> What `proxy()` does now, in order — every step that refuses throws, and
+> writes an audit line first:
 >
-> 1. Refuses (`not_authenticated`) if no certs are held. Certs are held
->    only after `authenticate()` has verified them against the CA AND the
+> 1. Refuses (`not_authenticated`) if the session holds no certs, which is
+>    the case once its stub has been disposed. A session exists only
+>    after `authenticate()` has verified the certs against the CA AND the
 >    caller has proved it holds both private keys (`notme-fbbfbc`): it calls
 >    `authChallenge(identity)` for a challenge — single-use, at most 60 s
 >    old, bound to that identity and to the calling binding's `props` when
@@ -289,13 +404,10 @@ export default {
 >    (`worker/src/auth/cert-pair-binding.ts`, tag
 >    `notme/authservice-authenticate/v1`) with each key, and passes certs,
 >    challenge and proofs. Before this, any binding holder could present
->    another principal's public certs and be audited as them. Measured over a
->    real binding (`auth-binding-session.do.test.ts`): each top-level binding
->    call is its own session, so held certs do not survive from
->    `authenticate()` to the next call — `proxy()` and `sign()` work only
->    in-isolate today, and the attack did not chain end to end. CryptoKeys
->    do not serialize, so a binding caller passes no keys and `sign()`
->    refuses without one.
+>    another principal's public certs and be audited as them. The certs
+>    live on the returned session, so `proxy()` and `sign()` work over a
+>    real binding (`auth-binding-session.do.test.ts`); see "Authenticated
+>    sessions" below.
 > 2. Refuses (`credentials_expired`) if the held certs have expired. Nothing
 >    re-authenticates transparently; the caller must call `authenticate()`
 >    again.
@@ -357,7 +469,9 @@ export default {
 >   by `revokeEpoch()` (which stops every cert of its epoch) or by expiry;
 > - `sign()` does not run the epoch check. Its output carries the signing
 >   cert, and every verifier checks that cert's epoch itself (`verifyX509`),
->   so a revoked cert's signature fails where it is used rather than here;
+>   so a revoked cert's signature fails where it is used rather than here.
+>   It does refuse once the certs have expired, since a session can outlive
+>   them (`notme-153f03`);
 > - (fixed, `notme-bad2e5`) the IPv6 gap in the denylist: `new URL()` keeps
 >   brackets on IPv6 hostnames, so the old `startsWith("fd00:")` test never
 >   fired and IPv4-mapped literals slipped through. The policy now lives in
@@ -587,10 +701,12 @@ sequenceDiagram
     Note over NW: Certs + keys held in V8 heap only
 
     WD->>AW: start (receives NOTME service binding)
-    AW->>NW: env.NOTME.identity()
+    AW->>NW: env.NOTME.authChallenge(identity), then authenticate(certs, proofs)
+    NW-->>AW: AuthSession stub (notme-153f03)
+    AW->>NW: session.identity()
     NW-->>AW: {identity, scopes, expires_at}
-    AW->>NW: env.NOTME.proxy(url, ...)
-    AW->>NW: env.NOTME.sign(payload, format)
+    AW->>NW: session.proxy(url, ...)
+    AW->>NW: session.sign(payload, format)
 
     Note over NW: cert TTL - 60s reached
     NW->>EXT: re-authenticate (transparent)
@@ -632,10 +748,10 @@ They compose: nono can sandbox the workerd process itself (restrict what workerd
 ## Success criteria
 
 1. Agent Worker with no `globalOutbound` cannot call `fetch()` — confirmed by test
-2. Agent can make authenticated requests via `env.NOTME.proxy()` — mTLS verified by target service
-3. Agent can sign artifacts via `env.NOTME.sign()` — signature verifiable with bridge cert
-4. `env.NOTME.proxy()` rejects destinations not in allowlist
-5. `env.NOTME.proxy()` rejects requests exceeding cert scope
+2. Agent can make authenticated requests via `session.proxy()` (the session `env.NOTME.authenticate()` returns) — mTLS verified by target service
+3. Agent can sign artifacts via `session.sign()` — signature verifiable with bridge cert
+4. `session.proxy()` rejects destinations not in allowlist
+5. `session.proxy()` rejects requests exceeding cert scope
 6. Cloud metadata endpoints hard-denied
 7. Private keys never appear in any service binding response
 8. Audit log captures every proxy + sign operation

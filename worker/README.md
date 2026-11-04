@@ -57,7 +57,7 @@ flowchart TB
     Routes --> RL
 
     SA -->|alarm: every 4min| KV
-    SA -.->|RPC: AuthService.proxy/sign| AuthSvc
+    SA -.->|RPC: AuthService.authenticate, then AuthSession.proxy/sign| AuthSvc
 
     AuthSvc -->|009 colocated agent worker| Proxy
 ```

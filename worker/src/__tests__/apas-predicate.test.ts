@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   DurableObject: class {},
   WorkerEntrypoint: class {},
 }));
