@@ -347,7 +347,7 @@ export type BridgeCertRefusal =
   | "authority_state_changed";
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
-const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
+export const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 
 /** Tier renewal health, reported under `renewal` by getAlarmHealth (notme-c9fc8c, review L1). */
 export interface RenewalHealth {
@@ -358,6 +358,41 @@ export interface RenewalHealth {
    * revoked; `last` says which key, binding and generation.
    */
   belowBinding: { count: number; lastAt: number; last: string };
+}
+
+/**
+ * The alarm circuit breaker, reported under `breaker` by getAlarmHealth
+ * (notme-a36d10). Times are epoch ms, as lastFireAt.
+ */
+export interface AlarmBreakerHealth {
+  /**
+   * closed: the loop runs at cadence. open: inside a cool-off, no work until
+   * nextProbeAt. half_open: open with its probe due (the next fire runs the
+   * full work; success closes it, failure re-opens it with a longer cool-off).
+   */
+  state: "closed" | "open" | "half_open";
+  /** When the breaker last tripped or re-opened; 0 if never. Kept after it closes. */
+  lastTrippedAt: number;
+  /** When the probe fires; 0 while closed. */
+  nextProbeAt: number;
+  /** Trips since the last success: sets the cool-off (base x 2^(n-1), capped). */
+  consecutiveTrips: number;
+}
+
+/**
+ * Revocation statements not yet in Rekor, reported under `rekor` by
+ * getAlarmHealth (notme-d8cf4e), the way `ct.backlog` reports the CT queue.
+ */
+export interface RekorHealth {
+  /** Revocations with no Rekor log index yet (signed or not). */
+  pending: number;
+  /** Seconds since the oldest of those was revoked; null when none. */
+  oldestPendingAgeS: number | null;
+  /** The most recent submission error among pending rows, and when (epoch s); "" / 0 when none. */
+  lastError: string;
+  lastAttemptAt: number;
+  /** False under REKOR_SUBMIT=off: pending rows are then expected and never sent. */
+  submitEnabled: boolean;
 }
 
 /** CT backlog health, reported under `ct` by getAlarmHealth (notme-1b46a8). */
@@ -412,8 +447,9 @@ export interface CtHealth {
 }
 
 // Circuit-breaker threshold for the alarm() loop. After this many consecutive
-// generateBundle() failures, alarm() stops re-arming itself. Manual recovery
-// via resetAlarmHealth() RPC. Defends against the runaway-alarm-bills failure
+// generateBundle() failures the breaker opens: alarm() stops the 4-minute loop
+// and arms only a half-open probe (below). resetAlarmHealth() RPC recovers at
+// once. Defends against the runaway-alarm-bills failure
 // mode (per notme-5c2511 EPIC and the reddit cautionary tale that motivated it):
 // if generateBundle starts throwing — DO storage corruption, key import failure,
 // KV unavailable, signing-key state desync — without this, we'd fire every 4
@@ -421,6 +457,16 @@ export interface CtHealth {
 //
 // 5 strikes ≈ 20 minutes of failure before kill switch fires. Tunable.
 const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
+
+// The half-open breaker (notme-a36d10, overnight review H2). An open breaker
+// used to latch: no alarm until an operator called resetAlarmHealth(), which
+// silently stopped the Rekor retry and the CT drain along with the bundle,
+// and nothing watched it. Now a trip arms ONE probe a cool-off out; the probe
+// fire does the full work, and success closes the breaker while failure
+// re-opens it with the cool-off doubled, up to the cap. Cost while open is
+// one fire per cool-off (at the cap, 12 a day) instead of one per 4 minutes.
+export const ALARM_BREAKER_COOLOFF_BASE_MS = 15 * 60 * 1000;
+export const ALARM_BREAKER_COOLOFF_MAX_MS = 2 * 60 * 60 * 1000;
 
 import { keyIdFromSpki } from "./key-id";
 import { ADMIN_SCOPES, PRIOR_ADMIN_SCOPES, SIGNING_SCOPES } from "./auth/admin-scopes";
@@ -3089,6 +3135,27 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       cutoff,
       cutoff,
     );
+  }
+
+  /** What getAlarmHealth reports under `rekor` (notme-d8cf4e). */
+  #readRekorHealth(): RekorHealth {
+    this.#ensureEpochHistorySchema();
+    const sql = this.ctx.storage.sql;
+    const p = sql
+      .exec("SELECT COUNT(*) AS n, MIN(revoked_at) AS oldest FROM epoch_revocations WHERE rekor_log_index IS NULL")
+      .toArray()[0] as { n: number; oldest: number | null };
+    const last = sql
+      .exec(
+        "SELECT rekor_last_error, rekor_last_attempt_at FROM epoch_revocations WHERE rekor_log_index IS NULL AND rekor_last_attempt_at IS NOT NULL ORDER BY rekor_last_attempt_at DESC LIMIT 1",
+      )
+      .toArray()[0] as { rekor_last_error: string | null; rekor_last_attempt_at: number } | undefined;
+    return {
+      pending: p.n,
+      oldestPendingAgeS: p.oldest === null ? null : Math.max(0, Math.floor(Date.now() / 1000) - p.oldest),
+      lastError: last?.rekor_last_error ?? "",
+      lastAttemptAt: last?.rekor_last_attempt_at ?? 0,
+      submitEnabled: this.env.REKOR_SUBMIT !== "off",
+    };
   }
 
   async #readCtHealth(): Promise<CtHealth> {
@@ -5889,9 +5956,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   //   - alarm_health table tracks failure_count, total_fires, last_fire_at,
   //     last_outcome, first_fire_at.
   //   - Circuit breaker: after MAX_CONSECUTIVE_ALARM_FAILURES consecutive
-  //     failures, no alarm stays pending: the tripping fire deletes any
-  //     successor its bundle work armed, and scheduleNextRefresh() declines
-  //     while the breaker is open. Manual recovery via resetAlarmHealth() RPC.
+  //     failures it opens, and the only alarm pending is the half-open probe
+  //     a cool-off out (notme-a36d10): the tripping fire replaces any
+  //     successor its bundle work armed, and scheduleNextRefresh() never arms
+  //     earlier than the probe. The probe's success closes it; its failure
+  //     re-opens it with the cool-off doubled, capped. resetAlarmHealth()
+  //     RPC recovers at once.
   //   - Defense-in-depth: re-arm goes through getAlarm() check first
   //     (mirrors scheduleNextRefresh's pattern).
 
@@ -5909,10 +5979,33 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         first_fire_at   INTEGER NOT NULL DEFAULT 0
       )
     `);
+    // The half-open breaker's state (notme-a36d10), in ms like last_fire_at.
+    // next_probe_at 0 with the breaker open is a row tripped under the old
+    // latch: its probe is due now (see scheduleNextRefresh).
+    for (const col of [
+      "tripped_at INTEGER NOT NULL DEFAULT 0",
+      "next_probe_at INTEGER NOT NULL DEFAULT 0",
+      "consecutive_trips INTEGER NOT NULL DEFAULT 0",
+    ]) {
+      try {
+        this.ctx.storage.sql.exec(`ALTER TABLE alarm_health ADD COLUMN ${col}`);
+      } catch {
+        /* already present */
+      }
+    }
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO alarm_health (id) VALUES ('authority')",
     );
     this.#alarmHealthInitialized = true;
+  }
+
+  /** The half-open breaker's columns (notme-a36d10). */
+  #readBreakerRow(): { tripped_at: number; next_probe_at: number; consecutive_trips: number } {
+    this.#ensureAlarmHealthSchema();
+    const row = this.ctx.storage.sql
+      .exec("SELECT tripped_at, next_probe_at, consecutive_trips FROM alarm_health WHERE id = 'authority'")
+      .toArray()[0] as { tripped_at: number; next_probe_at: number; consecutive_trips: number } | undefined;
+    return row ?? { tripped_at: 0, next_probe_at: 0, consecutive_trips: 0 };
   }
 
   #readAlarmHealthRow(): {
@@ -5957,8 +6050,22 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // path of #getOrCreateSigningKey reaches here on every request that
     // touches the signing key, and generateBundle reaches it inside alarm()
     // itself; without this check either one re-armed the loop the breaker had
-    // just stopped. Only resetAlarmHealth() re-arms past an open breaker.
-    if (this.#alarmBreakerOpen()) return;
+    // just stopped.
+    //
+    // Half-open (notme-a36d10): behind an open breaker the one alarm allowed
+    // is the probe at next_probe_at, which the tripping fire arms itself. So
+    // this arms nothing while an alarm is pending, and never earlier than the
+    // probe. With none pending (a row tripped under the old latch, whose
+    // next_probe_at is 0, or a lost probe) it arms the probe, no sooner than
+    // one cadence out — never in the past, so a probe fire that reaches the
+    // warm path cannot schedule an immediate re-fire.
+    if (this.#alarmBreakerOpen()) {
+      if (!(await this.ctx.storage.getAlarm())) {
+        const { next_probe_at } = this.#readBreakerRow();
+        await this.ctx.storage.setAlarm(Math.max(next_probe_at, Date.now() + BUNDLE_REFRESH_MS));
+      }
+      return;
+    }
     const current = await this.ctx.storage.getAlarm();
     if (!current) {
       await this.ctx.storage.setAlarm(Date.now() + BUNDLE_REFRESH_MS);
@@ -6018,24 +6125,35 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       first_fire_at: 0,
     };
 
-    // Circuit breaker — stop re-arming if too many consecutive failures.
-    // Operator must call resetAlarmHealth() to recover.
+    // Circuit breaker, half-open (notme-a36d10). Open and still inside the
+    // cool-off: do no work, and leave exactly the probe armed — never an
+    // earlier alarm, so a stray fire cannot start a storm. Open and past
+    // next_probe_at: this fire IS the probe, and runs the full work below.
     //
-    // Even though we early-return without doing the bundle work, we DO
-    // record the fire in alarm_health (atomic increment). Otherwise total_fires
-    // would undercount the actual alarm fires that occurred — important for
-    // post-mortem ("how many fires did we eat after the breaker tripped").
-    if (pre.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES) {
+    // Even though the cool-off path returns without doing the bundle work, we
+    // DO record the fire in alarm_health (atomic increment). Otherwise
+    // total_fires would undercount the actual alarm fires that occurred —
+    // important for post-mortem ("how many fires did we eat after the
+    // breaker tripped").
+    const breaker = this.#readBreakerRow();
+    const probing = pre.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES;
+    if (probing && now < breaker.next_probe_at) {
       console.error(
         `[signing-authority] CIRCUIT BREAKER OPEN: ${pre.failure_count} consecutive ` +
           `alarm failures. Last outcome: "${pre.last_outcome}". ` +
-          `Not re-arming. Manual recovery via resetAlarmHealth() RPC.`,
+          `Next probe at ${new Date(breaker.next_probe_at).toISOString()}.`,
       );
       this.ctx.storage.sql.exec(
         "UPDATE alarm_health SET total_fires = total_fires + 1, last_fire_at = ?, last_outcome = 'skipped: circuit breaker open' WHERE id = 'authority'",
         now,
       );
-      return; // do NOT re-arm
+      await this.ctx.storage.setAlarm(breaker.next_probe_at);
+      return;
+    }
+    if (probing) {
+      console.warn(
+        JSON.stringify({ event: "alarm.breaker_probe", failureCount: pre.failure_count, trips: breaker.consecutive_trips }),
+      );
     }
 
     // Set first_fire_at on the very first fire (idempotent: only updates
@@ -6086,10 +6204,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // can't drop increments. failure_count resets to 0 on success.
     if (success) {
       this.ctx.storage.sql.exec(
-        "UPDATE alarm_health SET failure_count = 0, total_fires = total_fires + 1, last_fire_at = ?, last_outcome = ? WHERE id = 'authority'",
+        "UPDATE alarm_health SET failure_count = 0, consecutive_trips = 0, next_probe_at = 0, total_fires = total_fires + 1, last_fire_at = ?, last_outcome = ? WHERE id = 'authority'",
         now,
         outcome,
       );
+      if (probing) {
+        console.warn(JSON.stringify({ event: "alarm.breaker_closed", afterTrips: breaker.consecutive_trips }));
+      }
     } else {
       this.ctx.storage.sql.exec(
         "UPDATE alarm_health SET failure_count = failure_count + 1, total_fires = total_fires + 1, last_fire_at = ?, last_outcome = ? WHERE id = 'authority'",
@@ -6108,16 +6229,32 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray() as Array<{ failure_count: number }>;
     const postFailureCount = postRows[0]?.failure_count ?? 0;
     if (postFailureCount >= MAX_CONSECUTIVE_ALARM_FAILURES) {
-      console.error(
-        `[signing-authority] CIRCUIT BREAKER TRIPPED on this fire: ` +
-          `${postFailureCount} consecutive failures. ` +
-          `Not re-arming. Manual recovery via resetAlarmHealth() RPC.`,
+      // Tripped on this fire, or a failed probe re-opening it (notme-a36d10).
+      // Either way: the cool-off doubles per consecutive trip, capped, and
+      // the ONE alarm left is the next probe.
+      const trips = breaker.consecutive_trips + 1;
+      const cooloff = Math.min(
+        ALARM_BREAKER_COOLOFF_BASE_MS * 2 ** (trips - 1),
+        ALARM_BREAKER_COOLOFF_MAX_MS,
       );
-      // This fire's own bundle work ran #getOrCreateSigningKey's warm path
-      // while failure_count was still one short, so it may already have armed
-      // a successor. Clear it: "not re-arming" has to mean no alarm pending.
-      await this.ctx.storage.deleteAlarm();
-      return; // do NOT re-arm — breaker tripped on this fire
+      const nextProbeAt = now + cooloff;
+      this.ctx.storage.sql.exec(
+        "UPDATE alarm_health SET tripped_at = ?, next_probe_at = ?, consecutive_trips = ? WHERE id = 'authority'",
+        now,
+        nextProbeAt,
+        trips,
+      );
+      console.error(
+        `[signing-authority] CIRCUIT BREAKER ${probing ? "RE-OPENED by a failed probe" : "TRIPPED on this fire"}: ` +
+          `${postFailureCount} consecutive failures. ` +
+          `Next probe in ${cooloff / 60_000} min (trip ${trips}).`,
+      );
+      // This fire's own bundle work ran #getOrCreateSigningKey's warm path,
+      // which may already have armed a cadence successor. setAlarm REPLACES
+      // it: the only alarm pending is the probe (notme-5c2511's "no alarm
+      // storm", kept).
+      await this.ctx.storage.setAlarm(nextProbeAt);
+      return;
     }
 
     // Re-arm with defense-in-depth getAlarm() check.
@@ -6147,7 +6284,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // last administrative action." If a "last reset at" timestamp is wanted
     // later, add it as a separate column.
     this.ctx.storage.sql.exec(
-      "UPDATE alarm_health SET failure_count = 0, last_outcome = 'manually_reset' WHERE id = 'authority'",
+      "UPDATE alarm_health SET failure_count = 0, consecutive_trips = 0, next_probe_at = 0, last_outcome = 'manually_reset' WHERE id = 'authority'",
     );
     let rearmed = false;
     if (!(await this.ctx.storage.getAlarm())) {
@@ -6203,10 +6340,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     driftRatio: number;
     warmupComplete: boolean;
     circuitBreakerOpen: boolean;
+    breaker: AlarmBreakerHealth;
+    rekor: RekorHealth;
     ct: CtHealth;
     renewal: RenewalHealth;
   }> {
     const health = this.#readAlarmHealthRow();
+    const b = this.#readBreakerRow();
+    const open = health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES;
     const now = Date.now();
     const elapsedHours =
       health.first_fire_at > 0
@@ -6228,8 +6369,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       driftRatio,
       warmupComplete:
         health.total_fires >= SigningAuthority.DRIFT_RATIO_WARMUP_FIRES,
-      circuitBreakerOpen:
-        health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES,
+      circuitBreakerOpen: open,
+      breaker: {
+        state: !open ? "closed" : now >= b.next_probe_at ? "half_open" : "open",
+        lastTrippedAt: b.tripped_at,
+        nextProbeAt: open ? b.next_probe_at : 0,
+        consecutiveTrips: b.consecutive_trips,
+      },
+      rekor: this.#readRekorHealth(),
       ct: await this.#readCtHealth(),
       renewal: this.#readRenewalHealth(),
     };
