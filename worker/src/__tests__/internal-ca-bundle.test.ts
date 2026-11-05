@@ -89,13 +89,11 @@ describe("internal CA bundle endpoint", () => {
     expect(cache.put).toHaveBeenCalledWith(
       "bundle:current",
       JSON.stringify(sampleBundle),
-      // The TTL IS the fix. Without it the first bundle generated is pinned in
-      // KV permanently — production served one issued 2026-03-29, 130 days
-      // old, against a five-minute staleness window, so every conformant
-      // consumer rejected it (notme-77a024). Asserted rather than assumed
-      // because a silently-dropped TTL restores the original bug exactly.
-      { expirationTtl: 60 },
     );
+    // And with NO third argument: a KV TTL turns a stale bundle into an
+    // absent one, and checkRevocation fails OPEN on absent
+    // (bundle-no-ttl.test.ts). The read-time staleness check is the bound.
+    expect(cache.put.mock.calls[0]).toHaveLength(2);
   });
 
   it("regenerates when the cached bundle is malformed", async () => {
@@ -111,13 +109,11 @@ describe("internal CA bundle endpoint", () => {
     expect(cache.put).toHaveBeenCalledWith(
       "bundle:current",
       JSON.stringify(sampleBundle),
-      // The TTL IS the fix. Without it the first bundle generated is pinned in
-      // KV permanently — production served one issued 2026-03-29, 130 days
-      // old, against a five-minute staleness window, so every conformant
-      // consumer rejected it (notme-77a024). Asserted rather than assumed
-      // because a silently-dropped TTL restores the original bug exactly.
-      { expirationTtl: 60 },
     );
+    // And with NO third argument: a KV TTL turns a stale bundle into an
+    // absent one, and checkRevocation fails OPEN on absent
+    // (bundle-no-ttl.test.ts). The read-time staleness check is the bound.
+    expect(cache.put.mock.calls[0]).toHaveLength(2);
   });
 
   it("regenerates when the cached bundle is STALE — the read path is the third safeguard", async () => {
