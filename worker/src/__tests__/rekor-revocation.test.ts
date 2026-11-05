@@ -18,6 +18,7 @@ import { assertFixtures } from "../../../scripts/fixture-manifest";
 import type { EpochHistory } from "../epoch-history";
 import {
   checkRevocationsAgainstLog,
+  DEFAULT_REKOR_URL,
   type DsseEnvelope,
   dssePae,
   EPOCH_REVOCATION_PREDICATE_TYPE,
@@ -25,9 +26,11 @@ import {
   IN_TOTO_STATEMENT_TYPE,
   type LoggedRevocation,
   parseRekorEntry,
+  publicRekorRefusal,
   rekorDsseProposedEntry,
   revocationStatementPayload,
   signRevocationStatement,
+  submitToRekor,
   verifyRevocationStatement,
 } from "../rekor-revocation";
 
@@ -279,5 +282,68 @@ describe("epochs.json against the log (notme-8befcc)", () => {
     const doc = { ...history, revocations: history.revocations.map((x) => ({ ...x, rekorLogIndex: 8 })) };
     const r = await checkRevocationsAgainstLog(doc, [logged(envelope, 7)]);
     expect(r.problems).toEqual([expect.objectContaining({ epoch: 1, problem: "log_index_mismatch" })]);
+  });
+});
+
+// notme-a3804c (overnight review H3): a staging whose REKOR_URL was never set
+// fell back to DEFAULT_REKOR_URL, so its revocations would have become
+// permanent PUBLIC entries. The config-drift check catches the config; this
+// is the defence in depth, in the code that sends.
+describe("only the production authority may write to the public Rekor (notme-a3804c)", () => {
+  it("rekor.public.production-only — refused for staging, local, unset and unparseable authorities", () => {
+    for (const authority of ["https://auth-staging.notme.bot", "http://localhost:8788", undefined, "", "not a url"]) {
+      expect(publicRekorRefusal(DEFAULT_REKOR_URL, authority), String(authority)).toMatch(/^refused: the public Rekor/);
+    }
+    // Trailing slash and case: still the public log.
+    expect(publicRekorRefusal("https://REKOR.sigstore.dev/", "https://auth-staging.notme.bot")).not.toBeNull();
+    // A look-alike authority host is not production's.
+    expect(publicRekorRefusal(DEFAULT_REKOR_URL, "https://auth.notme.bot.evil.test")).not.toBeNull();
+  });
+
+  it("allowed for auth.notme.bot, and any other log is the operator's choice", () => {
+    expect(publicRekorRefusal(DEFAULT_REKOR_URL, "https://auth.notme.bot")).toBeNull();
+    expect(publicRekorRefusal(DEFAULT_REKOR_URL, "https://AUTH.notme.bot/")).toBeNull();
+    expect(publicRekorRefusal("https://rekor.sigstage.dev", "https://auth-staging.notme.bot")).toBeNull();
+    expect(publicRekorRefusal("https://rekor.notme.test", undefined)).toBeNull();
+  });
+
+  it("submitToRekor sends NOTHING when refused, and says so", async () => {
+    const { envelope } = load();
+    const sent: string[] = [];
+    const spy = (async (input: RequestInfo | URL) => {
+      sent.push(String(input));
+      return new Response("unreachable", { status: 500 });
+    }) as typeof fetch;
+    const r = await submitToRekor({
+      baseUrl: DEFAULT_REKOR_URL,
+      authorityUrl: "https://auth-staging.notme.bot",
+      envelope,
+      rootPublicRawB64: FIXTURE_ROOT_PUB_B64,
+      timeoutMs: 1000,
+      fetch: spy,
+    });
+    expect(sent).toEqual([]);
+    expect(r).toMatchObject({ ok: false, refused: true });
+    if (!r.ok) expect(r.reason).toMatch(/auth-staging\.notme\.bot/);
+  });
+
+  it("control: from production the same call reaches the log", async () => {
+    const { envelope } = load();
+    const sent: string[] = [];
+    const spy = (async (input: RequestInfo | URL) => {
+      sent.push(String(input));
+      return new Response("down", { status: 503 });
+    }) as typeof fetch;
+    const r = await submitToRekor({
+      baseUrl: DEFAULT_REKOR_URL,
+      authorityUrl: "https://auth.notme.bot",
+      envelope,
+      rootPublicRawB64: FIXTURE_ROOT_PUB_B64,
+      timeoutMs: 1000,
+      fetch: spy,
+    });
+    expect(sent).toEqual([`${DEFAULT_REKOR_URL}/api/v1/log/entries`]);
+    expect(r).toMatchObject({ ok: false });
+    expect("refused" in r).toBe(false);
   });
 });

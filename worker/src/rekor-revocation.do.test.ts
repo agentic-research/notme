@@ -273,6 +273,62 @@ describe("a Rekor outage never touches the revocation (notme-8befcc)", () => {
   });
 });
 
+// notme-a3804c (review H3): a staging authority with no REKOR_URL fell back
+// to the public Rekor. The guard is in submitToRekor; this is the DO path end
+// to end: the revocation commits, nothing is sent, the row stays pending and
+// alarm-health says why.
+describe("a non-production authority never writes to the public Rekor (notme-a3804c)", () => {
+  /** Run `fn` with the DO's own env pointed at the public Rekor from a staging host. */
+  async function asStagingOnPublicRekor<T>(fn: () => Promise<T>): Promise<T> {
+    const swap = (vals: Record<string, string | undefined>) =>
+      runInDurableObject(authority(), async (instance) => {
+        const e = (instance as unknown as { env: Record<string, string | undefined> }).env;
+        const before = { REKOR_URL: e.REKOR_URL, SIGNET_AUTHORITY_URL: e.SIGNET_AUTHORITY_URL };
+        Object.assign(e, vals);
+        return before;
+      });
+    const before = await swap({ REKOR_URL: "https://rekor.sigstore.dev", SIGNET_AUTHORITY_URL: "https://auth-staging.notme.bot" });
+    try {
+      return await fn();
+    } finally {
+      await swap(before);
+    }
+  }
+
+  it("rekor.public.production-only — the revocation commits, nothing reaches any log, the row is pending with the refusal", async () => {
+    const sentElsewhere: string[] = [];
+    const guard = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const host = new URL(new Request(input, init).url).hostname;
+      if (host !== REKOR_HOST) sentElsewhere.push(host);
+      return guard(input, init);
+    }) as typeof fetch;
+    try {
+      await asStagingOnPublicRekor(async () => {
+        const { ended } = await revoke("staging on public rekor");
+        const r = (await history()).revocations.find((x) => x.epoch === ended)!;
+        expect(r.statement).not.toBeNull(); // signed, so it can be sent once the config is fixed
+        expect(r.rekorLogIndex).toBeNull();
+        expect(postsFor(ended)).toHaveLength(0);
+        // The alarm's retry is refused the same way.
+        await ageAttempt(ended);
+        await runAlarm();
+        expect(postsFor(ended)).toHaveLength(0);
+        const row = await runInDurableObject(authority(), async (_i, state) =>
+          state.storage.sql
+            .exec("SELECT rekor_last_error, rekor_log_index FROM epoch_revocations WHERE epoch = ?", ended)
+            .toArray()[0] as { rekor_last_error: string; rekor_log_index: number | null },
+        );
+        expect(row.rekor_log_index).toBeNull();
+        expect(row.rekor_last_error).toMatch(/^refused: the public Rekor \(rekor\.sigstore\.dev\)/);
+      });
+      expect(sentElsewhere).not.toContain("rekor.sigstore.dev");
+    } finally {
+      globalThis.fetch = guard;
+    }
+  });
+});
+
 describe("a stuck Rekor queue is visible in /admin/alarm-health (notme-d8cf4e)", () => {
   const health = async () => {
     const res = await call("/admin/alarm-health", { headers: { cookie: await adminCookie() } });

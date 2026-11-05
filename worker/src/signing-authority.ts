@@ -4623,13 +4623,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // logged once in Rekor, AFTER revokeEpoch() commits. Pending rows are
   // retried from alarm() with bounded exponential backoff and never
   // abandoned: a revocation is rare and its log entry is permanent evidence,
-  // so a long outage costs a few requests a day, not the record.
+  // so a long outage costs about one request an hour per pending
+  // revocation, not the record.
 
   /** Requests are bounded per attempt; revokeEpoch's response waits at most this (x2 on a 409). */
   static readonly REKOR_TIMEOUT_MS = 5_000;
   /** Backoff after the n-th failure: REKOR_RETRY_BASE_S * 2^(n-1), capped at REKOR_RETRY_MAX_S. */
   static readonly REKOR_RETRY_BASE_S = 4 * 60;
-  static readonly REKOR_RETRY_MAX_S = 6 * 60 * 60;
+  // 1 h, not 6 h (notme-a3804c, review L2): at 6 h the first try after a
+  // long Rekor outage could come 6 h after it ended. Revocations are rare,
+  // so an hourly retry of each pending one costs nothing.
+  static readonly REKOR_RETRY_MAX_S = 60 * 60;
   /** Rows attempted per alarm fire. */
   static readonly REKOR_DRAIN_BATCH = 5;
 
@@ -4736,6 +4740,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       try {
         const result = await submitToRekor({
           baseUrl: this.env.REKOR_URL || DEFAULT_REKOR_URL,
+          // The public-Rekor guard (notme-a3804c): a non-production
+          // authority's statement never reaches the public log.
+          authorityUrl: this.env.SIGNET_AUTHORITY_URL,
           envelope: JSON.parse(cur.statement) as DsseEnvelope,
           rootPublicRawB64: cur.statement_key,
           timeoutMs: SigningAuthority.REKOR_TIMEOUT_MS,
@@ -4758,7 +4765,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
             result.reason.slice(0, 200),
             r.epoch,
           );
-          console.error({ event: "rekor.submit_failed", epoch: r.epoch, reason: result.reason });
+          // A refusal is its own event: nothing was sent, and only a config
+          // fix (REKOR_URL, or the authority host) clears it. The row stays
+          // pending either way, with the reason in alarm-health lastError.
+          console.error({
+            event: result.refused ? "rekor.submit_refused" : "rekor.submit_failed",
+            epoch: r.epoch,
+            reason: result.reason,
+          });
         }
       } finally {
         this.#rekorInFlight.delete(r.epoch);
