@@ -100,6 +100,7 @@ export const baseMiniflare = {
   // here (each suite injects a stand-in), as before.
   ratelimits: {
     SESSION_LIMITER: { namespace_id: "1004", simple: { limit: 60, period: 60 as const } },
+    PRINCIPAL_LIMITER: { namespace_id: "1005", simple: { limit: 300, period: 60 as const } },
   },
 };
 

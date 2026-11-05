@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   __resetCABundleMemoForTests,
+  BYPASS_FLOOR_MS,
   ensureCurrentCABundle,
   handleInternalCABundle,
 } from "../internal-ca-bundle";
@@ -266,9 +267,13 @@ describe("ca-bundle.single-flight — /internal/ca-bundle under load (notme-a34d
   });
 
   it("Cache-Control: no-cache reads past the edge and memory (the trust-anchor gate), within its limiter", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-05T00:00:00Z"));
     const { env, platform, cache } = makeHarness({ cached: JSON.stringify({ ...sampleBundle, issuedAt: nowS() }) });
     const f = fakeEdge();
     await handleInternalCABundle(req(), env, platform, f);
+    // Past the bypass floor (L5): a copy read from KV this recently would answer it.
+    vi.setSystemTime(Date.now() + BYPASS_FLOOR_MS + 1);
     const allowed = await handleInternalCABundle(req({ "cache-control": "no-cache" }), env, platform, {
       ...f,
       bypassAllowed: async () => true,
@@ -296,5 +301,96 @@ describe("ca-bundle.single-flight — /internal/ca-bundle under load (notme-a34d
     expect(authority.generateBundle).toHaveBeenCalledTimes(2);
     // ...and the colo's edge holds that 503 for 5 s too.
     expect(f.maxAges).toEqual([5]);
+  });
+});
+
+describe("ca-bundle.edge-read-gate — review round 2 (notme-a34dad M1, L1, L2, L5)", () => {
+  const nowS = () => Math.floor(Date.now() / 1000);
+  const req = (headers: Record<string, string> = {}) =>
+    new Request("https://notme-bot/internal/ca-bundle", { headers });
+  /** A Cache API stand-in that keeps whatever it is given, max-age or not. */
+  function sloppyEdge() {
+    const store = new Map<string, Response>();
+    return {
+      store,
+      edgeKey: new Request("https://notme-bot/internal/ca-bundle?_build=t"),
+      edge: {
+        match: vi.fn(async (k: Request) => store.get(k.url)?.clone()),
+        put: vi.fn(async (k: Request, v: Response) => void store.set(k.url, v)),
+      },
+    };
+  }
+  afterEach(() => vi.useRealTimers());
+
+  it("M1: an edge hit past the 300 s window is not served, even if the cache kept it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-05T00:00:00Z"));
+    const old: CABundle = { ...sampleBundle, seqno: 1, issuedAt: nowS() };
+    const f = sloppyEdge();
+    f.store.set(
+      f.edgeKey.url,
+      new Response(JSON.stringify(old), { headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=999" } }),
+    );
+    vi.setSystemTime(Date.now() + 301_000);
+    const regenerated: CABundle = { ...sampleBundle, seqno: 2, issuedAt: nowS() };
+    const { env, platform, authority } = makeHarness({ cached: JSON.stringify(old), generated: regenerated });
+    const res = await handleInternalCABundle(req(), env, platform, f);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual(regenerated);
+    expect(authority.generateBundle).toHaveBeenCalledTimes(1);
+  });
+
+  it("M1: an edge hit inside the window is served, and a malformed one is a miss", async () => {
+    const good: CABundle = { ...sampleBundle, issuedAt: nowS() };
+    const f = sloppyEdge();
+    f.store.set(f.edgeKey.url, new Response(JSON.stringify(good), { headers: { "Content-Type": "application/json" } }));
+    const h1 = makeHarness({ cached: null });
+    await expect((await handleInternalCABundle(req(), h1.env, h1.platform, f)).json()).resolves.toEqual(good);
+    expect(h1.cache.get).not.toHaveBeenCalled();
+    __resetCABundleMemoForTests();
+    f.store.set(f.edgeKey.url, new Response("not json", { headers: { "Content-Type": "application/json" } }));
+    const h2 = makeHarness({ cached: JSON.stringify(good) });
+    expect((await handleInternalCABundle(req(), h2.env, h2.platform, f)).status).toBe(200);
+    expect(h2.cache.get).toHaveBeenCalledTimes(1);
+  });
+
+  it("L1: a colo-wide 503 at the edge does not override this isolate's valid copy", async () => {
+    const good: CABundle = { ...sampleBundle, issuedAt: nowS() };
+    const { env, platform } = makeHarness({ cached: JSON.stringify(good) });
+    const f = sloppyEdge();
+    expect((await handleInternalCABundle(req(), env, platform, f)).status).toBe(200); // memo filled
+    // Another isolate's failed refresh negatively caches the colo.
+    f.store.set(f.edgeKey.url, new Response(JSON.stringify({ error: "authority unavailable" }), { status: 503 }));
+    const res = await handleInternalCABundle(req(), env, platform, f);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual(good);
+  });
+
+  it("L2: a failed KV put still returns the freshly generated bundle, and logs it", async () => {
+    const fresh: CABundle = { ...sampleBundle, seqno: 5, issuedAt: nowS() };
+    const { env, platform, cache } = makeHarness({ cached: null, generated: fresh });
+    cache.put.mockRejectedValueOnce(new Error("KV PUT failed: 429 Too Many Requests"));
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await handleInternalCABundle(req(), env, platform);
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toEqual(fresh);
+      expect(err.mock.calls.some((c) => String(c[0]).includes("bundle:current"))).toBe(true);
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("L5: no-cache reads within BYPASS_FLOOR_MS of a refresh share it; after it, they read KV again", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-05T00:00:00Z"));
+    const { env, platform, cache } = makeHarness({ cached: JSON.stringify({ ...sampleBundle, issuedAt: nowS() }) });
+    const bypass = () => handleInternalCABundle(req({ "cache-control": "no-cache" }), env, platform, { bypassAllowed: async () => true });
+    // A /48 fanned over many /64s: each passes its own per-IP bucket.
+    for (let i = 0; i < 50; i++) expect((await bypass()).status).toBe(200);
+    expect(cache.get).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() + BYPASS_FLOOR_MS + 1);
+    await bypass();
+    expect(cache.get).toHaveBeenCalledTimes(2);
   });
 });

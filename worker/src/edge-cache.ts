@@ -7,9 +7,9 @@
  * singleton SigningAuthority — during an overload, exactly when it could
  * least afford them, so the overload fed itself.
  *
- * Now a failure turns the cache off for a backoff that doubles per
- * consecutive failure (1 s, 2 s, 4 s … capped at 60 s) and resets on the
- * first success. A permanently broken cache costs one attempt a minute; a
+ * Now a failure turns that route's cache operation off for a backoff that
+ * doubles per consecutive failure (1 s, 2 s, 4 s … capped at 60 s) and
+ * resets on the first success. A permanently broken cache costs one attempt a minute; a
  * blip costs a second.
  *
  * The one PERMANENT off switch is deliberate and separate: local workerd has
@@ -27,9 +27,46 @@ type CacheLike = {
   put(key: Request, value: Response): Promise<void>;
 };
 
-let failures = 0;
-let disabledUntil = 0;
+/**
+ * One circuit per (operation, route), not one per isolate (review L6). A
+ * single shared circuit let ANY failure — a `put` that throws on some other
+ * route's key, a match timeout — switch caching off for the DO-backed
+ * `.well-known` documents too, which is M3's amplification again for up to
+ * BACKOFF_MAX_MS. Now:
+ *  - the family is the key's PATH (the query, which carries the build and
+ *    whatever a caller appended, is not part of it), so jwks.json failing
+ *    leaves epochs.json alone;
+ *  - `match` and `put` have separate circuits, so a failing put never stops
+ *    the matches that keep requests off the DO.
+ * Bounded: past MAX_FAMILIES distinct paths (the host-canonicalisation
+ * redirect caches arbitrary paths), new paths share one overflow circuit
+ * rather than growing the map.
+ */
+type Circuit = { failures: number; disabledUntil: number };
+type Op = "match" | "put";
+const MAX_FAMILIES = 64;
+const circuits = new Map<string, Circuit>();
+const overflow: Record<Op, Circuit> = { match: { failures: 0, disabledUntil: 0 }, put: { failures: 0, disabledUntil: 0 } };
 let offForIsolate = false;
+
+function familyOf(key: Request): string {
+  try {
+    return new URL(key.url).pathname;
+  } catch {
+    return "";
+  }
+}
+
+function circuit(op: Op, key: Request, create: boolean): Circuit | undefined {
+  const id = `${op}:${familyOf(key)}`;
+  let c = circuits.get(id);
+  if (!c && create) {
+    if (circuits.size >= 2 * MAX_FAMILIES) return overflow[op];
+    c = { failures: 0, disabledUntil: 0 };
+    circuits.set(id, c);
+  }
+  return c ?? (circuits.size >= 2 * MAX_FAMILIES ? overflow[op] : undefined);
+}
 
 function defaultCache(): CacheLike {
   // Throws (ReferenceError) where there is no Cache API; that is a failure
@@ -37,18 +74,24 @@ function defaultCache(): CacheLike {
   return (caches as unknown as { default: CacheLike }).default;
 }
 
-function usable(now: number): boolean {
-  return !offForIsolate && now >= disabledUntil;
+function usable(op: Op, key: Request, now: number): boolean {
+  if (offForIsolate) return false;
+  const c = circuit(op, key, false);
+  return !c || now >= c.disabledUntil;
 }
 
-function failed(now: number): void {
-  failures++;
-  disabledUntil = now + Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS);
+function failed(op: Op, key: Request, now: number): void {
+  const c = circuit(op, key, true)!;
+  c.failures++;
+  c.disabledUntil = now + Math.min(BACKOFF_BASE_MS * 2 ** (c.failures - 1), BACKOFF_MAX_MS);
 }
 
-function succeeded(): void {
-  failures = 0;
-  disabledUntil = 0;
+function succeeded(op: Op, key: Request): void {
+  const c = circuit(op, key, false);
+  if (c) {
+    c.failures = 0;
+    c.disabledUntil = 0;
+  }
 }
 
 /** Local workerd: no Cache API, for the life of this isolate. */
@@ -61,13 +104,13 @@ export async function edgeMatch(
   cache?: CacheLike,
   now = Date.now(),
 ): Promise<Response | undefined> {
-  if (!usable(now)) return undefined;
+  if (!usable("match", key, now)) return undefined;
   try {
     const hit = await (cache ?? defaultCache()).match(key);
-    succeeded();
+    succeeded("match", key);
     return hit;
   } catch {
-    failed(now);
+    failed("match", key, now);
     return undefined;
   }
 }
@@ -78,24 +121,36 @@ export async function edgePut(
   cache?: CacheLike,
   now = Date.now(),
 ): Promise<void> {
-  if (!usable(now)) return;
+  if (!usable("put", key, now)) return;
   try {
     await (cache ?? defaultCache()).put(key, value);
-    succeeded();
+    succeeded("put", key);
   } catch {
-    failed(now);
+    failed("put", key, now);
   }
 }
 
-/** For tests only. */
-export function __edgeCacheStateForTests(): { failures: number; disabledUntil: number; offForIsolate: boolean } {
-  return { failures, disabledUntil, offForIsolate };
+/** For tests only: one circuit's state. */
+export function __edgeCacheStateForTests(
+  key: Request,
+  op: Op,
+): { failures: number; disabledUntil: number; offForIsolate: boolean } {
+  const c = circuit(op, key, false) ?? { failures: 0, disabledUntil: 0 };
+  return { failures: c.failures, disabledUntil: c.disabledUntil, offForIsolate };
+}
+
+/** For tests only: how many circuits exist. */
+export function __edgeCacheFamiliesForTests(): number {
+  return circuits.size;
 }
 
 /** For tests only. */
 export function __resetEdgeCacheForTests(): void {
-  failures = 0;
-  disabledUntil = 0;
+  circuits.clear();
+  for (const c of Object.values(overflow)) {
+    c.failures = 0;
+    c.disabledUntil = 0;
+  }
   offForIsolate = false;
 }
 
@@ -143,3 +198,4 @@ export function unavailableFor(key: Request, now = Date.now()): number {
   }
   return Math.ceil((t - now) / 1000);
 }
+

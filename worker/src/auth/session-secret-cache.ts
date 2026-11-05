@@ -36,9 +36,10 @@
  * (`liveSessionSecret`). Refetching on a failed HMAC would close the window
  * and reopen the flood, so it is not done.
  *
- * `limit` is the caller's limiter, keyed by WHO the cookie proved to be. It
- * runs once, only after the HMAC has passed, and before the liveness
- * confirmation, so junk never reaches it and a limited session costs no RPC.
+ * `limit` is the caller's limiter, keyed by the SESSION the cookie proved and
+ * then its principal (sessionLimiter). It runs once, only after the HMAC has
+ * passed, and before the liveness confirmation, so junk never reaches it and
+ * a limited session costs no RPC.
  * (On a cold isolate the secret fetch comes first, because there is nothing
  * to check the HMAC against without it; that fetch is single-flight and
  * cached for the TTL, so it is bounded per isolate whatever the request
@@ -51,8 +52,9 @@ import { type SessionPayload, verifySessionCookie } from "./session";
 export const SESSION_SECRET_TTL_MS = 30_000;
 
 /**
- * SESSION_LIMITER's rate: requests per PRINCIPAL per 60 s (wrangler.toml.example,
- * and the test pool, which binds it at this number).
+ * SESSION_LIMITER's rate: requests per SESSION (one issued cookie) per 60 s,
+ * PER CLOUDFLARE LOCATION (wrangler.toml.example, and the test pool, which
+ * binds it at this number).
  *
  * Sized from the routes, not guessed. Every same-origin page and flow that
  * presents the cookie, counted from worker.ts and public/*.html:
@@ -69,9 +71,23 @@ export const SESSION_SECRET_TTL_MS = 30_000;
  * /cert/issuing-ca/device/token, which carries no cookie). So one flow is at
  * most 3, and an admin clicking through EVERYTHING in one minute is about
  * 15 (the dashboard-burst test replays that minute). 60 is four times that,
- * room for a CLI minting about 30 pairs a minute. It holds one hammering
- * session to 1 request/s of DO work, which is about a thousandth of the
- * singleton's soft limit.
+ * room for a CLI minting about 30 pairs a minute.
+ *
+ * THE BOUND IS PER LOCATION, NOT GLOBAL. Cloudflare's Workers rate limiting
+ * binding (https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/):
+ * "Rate limits are approximate and apply separately in each Cloudflare
+ * location", "Requests served in another Cloudflare location count toward a
+ * separate limit, even with the same namespace and key", "These counts do not
+ * combine into one worldwide limit", and "If you need one strict limit
+ * across all locations, implement a rate limiter with Durable Objects." So
+ * one session spread over proxies in N locations gets about 60·N per minute,
+ * that is about N/60 requests/s of DO work: one location is 1 rps, and all of
+ * Cloudflare's (some 300) is about 300 rps per session — a few sessions'
+ * worth reaches the singleton's soft limit. The documented strict
+ * alternative is a DO-backed counter, which costs a DO call on every request:
+ * the very call this limiter exists to keep off the singleton, so it is not
+ * used. The bound is documented instead (THREAT_MODEL §8), and what keeps it
+ * from being free is that every unit of it needs a session.
  *
  * NO per-IP backstop. Its job was junk, and junk no longer reaches the DO.
  * Every request this limiter sees carries a cookie the authority signed, so
@@ -82,30 +98,58 @@ export const SESSION_SECRET_TTL_MS = 30_000;
  */
 export const SESSION_LIMIT_PER_MINUTE = 60;
 
+/**
+ * PRINCIPAL_LIMITER's rate: requests per PRINCIPAL per 60 s, per location —
+ * the aggregate over all its sessions, so minting many sessions does not
+ * multiply a principal's budget. Five sessions' worth: an admin with a
+ * laptop, a phone, a CLI and a linked CI workflow all busy at once fits.
+ * Because the session key is checked first, one session (a stolen cookie
+ * included) can spend at most SESSION_LIMIT_PER_MINUTE of it, so no single
+ * session can lock its principal's other sessions out (review L4).
+ */
+export const PRINCIPAL_LIMIT_PER_MINUTE = 300;
+
 /** HMAC-SHA256, the only signature session.ts produces. */
 const SIG_BYTES = 32;
 
 type SecretSource = { getSessionSecret(): Promise<string> };
 
-type Entry = { secret: string; fetchedAt: number };
+/**
+ * `seq` orders fetches by when they STARTED (Date.now() does not: in workerd
+ * it only advances across I/O, so two events in one tick share a time). A
+ * verification is "fresh" only if its secret came from a fetch that started
+ * after the verification did; one that joined an earlier fetch may hold a
+ * pre-reset secret, so it is confirmed live (review L3).
+ */
+type Entry = { secret: string; fetchedAt: number; seq: number };
 
 let cached: Entry | null = null;
 let inflight: Promise<Entry> | null = null;
+let fetchSeq = 0;
+/**
+ * Bumped by invalidateSessionSecret. A fetch records the generation it began
+ * in and is not cached if that has moved on, so a fetch in flight across this
+ * isolate's own reset can never re-cache the pre-reset secret.
+ */
+let generation = 0;
 
-function store(e: Entry): void {
+function store(e: Entry, gen: number): void {
+  if (gen !== generation) return;
   // A slow fetch that started before a newer one finished must not overwrite
   // it with what may be a pre-rotation secret.
-  if (!cached || e.fetchedAt >= cached.fetchedAt) cached = e;
+  if (!cached || e.seq >= cached.seq) cached = e;
 }
 
 /** One fetch at a time per isolate; concurrent callers share its result. */
 function refresh(authority: SecretSource): Promise<Entry> {
   if (inflight) return inflight;
+  const gen = generation;
+  const seq = ++fetchSeq;
   const p = (async () => {
     const startedAt = Date.now();
     const secret = await authority.getSessionSecret();
-    const e = { secret, fetchedAt: startedAt };
-    store(e);
+    const e = { secret, fetchedAt: startedAt, seq };
+    store(e, gen);
     return e;
   })();
   inflight = p;
@@ -123,19 +167,29 @@ function refresh(authority: SecretSource): Promise<Entry> {
  * current secret, and reading it is a chance to refresh the cache for free.
  */
 export async function liveSessionSecret(authority: SecretSource): Promise<string> {
+  const gen = generation;
+  const seq = ++fetchSeq;
   const startedAt = Date.now();
   const secret = await authority.getSessionSecret();
-  store({ secret, fetchedAt: startedAt });
+  store({ secret, fetchedAt: startedAt, seq }, gen);
   return secret;
 }
 
-/** Forget this isolate's copy — after a reset this isolate performed. */
+/**
+ * Forget this isolate's copy, and abandon any fetch in flight — after a reset
+ * this isolate performed. Later requests start a new fetch rather than join
+ * one that may have read the pre-reset secret, and that fetch's result is
+ * not cached when it lands.
+ */
 export function invalidateSessionSecret(): void {
+  generation++;
   cached = null;
+  inflight = null;
 }
 
 /** For tests only: a cold isolate. */
 export function __resetSessionSecretCacheForTests(): void {
+  generation++;
   cached = null;
   inflight = null;
 }
@@ -171,17 +225,44 @@ export function couldBeSessionCookie(cookie: string, nowSeconds = Math.floor(Dat
 type RateLimitBinding = { limit(opts: { key: string }): Promise<{ success: boolean }> };
 
 /**
- * The cookie-route limiter: SESSION_LIMITER, its own binding (TOKEN_LIMITER's
- * 20/min is /token's budget, keyed by the same principals), keyed
- * `session:<principalId>` — the principal the HMAC proved, which a forger
- * cannot choose. No binding (local workerd) means no limit, as at every
- * other limiter site.
+ * The cookie-route limiter, after a valid HMAC, in two keys (review L4):
+ *  1. SESSION_LIMITER, `session:<the cookie's MAC>` — the one issued cookie.
+ *     The MAC is unforgeable and unique per issued cookie, and naming the
+ *     session rather than the principal means one session hammering (a
+ *     stolen cookie, a runaway CLI, a CI workflow linked to an admin) spends
+ *     its own budget, never the principal's other sessions'.
+ *  2. PRINCIPAL_LIMITER, `principal:<principalId>` — the aggregate, so many
+ *     sessions do not multiply one principal's budget. Charged only once the
+ *     session key admitted the request, so one session can spend at most
+ *     SESSION_LIMIT_PER_MINUTE of it.
+ *
+ * WHY BEFORE THE LIVE CONFIRMATION, not after it. After would mean the
+ * confirmation's getSessionSecret, the DO call this limiter exists to
+ * protect, ran unthrottled for every correctly signed cookie. The cost of
+ * before is that a cookie a reset revoked can still be charged — and that
+ * cost is one request per isolate: the confirmation stores the live secret,
+ * so every later use of the revoked cookie fails the local HMAC and is never
+ * charged (session-cookie-amplification.do.test.ts). Keying by session makes
+ * even that one charge land on the revoked session, not on its principal's
+ * live ones.
+ *
+ * Their own bindings: TOKEN_LIMITER's 20/min is /token's budget. No binding
+ * (local workerd) means no limit, as at every other limiter site.
  */
-export function sessionLimiter(env: { SESSION_LIMITER?: RateLimitBinding }): (s: SessionPayload) => Promise<boolean> {
-  return async (session) => {
-    if (!env.SESSION_LIMITER) return true;
-    const { success } = await env.SESSION_LIMITER.limit({ key: `session:${session.principalId}` });
-    return success;
+export function sessionLimiter(env: {
+  SESSION_LIMITER?: RateLimitBinding;
+  PRINCIPAL_LIMITER?: RateLimitBinding;
+}): (s: SessionPayload, sessionId: string) => Promise<boolean> {
+  return async (session, sessionId) => {
+    if (env.SESSION_LIMITER) {
+      const { success } = await env.SESSION_LIMITER.limit({ key: `session:${sessionId}` });
+      if (!success) return false;
+    }
+    if (env.PRINCIPAL_LIMITER) {
+      const { success } = await env.PRINCIPAL_LIMITER.limit({ key: `principal:${session.principalId}` });
+      if (!success) return false;
+    }
+    return true;
   };
 }
 
@@ -200,25 +281,24 @@ const LIMITED: SessionCheck = { ok: false, limited: true };
 export async function verifySessionCached(
   cookie: string,
   authority: SecretSource,
-  limit?: (session: SessionPayload) => Promise<boolean>,
+  limit?: (session: SessionPayload, sessionId: string) => Promise<boolean>,
 ): Promise<SessionCheck> {
   if (!couldBeSessionCookie(cookie)) return REFUSED;
 
   const startedAt = Date.now();
+  const seqAtStart = fetchSeq;
   let entry = cached && startedAt - cached.fetchedAt < SESSION_SECRET_TTL_MS && startedAt >= cached.fetchedAt
     ? cached
-    : null;
-  let fresh = false;
-  if (!entry) {
-    entry = await refresh(authority);
-    fresh = true;
-  }
+    : await refresh(authority);
+  // Fresh only if the fetch began after this verification did (review L3).
+  // Joining a fetch already in flight is not fresh: it may predate a reset.
+  const fresh = entry.seq > seqAtStart;
 
   const session = await verifySessionCookie(cookie, entry.secret);
   if (!session) return REFUSED;
-  // Signed by us, so the principal is real: only now is there an identity to
-  // charge, and only now can a DO call follow.
-  if (limit && !(await limit(session))) return LIMITED;
+  // Signed by us, so the session and its principal are real: only now is
+  // there an identity to charge, and only now can a DO call follow.
+  if (limit && !(await limit(session, cookie.split(".")[1]!))) return LIMITED;
   if (fresh) return { ok: true, session, secret: entry.secret };
 
   // Correctly signed under a cached secret: confirm it is still THE secret.

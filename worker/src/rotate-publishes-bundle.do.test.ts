@@ -12,6 +12,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker from "../worker";
+import { BYPASS_FLOOR_MS } from "./internal-ca-bundle";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
@@ -33,6 +34,11 @@ describe("rotate() republishes the CA bundle", () => {
     const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
     const { newKeyId } = await stub.rotate();
     expect(newKeyId).not.toBe(before.keyId);
+    // A no-cache read is answered from a copy read under BYPASS_FLOOR_MS ago
+    // (review L5: one KV read per isolate per floor, however many addresses
+    // ask). The gates read once, well after the rotation they wait on; this
+    // waits the floor out the same way.
+    await new Promise((r) => setTimeout(r, BYPASS_FLOOR_MS + 100));
     const after = await bundle();
     expect(after.keyId).toBe(newKeyId);
     // The grace window still publishes the outgoing key beside it.

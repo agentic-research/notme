@@ -17,10 +17,11 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { encodeBase64url } from "@oslojs/encoding";
-import { createSessionCookie } from "./auth/session";
+import { createSessionCookie, createSessionCookieWithExp } from "./auth/session";
 import {
   __resetSessionSecretCacheForTests,
   couldBeSessionCookie,
+  PRINCIPAL_LIMIT_PER_MINUTE,
   SESSION_LIMIT_PER_MINUTE,
 } from "./auth/session-secret-cache";
 
@@ -295,7 +296,7 @@ describe("a valid cookie still works, and still answers to the live secret", () 
  * the production rate, so "not limited" and "limited" are measured against
  * the number that ships, not a stand-in.
  */
-describe("session.limiter.per-principal — the session limiter is keyed by principal, after the HMAC", () => {
+describe("session.limiter.per-principal — the session limiter is keyed by session, then principal, after the HMAC", () => {
   beforeEach(() => __resetSessionSecretCacheForTests());
 
   const me = (cookie: string, ip = "198.51.100.20") =>
@@ -303,8 +304,19 @@ describe("session.limiter.per-principal — the session limiter is keyed by prin
   const nonce = (cookie: string, ip = "198.51.100.20") =>
     new Request(`${ORIGIN}/cert/nonce`, { method: "POST", headers: { cookie, "cf-connecting-ip": ip } });
 
-  it("the shipped rate is 60 per principal per minute", () => {
+  /**
+   * The limiter's windows are aligned to the wall clock (miniflare's, like
+   * Cloudflare's fixed windows), so a burst that straddles a minute boundary
+   * would see two budgets. Each counting test starts with room left.
+   */
+  async function roomInWindow(ms = 15_000): Promise<void> {
+    const left = 60_000 - (Date.now() % 60_000);
+    if (left < ms) await new Promise((r) => setTimeout(r, left + 100));
+  }
+
+  it("the shipped rates are 60 per session and 300 per principal, per minute", () => {
     expect(SESSION_LIMIT_PER_MINUTE).toBe(60);
+    expect(PRINCIPAL_LIMIT_PER_MINUTE).toBe(300);
   });
 
   it("a realistic dashboard minute from one valid session is not limited", async () => {
@@ -330,6 +342,7 @@ describe("session.limiter.per-principal — the session limiter is keyed by prin
   });
 
   it("one valid session hammering is limited, and its refused requests cost no RPC", async () => {
+    await roomInWindow();
     const cookie = await validCookie(`hammer-${crypto.randomUUID()}`);
     const statuses: number[] = [];
     for (let i = 0; i < SESSION_LIMIT_PER_MINUTE + 5; i++) statuses.push((await call(me(cookie), {})).status);
@@ -338,17 +351,18 @@ describe("session.limiter.per-principal — the session limiter is keyed by prin
     const spy = spiedAuthority();
     expect((await call(nonce(cookie), { SIGNING_AUTHORITY: spy.binding })).status).toBe(429);
     expect(spy.calls).toEqual([]);
-  });
+  }, 60_000);
 
   it("two sessions behind the same IP do not share a budget", async () => {
+    await roomInWindow();
     const a = await validCookie(`nat-a-${crypto.randomUUID()}`);
     const b = await validCookie(`nat-b-${crypto.randomUUID()}`);
     for (let i = 0; i < SESSION_LIMIT_PER_MINUTE; i++) await call(me(a, "203.0.113.50"), {});
     expect((await call(me(a, "203.0.113.50"), {})).status).toBe(429);
     expect((await call(me(b, "203.0.113.50"), {})).status).toBe(200);
-  });
+  }, 60_000);
 
-  it("is keyed by the principal the HMAC proved, consulted after it, and never for junk", async () => {
+  it("is keyed by the SESSION the HMAC proved, then its principal, after the HMAC, and never for junk", async () => {
     const rl = limiter(() => false);
     await call(me(`notme_session=${wellFormedForgery()}`), { SESSION_LIMITER: rl.binding });
     await call(me("notme_session=x"), { SESSION_LIMITER: rl.binding });
@@ -360,6 +374,70 @@ describe("session.limiter.per-principal — the session limiter is keyed by prin
     const res = await call(me(cookie), { SIGNING_AUTHORITY: spy.binding, SESSION_LIMITER: rl.binding });
     expect(res.status).toBe(429);
     expect(spy.calls).toEqual([]);
-    expect(rl.keys).toEqual(["session:keyed-principal"]);
+    // The session key is the cookie's own MAC: unique per issued cookie,
+    // unforgeable, and not the principal's.
+    expect(rl.keys).toEqual([`session:${cookie.split(".")[1]}`]);
+    // Within its own budget, it is then charged to the principal too.
+    const pl = limiter(() => false);
+    const res2 = await call(me(cookie), { SESSION_LIMITER: limiter(() => true).binding, PRINCIPAL_LIMITER: pl.binding });
+    expect(res2.status).toBe(429);
+    expect(pl.keys).toEqual(["principal:keyed-principal"]);
+  });
+
+  /** A cookie for `principalId`, distinct from any other one minted for it (its own exp). */
+  async function nthCookie(principalId: string, n: number): Promise<string> {
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+    const set = await createSessionCookieWithExp(
+      { principalId, scopes: ["bridgeCert"], authMethod: "passkey" },
+      await stub.getSessionSecret(),
+      Math.floor(Date.now() / 1000) + 3600 + n,
+    );
+    return set.split(";")[0]!;
+  }
+
+  it("another session of the SAME principal hammering does not lock this one out (L4)", async () => {
+    await roomInWindow();
+    // The victim-lockout case: a stolen cookie, or a CI workflow linked to an
+    // admin principal, burns its own budget, not the admin's browser session.
+    const pid = `shared-${crypto.randomUUID()}`;
+    const browser = await nthCookie(pid, 1);
+    const attacker = await nthCookie(pid, 2);
+    const statuses: number[] = [];
+    for (let i = 0; i < SESSION_LIMIT_PER_MINUTE + 5; i++) statuses.push((await call(me(attacker), {})).status);
+    expect(statuses.slice(SESSION_LIMIT_PER_MINUTE)).toEqual(Array(5).fill(429));
+    expect((await call(me(browser), {})).status).toBe(200);
+  }, 60_000);
+
+  it("a principal's sessions TOGETHER are bounded at PRINCIPAL_LIMIT_PER_MINUTE", async () => {
+    await roomInWindow();
+    // Many sessions of one principal (logins are cheap for whoever holds the
+    // credential) do not multiply its budget past the principal key.
+    const pid = `many-${crypto.randomUUID()}`;
+    const per = SESSION_LIMIT_PER_MINUTE - 1; // never trips a session key
+    const sessions = Math.ceil(PRINCIPAL_LIMIT_PER_MINUTE / per) + 1;
+    let limited = 0;
+    for (let n = 0; n < sessions; n++) {
+      const c = await nthCookie(pid, n);
+      for (let i = 0; i < per; i++) if ((await call(me(c), {})).status === 429) limited++;
+    }
+    expect(limited).toBe(sessions * per - PRINCIPAL_LIMIT_PER_MINUTE);
+  }, 60_000);
+
+  it("a cookie a reset revoked costs at most one confirmation per isolate, then nothing", async () => {
+    // Why charging BEFORE the live check cannot be turned into a lockout by a
+    // revoked cookie: the first confirmation refreshes the cached secret, so
+    // every later use fails the local HMAC and is never charged.
+    const old = await validCookie(`revoked-${crypto.randomUUID()}`);
+    await warm();
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+    await stub.resetPasskeyData(); // in "another isolate": this one still caches the old secret
+    const spy = spiedAuthority();
+    const rl = limiter(() => true);
+    for (let i = 0; i < 10; i++) {
+      const res = await call(me(old), { SIGNING_AUTHORITY: spy.binding, SESSION_LIMITER: rl.binding });
+      expect(res.status).toBe(302);
+    }
+    expect(spy.calls).toEqual(["getSessionSecret"]);
+    expect(rl.keys).toHaveLength(1);
   });
 });

@@ -68,10 +68,13 @@ describe("cache.error-backoff — the edge cache recovers from an error (M3)", (
     const spy = spiedAuthority();
     expect((await get(JWKS, { SIGNING_AUTHORITY: spy.binding })).status).toBe(200); // match throws: DO
     await new Promise((r) => setTimeout(r, 1_100)); // past the first backoff
-    expect((await get(JWKS, { SIGNING_AUTHORITY: spy.binding })).status).toBe(200); // miss: DO, and stored
+    expect((await get(JWKS, { SIGNING_AUTHORITY: spy.binding })).status).toBe(200); // match retried: a hit
     expect((await get(JWKS, { SIGNING_AUTHORITY: spy.binding })).status).toBe(200); // hit
-    // Latched off, the third request was a third DO call.
-    expect(spy.calls).toEqual(["getPublicKeyJwk", "getPublicKeyJwk"]);
+    // One DO call. The failed MATCH backed off only matches (review L6: one
+    // circuit per operation and route), so the first request still stored
+    // its response, and the retried match after the backoff found it.
+    // Latched off, as before notme-a34dad, all three were DO calls.
+    expect(spy.calls).toEqual(["getPublicKeyJwk"]);
   });
 });
 

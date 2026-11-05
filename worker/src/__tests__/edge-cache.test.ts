@@ -5,6 +5,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   BACKOFF_MAX_MS,
+  __edgeCacheFamiliesForTests,
   __edgeCacheStateForTests,
   __resetEdgeCacheForTests,
   disableForIsolate,
@@ -46,7 +47,7 @@ describe("edge cache backoff", () => {
     expect(c.calls).toBe(1); // inside the backoff: not even attempted
     await edgeMatch(key, c, t0 + 1_000);
     expect(c.calls).toBe(2);
-    expect(__edgeCacheStateForTests().failures).toBe(0); // the success reset it
+    expect(__edgeCacheStateForTests(key, "match").failures).toBe(0); // the success reset it
   });
 
   it("doubles per consecutive failure and caps at 60 s", async () => {
@@ -55,7 +56,7 @@ describe("edge cache backoff", () => {
     const waits: number[] = [];
     for (let i = 0; i < 9; i++) {
       await edgePut(key, new Response("x"), c, now);
-      const { disabledUntil } = __edgeCacheStateForTests();
+      const { disabledUntil } = __edgeCacheStateForTests(key, "put");
       waits.push(disabledUntil - now);
       now = disabledUntil;
     }
@@ -75,5 +76,33 @@ describe("edge cache backoff", () => {
     expect(unavailableFor(key, t0 + 1)).toBe(5);
     expect(unavailableFor(key, t0 + 4_001)).toBe(1);
     expect(unavailableFor(key, t0 + 5_000)).toBe(0);
+  });
+});
+
+describe("cache.backoff-per-route — one route's cache failure does not switch the cache off for the others (review L6)", () => {
+  const jwks = new Request("https://auth.notme.bot/.well-known/jwks.json?_build=t");
+  const epochs = new Request("https://auth.notme.bot/.well-known/epochs.json?_build=t");
+
+  it("a failed match on one route leaves another route's match working", async () => {
+    const broken = fakeCache(1);
+    const t0 = 3_000_000;
+    await edgeMatch(jwks, broken, t0);
+    const healthy = fakeCache(0);
+    await edgeMatch(epochs, healthy, t0 + 1);
+    expect(healthy.calls).toBe(1);
+  });
+
+  it("a failed put does not stop matches on the same route", async () => {
+    const c = fakeCache(1);
+    const t0 = 4_000_000;
+    await edgePut(jwks, new Response("x"), c, t0); // throws: put backs off
+    await edgeMatch(jwks, c, t0 + 1);
+    expect(c.calls).toBe(2); // the match was still attempted
+  });
+
+  it("an attacker-chosen path cannot grow the state without bound", async () => {
+    const c = fakeCache(1_000_000);
+    for (let i = 0; i < 1_000; i++) await edgePut(new Request(`https://x.example/p${i}?_build=t`), new Response("x"), c, 5_000_000);
+    expect(__edgeCacheFamiliesForTests()).toBeLessThanOrEqual(2 * 65);
   });
 });

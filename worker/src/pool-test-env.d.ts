@@ -22,6 +22,7 @@ declare global {
       // The per-principal session limiter (notme-a34dad), declared in
       // vitest.workers.config.mts at the production rate.
       SESSION_LIMITER: RateLimit;
+      PRINCIPAL_LIMITER: RateLimit;
       // Bound ONLY under vitest.workers.ct.config.mts (a stub transparency
       // log); absent in the main pool config, hence optional.
       CT_LOG?: Fetcher;

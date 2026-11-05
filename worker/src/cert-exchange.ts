@@ -103,8 +103,9 @@ export async function handleCertExchange(
     if (!cookie) {
       return Response.json({ error: "no session cookie" }, { status: 401 });
     }
-    // Through the isolate cache and the per-IP limiter, as every cookie route
-    // is: a junk cookie must not cost the SigningAuthority (notme-a34dad).
+    // Through the isolate cache and the session limiter (per session, then
+    // per principal, after the HMAC), as every cookie route is: a junk cookie
+    // must not cost the SigningAuthority (notme-a34dad).
     const { verifySessionCached, sessionLimiter } = await import("./auth/session-secret-cache");
     const checked = await verifySessionCached(cookie, authority, sessionLimiter(env));
     if (!checked.ok && checked.limited) {
