@@ -105,8 +105,8 @@ export async function handleCertExchange(
     }
     // Through the isolate cache and the per-IP limiter, as every cookie route
     // is: a junk cookie must not cost the SigningAuthority (notme-a34dad).
-    const { verifySessionCached, sessionIpLimiter } = await import("./auth/session-secret-cache");
-    const checked = await verifySessionCached(cookie, authority, sessionIpLimiter(env, request));
+    const { verifySessionCached, sessionLimiter } = await import("./auth/session-secret-cache");
+    const checked = await verifySessionCached(cookie, authority, sessionLimiter(env));
     if (!checked.ok && checked.limited) {
       return Response.json({ error: "rate_limited" }, { status: 429, headers: { "Retry-After": "60" } });
     }

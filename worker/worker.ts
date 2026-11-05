@@ -58,7 +58,7 @@ import { AUTH_METHOD, oidcAuthMethod, type SessionPayload } from "./src/auth/ses
 import {
   invalidateSessionSecret,
   liveSessionSecret,
-  sessionIpLimiter,
+  sessionLimiter,
   verifySessionCached,
 } from "./src/auth/session-secret-cache";
 import { authorityStub } from "./src/authority-stub";
@@ -1313,18 +1313,17 @@ function parseCookie(cookieHeader: string, name: string): string | null {
  * the cache and why a positive answer is still confirmed against the live
  * secret.
  *
- * The per-IP limiter (sessionIpLimiter) is defence in depth for the call that
- * remains: it runs only when a DO call is about to happen (a cold isolate's
- * secret fetch, or the confirmation of a correctly signed cookie), so a
- * request that will be refused locally spends no one's budget.
+ * The limiter (sessionLimiter: SESSION_LIMITER, `session:<principalId>`) runs
+ * only once the HMAC has passed, so it charges the principal the cookie
+ * proved, never an address, and junk spends no one's budget. Its rate and
+ * why there is no per-IP backstop: SESSION_LIMIT_PER_MINUTE.
  */
 async function checkSession(
-  request: Request,
   env: any,
   authority: { getSessionSecret(): Promise<string> },
   cookie: string,
 ): Promise<{ session: SessionPayload | null; limited: boolean }> {
-  const r = await verifySessionCached(cookie, authority, sessionIpLimiter(env, request));
+  const r = await verifySessionCached(cookie, authority, sessionLimiter(env));
   return r.ok ? { session: r.session, limited: false } : { session: null, limited: r.limited };
 }
 
@@ -2327,7 +2326,7 @@ export default {
         }
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) {
@@ -2416,7 +2415,7 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
@@ -2508,7 +2507,7 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
@@ -2545,7 +2544,7 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
@@ -2602,7 +2601,7 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
@@ -2679,7 +2678,7 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
@@ -2699,7 +2698,7 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
@@ -2770,7 +2769,7 @@ export default {
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
           const { liveScopes } = await import("./src/auth/session");
-          const sc = await checkSession(request, env, authority, cookie);
+          const sc = await checkSession(env, authority, cookie);
           if (sc.limited) return rateLimitedResponse();
           const session = sc.session;
           if (!session) return jsonErr("invalid session", 401);
@@ -3033,7 +3032,7 @@ export default {
           "notme_session",
         );
         if (!statusCookie) return jsonErr("unauthorized", 401);
-        const sc = await checkSession(request, env, authDO, statusCookie);
+        const sc = await checkSession(env, authDO, statusCookie);
         if (sc.limited) return rateLimitedResponse();
         const statusSession = sc.session;
         if (!statusSession) return jsonErr("admin required", 403);
@@ -3109,7 +3108,7 @@ export default {
         const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
         if (!cookie) return jsonErr("session_required", 401);
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid_session", 401);
@@ -3158,7 +3157,7 @@ export default {
 
           // Typed stub: the mint below takes a parsed AuthMethod (notme-32003c).
           const authority = authorityStub(env);
-          const sc = await checkSession(request, env, authority, cookie);
+          const sc = await checkSession(env, authority, cookie);
           if (sc.limited) return rateLimitedResponse();
           const session = sc.session;
           if (!session) {
@@ -3344,7 +3343,7 @@ export default {
         const code = (new URL(request.url).searchParams.get("code") || "").toUpperCase();
         const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const sc = cookie ? await checkSession(request, env, authority, cookie) : null;
+        const sc = cookie ? await checkSession(env, authority, cookie) : null;
         if (sc?.limited) return rateLimitedResponse();
         const session = sc?.session ?? null;
         if (!session) {
@@ -3379,7 +3378,7 @@ export default {
         if (!cookie) return jsonErr("session_required", 401);
         const authority = authorityStub(env);
         const { liveScopes } = await import("./src/auth/session");
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid_session", 401);
@@ -3556,7 +3555,7 @@ export default {
         if (!cookie) return jsonErr("session_required", 401);
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
         const { liveScopes } = await import("./src/auth/session");
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) return jsonErr("invalid_session", 401);
@@ -3598,7 +3597,7 @@ export default {
           }
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const sc = await checkSession(request, env, authority, cookie);
+          const sc = await checkSession(env, authority, cookie);
           if (sc.limited) return rateLimitedResponse();
           const session = sc.session;
           if (!session) {
@@ -3841,7 +3840,7 @@ export default {
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const sc = await checkSession(request, env, authority, cookie);
+        const sc = await checkSession(env, authority, cookie);
         if (sc.limited) return rateLimitedResponse();
         const session = sc.session;
         if (!session) {
@@ -3948,7 +3947,7 @@ export default {
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const sc = await checkSession(request, env, authority, cookie);
+          const sc = await checkSession(env, authority, cookie);
           if (sc.limited) return rateLimitedResponse();
           const session = sc.session;
           if (!session) {
@@ -4097,7 +4096,7 @@ export default {
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const sc = await checkSession(request, env, authority, cookie);
+          const sc = await checkSession(env, authority, cookie);
           if (sc.limited) return rateLimitedResponse();
           const session = sc.session;
           if (!session) {

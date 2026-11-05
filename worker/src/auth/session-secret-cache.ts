@@ -36,16 +36,51 @@
  * (`liveSessionSecret`). Refetching on a failed HMAC would close the window
  * and reopen the flood, so it is not done.
  *
- * `beforeDoCall` is the caller's limiter. It runs at most once per
- * verification and only when a DO call is actually about to happen, so junk
- * never spends an honest caller's budget and a limited caller costs nothing.
+ * `limit` is the caller's limiter, keyed by WHO the cookie proved to be. It
+ * runs once, only after the HMAC has passed, and before the liveness
+ * confirmation, so junk never reaches it and a limited session costs no RPC.
+ * (On a cold isolate the secret fetch comes first, because there is nothing
+ * to check the HMAC against without it; that fetch is single-flight and
+ * cached for the TTL, so it is bounded per isolate whatever the request
+ * rate, and needs no limiter of its own.)
  */
 import { decodeBase64url } from "@oslojs/encoding";
-import { clientIpBucket } from "../client-ip-key";
 import { type SessionPayload, verifySessionCookie } from "./session";
 
 /** How long an isolate trusts its copy of the secret for a NEGATIVE answer. */
 export const SESSION_SECRET_TTL_MS = 30_000;
+
+/**
+ * SESSION_LIMITER's rate: requests per PRINCIPAL per 60 s (wrangler.toml.example,
+ * and the test pool, which binds it at this number).
+ *
+ * Sized from the routes, not guessed. Every same-origin page and flow that
+ * presents the cookie, counted from worker.ts and public/*.html:
+ *   - /me: 1. The invites page (public/_invite.html): GET /invites, then 1
+ *     per invite created or revoked.
+ *   - An OAuth /authorize round trip: GET /authorize, then the page's one
+ *     POST to /authorize/code or /authorize/token, so 2.
+ *   - A bridge-pair mint: POST /cert/nonce, then POST /cert/passkey, so 2.
+ *     POST /cert with a session proof: 1.
+ *   - A device enrolment approval: GET /enroll, POST .../device/approve,
+ *     then GET .../enrollments to see it, so 3.
+ *   - Admin reads: /admin/alarm-health, /auth/passkey/status, /connections: 1 each.
+ * No page polls a cookie route (the 5 s enrolment poll is
+ * /cert/issuing-ca/device/token, which carries no cookie). So one flow is at
+ * most 3, and an admin clicking through EVERYTHING in one minute is about
+ * 15 (the dashboard-burst test replays that minute). 60 is four times that,
+ * room for a CLI minting about 30 pairs a minute. It holds one hammering
+ * session to 1 request/s of DO work, which is about a thousandth of the
+ * singleton's soft limit.
+ *
+ * NO per-IP backstop. Its job was junk, and junk no longer reaches the DO.
+ * Every request this limiter sees carries a cookie the authority signed, so
+ * the attacker's unit of cost is a SESSION, and sessions are not free: they
+ * come from a passkey login (PASSKEY_LIMITER, 5/min per IP), an invite (an
+ * admin's act), an OIDC or bootstrap proof. Keying by IP would only re-create
+ * the NAT problem this replaced (two admins behind one address sharing 20/min).
+ */
+export const SESSION_LIMIT_PER_MINUTE = 60;
 
 /** HMAC-SHA256, the only signature session.ts produces. */
 const SIG_BYTES = 32;
@@ -136,20 +171,16 @@ export function couldBeSessionCookie(cookie: string, nowSeconds = Math.floor(Dat
 type RateLimitBinding = { limit(opts: { key: string }): Promise<{ success: boolean }> };
 
 /**
- * The per-IP limiter for cookie routes, as a `beforeDoCall`: TOKEN_LIMITER
- * under its own `session-ip:` prefix — a separate bucket from /token's
- * `token-ip:` — keyed the way /token keys its pre-DO bucket (IPv6 by /64,
- * src/client-ip-key.ts). No binding (local workerd, tests) means no limit, as
- * at every other limiter site.
+ * The cookie-route limiter: SESSION_LIMITER, its own binding (TOKEN_LIMITER's
+ * 20/min is /token's budget, keyed by the same principals), keyed
+ * `session:<principalId>` — the principal the HMAC proved, which a forger
+ * cannot choose. No binding (local workerd) means no limit, as at every
+ * other limiter site.
  */
-export function sessionIpLimiter(
-  env: { TOKEN_LIMITER?: RateLimitBinding },
-  request: Request,
-): () => Promise<boolean> {
-  return async () => {
-    if (!env.TOKEN_LIMITER) return true;
-    const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
-    const { success } = await env.TOKEN_LIMITER.limit({ key: `session-ip:${ip}` });
+export function sessionLimiter(env: { SESSION_LIMITER?: RateLimitBinding }): (s: SessionPayload) => Promise<boolean> {
+  return async (session) => {
+    if (!env.SESSION_LIMITER) return true;
+    const { success } = await env.SESSION_LIMITER.limit({ key: `session:${session.principalId}` });
     return success;
   };
 }
@@ -169,15 +200,9 @@ const LIMITED: SessionCheck = { ok: false, limited: true };
 export async function verifySessionCached(
   cookie: string,
   authority: SecretSource,
-  beforeDoCall?: () => Promise<boolean>,
+  limit?: (session: SessionPayload) => Promise<boolean>,
 ): Promise<SessionCheck> {
   if (!couldBeSessionCookie(cookie)) return REFUSED;
-
-  let admitted: boolean | null = null;
-  const admit = async (): Promise<boolean> => {
-    if (admitted === null) admitted = beforeDoCall ? await beforeDoCall() : true;
-    return admitted;
-  };
 
   const startedAt = Date.now();
   let entry = cached && startedAt - cached.fetchedAt < SESSION_SECRET_TTL_MS && startedAt >= cached.fetchedAt
@@ -185,17 +210,18 @@ export async function verifySessionCached(
     : null;
   let fresh = false;
   if (!entry) {
-    if (!(await admit())) return LIMITED;
     entry = await refresh(authority);
     fresh = true;
   }
 
   const session = await verifySessionCookie(cookie, entry.secret);
   if (!session) return REFUSED;
+  // Signed by us, so the principal is real: only now is there an identity to
+  // charge, and only now can a DO call follow.
+  if (limit && !(await limit(session))) return LIMITED;
   if (fresh) return { ok: true, session, secret: entry.secret };
 
   // Correctly signed under a cached secret: confirm it is still THE secret.
-  if (!(await admit())) return LIMITED;
   const live = await liveSessionSecret(authority);
   if (live === entry.secret) return { ok: true, session, secret: live };
   const reverified = await verifySessionCookie(cookie, live);

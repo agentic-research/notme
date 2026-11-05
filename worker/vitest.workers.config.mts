@@ -93,6 +93,14 @@ export const baseMiniflare = {
   },
   // KV binding the checkRevocation() tests write bundle:current into.
   kvNamespaces: ["CA_BUNDLE_CACHE"],
+  // The per-principal session limiter (notme-a34dad), at the PRODUCTION rate
+  // in wrangler.toml.example, so the suites exercise the number that ships:
+  // session-cookie-amplification.do.test.ts measures a real dashboard minute
+  // and a hammering session against it. The other limiters stay unbound
+  // here (each suite injects a stand-in), as before.
+  ratelimits: {
+    SESSION_LIMITER: { namespace_id: "1004", simple: { limit: 60, period: 60 as const } },
+  },
 };
 
 /**

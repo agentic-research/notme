@@ -172,7 +172,7 @@ describe("[env.staging] isolation (ADR-018)", () => {
       .filter((s) => /(^|\.)ratelimits$/.test(s.header))
       .map((s) => s.body.match(/^\s*name\s*=\s*"([^"]+)"/m)?.[1])
       .filter(Boolean);
-    for (const name of ["TOKEN_LIMITER", "CERT_LIMITER", "PASSKEY_LIMITER"]) {
+    for (const name of ["TOKEN_LIMITER", "CERT_LIMITER", "PASSKEY_LIMITER", "SESSION_LIMITER"]) {
       expect(declared, `staging does not bind ${name}`).toContain(name);
     }
   });

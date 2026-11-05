@@ -18,7 +18,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../worker";
 import { encodeBase64url } from "@oslojs/encoding";
 import { createSessionCookie } from "./auth/session";
-import { __resetSessionSecretCacheForTests, couldBeSessionCookie } from "./auth/session-secret-cache";
+import {
+  __resetSessionSecretCacheForTests,
+  couldBeSessionCookie,
+  SESSION_LIMIT_PER_MINUTE,
+} from "./auth/session-secret-cache";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
@@ -280,41 +284,82 @@ describe("a valid cookie still works, and still answers to the live secret", () 
   });
 });
 
-describe("the per-IP session limiter runs before the DO (defence in depth)", () => {
+
+/**
+ * The limiter is keyed by SESSION IDENTITY, not by address (notme-a34dad
+ * fix round). After the C2 fix a cookie that fails the cached-secret HMAC
+ * never reaches the DO, so the only callers the limiter has to bound hold a
+ * correctly signed cookie, and the principal it names is the one thing a
+ * per-IP key cannot tell apart behind a NAT. These use the REAL
+ * SESSION_LIMITER binding the pool declares (vitest.workers.config.mts), at
+ * the production rate, so "not limited" and "limited" are measured against
+ * the number that ships, not a stand-in.
+ */
+describe("session.limiter.per-principal — the session limiter is keyed by principal, after the HMAC", () => {
   beforeEach(() => __resetSessionSecretCacheForTests());
 
-  it("a limited caller with a VALID cookie is refused 429 with no RPC", async () => {
-    const cookie = await validCookie("limited");
+  const me = (cookie: string, ip = "198.51.100.20") =>
+    new Request(`${ORIGIN}/me`, { headers: { cookie, accept: "application/json", "cf-connecting-ip": ip } });
+  const nonce = (cookie: string, ip = "198.51.100.20") =>
+    new Request(`${ORIGIN}/cert/nonce`, { method: "POST", headers: { cookie, "cf-connecting-ip": ip } });
+
+  it("the shipped rate is 60 per principal per minute", () => {
+    expect(SESSION_LIMIT_PER_MINUTE).toBe(60);
+  });
+
+  it("a realistic dashboard minute from one valid session is not limited", async () => {
+    // The busiest real minute, measured from the routes (SESSION_LIMIT_PER_MINUTE
+    // has the count): /me, the invites page (list + create), an /authorize
+    // round trip in both shapes, an enrolment approval (/enroll, approve,
+    // list), a bridge-pair mint (/cert/nonce + /cert/passkey) twice, alarm
+    // health and passkey status.
+    const cookie = await validCookie(`dash-${crypto.randomUUID()}`, ["bridgeCert", "authorityManage", "certMint"]);
+    const pick = /authorize|enroll|enrollments|device\/approve|alarm-health|passkey\/status|cert\/passkey|GET \/invites|POST \/invites/;
+    const burst = [
+      me(cookie),
+      ...ROUTES.filter((r) => pick.test(r.name)).map((r) => r.req(cookie)),
+      nonce(cookie),
+      nonce(cookie),
+      ROUTES.find((r) => r.name === "POST /cert/passkey")!.req(cookie),
+    ];
+    expect(burst.length).toBeGreaterThanOrEqual(14);
+    for (const req of burst) {
+      const res = await call(req, {});
+      expect(res.status, new URL(req.url).pathname).not.toBe(429);
+    }
+  });
+
+  it("one valid session hammering is limited, and its refused requests cost no RPC", async () => {
+    const cookie = await validCookie(`hammer-${crypto.randomUUID()}`);
+    const statuses: number[] = [];
+    for (let i = 0; i < SESSION_LIMIT_PER_MINUTE + 5; i++) statuses.push((await call(me(cookie), {})).status);
+    expect(statuses.slice(0, SESSION_LIMIT_PER_MINUTE).every((s) => s === 200)).toBe(true);
+    expect(statuses.slice(SESSION_LIMIT_PER_MINUTE)).toEqual(Array(5).fill(429));
+    const spy = spiedAuthority();
+    expect((await call(nonce(cookie), { SIGNING_AUTHORITY: spy.binding })).status).toBe(429);
+    expect(spy.calls).toEqual([]);
+  });
+
+  it("two sessions behind the same IP do not share a budget", async () => {
+    const a = await validCookie(`nat-a-${crypto.randomUUID()}`);
+    const b = await validCookie(`nat-b-${crypto.randomUUID()}`);
+    for (let i = 0; i < SESSION_LIMIT_PER_MINUTE; i++) await call(me(a, "203.0.113.50"), {});
+    expect((await call(me(a, "203.0.113.50"), {})).status).toBe(429);
+    expect((await call(me(b, "203.0.113.50"), {})).status).toBe(200);
+  });
+
+  it("is keyed by the principal the HMAC proved, consulted after it, and never for junk", async () => {
+    const rl = limiter(() => false);
+    await call(me(`notme_session=${wellFormedForgery()}`), { SESSION_LIMITER: rl.binding });
+    await call(me("notme_session=x"), { SESSION_LIMITER: rl.binding });
+    expect(rl.keys).toEqual([]);
+    // A valid cookie on a warm isolate is refused before the liveness confirmation.
+    const cookie = await validCookie("keyed-principal");
     await warm();
     const spy = spiedAuthority();
-    const rl = limiter(() => false);
-    const res = await call(
-      new Request(`${ORIGIN}/me`, { headers: { cookie, accept: "application/json", "cf-connecting-ip": "198.51.100.9" } }),
-      { SIGNING_AUTHORITY: spy.binding, TOKEN_LIMITER: rl.binding },
-    );
+    const res = await call(me(cookie), { SIGNING_AUTHORITY: spy.binding, SESSION_LIMITER: rl.binding });
     expect(res.status).toBe(429);
     expect(spy.calls).toEqual([]);
-    expect(rl.keys).toEqual(["session-ip:198.51.100.9"]);
-  });
-
-  it("a cold isolate checks the limiter before fetching the secret", async () => {
-    const spy = spiedAuthority();
-    const rl = limiter(() => false);
-    const res = await call(
-      new Request(`${ORIGIN}/cert/nonce`, {
-        method: "POST",
-        headers: { cookie: `notme_session=${wellFormedForgery()}`, "cf-connecting-ip": "2001:db8:5:6::1" },
-      }),
-      { SIGNING_AUTHORITY: spy.binding, TOKEN_LIMITER: rl.binding },
-    );
-    expect(res.status).toBe(429);
-    expect(spy.calls).toEqual([]);
-    expect(rl.keys).toEqual(["session-ip:2001:db8:5:6::/64"]);
-  });
-
-  it("junk that never reaches the DO does not spend the caller's budget", async () => {
-    const rl = limiter(() => true);
-    await call(ROUTES[0]!.req("notme_session=x"), { TOKEN_LIMITER: rl.binding });
-    expect(rl.keys).toEqual([]);
+    expect(rl.keys).toEqual(["session:keyed-principal"]);
   });
 });

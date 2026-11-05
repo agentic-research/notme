@@ -49,6 +49,18 @@ namespace_id = "1003"
   limit = 5
   period = 60
 
+# Cookie routes: 60 per PRINCIPAL per minute, charged only after the session
+# HMAC passes (notme-a34dad). Its own binding: TOKEN_LIMITER is /token's
+# budget. Sizing: SESSION_LIMIT_PER_MINUTE in src/auth/session-secret-cache.ts.
+# OPERATOR: add this block to the live (untracked) wrangler.toml too, or the
+# cookie routes run unlimited (absent binding = no limit, as for the others).
+[[ratelimits]]
+name = "SESSION_LIMITER"
+namespace_id = "1004"
+  [ratelimits.simple]
+  limit = 60
+  period = 60
+
 # Custom domain routes — adjust zone_name to your domain.
 [[routes]]
 pattern = "notme.bot/*"
@@ -343,4 +355,11 @@ name = "PASSKEY_LIMITER"
 namespace_id = "1003"
   [env.staging.ratelimits.simple]
   limit = 5
+  period = 60
+
+[[env.staging.ratelimits]]
+name = "SESSION_LIMITER"
+namespace_id = "1004"
+  [env.staging.ratelimits.simple]
+  limit = 60
   period = 60
