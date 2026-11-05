@@ -2454,12 +2454,15 @@ export default {
       // GET  /admin/alarm-health        — is the bundle-refresh alarm alive?
       // POST /admin/alarm-health/reset  — clear the circuit breaker, re-arm
       //
-      // The alarm republishes the CA bundle every BUNDLE_REFRESH_MS. It has a
-      // circuit breaker that stops re-arming after repeated failures, and
-      // recovery requires resetAlarmHealth() — which was an RPC method with NO
-      // ROUTE, so the documented recovery procedure could not be invoked at
-      // all. Production ran with a dead alarm for 130 days and served a bundle
-      // every conformant consumer rejected (notme-77a024).
+      // The alarm republishes the CA bundle every BUNDLE_REFRESH_MS. After
+      // repeated failures its circuit breaker opens: it keeps exactly one
+      // probe alarm pending (15 min, doubling per consecutive trip to 2 h) and
+      // closes again when a probe succeeds (half-open, notme-a36d10), so it no
+      // longer needs a manual reset to recover. GET reports the breaker state
+      // and the Rekor revocation queue; POST reset still closes it at once.
+      // History: recovery once depended on resetAlarmHealth(), an RPC method
+      // with NO ROUTE, and production ran with a dead alarm for 130 days,
+      // serving a bundle every conformant consumer rejected (notme-77a024).
       //
       // authorityManage-gated, not public: alarm health leaks operational
       // state (how long the authority has been running, whether it is
