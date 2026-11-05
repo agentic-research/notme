@@ -14,8 +14,8 @@ Tracked: rig-ed460e (WAF spend guard never applied; gates deploy), notme-ed6114 
 - **Unmatched auth-host paths proxied to signet (M4).** Fixed: closed by default behind an exact-path allowlist (`SIGNET_PASSTHROUGH_PATHS`), with per-IP limits.
 
 **Still NOT limited before the DO, as of this correction** (out of notme-a34dad's scope, recorded so the claim is not repeated):
-- `POST /auth/passkey/reset` (`consumeBootstrapCode` on any body)
-- `POST /authorize/redeem` (`redeemAuthorizationCode` once the body is well-formed)
+- `POST /auth/passkey/reset` (`consumeBootstrapCode` on any body). **Fixed 2026-11-04 (notme-c3fdbc):** `PASSKEY_LIMITER`, `passkey-reset:<ip bucket>`, before the DO.
+- `POST /authorize/redeem` (`redeemAuthorizationCode` once the body is well-formed). **Fixed 2026-11-04 (notme-c3fdbc):** `CERT_LIMITER`, `redeem-ip:<ip bucket>`, after the shape checks and before the DO.
 - `POST /cert/issuing-ca/device` and `/cert/issuing-ca/device/token` (enrolment start and collect; review H1, notme-a36d10)
 
 The stress scenario below ("/cert/nonce with a junk cookie") describes the pre-fix tree.
