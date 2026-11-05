@@ -46,7 +46,10 @@ export function cacheKey(request: Request, vary?: string): Request {
   // What the query used to buy deliberately — an operator's cache bypass —
   // the build in the key now provides across deploys; within one build an
   // operator sees what clients see.
-  if (url.pathname.startsWith("/.well-known/")) url.search = "";
+  //
+  // /internal/ca-bundle likewise (notme-a34dad): it reads no parameter, and
+  // a random query would otherwise miss the edge on every request.
+  if (url.pathname.startsWith("/.well-known/") || url.pathname === "/internal/ca-bundle") url.search = "";
   url.searchParams.set("_build", currentBuild);
   // For content-negotiated routes, include Accept in the cache key so JSON
   // and HTML responses are cached separately. `_cache=v2` invalidates the v1

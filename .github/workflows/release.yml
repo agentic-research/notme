@@ -207,7 +207,8 @@ jobs:
           # scripts/trust-anchor-freshness.ts); only then is "trust/ matches
           # the served root" evidence about production.
           curl -fsS "https://auth.notme.bot/.well-known/ca-bundle.pem" -o live.pem
-          curl -fsS "https://auth.notme.bot/internal/ca-bundle" -o bundle.json
+          # no-cache: past the route's 30 s edge/isolate copy (notme-a34dad).
+          curl -fsS -H "Cache-Control: no-cache" "https://auth.notme.bot/internal/ca-bundle" -o bundle.json
           served=$(openssl x509 -in live.pem -noout -pubkey | openssl pkey -pubin -outform DER | tee spki.der | tail -c 32 | base64 -w0)
           current=$(jq -r '.keys[.keyId] // empty' bundle.json)
           if [ "$(stat -c %s spki.der)" != 44 ] || [ -z "$current" ] || [ "$served" != "$current" ]; then

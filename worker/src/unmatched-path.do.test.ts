@@ -111,7 +111,8 @@ describe("the fallthrough is identical WITHOUT a VPC binding (notme-cb0354)", ()
           authorization: "Bearer keep-me",
         },
       }),
-      { ...env, ...LOCAL_ENV, VPC_AUTH: capture },
+      // Allowlisted: since notme-a34dad nothing passes through by default.
+      { ...env, ...LOCAL_ENV, VPC_AUTH: capture, SIGNET_PASSTHROUGH_PATHS: "/no/such/endpoint" },
     );
     expect(res.status).toBe(200);
     expect(seen).not.toBeNull();
@@ -123,5 +124,81 @@ describe("the fallthrough is identical WITHOUT a VPC binding (notme-cb0354)", ()
   it("does not disclose configuration state to unauthenticated callers", async () => {
     const res = await get("/whatever");
     expect(await res.text()).not.toMatch(/configur/i);
+  });
+});
+
+describe("vpc.passthrough.allowlist — the signet passthrough is an explicit allowlist, closed by default (notme-a34dad, review M4)", () => {
+  // Every unmatched path under the authority host used to be proxied —
+  // method, headers and body — through VPC_AUTH to signet on Fly: no limiter,
+  // no WAF coverage, never cached. Nothing notme ships or documents calls a
+  // signet-only path through this host (discovery stopped advertising
+  // /exchange-token and /api/cert/register in 4a51a6d), so the default is a
+  // 404 that never touches the tunnel.
+  function spyVpc() {
+    const paths: string[] = [];
+    return {
+      paths,
+      binding: {
+        fetch: async (req: Request) => {
+          paths.push(new URL(req.url).pathname);
+          return new Response("upstream", { status: 200 });
+        },
+      },
+    };
+  }
+  const limiter = (allow: boolean) => {
+    const keys: string[] = [];
+    return { keys, binding: { limit: async ({ key }: { key: string }) => (keys.push(key), { success: allow }) } };
+  };
+
+  it("with no allowlist, signet's own paths and junk paths alike 404 without a tunnel call", async () => {
+    const vpc = spyVpc();
+    for (const path of ["/exchange-token", "/api/cert/register", "/callback", "/no/such/endpoint", "/x?y=1"]) {
+      const res = await worker.fetch(new Request(`${ORIGIN}${path}`, { method: "POST", body: "{}" }), {
+        ...env,
+        ...LOCAL_ENV,
+        VPC_AUTH: vpc.binding,
+      });
+      expect(res.status, path).toBe(404);
+      expect(await res.json()).toEqual({ error: "not_found" });
+    }
+    expect(vpc.paths).toEqual([]);
+  });
+
+  it("an allowlisted path is proxied; anything else, a prefix match included, is not", async () => {
+    const vpc = spyVpc();
+    const extra = { VPC_AUTH: vpc.binding, SIGNET_PASSTHROUGH_PATHS: " /exchange-token , /api/cert/register " };
+    const status = async (path: string) =>
+      (await worker.fetch(new Request(`${ORIGIN}${path}`, { method: "POST", body: "{}" }), { ...env, ...LOCAL_ENV, ...extra }))
+        .status;
+    expect(await status("/exchange-token")).toBe(200);
+    expect(await status("/api/cert/register")).toBe(200);
+    expect(await status("/exchange-token/extra")).toBe(404);
+    expect(await status("/exchange-tokenx")).toBe(404);
+    expect(await status("/callback")).toBe(404);
+    expect(vpc.paths).toEqual(["/exchange-token", "/api/cert/register"]);
+  });
+
+  it("an allowlisted path is per-IP limited before the tunnel", async () => {
+    const vpc = spyVpc();
+    const rl = limiter(false);
+    const res = await worker.fetch(
+      new Request(`${ORIGIN}/exchange-token`, { method: "POST", body: "{}", headers: { "cf-connecting-ip": "203.0.113.4" } }),
+      { ...env, ...LOCAL_ENV, VPC_AUTH: vpc.binding, TOKEN_LIMITER: rl.binding, SIGNET_PASSTHROUGH_PATHS: "/exchange-token" },
+    );
+    expect(res.status).toBe(429);
+    expect(vpc.paths).toEqual([]);
+    expect(rl.keys).toEqual(["vpc-ip:203.0.113.4"]);
+  });
+
+  it("an unlisted path spends no limiter budget either", async () => {
+    const rl = limiter(true);
+    await worker.fetch(new Request(`${ORIGIN}/no/such/endpoint`), {
+      ...env,
+      ...LOCAL_ENV,
+      VPC_AUTH: spyVpc().binding,
+      TOKEN_LIMITER: rl.binding,
+    });
+    expect(rl.keys).toEqual([]);
   });
 });

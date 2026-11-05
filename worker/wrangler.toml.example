@@ -49,6 +49,29 @@ namespace_id = "1003"
   limit = 5
   period = 60
 
+# Cookie routes (notme-a34dad), charged only after the session HMAC passes:
+# 60 per SESSION (one issued cookie) per minute, then 300 per PRINCIPAL per
+# minute across all its sessions. Both PER CLOUDFLARE LOCATION — Cloudflare's
+# rate limits "apply separately in each Cloudflare location" and "do not
+# combine into one worldwide limit". Their own bindings: TOKEN_LIMITER is
+# /token's budget. Sizing and the per-location bound:
+# SESSION_LIMIT_PER_MINUTE in src/auth/session-secret-cache.ts.
+# OPERATOR: add both blocks to the live (untracked) wrangler.toml too, or the
+# cookie routes run unlimited (absent binding = no limit, as for the others).
+[[ratelimits]]
+name = "SESSION_LIMITER"
+namespace_id = "1004"
+  [ratelimits.simple]
+  limit = 60
+  period = 60
+
+[[ratelimits]]
+name = "PRINCIPAL_LIMITER"
+namespace_id = "1005"
+  [ratelimits.simple]
+  limit = 300
+  period = 60
+
 # Custom domain routes — adjust zone_name to your domain.
 [[routes]]
 pattern = "notme.bot/*"
@@ -164,6 +187,12 @@ RENEWAL_BINDING_V3 = "off"
 # Workers VPC — direct tunnel to signet on Fly (identity server).
 # Create via: wrangler vpc create <name>
 # CF TF provider does not support vpc_service binding type — configured here directly.
+#
+# An unmatched auth-host path is NOT proxied through this binding unless it is
+# listed, exactly, in SIGNET_PASSTHROUGH_PATHS (a [vars] entry, comma-separated,
+# no prefixes; unset = nothing passes, the default). Each listed path is
+# per-IP limited (TOKEN_LIMITER, `vpc-ip:`) before the tunnel (notme-a34dad).
+# SIGNET_PASSTHROUGH_PATHS = "/exchange-token"
 [[vpc_services]]
 binding = "VPC_AUTH"
 service_id = "<your-vpc-service-id>"
@@ -318,23 +347,46 @@ class_name = "RevocationAuthority"
 
 # Same limits as production — staging exists to exercise the production
 # code path, and an unlimited staging would not.
+#
+# Its OWN namespace ids (2001-2005), never production's 1001-1005. A
+# namespace_id is unique within the Cloudflare ACCOUNT, and bindings that
+# share one "share counters for a given key within each Cloudflare location,
+# including across different Workers" (developers.cloudflare.com/workers/
+# runtime-apis/bindings/rate-limit/). When staging and production share an
+# account, as in a one-account setup, shared ids meant a staging request
+# spent production's budget for the same key (a principal, an IP).
+# staging-isolation.test.ts pins it.
 [[env.staging.ratelimits]]
 name = "TOKEN_LIMITER"
-namespace_id = "1001"
+namespace_id = "2001"
   [env.staging.ratelimits.simple]
   limit = 20
   period = 60
 
 [[env.staging.ratelimits]]
 name = "CERT_LIMITER"
-namespace_id = "1002"
+namespace_id = "2002"
   [env.staging.ratelimits.simple]
   limit = 10
   period = 60
 
 [[env.staging.ratelimits]]
 name = "PASSKEY_LIMITER"
-namespace_id = "1003"
+namespace_id = "2003"
   [env.staging.ratelimits.simple]
   limit = 5
+  period = 60
+
+[[env.staging.ratelimits]]
+name = "SESSION_LIMITER"
+namespace_id = "2004"
+  [env.staging.ratelimits.simple]
+  limit = 60
+  period = 60
+
+[[env.staging.ratelimits]]
+name = "PRINCIPAL_LIMITER"
+namespace_id = "2005"
+  [env.staging.ratelimits.simple]
+  limit = 300
   period = 60

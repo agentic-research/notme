@@ -309,7 +309,7 @@ flight. Staging has its own CA and DOs for exactly this.
 ```mermaid
 graph LR
     AL["DO alarm<br/>every 4 min"] --> GB["generateBundle()<br/>epoch · seqno · keys · signature"]
-    GB --> KV["KV bundle:current<br/>60s TTL"]
+    GB --> KV["KV bundle:current<br/>no TTL"]
     KV --> EP["GET /internal/ca-bundle"]
     EP --> CO["consumers"]
     RQ["a request, on cache miss"] --> GB
@@ -318,11 +318,13 @@ graph LR
 **Two independent refresh paths, and you need both.** The alarm never fired for
 130 days *and* the KV write had no TTL, so the published bundle was four months
 stale — rejected by any conformant verifier. Either safeguard alone would have
-prevented it (`notme-77a024`, `notme-4896d8`). The 60 s TTL is on the
-request-path put (`worker/src/internal-ca-bundle.ts:18`); the alarm's put
-(`worker/src/signing-authority.ts:5327`) sets none. What stops a fossil from
-being served is the read: `/internal/ca-bundle` checks `isBundleStale` on the
-cached bundle and regenerates if it is stale (`internal-ca-bundle.ts:46`).
+prevented it (`notme-77a024`, `notme-4896d8`). Neither put sets a KV TTL any
+more: the request-path put used to set 60 s, and an expired key fails revocation
+OPEN (an absent bundle is the bootstrap case), so with a dead alarm revoked
+certificates were accepted a minute after the last write. What stops a fossil is
+the read: `/internal/ca-bundle` and `checkRevocation` both run `isBundleStale`,
+which fails closed, and the request path regenerates a stale bundle
+(`worker/src/internal-ca-bundle.ts`, `bundle-no-ttl.test.ts`).
 
 Health: `GET /admin/alarm-health` (`authorityManage`-gated).
 

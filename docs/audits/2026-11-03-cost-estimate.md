@@ -2,7 +2,23 @@
 
 Tracked: rig-ed460e (WAF spend guard never applied; gates deploy), notme-ed6114 (unthrottled DO paths; gates deploy), CT-log cost decisions on notme-1b46a8. Prices are from the Cloudflare pages cited below as fetched on 2026-11-03; line numbers as of goalzero 90297b7.
 
-**Status (2026-11-03, after notme-ed6114 merged in d3a0814 and the CT cost decisions in 89d459d):** the notme-side items below are done. Every unauthenticated path checks a limit before the Durable Object (`/token` included, 0cdde59), `/.well-known/*` cache keys ignore the query string (bfbcb24), `jwks.json` and `ca-bundle.pem` are `max-age=300` (728aca2, `worker/worker.ts:1951`), and the CT shard config is `sequence_interval_millis` 750 with `max_sequence_skips` 1 (`ct/config.notme.json:25-26`). rig-ed460e (the WAF ruleset) and the billing alerts are outside this repo and remain owner actions. The estimate below is as written before those fixes.
+**Status (2026-11-03, after notme-ed6114 merged in d3a0814 and the CT cost decisions in 89d459d):** the notme-side items below are done. `/token` checks a limit before the Durable Object (0cdde59; this line used to say EVERY unauthenticated path did, which was wrong, see the correction below), `/.well-known/*` cache keys ignore the query string (bfbcb24), `jwks.json` and `ca-bundle.pem` are `max-age=300` (728aca2, `worker/worker.ts:1951`), and the CT shard config is `sequence_interval_millis` 750 with `max_sequence_skips` 1 (`ct/config.notme.json:25-26`). rig-ed460e (the WAF ruleset) and the billing alerts are outside this repo and remain owner actions. The estimate below is as written before those fixes.
+
+**Correction (2026-11-04, notme-a34dad):** the sentence "Every unauthenticated path checks a limit before the Durable Object" was false when written. The 2026-11-04 overnight review found it on goalzero dff01a8, and it was re-verified against the tree before fixing:
+- **Junk session cookie (review C2).** Only `/token` limited before the DO. Every other cookie route read `getSessionSecret()` on the singleton for any `notme_session` value, with no limiter. That covered `/me`, `/connections`, `/invites`, `/principals/:id/revoke`, `/admin/*`, `/auth/passkey/status`, `/cert`, `/cert/nonce`, `/cert/passkey`, `/enroll`, `/cert/issuing-ca*` and `/authorize*`.
+  - Fixed: junk is refused in the Worker with no DO call. The cookie shape is checked first, then the HMAC against an isolate-cached secret (30 s TTL, single-flight refresh).
+  - The one DO call that remains is for a correctly signed cookie (the live-secret confirmation) or a cold isolate. After the HMAC passes, two dedicated limiters run before it: `SESSION_LIMITER` (60 per session per minute) and `PRINCIPAL_LIMITER` (300 per principal per minute across its sessions). **Both are per Cloudflare location, not global.** Cloudflare's rate limits "apply separately in each Cloudflare location" and "do not combine into one worldwide limit" (https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/). So one session spread over N locations costs up to about N requests/s of DO work, and every location at once is about 300 rps per session. That is not free (each unit needs a session), but it is not a global ceiling either. **Operator step:** add both blocks from `worker/wrangler.toml.example` to the live `wrangler.toml`. Test: `worker/src/session-cookie-amplification.do.test.ts`.
+- **`/internal/ca-bundle` (M1).** It was public and unlimited, with one KV read per request, and a herd of `generateBundle()` calls when the bundle was stale.
+  - Fixed: it is served from the edge and from an isolate copy for at most 30 s, and never past the bundle's 300 s. A refresh is single-flight per isolate, and `no-cache` reads are per-IP limited.
+- **Cache error latch and uncached 503s (M3).** Fixed with backoff and recovery, plus a 5 s negative cache for DO-backed public documents.
+- **Unmatched auth-host paths proxied to signet (M4).** Fixed: closed by default behind an exact-path allowlist (`SIGNET_PASSTHROUGH_PATHS`), with per-IP limits.
+
+**Still NOT limited before the DO, as of this correction** (out of notme-a34dad's scope, recorded so the claim is not repeated):
+- `POST /auth/passkey/reset` (`consumeBootstrapCode` on any body)
+- `POST /authorize/redeem` (`redeemAuthorizationCode` once the body is well-formed)
+- `POST /cert/issuing-ca/device` and `/cert/issuing-ca/device/token` (enrolment start and collect; review H1, notme-a36d10)
+
+The stress scenario below ("/cert/nonce with a junk cookie") describes the pre-fix tree.
 
 
 Month = 30 d = 2,592,000 s. Prices fetched today.

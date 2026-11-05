@@ -19,6 +19,7 @@ import {
 import {
   ensureCurrentCABundle,
   handleInternalCABundle,
+  invalidateCABundleMemo,
 } from "./src/internal-ca-bundle";
 import { ED25519, type Platform } from "./src/platform";
 
@@ -53,12 +54,26 @@ import { getAllowedAudiences } from "./src/allowed-audiences";
 import { opaqueError } from "./src/error-body";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
-import { AUTH_METHOD, oidcAuthMethod } from "./src/auth/session";
+import { AUTH_METHOD, oidcAuthMethod, type SessionPayload } from "./src/auth/session";
+import {
+  invalidateSessionSecret,
+  liveSessionSecret,
+  sessionLimiter,
+  verifySessionCached,
+} from "./src/auth/session-secret-cache";
 import { authorityStub } from "./src/authority-stub";
 import { principalIdentity } from "./src/cert-authority";
 import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
 import { buildInfo, disclosedVersionId } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
+import {
+  disableForIsolate as disableEdgeCacheForIsolate,
+  edgeMatch,
+  edgePut,
+  NEGATIVE_CACHE_SECONDS,
+  noteUnavailable,
+  unavailableFor,
+} from "./src/edge-cache";
 import { clientIpBucket, clientNetworkBucket } from "./src/client-ip-key";
 
 /**
@@ -430,9 +445,10 @@ export class AuthService extends WorkerEntrypoint<any> {
   /** Verify a session cookie, return principal info. */
   async verifySession(cookie: string) {
     const authority = this.#getAuthority();
-    const { verifySessionCookie } = await import("./src/auth/session");
-    const secret = await authority.getSessionSecret();
-    return verifySessionCookie(cookie, secret);
+    // Through the isolate cache, as every cookie route is (notme-a34dad): a
+    // bound service passing a caller's junk cookie must not cost the DO.
+    const r = await verifySessionCached(cookie, authority);
+    return r.ok ? r.session : null;
   }
 
   // ── 009: Identity-gated runtime methods ──────────────────────────────────
@@ -1138,7 +1154,7 @@ async function handlePasskey(
         );
       }
       const { createSessionCookie } = await import("./src/auth/session");
-      const sessionSecret = await authority.getSessionSecret();
+      const sessionSecret = await liveSessionSecret(authority);
       // Principal model: userId is the principalId, scopes from the grant
       // store. A user registered before grants existed is enrolled on first
       // login (is_admin decides ONLY then); after that, revoking a grant is
@@ -1217,7 +1233,7 @@ async function passkeyRegisterVerify(
     const { createSessionCookie } = await import("./src/auth/session");
     const cookie = await createSessionCookie(
       { principalId: body.userId, scopes: [], authMethod: AUTH_METHOD.passkey },
-      await authority.getSessionSecret(),
+      await liveSessionSecret(authority),
     );
     return new Response(
       JSON.stringify({
@@ -1249,7 +1265,7 @@ async function passkeyRegisterVerify(
 
   // Issue session immediately after registration
   const { createSessionCookie } = await import("./src/auth/session");
-  const sessionSecret = await authority.getSessionSecret();
+  const sessionSecret = await liveSessionSecret(authority);
   const cookie = await createSessionCookie(
     { principalId: body.userId, scopes, authMethod: AUTH_METHOD.passkey },
     sessionSecret,
@@ -1289,6 +1305,30 @@ function parseCookie(cookieHeader: string, name: string): string | null {
     .find((c) => c.startsWith(`${name}=`));
   return match ? match.slice(name.length + 1) : null;
 }
+
+/**
+ * Verify a `notme_session` cookie without letting junk reach the
+ * SigningAuthority (notme-a34dad, overnight review C2). Every route that
+ * reads the cookie goes through here; see src/auth/session-secret-cache.ts for
+ * the cache and why a positive answer is still confirmed against the live
+ * secret.
+ *
+ * The limiter (sessionLimiter: SESSION_LIMITER, `session:<principalId>`) runs
+ * only once the HMAC has passed, so it charges the principal the cookie
+ * proved, never an address, and junk spends no one's budget. Its rate and
+ * why there is no per-IP backstop: SESSION_LIMIT_PER_MINUTE.
+ */
+async function checkSession(
+  env: any,
+  authority: { getSessionSecret(): Promise<string> },
+  cookie: string,
+): Promise<{ session: SessionPayload | null; limited: boolean }> {
+  const r = await verifySessionCached(cookie, authority, sessionLimiter(env));
+  return r.ok ? { session: r.session, limited: false } : { session: null, limited: r.limited };
+}
+
+const rateLimitedResponse = (): Response =>
+  Response.json({ error: "rate_limited" }, { status: 429, headers: { "Retry-After": "60" } });
 
 // ── GET /authorize — inline HTML page for cross-origin DPoP token issuance ──
 //
@@ -1951,23 +1991,20 @@ export function siteHostFromEnv(siteUrl: string | undefined): string {
 // Cache key includes Accept header for content-negotiated routes.
 
 
-// Edge cache disabled when cacheApiOutbound is not configured (local workerd).
-let cacheEnabled = true;
+// A failure backs off and recovers rather than disabling the cache for the
+// isolate's lifetime (notme-a34dad, review M3; src/edge-cache.ts). Local
+// workerd, which has no Cache API, is switched off once per isolate below.
 
 async function cachePut(
   request: Request,
   response: Response,
   vary?: string,
+  // Only serveCachedPublic passes this, for its 503 (NEGATIVE_CACHE_SECONDS).
+  allowUnavailable = false,
 ): Promise<Response> {
-  if (!cacheEnabled || request.method !== "GET") return response;
-  if (!response.ok && response.status !== 301) return response;
-  try {
-    const cache = caches.default;
-    const toCache = response.clone();
-    await cache.put(cacheKey(request, vary), toCache);
-  } catch {
-    cacheEnabled = false; // Disable for remainder of isolate lifetime
-  }
+  if (request.method !== "GET") return response;
+  if (!response.ok && response.status !== 301 && !(allowUnavailable && response.status === 503)) return response;
+  await edgePut(cacheKey(request, vary), response.clone());
   return response;
 }
 
@@ -1975,14 +2012,8 @@ async function cacheMatch(
   request: Request,
   vary?: string,
 ): Promise<Response | undefined> {
-  if (!cacheEnabled || request.method !== "GET") return undefined;
-  try {
-    const cache = caches.default;
-    return cache.match(cacheKey(request, vary));
-  } catch {
-    cacheEnabled = false;
-    return undefined;
-  }
+  if (request.method !== "GET") return undefined;
+  return edgeMatch(cacheKey(request, vary));
 }
 
 /**
@@ -2017,10 +2048,35 @@ async function serveCachedPublic(
   const asGet =
     request.method === "GET" ? request : new Request(request.url, { method: "GET", headers: request.headers });
   let resp = (await cacheMatch(asGet)) ?? null;
+  const left = resp ? 0 : unavailableFor(cacheKey(asGet));
+  if (left > 0) {
+    // This isolate saw this document's 503 under NEGATIVE_CACHE_SECONDS ago.
+    resp = Response.json(
+      { error: "authority unavailable" },
+      { status: 503, headers: { "Cache-Control": `public, max-age=${left}`, "Retry-After": String(left) } },
+    );
+  }
   if (!resp) {
-    const built = await build();
+    let built: Response | null;
+    try {
+      built = await build();
+    } catch (e) {
+      // A DO call that THROWS (overloaded, reset) is the same event as a
+      // builder's own 503, so it gets the same constant answer — and the
+      // same short negative cache — instead of escaping as a Worker error.
+      built = opaqueError("well-known", "authority unavailable", 503, e);
+    }
     if (!built) return null;
-    resp = await cachePut(asGet, built);
+    if (built.status === 503) {
+      // Negatively cached for a few seconds, deliberately (M3): see
+      // NEGATIVE_CACHE_SECONDS in src/edge-cache.ts for why, and why only 503.
+      const headers = new Headers(built.headers);
+      headers.set("Cache-Control", `public, max-age=${NEGATIVE_CACHE_SECONDS}`);
+      headers.set("Retry-After", String(NEGATIVE_CACHE_SECONDS));
+      built = new Response(built.body, { status: 503, headers });
+      noteUnavailable(cacheKey(asGet));
+    }
+    resp = await cachePut(asGet, built, undefined, true);
   }
   return request.method === "HEAD" ? new Response(null, { status: resp.status, headers: resp.headers }) : resp;
 }
@@ -2099,7 +2155,7 @@ export default {
     const sub = getSubdomain(host);
     const envSiteUrl: string = env.SITE_URL || "";
     const isLocal = envSiteUrl.startsWith("http://localhost");
-    if (isLocal) cacheEnabled = false; // Cache API unavailable in local workerd
+    if (isLocal) disableEdgeCacheForIsolate(); // Cache API unavailable in local workerd
 
     // ── /health liveness probe ──
     // Host-agnostic, no auth, no DO access. Cloister + container orchestrators
@@ -2158,7 +2214,18 @@ export default {
     // JSON CABundle. Host-agnostic by design: service bindings commonly use
     // synthetic hostnames such as https://notme-bot/.
     if (pathname === "/internal/ca-bundle") {
-      return handleInternalCABundle(request, env, platform);
+      // Edge-cached and single-flighted (notme-a34dad, review M1); a
+      // `Cache-Control: no-cache` read is per-IP limited — see the module.
+      return handleInternalCABundle(request, env, platform, {
+        edge: { match: (k) => edgeMatch(k), put: (k, v) => edgePut(k, v) },
+        edgeKey: cacheKey(request),
+        bypassAllowed: async () => {
+          if (!env.CERT_LIMITER) return true;
+          const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+          const { success } = await env.CERT_LIMITER.limit({ key: `ca-bundle-ip:${ip}` });
+          return success;
+        },
+      });
     }
 
     // Receipt signing is NOT an HTTP path (ADR-014). Refused explicitly rather
@@ -2259,9 +2326,9 @@ export default {
         }
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) {
           return Response.redirect(`${authorityUrl}/login`, 302);
         }
@@ -2348,9 +2415,9 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
 
         const body = (await request.json()) as {
@@ -2440,9 +2507,9 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
 
         const conns = await authority.getConnectionsForUser(session.userId);
@@ -2480,9 +2547,9 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
         // LIVE against the grant store — a revoked grant shuts this door on
         // the next request, not when the cookie expires (notme-77a024).
@@ -2537,9 +2604,9 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
         // LIVE against the grant store, so a revoked grant shuts this door on
         // the next request rather than when the cookie expires.
@@ -2576,6 +2643,9 @@ export default {
           return jsonErr("reason must be 1-200 characters with no control characters", 400);
         }
         const result = await authority.revokeEpoch(why);
+        // The revocation republished the bundle; this isolate's copy is now
+        // the one thing that could still serve the old one (notme-a34dad).
+        invalidateCABundleMemo();
         // Dynamic import to match this file's idiom — the constant is only
         // needed on the one request that pulls the lever.
         const { BUNDLE_MAX_AGE_MS } = await import("./src/revocation");
@@ -2611,11 +2681,9 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const session = await verifySessionCookie(
-          cookie,
-          await authority.getSessionSecret(),
-        );
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
         const { liveScopes } = await import("./src/auth/session");
         if (!(await liveScopes(session, authority)).includes("authorityManage")) {
@@ -2633,9 +2701,9 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
         // LIVE scopes feed BOTH the gate and canGrant below: a granter whose
         // own authority was revoked must not be able to pass it on from a
@@ -2703,13 +2771,10 @@ export default {
           if (!cookie) return jsonErr("sign in first", 401);
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const { verifySessionCookie, liveScopes } = await import(
-            "./src/auth/session"
-          );
-          const session = await verifySessionCookie(
-            cookie,
-            await authority.getSessionSecret(),
-          );
+          const { liveScopes } = await import("./src/auth/session");
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
           if (!session) return jsonErr("invalid session", 401);
           if (!(await liveScopes(session, authority)).includes("authorityManage")) {
             return jsonErr("authorityManage scope required", 403);
@@ -2848,7 +2913,7 @@ export default {
         const { createSessionCookie } = await import("./src/auth/session");
         const cookie = await createSessionCookie(
           { principalId: joined.principalId, scopes: joined.scopes, authMethod: AUTH_METHOD.invite },
-          await authority.getSessionSecret(),
+          await liveSessionSecret(authority),
         );
         return new Response(
           JSON.stringify({ joined: true, principalId: joined.principalId, scopes: joined.scopes }),
@@ -2869,8 +2934,11 @@ export default {
         try {
           identity = await verifyOIDC(body.token, issuerAudiences(env));
         } catch (e: any) {
-          // Logged, not returned (review F1, as /join's L4): verifier
-          // messages describe what the server expected.
+          // Logged, not returned (review F1, as in /join, L4): verifier
+          // messages describe what the server expected. (No apostrophe in
+          // this comment: error-body-guard.test.ts scans catch blocks with a
+          // quote-aware brace matcher that does not skip comments, and one
+          // here made it read every route to :3713 as inside this catch.)
           console.error("[oidc-login] token rejected:", e?.message);
           return jsonErr("invalid oidc proof", 401);
         }
@@ -2904,7 +2972,7 @@ export default {
           expirationTtl: Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
         });
         const { createSessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
+        const sessionSecret = await liveSessionSecret(authority);
         const cookie = await createSessionCookie(
           {
             principalId,
@@ -2952,6 +3020,9 @@ export default {
             return jsonErr("invalid or expired bootstrap code", 403);
           }
           const result = await authority.resetPasskeyData();
+          // The reset rotated the session secret; drop this isolate's copy so
+          // the next login here is not refused by it (notme-a34dad).
+          invalidateSessionSecret();
           return Response.json({ ok: true, ...result });
         } catch (e: any) {
           return opaqueError("passkey-reset", "reset failed", 500, e);
@@ -2960,7 +3031,6 @@ export default {
 
       // Passkey diagnostics — requires admin session (leaks user/admin counts, epoch, keyId)
       if (pathname === "/auth/passkey/status") {
-        const { verifySessionCookie } = await import("./src/auth/session");
         const authId = env.SIGNING_AUTHORITY.idFromName("default");
         const authDO = env.SIGNING_AUTHORITY.get(authId);
         const statusCookie = parseCookie(
@@ -2968,11 +3038,9 @@ export default {
           "notme_session",
         );
         if (!statusCookie) return jsonErr("unauthorized", 401);
-        const statusSecret = await authDO.getSessionSecret();
-        const statusSession = await verifySessionCookie(
-          statusCookie,
-          statusSecret,
-        );
+        const sc = await checkSession(env, authDO, statusCookie);
+        if (sc.limited) return rateLimitedResponse();
+        const statusSession = sc.session;
         if (!statusSession) return jsonErr("admin required", 403);
         {
           const { liveScopes } = await import("./src/auth/session");
@@ -3046,8 +3114,9 @@ export default {
         const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
         if (!cookie) return jsonErr("session_required", 401);
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const session = await verifySessionCookie(cookie, await authority.getSessionSecret());
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid_session", 401);
         const { nonce, expiresIn } = await authority.issuePopNonce(session.principalId);
         return Response.json({ nonce, expires_in: expiresIn }, { headers: { "Cache-Control": "no-store" } });
@@ -3094,9 +3163,9 @@ export default {
 
           // Typed stub: the mint below takes a parsed AuthMethod (notme-32003c).
           const authority = authorityStub(env);
-          const { verifySessionCookie } = await import("./src/auth/session");
-          const sessionSecret = await authority.getSessionSecret();
-          const session = await verifySessionCookie(cookie, sessionSecret);
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
           if (!session) {
             return Response.json({ error: "invalid_session" }, { status: 401 });
           }
@@ -3294,10 +3363,9 @@ export default {
         const code = (new URL(request.url).searchParams.get("code") || "").toUpperCase();
         const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const session = cookie
-          ? await verifySessionCookie(cookie, await authority.getSessionSecret())
-          : null;
+        const sc = cookie ? await checkSession(env, authority, cookie) : null;
+        if (sc?.limited) return rateLimitedResponse();
+        const session = sc?.session ?? null;
         if (!session) {
           return Response.redirect(
             // The AUTHORITY's /login, not SITE_URL's (notme-486e8a): the
@@ -3329,8 +3397,10 @@ export default {
         const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
         if (!cookie) return jsonErr("session_required", 401);
         const authority = authorityStub(env);
-        const { verifySessionCookie, liveScopes } = await import("./src/auth/session");
-        const session = await verifySessionCookie(cookie, await authority.getSessionSecret());
+        const { liveScopes } = await import("./src/auth/session");
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid_session", 401);
         // LIVE grants, not the cookie's copy: a revoked certMint stops
         // working now, not when the cookie expires.
@@ -3504,8 +3574,10 @@ export default {
         const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
         if (!cookie) return jsonErr("session_required", 401);
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
-        const { verifySessionCookie, liveScopes } = await import("./src/auth/session");
-        const session = await verifySessionCookie(cookie, await authority.getSessionSecret());
+        const { liveScopes } = await import("./src/auth/session");
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid_session", 401);
         if (pathname === "/cert/issuing-ca/enrollments" && request.method === "GET") {
           return Response.json(await authority.listTierEnrolments(session.principalId));
@@ -3545,9 +3617,9 @@ export default {
           }
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const { verifySessionCookie } = await import("./src/auth/session");
-          const sessionSecret = await authority.getSessionSecret();
-          const session = await verifySessionCookie(cookie, sessionSecret);
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
           if (!session) {
             return Response.json({ error: "invalid_session" }, { status: 401 });
           }
@@ -3788,9 +3860,9 @@ export default {
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) {
           const returnTo = `/authorize?${url.searchParams.toString()}`;
           return Response.redirect(
@@ -3895,9 +3967,9 @@ export default {
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const { verifySessionCookie } = await import("./src/auth/session");
-          const sessionSecret = await authority.getSessionSecret();
-          const session = await verifySessionCookie(cookie, sessionSecret);
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
           if (!session) {
             return Response.json({ error: "invalid_session" }, { status: 401 });
           }
@@ -4044,9 +4116,9 @@ export default {
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const { verifySessionCookie } = await import("./src/auth/session");
-          const sessionSecret = await authority.getSessionSecret();
-          const session = await verifySessionCookie(cookie, sessionSecret);
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
           if (!session) {
             return Response.json({ error: "invalid_session" }, { status: 401 });
           }
@@ -4192,7 +4264,7 @@ export default {
                 // GitHub-signed, so the subject is known (and not the
                 // caller's to vary) without asking the DO.
                 if (await rateLimited(`token:${principalId}`)) return tooMany();
-                sessionSecret = await authority.getSessionSecret();
+                sessionSecret = await liveSessionSecret(authority);
               } else {
                 // Session cookie (browser/passkey users)
                 const cookie = parseCookie(
@@ -4207,11 +4279,12 @@ export default {
                   // src/client-ip-key.ts).
                   const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
                   if (await rateLimited(`token-ip:${ip}`)) return tooMany();
-                  const { verifySessionCookie, liveScopes } =
-                    await import("./src/auth/session");
-                  const secret: string = await authority.getSessionSecret();
-                  sessionSecret = secret;
-                  const session = await verifySessionCookie(cookie, secret);
+                  // Already limited by token-ip above, so no second limiter
+                  // here; the cache keeps junk off the DO (notme-a34dad).
+                  const { liveScopes } = await import("./src/auth/session");
+                  const checked = await verifySessionCached(cookie, authority);
+                  const session = checked.ok ? checked.session : null;
+                  if (checked.ok) sessionSecret = checked.secret;
                   if (session) {
                     principalId = session.principalId;
                     if (await rateLimited(`token:${principalId}`)) return tooMany();
@@ -4554,7 +4627,12 @@ export default {
               },
             });
           } catch {
-            return null; // DO not available — fall through to VPC proxy
+            // DO not available. This used to return null and fall through to
+            // the VPC proxy — signet's OWN ca-bundle.pem, a different CA,
+            // answering for notme's. The passthrough is closed by default now
+            // (notme-a34dad), and serving another authority's CA was never
+            // right: say unavailable, as jwks.json does.
+            return jsonErr("authority unavailable", 503);
           }
         });
         if (served) return served;
@@ -4623,7 +4701,34 @@ export default {
       // unauthenticated callers. The cause goes to the log, where an operator
       // can tell an outage from a typo; the caller learns only that nothing
       // answers here.
-      if (env.VPC_AUTH) {
+      //
+      // ALLOWLISTED, AND CLOSED BY DEFAULT (notme-a34dad, overnight review
+      // M4). This proxied EVERY unmatched path — method, headers, body — to
+      // signet on Fly, with no limiter, no WAF rule and no cache, so a flood
+      // of random paths cost about $0.92 per million here and passed straight
+      // through to the tunnel. What signet serves behind it
+      // (signet/cmd/signet/authority.go): /login, /.well-known/ca-bundle.pem,
+      // / and /healthz, all answered by this Worker first; /callback, which
+      // only follows signet's /login, unreachable here; and /exchange-token
+      // and /api/cert/register, which notme stopped advertising in 4a51a6d
+      // because nothing routes to them. Nothing notme ships calls a path that
+      // only this branch could serve — signet's own CI clients use /cert/gha,
+      // which this Worker serves — so no path passes by default. An operator
+      // who finds a real caller lists the EXACT path in
+      // SIGNET_PASSTHROUGH_PATHS (comma-separated, no prefixes), and each
+      // allowed request is per-IP limited before the tunnel is touched.
+      const passthrough = new Set(
+        String(env.SIGNET_PASSTHROUGH_PATHS || "")
+          .split(",")
+          .map((p: string) => p.trim())
+          .filter((p: string) => p.startsWith("/")),
+      );
+      if (env.VPC_AUTH && passthrough.has(pathname)) {
+        if (env.TOKEN_LIMITER) {
+          const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+          const { success } = await env.TOKEN_LIMITER.limit({ key: `vpc-ip:${ip}` });
+          if (!success) return rateLimitedResponse();
+        }
         const originUrl = `http://localhost${pathname}${url.search}`;
         // No cookies cross to the origin (security review F3 of
         // notme-a2e75d). The registration cookie is Path=/ and the session
