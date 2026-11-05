@@ -15,8 +15,14 @@ import worker from "../worker";
 
 const ORIGIN = "http://localhost:8788";
 const LOCAL_ENV = { SITE_URL: ORIGIN, SIGNET_AUTHORITY_URL: ORIGIN };
+// `no-cache`, as the trust-anchor gates send it: the route keeps a short-lived
+// copy per isolate and per colo (notme-a34dad), and a read straight after a
+// rotation must not be answered from it.
 const bundle = async () => {
-  const res = await worker.fetch(new Request(`${ORIGIN}/internal/ca-bundle`), { ...env, ...LOCAL_ENV } as never);
+  const res = await worker.fetch(
+    new Request(`${ORIGIN}/internal/ca-bundle`, { headers: { "cache-control": "no-cache" } }),
+    { ...env, ...LOCAL_ENV } as never,
+  );
   expect(res.status).toBe(200);
   return (await res.json()) as { keyId: string; keys: Record<string, string>; prevKeyId?: string };
 };

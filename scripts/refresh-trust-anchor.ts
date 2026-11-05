@@ -49,7 +49,9 @@ async function main() {
   const res = await fetch(BUNDLE);
   if (!res.ok) throw new Error(`${BUNDLE} answered ${res.status}`);
   const live = new x509.X509Certificate(await res.text());
-  const cab = await fetch(LIVE_BUNDLE, { headers: { accept: "application/json" } });
+  // no-cache: past the route's 30 s edge/isolate copy to the live KV bundle
+  // (notme-a34dad). Per-IP limited server-side; this is one read.
+  const cab = await fetch(LIVE_BUNDLE, { headers: { accept: "application/json", "cache-control": "no-cache" } });
   if (!cab.ok) throw new Error(`${LIVE_BUNDLE} answered ${cab.status}`);
   const bundle = (await cab.json()) as { keyId: string; keys: Record<string, string> };
   if (!rootKeyIsCurrent(new Uint8Array(live.publicKey.rawData), bundle)) {

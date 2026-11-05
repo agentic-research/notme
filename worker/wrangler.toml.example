@@ -164,6 +164,12 @@ RENEWAL_BINDING_V3 = "off"
 # Workers VPC — direct tunnel to signet on Fly (identity server).
 # Create via: wrangler vpc create <name>
 # CF TF provider does not support vpc_service binding type — configured here directly.
+#
+# An unmatched auth-host path is NOT proxied through this binding unless it is
+# listed, exactly, in SIGNET_PASSTHROUGH_PATHS (a [vars] entry, comma-separated,
+# no prefixes; unset = nothing passes, the default). Each listed path is
+# per-IP limited (TOKEN_LIMITER, `vpc-ip:`) before the tunnel (notme-a34dad).
+# SIGNET_PASSTHROUGH_PATHS = "/exchange-token"
 [[vpc_services]]
 binding = "VPC_AUTH"
 service_id = "<your-vpc-service-id>"

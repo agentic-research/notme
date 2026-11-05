@@ -103,9 +103,14 @@ export async function handleCertExchange(
     if (!cookie) {
       return Response.json({ error: "no session cookie" }, { status: 401 });
     }
-    const { verifySessionCookie } = await import("./auth/session");
-    const sessionSecret = await authority.getSessionSecret();
-    const session = await verifySessionCookie(cookie, sessionSecret);
+    // Through the isolate cache and the per-IP limiter, as every cookie route
+    // is: a junk cookie must not cost the SigningAuthority (notme-a34dad).
+    const { verifySessionCached, sessionIpLimiter } = await import("./auth/session-secret-cache");
+    const checked = await verifySessionCached(cookie, authority, sessionIpLimiter(env, request));
+    if (!checked.ok && checked.limited) {
+      return Response.json({ error: "rate_limited" }, { status: 429, headers: { "Retry-After": "60" } });
+    }
+    const session = checked.ok ? checked.session : null;
     if (!session) {
       return Response.json({ error: "invalid session" }, { status: 401 });
     }
