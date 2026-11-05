@@ -545,7 +545,16 @@ const CLAIM_CODE_TTL_S = 1800; // long enough to go run a workflow
 const CLAIM_CAP = 100; // pending claim registrations; storage-exhaustion bound
 const POP_NONCE_TTL_S = 120; // fetched and spent in one page interaction
 const TIER_ENROLMENT_TTL_S = 600; // RFC 8628 device codes are minutes, not hours
-const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
+export const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
+/**
+ * In-flight enrolments one SOURCE (a network: IPv4 /24, IPv6 /48, see
+ * clientNetworkBucket) may hold at once (notme-a36d10, review H1). Far below
+ * TIER_ENROLMENT_CAP, so one network can hold at most 1/31 of it; generous
+ * for one operator, who enrols a handful of machines inside one 10-minute
+ * device-code window. A distributed flood that still fills the global cap
+ * meets fair-share eviction in startTierEnrolment instead.
+ */
+export const TIER_ENROLMENT_PER_SOURCE_CAP = 16;
 // A collect claim older than this is abandoned (its isolate was evicted
 // mid-mint) and may be reclaimed (notme-d06b7b). Far above any mint: the CT
 // path is bounded by its 2 s submission timeouts.
@@ -3314,6 +3323,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       // the activation that follows a successful mint.
       "collect_claim TEXT",
       "collect_started_at INTEGER",
+      // The network that started the enrolment (notme-a36d10): what the
+      // per-source cap and fair-share eviction count by. NULL on rows from
+      // before it, which count as one source of their own.
+      "source TEXT",
     ]) {
       try {
         this.ctx.storage.sql.exec(`ALTER TABLE tier_enrolments ADD COLUMN ${col}`);
@@ -3341,13 +3354,26 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * key and waits for a human. Bounded, because an open endpoint that writes
    * rows is a storage-exhaustion vector: expired rows are pruned on every
    * start and the pending set is capped.
+   *
+   * The cap is also an availability target (notme-a36d10, review H1): one
+   * global cap let 0.83 rps from anywhere keep every honest machine "busy".
+   * So the in-flight set is bounded per `source` (the caller's network, from
+   * clientNetworkBucket) at TIER_ENROLMENT_PER_SOURCE_CAP, and when the
+   * global cap is full anyway a source holding FEWER rows than the busiest
+   * source evicts that source's oldest still-PENDING row (max-min fairness).
+   * A new source therefore always gets in; a flood can only displace an
+   * honest row by spreading over more networks than the cap has rows, each
+   * holding no more than the honest one. Approved and collecting rows — a
+   * human vetted them — are never evicted.
    */
   async startTierEnrolment(params: {
     publicKeyPem: string;
     requestedScopes: string[];
+    /** The caller's network bucket. Absent (internal callers) is "none". */
+    source?: string;
   }): Promise<
     | { ok: true; deviceCode: string; userCode: string; keyFingerprint: string; expiresIn: number }
-    | { ok: false; reason: "invalid_key" | "busy" }
+    | { ok: false; reason: "invalid_key" | "busy" | "source_busy" }
   > {
     this.#ensureTierEnrolmentSchema();
     const { importPublicKey } = await import("./cert-authority");
@@ -3371,12 +3397,39 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       "DELETE FROM tier_enrolments WHERE expires_at <= ? AND status IN ('pending', 'approved', 'collecting')",
       now,
     );
-    const [{ n }] = [
-      ...sql.exec<{ n: number }>(
-        "SELECT COUNT(*) AS n FROM tier_enrolments WHERE status IN ('pending', 'approved', 'collecting')",
+    const source = typeof params.source === "string" && params.source ? params.source.slice(0, 128) : "none";
+    const IN_FLIGHT = "status IN ('pending', 'approved', 'collecting')";
+    const [{ mine }] = [
+      ...sql.exec<{ mine: number }>(
+        `SELECT COUNT(*) AS mine FROM tier_enrolments WHERE ${IN_FLIGHT} AND source IS ?`,
+        source,
       ),
     ];
-    if (n >= TIER_ENROLMENT_CAP) return { ok: false, reason: "busy" };
+    if (mine >= TIER_ENROLMENT_PER_SOURCE_CAP) return { ok: false, reason: "source_busy" };
+    const [{ n }] = [
+      ...sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM tier_enrolments WHERE ${IN_FLIGHT}`),
+    ];
+    if (n >= TIER_ENROLMENT_CAP) {
+      // Full. The busiest source by PENDING rows (ties: the one whose oldest
+      // pending row is oldest) gives up its oldest pending row, if it holds
+      // more than this caller does. Otherwise nobody is fairly evictable.
+      const busiest = [
+        ...sql.exec<{ source: string | null; c: number }>(
+          `SELECT source, COUNT(*) AS c, MIN(expires_at) AS oldest FROM tier_enrolments
+             WHERE status = 'pending' GROUP BY source ORDER BY c DESC, oldest ASC LIMIT 1`,
+        ),
+      ][0];
+      if (!busiest || busiest.c <= mine) return { ok: false, reason: "busy" };
+      sql.exec(
+        `DELETE FROM tier_enrolments WHERE device_code_hash = (
+           SELECT device_code_hash FROM tier_enrolments
+             WHERE status = 'pending' AND source IS ? ORDER BY expires_at ASC LIMIT 1)`,
+        busiest.source,
+      );
+      console.warn(
+        JSON.stringify({ event: "tier_enrolment.evicted", reason: "global_cap_full", from: busiest.source, held: busiest.c, for: source }),
+      );
+    }
 
     const deviceCode = b64url(crypto.getRandomValues(new Uint8Array(32)));
     const deviceCodeHash = hex(
@@ -3388,14 +3441,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     sql.exec(
       `INSERT INTO tier_enrolments
          (device_code_hash, user_code, public_key_pem, key_fingerprint,
-          requested_scopes, status, expires_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+          requested_scopes, status, expires_at, source)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
       deviceCodeHash,
       userCode,
       params.publicKeyPem,
       keyFingerprint,
       JSON.stringify(params.requestedScopes),
       now + TIER_ENROLMENT_TTL_S,
+      source,
     );
     return { ok: true, deviceCode, userCode, keyFingerprint, expiresIn: TIER_ENROLMENT_TTL_S };
   }

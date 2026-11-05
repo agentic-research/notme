@@ -40,3 +40,22 @@ export function clientIpBucket(ip: string | null | undefined): string {
   if (hextets.length !== 8 || !hextets.every((h) => HEXTET.test(h))) return `raw:${v}`;
   return `${hextets.slice(0, 4).map((h) => parseInt(h, 16).toString(16)).join(":")}::/64`;
 }
+
+/**
+ * The NETWORK a source address belongs to, for a cap on rows held per source
+ * rather than on requests per second (notme-a36d10, review H1): IPv4 by its
+ * /24, IPv6 by its /48. Coarser than clientIpBucket on purpose: a cap one
+ * host can multiply by renting neighbouring addresses (on IPv6, 65,536 /64s
+ * out of one /48) is no cap. The cost is that hosts sharing a /24 share the
+ * allowance, which a per-source cap set well above one operator's in-flight
+ * needs absorbs.
+ *
+ * "none" and "raw:" buckets pass through unchanged, as in clientIpBucket.
+ */
+export function clientNetworkBucket(ip: string | null | undefined): string {
+  const b = clientIpBucket(ip);
+  const v4 = IPV4.exec(b);
+  if (v4) return `${v4[1]}.${v4[2]}.${v4[3]}.0/24`;
+  if (b.endsWith("::/64")) return `${b.split(":").slice(0, 3).join(":")}::/48`;
+  return b;
+}
