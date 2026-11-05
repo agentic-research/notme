@@ -5,6 +5,7 @@ import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
 import { base64urlDecode } from "@agentic-research/dpop";
 import { OID_EPOCH } from "../cert-authority";
 import { assertGhaEventAllowed, GHA_ISSUER as GHA_OIDC_ISSUER } from "../gha-oidc";
+import { JWKS_FETCH_TIMEOUT_MS, JWKS_POLICY, JwksCache } from "./jwks-cache";
 
 export interface VerifiedIdentity {
   type: "oidc" | "x509";
@@ -120,38 +121,52 @@ function expectedAudiencesFor(map: IssuerAudienceMap, iss: string): string[] | n
   return arr.length > 0 ? arr : null;
 }
 
-// Simple JWKS cache — per-issuer, 1 hour TTL
-const jwksCache = new Map<string, { keys: JWK[]; at: number }>();
+// Per-issuer JWKS cache (notme-a36d10, review M2): 1 h TTL, one rate-limited
+// refetch on an unknown kid, stale keys served up to 24 h when the issuer is
+// down. The rules are in jwks-cache.ts. The fetcher runs only for an issuer
+// fetchJWKS has already checked against the trust map.
+const jwksCache = new JwksCache<JWK>(async (issuer, { bypassCache }) => {
+  // Each request bounded, so the up-to-three-step discovery cannot hold a
+  // route on a hung issuer; an unknown-kid refetch skips any HTTP cache.
+  const get = (url: string) =>
+    fetch(url, {
+      ...(bypassCache ? { cache: "no-store" as const } : {}),
+      signal: AbortSignal.timeout(JWKS_FETCH_TIMEOUT_MS),
+    });
+  // Try .well-known/jwks first, then .well-known/openid-configuration
+  let res = await get(`${issuer}/.well-known/jwks`);
+  if (!res.ok) {
+    const configRes = await get(`${issuer}/.well-known/openid-configuration`);
+    if (configRes.ok) {
+      const config = (await configRes.json()) as { jwks_uri?: string };
+      if (config.jwks_uri) {
+        res = await get(config.jwks_uri);
+      }
+    }
+  }
+  if (!res.ok) throw new Error(`JWKS fetch failed for ${issuer}: ${res.status}`);
+  const body = (await res.json()) as { keys?: unknown };
+  if (!Array.isArray(body.keys)) throw new Error(`JWKS fetch failed for ${issuer}: no keys array`);
+  return body.keys as JWK[];
+}, JWKS_POLICY);
 
-async function fetchJWKS(issuer: string, audiences: IssuerAudienceMap): Promise<JWK[]> {
+async function fetchJWKS(
+  issuer: string,
+  audiences: IssuerAudienceMap,
+  kid: string | undefined,
+): Promise<JWK[]> {
   // Re-checked here, where the fetch is, so that no path can reach the
   // network with an issuer the map does not name.
   if (!expectedAudiencesFor(audiences, issuer)) {
     throw new Error(`untrusted issuer: ${issuer}`);
   }
-  const now = Date.now();
-  const cached = jwksCache.get(issuer);
-  if (cached && now - cached.at < 3600_000) return cached.keys;
-
-  // Try .well-known/jwks first, then .well-known/openid-configuration
-  let jwksUrl = `${issuer}/.well-known/jwks`;
-  let res = await fetch(jwksUrl);
-  if (!res.ok) {
-    const configRes = await fetch(
-      `${issuer}/.well-known/openid-configuration`,
-    );
-    if (configRes.ok) {
-      const config = (await configRes.json()) as { jwks_uri?: string };
-      if (config.jwks_uri) {
-        res = await fetch(config.jwks_uri);
-      }
+  return jwksCache.get(issuer, (keys) => {
+    try {
+      return selectVerifyingKey(keys, kid) !== undefined;
+    } catch {
+      return true; // kid omitted with several keys: refetching cannot help; the caller refuses
     }
-  }
-  if (!res.ok) throw new Error(`JWKS fetch failed for ${issuer}: ${res.status}`);
-
-  const body = (await res.json()) as { keys: JWK[] };
-  jwksCache.set(issuer, { keys: body.keys, at: now });
-  return body.keys;
+  });
 }
 
 /**
@@ -206,7 +221,7 @@ export async function verifyOIDC(
   }
 
   // Fetch JWKS and select the verifying key by kid (see selectVerifyingKey).
-  const keys = await fetchJWKS(iss, audiences);
+  const keys = await fetchJWKS(iss, audiences, header.kid);
   const jwk = selectVerifyingKey(keys, header.kid);
   if (!jwk) throw new Error(`unknown key id: ${header.kid ?? "<omitted>"}`);
 

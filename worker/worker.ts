@@ -59,7 +59,7 @@ import { principalIdentity } from "./src/cert-authority";
 import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
 import { buildInfo, disclosedVersionId } from "./src/build-version";
 import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
-import { clientIpBucket } from "./src/client-ip-key";
+import { clientIpBucket, clientNetworkBucket } from "./src/client-ip-key";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -3237,6 +3237,16 @@ export default {
       // POST /cert/issuing-ca/device — machine starts. Unauthenticated by
       // nature; it grants nothing until a human approves.
       if (pathname === "/cert/issuing-ca/device" && request.method === "POST") {
+        // Unauthenticated and row-writing, so limited BEFORE the DO
+        // (notme-a36d10, review H1): CERT_LIMITER (10 / 60 s per key) under
+        // its own `enrol-ip:` prefix, by IP bucket as /token and passkey are.
+        // Unbound it fails open like the other HTTP limiters; the DO's
+        // per-network cap below holds either way.
+        const ip = request.headers.get("cf-connecting-ip");
+        if (env.CERT_LIMITER) {
+          const { success } = await env.CERT_LIMITER.limit({ key: `enrol-ip:${clientIpBucket(ip)}` });
+          if (!success) return jsonErr("rate_limited", 429);
+        }
         let body: { public_key?: unknown; scopes?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
@@ -3254,8 +3264,12 @@ export default {
         const r = await authority.startTierEnrolment({
           publicKeyPem: body.public_key,
           requestedScopes: requested,
+          source: clientNetworkBucket(ip),
         });
         if (!r.ok) {
+          if (r.reason === "source_busy") {
+            return jsonErr("too many pending enrolments from your network — retry once one is approved or expires", 429);
+          }
           return r.reason === "busy"
             ? jsonErr("too many pending enrolments — retry shortly", 503)
             : jsonErr("public_key must be an Ed25519 SPKI PEM", 400);

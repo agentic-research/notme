@@ -3,7 +3,7 @@
  * the authority is asked anything (notme-ed6114, review F4).
  */
 import { describe, expect, it } from "vitest";
-import { clientIpBucket } from "../client-ip-key";
+import { clientIpBucket, clientNetworkBucket } from "../client-ip-key";
 
 describe("clientIpBucket", () => {
   it("keeps an IPv4 address as is", () => {
@@ -42,5 +42,21 @@ describe("clientIpBucket", () => {
   it("a malformed value is kept verbatim rather than guessed at", () => {
     expect(clientIpBucket("not-an-ip")).toBe("raw:not-an-ip");
     expect(clientIpBucket("1:2:3")).toBe("raw:1:2:3");
+  });
+});
+
+describe("clientNetworkBucket (notme-a36d10)", () => {
+  it("charges IPv4 to its /24 and IPv6 to its /48", () => {
+    expect(clientNetworkBucket("203.0.113.9")).toBe("203.0.113.0/24");
+    expect(clientNetworkBucket("203.0.113.200")).toBe("203.0.113.0/24");
+    expect(clientNetworkBucket("::ffff:203.0.113.9")).toBe("203.0.113.0/24");
+    expect(clientNetworkBucket("2001:db8:1:2::1")).toBe("2001:db8:1::/48");
+    expect(clientNetworkBucket("2001:db8:1:ffff::1")).toBe("2001:db8:1::/48");
+    expect(clientNetworkBucket("2001:db8:2::1")).not.toBe(clientNetworkBucket("2001:db8:1::1"));
+  });
+
+  it("passes the none and raw buckets through", () => {
+    expect(clientNetworkBucket(null)).toBe("none");
+    expect(clientNetworkBucket("not-an-ip")).toBe("raw:not-an-ip");
   });
 });
