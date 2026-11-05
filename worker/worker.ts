@@ -75,6 +75,7 @@ import {
   unavailableFor,
 } from "./src/edge-cache";
 import { clientIpBucket, clientNetworkBucket } from "./src/client-ip-key";
+import { markJtiSpentInKv } from "./src/jti-kv";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -860,9 +861,13 @@ async function handleCertGHA(
   if (!(await authority.spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
     return jsonErr("token already used", 401);
   }
-  await platform.cache.put(jtiKey, "1", {
-    expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
-  });
+  // The KV cross-check; a failed write is logged, not a 500 (notme-a3804c).
+  await markJtiSpentInKv(
+    platform.cache,
+    jtiKey,
+    Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+    "/cert/gha",
+  );
 
   // Build WIMSE identity URI
   // The identity names the stable subject — the OIDC `sub`, which is also
@@ -2906,9 +2911,12 @@ export default {
         }
         // Spent in the shared keyspace only once the join succeeded, so the
         // token cannot then buy a cert at /cert/gha, /cert or /token.
-        await platform.cache.put(jtiKey, "1", {
-          expirationTtl: Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
-        });
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
+          "/join",
+        );
 
         const { createSessionCookie } = await import("./src/auth/session");
         const cookie = await createSessionCookie(
@@ -2968,9 +2976,12 @@ export default {
             : jsonErr("unknown identity — get an invite first", 403);
         }
         const { principalId, scopes } = loggedIn;
-        await platform.cache.put(jtiKey, "1", {
-          expirationTtl: Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
-        });
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
+          "/auth/oidc/login",
+        );
         const { createSessionCookie } = await import("./src/auth/session");
         const sessionSecret = await liveSessionSecret(authority);
         const cookie = await createSessionCookie(
@@ -3777,9 +3788,12 @@ export default {
         if (!(await authorityStub(env).spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
           return jsonErr("token already used", 401);
         }
-        await platform.cache.put(jtiKey, "1", {
-          expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
-        });
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+          "/bootstrap/claim",
+        );
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
         const r = await authority.approveBootstrapClaim(code, claims.sub);
         if (!r.ok) {
@@ -4383,9 +4397,12 @@ export default {
                 if (!(await authority.spendOidcJti(exchanged.iss, exchanged.jti, exchanged.exp))) {
                   return Response.json({ error: "invalid_grant" }, { status: 400 });
                 }
-                await platform.cache.put(key, "1", {
-                  expirationTtl: Math.max(60, exchanged.exp - Math.floor(Date.now() / 1000)),
-                });
+                await markJtiSpentInKv(
+                  platform.cache,
+                  key,
+                  Math.max(60, exchanged.exp - Math.floor(Date.now() / 1000)),
+                  "/token",
+                );
               }
               const mintResult = await authority.mintDPoPTokenOnce({
                 sub: principalId,

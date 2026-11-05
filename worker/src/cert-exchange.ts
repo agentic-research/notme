@@ -13,6 +13,7 @@ import { verifyPopProofs } from "./auth/pop";
 import { opaqueError } from "./error-body";
 import { AUTH_METHOD, oidcAuthMethod, type AuthMethod } from "./auth/session";
 import { authorityStub } from "./authority-stub";
+import { markJtiSpentInKv } from "./jti-kv";
 
 // Types from the schema (would import from gen/ts/identity.ts, but
 // we keep it simple and define the wire format inline to avoid
@@ -323,8 +324,8 @@ export async function handleCertExchange(
       if (!(await authority.spendOidcJti(oidc.issuer, oidc.jti, oidc.exp))) {
         return Response.json({ error: "token already used" }, { status: 401 });
       }
-      const ttl = Math.max(60, oidc.exp - Math.floor(Date.now() / 1000));
-      await platform.cache.put(key, "1", { expirationTtl: ttl });
+      // The KV cross-check; a failed write is logged, not a 500 (notme-a3804c).
+      await markJtiSpentInKv(platform.cache, key, Math.max(60, oidc.exp - Math.floor(Date.now() / 1000)), "/cert");
     }
 
     const { wimseTrustDomain } = await import("../worker");
