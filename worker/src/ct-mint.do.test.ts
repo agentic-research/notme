@@ -954,7 +954,7 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
     await withBacklog(3, async (a) => {
       const sql = a.ctx.storage.sql;
       // Row 3 (newest) is already at the cap and was tried a minute ago; it
-      // must not be submitted again (its slow retry is 24 h out).
+      // must not be submitted again (its backoff is at the 1 h cap).
       sql.exec(
         "UPDATE ct_backlog SET attempts = 24, last_attempt_at = ? WHERE id = (SELECT MAX(id) FROM ct_backlog)",
         Math.floor(Date.now() / 1000) - 60,
@@ -976,8 +976,9 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
       const adds = (await received()).filter((r) => r.path.endsWith("/add-chain"));
       expect(adds.length).toBe(2);
 
-      // Climb to the cap: a row at 23 gets one last try and then gives up.
-      sql.exec("UPDATE ct_backlog SET attempts = 23 WHERE attempts = 1");
+      // Climb to the cap: a row at 23, due, gets one more try and is then
+      // counted as gaveUp.
+      sql.exec("UPDATE ct_backlog SET attempts = 23, last_attempt_at = 0 WHERE attempts = 1");
       await a.alarm();
       const h2 = await a.getAlarmHealth();
       expect(h2.ct.backlog).toBe(0);
@@ -1123,17 +1124,24 @@ describe("ct.drain — the refresh alarm empties the backlog", () => {
   });
 });
 
-// ── Final review I2: gaveUp rows are retried slowly, not abandoned ─────────
+// ── Final review I2 + notme-a3804c (review L1): gaveUp rows keep the curve ─
+//
+// The curve used to have a cliff: 24 tries on every fire (~96 minutes), then
+// one a day, so after a 12 h outage almost every row waited up to a day past
+// recovery. Now every row backs off on its own: 3 minutes doubling to an
+// hourly cap, before and after the gaveUp threshold alike.
 
 const DAY_S = 24 * 60 * 60;
+const HOUR_S = 60 * 60;
 const nowS = () => Math.floor(Date.now() / 1000);
 
-describe("ct.drain — rows past the attempt cap are retried once per 24 h", () => {
-  it("a gaveUp row last tried over 24 h ago is retried and logged; health counts it until then", async () => {
+describe("ct.drain — the retry curve is continuous, capped at an hour (notme-a3804c)", () => {
+  it("ct.drain.retry-hourly-cap — a gaveUp row last tried just over an hour ago is retried and logged", async () => {
+    // RED before notme-a3804c: a row past 24 attempts waited 24 h.
     await withBacklog(1, async (a) => {
       a.ctx.storage.sql.exec(
         "UPDATE ct_backlog SET attempts = 24, last_attempt_at = ?",
-        nowS() - DAY_S - 60,
+        nowS() - HOUR_S - 60,
       );
       const before = await a.getAlarmHealth();
       expect(before.ct.gaveUp).toBe(1);
@@ -1147,12 +1155,12 @@ describe("ct.drain — rows past the attempt cap are retried once per 24 h", () 
     expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(1);
   });
 
-  it("a gaveUp row tried within 24 h is not retried; a failed slow retry waits another 24 h", async () => {
+  it("a gaveUp row tried within the hour is not retried; a failed retry waits another hour", async () => {
     await withBacklog(2, async (a) => {
       const sql = a.ctx.storage.sql;
       const [r1, r2] = rowsOf(a);
-      sql.exec("UPDATE ct_backlog SET attempts = 30, last_attempt_at = ? WHERE id = ?", nowS() - DAY_S + 3600, r1!.id);
-      sql.exec("UPDATE ct_backlog SET attempts = 30, last_attempt_at = ? WHERE id = ?", nowS() - DAY_S - 60, r2!.id);
+      sql.exec("UPDATE ct_backlog SET attempts = 30, last_attempt_at = ? WHERE id = ?", nowS() - HOUR_S + 600, r1!.id);
+      sql.exec("UPDATE ct_backlog SET attempts = 30, last_attempt_at = ? WHERE id = ?", nowS() - HOUR_S - 60, r2!.id);
       await setMode("500");
       await a.alarm();
       // Only the eligible row was submitted; it failed and is stamped now.
@@ -1167,6 +1175,53 @@ describe("ct.drain — rows past the attempt cap are retried once per 24 h", () 
       expect((await received()).filter((r) => r.path.endsWith("/add-chain")).length).toBe(0);
       rows = rowsOf(a);
       expect(rows.every((r) => r.logged_at === null)).toBe(true);
+    });
+  });
+
+  it("ct.drain.retry-curve — 3, 6, 12, 24, 48 minutes, then hourly; no overflow at any attempt count", async () => {
+    // [attempts, seconds since the last try, due?]
+    const cases: Array<[number, number, boolean]> = [
+      [1, 3 * 60 - 30, false],
+      [1, 3 * 60 + 5, true], // the next 4-minute fire after a first failure
+      [2, 6 * 60 - 30, false],
+      [2, 6 * 60 + 5, true],
+      [5, 48 * 60 - 30, false],
+      [5, 48 * 60 + 5, true],
+      [6, HOUR_S - 30, false], // 96 minutes would be next; the cap is an hour
+      [6, HOUR_S + 5, true],
+      [23, HOUR_S + 5, true],
+      [500, HOUR_S - 30, false], // the shift is clamped
+      [500, HOUR_S + 5, true],
+    ];
+    await withBacklog(cases.length, async (a) => {
+      const sql = a.ctx.storage.sql;
+      const rows = rowsOf(a);
+      cases.forEach(([attempts, ago], i) =>
+        sql.exec("UPDATE ct_backlog SET attempts = ?, last_attempt_at = ? WHERE id = ?", attempts, nowS() - ago, rows[i]!.id),
+      );
+      await a.alarm();
+      const after = rowsOf(a);
+      cases.forEach(([attempts, ago, due], i) =>
+        expect(after[i]!.logged_at !== null, `attempts ${attempts}, ${ago}s ago`).toBe(due),
+      );
+    });
+  });
+
+  it("ct.drain.no-day-cliff — after a 12 h outage, every row is retried within an hour of recovery", async () => {
+    // Review L1's scenario: rows failing for 12 h at the alarm's cadence.
+    // Under the old curve each had passed 24 attempts and waited a day.
+    await withBacklog(15, async (a) => {
+      const sql = a.ctx.storage.sql;
+      // Past the 24-attempt threshold, last tried 10 minutes ago: the state
+      // the old curve then held for 24 h.
+      sql.exec("UPDATE ct_backlog SET attempts = 24, last_attempt_at = ?", nowS() - 10 * 60);
+      await a.alarm();
+      expect(rowsOf(a).every((r) => r.logged_at === null), "inside the backoff, nothing is retried").toBe(true);
+      // Recovery an hour later: one fire drains them all (15 < CT_DRAIN_BATCH).
+      sql.exec("UPDATE ct_backlog SET last_attempt_at = ?", nowS() - HOUR_S - 10);
+      await a.alarm();
+      expect(rowsOf(a).every((r) => r.logged_at !== null)).toBe(true);
+      expect((await a.getAlarmHealth()).ct.gaveUp).toBe(0);
     });
   });
 
@@ -1247,7 +1302,7 @@ describe("ct.drain — logged rows are pruned, and the gaveUp retry is bounded i
   it("a gaveUp row 30 days old is abandoned: never retried again, counted in health, no longer in gaveUp", async () => {
     await withBacklog(1, async (a) => {
       const sql = a.ctx.storage.sql;
-      // Due for its daily slow retry, but minted 30 days and a minute ago.
+      // Due for its hourly retry, but minted 30 days and a minute ago.
       sql.exec(
         "UPDATE ct_backlog SET attempts = 40, created_at = ?, last_attempt_at = ?",
         nowS() - 30 * DAY_S - 60,
@@ -1425,6 +1480,8 @@ async function raceMint(
   kind: "pair" | "tier",
   op: "rotate" | "revokeEpoch",
   holdMs: number = HOLD_MS,
+  /** Runs first, inside the object: seed its storage. */
+  seed?: (sql: DrainAuth["ctx"]["storage"]["sql"]) => void,
 ) {
   const name = `ct-race-${++seq}-${crypto.randomUUID()}`;
   const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
@@ -1440,6 +1497,7 @@ async function raceMint(
 
   return runInDurableObject(stub, async (auth) => {
     const a = auth as unknown as RaceAuth;
+    seed?.((auth as unknown as DrainAuth).ctx.storage.sql);
     const before = await a.getAuthorityState();
     const doMint = (): Promise<Minted> =>
       kind === "pair"
@@ -1484,12 +1542,17 @@ async function raceMint(
       .filter((x) => x.path.endsWith("/add-pre-chain"))
       .map((x) => x.chain[0]!);
     const notDelivered = await a.listNotDeliveredCerts();
+    const storedSerials = (
+      (auth as unknown as DrainAuth).ctx.storage.sql
+        .exec("SELECT serial FROM ct_not_delivered ORDER BY serial")
+        .toArray() as Array<{ serial: string }>
+    ).map((x) => x.serial);
 
     // And the authority is not wedged: the next mint goes out under the
     // CURRENT key and epoch.
     await setMode("ok");
     const retry = await doMint();
-    return { before, after, r, retry, opInsideHold, precerts, expected, notDelivered };
+    return { before, after, r, retry, opInsideHold, precerts, expected, notDelivered, storedSerials };
   });
 }
 
@@ -1543,6 +1606,52 @@ describe("ct.mint — key/epoch change during the log round-trip (notme-b52d7c)"
       for (const s of delivered) expect(listed, "a delivered serial is listed").not.toContain(s);
     });
   }
+
+  // notme-a3804c (review L3): the table was never pruned and the route
+  // capped at 1000, so past 1000 rows the oldest dropped off silently. Now
+  // rows are kept 400 days (over a year past any logged certificate's
+  // lifetime and a whole shard interval) and pruned where the table grows.
+  const NOT_DELIVERED_DDL =
+    "CREATE TABLE IF NOT EXISTS ct_not_delivered (serial TEXT PRIMARY KEY, reason TEXT NOT NULL, discarded_at INTEGER NOT NULL)";
+  const DAY = 24 * 60 * 60;
+  it("ct.not-delivered.retention — a row past 400 days is pruned when the next one is recorded, and is not served", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { notDelivered, storedSerials } = await raceMint("pair", "rotate", HOLD_MS, (sql) => {
+      sql.exec(NOT_DELIVERED_DDL);
+      sql.exec("INSERT INTO ct_not_delivered VALUES ('0ld0', 'mint_failed', ?)", now - 401 * DAY);
+      sql.exec("INSERT INTO ct_not_delivered VALUES ('ke9t', 'mint_failed', ?)", now - 399 * DAY);
+    });
+    expect(storedSerials, "pruned from storage").not.toContain("0ld0");
+    expect(storedSerials).toContain("ke9t");
+    const listed = notDelivered.map((x) => x.serial);
+    expect(listed).not.toContain("0ld0");
+    expect(listed).toContain("ke9t");
+    // The new record is there too, newest first.
+    expect(notDelivered[0]!.reason).toBe("mint_state_moved");
+  });
+
+  it("ct.not-delivered.retention — the listing never serves a row past retention, pruned or not; past the cap it serves the newest 1000", async () => {
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(`ct-nd-${crypto.randomUUID()}`));
+    await runInDurableObject(stub, async (auth) => {
+      const a = auth as unknown as RaceAuth & DrainAuth;
+      const sql = a.ctx.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      sql.exec(NOT_DELIVERED_DDL);
+      sql.exec("INSERT INTO ct_not_delivered VALUES ('aa', 'mint_failed', ?)", now - 401 * DAY);
+      for (let i = 0; i < 1001; i++) {
+        sql.exec("INSERT INTO ct_not_delivered VALUES (?, 'claim_taken_over', ?)", `b${i}`, now - i);
+      }
+      const listed = await a.listNotDeliveredCerts();
+      expect(listed).toHaveLength(1000);
+      expect(listed[0]!.serial).toBe("b0");
+      expect(listed.map((x) => x.serial)).not.toContain("aa");
+      expect(listed.map((x) => x.serial)).not.toContain("b1000"); // the oldest retained, past the cap
+      const idx = sql
+        .exec("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ct_not_delivered_by_time'")
+        .toArray();
+      expect(idx).toHaveLength(1);
+    });
+  });
 
   // The other post-await signing point: the log outlasts the 2 s bound, the
   // mint falls back to an unlogged cert plus a backlog row — and that cert

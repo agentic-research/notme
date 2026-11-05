@@ -254,6 +254,30 @@ describe("a Rekor outage never touches the revocation (notme-8befcc)", () => {
     expect(r.rekorLogIndex).toBe(log.get(r.rekorUuid!)!.logIndex);
   });
 
+  it("rekor.retry.hourly-cap — after many failures the backoff is at most an hour, not 6 h (notme-a3804c, review L2)", async () => {
+    mode = "503";
+    const { ended } = await revoke("long outage");
+    const setLast = (attempts: number, agoS: number) =>
+      runInDurableObject(authority(), async (_i, state) => {
+        state.storage.sql.exec(
+          "UPDATE epoch_revocations SET rekor_attempts = ?, rekor_last_attempt_at = ? WHERE epoch = ?",
+          attempts,
+          Math.floor(Date.now() / 1000) - agoS,
+          ended,
+        );
+      });
+    mode = "ok";
+    // 20 failures, last one 50 minutes ago: still inside the hour.
+    await setLast(20, 50 * 60);
+    await runAlarm();
+    expect(postsFor(ended)).toHaveLength(1);
+    // 61 minutes ago: due. Under the old 6 h cap it waited up to 6 h.
+    await setLast(20, 61 * 60);
+    await runAlarm();
+    expect(postsFor(ended)).toHaveLength(2);
+    expect((await history()).revocations.find((x) => x.epoch === ended)!.rekorLogIndex).not.toBeNull();
+  });
+
   it("a retry whose first answer was lost records the existing entry (409), not a second one", async () => {
     const { ended } = await revoke("lost answer");
     const uuid = (await history()).revocations.find((x) => x.epoch === ended)!.rekorUuid!;
