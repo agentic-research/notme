@@ -5,6 +5,7 @@
 
 import { z } from "zod";
 import { GHA_REJECTED_EVENTS } from "@notme/contract";
+import { JWKS_FETCH_TIMEOUT_MS, JWKS_POLICY, JwksCache } from "./auth/jwks-cache";
 
 export const GHA_ISSUER = "https://token.actions.githubusercontent.com";
 
@@ -25,7 +26,6 @@ export function assertGhaEventAllowed(eventName: unknown): void {
   }
 }
 const JWKS_URL = `${GHA_ISSUER}/.well-known/jwks`;
-const JWKS_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 export const GHAClaimsSchema = z.object({
   // Standard JWT
@@ -85,21 +85,23 @@ interface JWK {
 }
 
 // Module-scope JWKS cache — lives for the lifetime of the Workers isolate.
-// GitHub rotates keys infrequently; a stale key causes a validation failure
-// on the next request, which will retry with a fresh fetch.
-let jwksCache: { keys: JWK[]; cachedAt: number } | null = null;
-
-async function fetchJWKS(): Promise<JWK[]> {
-  const now = Date.now();
-  if (jwksCache && now - jwksCache.cachedAt < JWKS_TTL_MS)
-    return jwksCache.keys;
+// An unknown kid refetches once (rate-limited, past the edge cache), and a
+// failed fetch serves the cached keys up to 24 h (notme-a36d10, review M2;
+// the old comment here promised the refetch, and nothing did it). The rules
+// are in auth/jwks-cache.ts.
+const jwksCache = new JwksCache<JWK>(async (_issuer, { bypassCache }) => {
   const res = await fetch(JWKS_URL, {
-    cf: { cacheTtl: 3600, cacheEverything: true },
+    ...(bypassCache ? { cache: "no-store" } : { cf: { cacheTtl: 3600, cacheEverything: true } }),
+    signal: AbortSignal.timeout(JWKS_FETCH_TIMEOUT_MS),
   } as RequestInit);
   if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
-  const body = (await res.json()) as { keys: JWK[] };
-  jwksCache = { keys: body.keys, cachedAt: now };
-  return body.keys;
+  const body = (await res.json()) as { keys?: unknown };
+  if (!Array.isArray(body.keys)) throw new Error("JWKS fetch failed: no keys array");
+  return body.keys as JWK[];
+}, JWKS_POLICY);
+
+function fetchJWKS(kid: string): Promise<JWK[]> {
+  return jwksCache.get(GHA_ISSUER, (keys) => keys.some((k) => k.kid === kid));
 }
 
 // b64urlDecode imported from SDK — single implementation for all JWT code
@@ -135,7 +137,7 @@ export async function validateGHAToken(
     throw new Error(`wrong audience: ${aud.join(",")}`);
 
   // RS256 signature verification
-  const keys = await fetchJWKS();
+  const keys = await fetchJWKS(header.kid);
   const jwk = keys.find((k) => k.kid === header.kid);
   if (!jwk) throw new Error(`unknown key id: ${header.kid}`);
 

@@ -273,6 +273,50 @@ describe("a Rekor outage never touches the revocation (notme-8befcc)", () => {
   });
 });
 
+describe("a stuck Rekor queue is visible in /admin/alarm-health (notme-d8cf4e)", () => {
+  const health = async () => {
+    const res = await call("/admin/alarm-health", { headers: { cookie: await adminCookie() } });
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { rekor: import("./signing-authority").RekorHealth }).rekor;
+  };
+  /** Age every pending row's last attempt, so the next alarm retries them all. */
+  const ageAll = () =>
+    runInDurableObject(authority(), async (_i, state) => {
+      state.storage.sql.exec(
+        "UPDATE epoch_revocations SET rekor_last_attempt_at = 0 WHERE rekor_log_index IS NULL AND rekor_last_attempt_at IS NOT NULL",
+      );
+    });
+
+  it("a pending submission is counted, with its age and error, and clears after the retry succeeds", async () => {
+    // Other tests in this file share the authority and may leave rows
+    // pending, so drain those first: the count below is then exactly ours.
+    for (let i = 0; i < 10 && (await health()).pending > 0; i++) {
+      await ageAll();
+      await runAlarm();
+    }
+    expect((await health()).pending).toBe(0);
+    expect((await health()).oldestPendingAgeS).toBeNull();
+
+    mode = "503";
+    const { ended } = await revoke("stuck queue");
+    const stuck = await health();
+    expect(stuck.submitEnabled).toBe(true);
+    expect(stuck.pending).toBe(1);
+    expect(stuck.oldestPendingAgeS).not.toBeNull();
+    expect(stuck.oldestPendingAgeS!).toBeGreaterThanOrEqual(0);
+    expect(stuck.lastError).toMatch(/503/);
+    expect(stuck.lastAttemptAt).toBeGreaterThan(0);
+
+    mode = "ok";
+    await ageAttempt(ended);
+    await runAlarm();
+    const cleared = await health();
+    expect(cleared.pending).toBe(0);
+    expect(cleared.oldestPendingAgeS).toBeNull();
+    expect(cleared.lastError).toBe("");
+  });
+});
+
 describe("epochs.json is checked against the log (notme-8befcc)", () => {
   it("agrees with what was logged, and a re-signed history that disagrees is caught", async () => {
     await revoke("check against log");

@@ -74,7 +74,7 @@ import {
   noteUnavailable,
   unavailableFor,
 } from "./src/edge-cache";
-import { clientIpBucket } from "./src/client-ip-key";
+import { clientIpBucket, clientNetworkBucket } from "./src/client-ip-key";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -2521,12 +2521,15 @@ export default {
       // GET  /admin/alarm-health        — is the bundle-refresh alarm alive?
       // POST /admin/alarm-health/reset  — clear the circuit breaker, re-arm
       //
-      // The alarm republishes the CA bundle every BUNDLE_REFRESH_MS. It has a
-      // circuit breaker that stops re-arming after repeated failures, and
-      // recovery requires resetAlarmHealth() — which was an RPC method with NO
-      // ROUTE, so the documented recovery procedure could not be invoked at
-      // all. Production ran with a dead alarm for 130 days and served a bundle
-      // every conformant consumer rejected (notme-77a024).
+      // The alarm republishes the CA bundle every BUNDLE_REFRESH_MS. After
+      // repeated failures its circuit breaker opens: it keeps exactly one
+      // probe alarm pending (15 min, doubling per consecutive trip to 2 h) and
+      // closes again when a probe succeeds (half-open, notme-a36d10), so it no
+      // longer needs a manual reset to recover. GET reports the breaker state
+      // and the Rekor revocation queue; POST reset still closes it at once.
+      // History: recovery once depended on resetAlarmHealth(), an RPC method
+      // with NO ROUTE, and production ran with a dead alarm for 130 days,
+      // serving a bundle every conformant consumer rejected (notme-77a024).
       //
       // authorityManage-gated, not public: alarm health leaks operational
       // state (how long the authority has been running, whether it is
@@ -2931,8 +2934,11 @@ export default {
         try {
           identity = await verifyOIDC(body.token, issuerAudiences(env));
         } catch (e: any) {
-          // Logged, not returned (review F1, as /join's L4): verifier
-          // messages describe what the server expected.
+          // Logged, not returned (review F1, as in /join, L4): verifier
+          // messages describe what the server expected. (No apostrophe in
+          // this comment: error-body-guard.test.ts scans catch blocks with a
+          // quote-aware brace matcher that does not skip comments, and one
+          // here made it read every route to :3713 as inside this catch.)
           console.error("[oidc-login] token rejected:", e?.message);
           return jsonErr("invalid oidc proof", 401);
         }
@@ -3303,6 +3309,16 @@ export default {
       // POST /cert/issuing-ca/device — machine starts. Unauthenticated by
       // nature; it grants nothing until a human approves.
       if (pathname === "/cert/issuing-ca/device" && request.method === "POST") {
+        // Unauthenticated and row-writing, so limited BEFORE the DO
+        // (notme-a36d10, review H1): CERT_LIMITER (10 / 60 s per key) under
+        // its own `enrol-ip:` prefix, by IP bucket as /token and passkey are.
+        // Unbound it fails open like the other HTTP limiters; the DO's
+        // per-network cap below holds either way.
+        const ip = request.headers.get("cf-connecting-ip");
+        if (env.CERT_LIMITER) {
+          const { success } = await env.CERT_LIMITER.limit({ key: `enrol-ip:${clientIpBucket(ip)}` });
+          if (!success) return jsonErr("rate_limited", 429);
+        }
         let body: { public_key?: unknown; scopes?: unknown } = {};
         try {
           body = (await request.json()) as typeof body;
@@ -3320,8 +3336,12 @@ export default {
         const r = await authority.startTierEnrolment({
           publicKeyPem: body.public_key,
           requestedScopes: requested,
+          source: clientNetworkBucket(ip),
         });
         if (!r.ok) {
+          if (r.reason === "source_busy") {
+            return jsonErr("too many pending enrolments from your network — retry once one is approved or expires", 429);
+          }
           return r.reason === "busy"
             ? jsonErr("too many pending enrolments — retry shortly", 503)
             : jsonErr("public_key must be an Ed25519 SPKI PEM", 400);
