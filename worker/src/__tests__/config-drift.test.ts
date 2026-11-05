@@ -45,6 +45,7 @@ describe("parseToml reads what wrangler configs use", () => {
     expect(t.workers_dev).toBe(false);
     expect(t.limits).toEqual({ cpu_ms: 50 });
     expect(t.observability).toEqual({ enabled: true });
+    expect((template.observability as Record<string, unknown>).head_sampling_rate).toBe(1);
     expect(t.vars.CT_LOG_SHARDS).toContain('"log_id"');
     expect(t.vars.ESCAPED).toBe('a "quoted" é value');
     expect(t.vars.MULTI).toBe("line one continued");
@@ -114,6 +115,20 @@ describe("configDrift", () => {
   it("a production [vars] without SIGNET_AUTHORITY_URL is named (the public-Rekor guard would refuse it)", () => {
     const live = inLine().replace('SIGNET_AUTHORITY_URL = "https://auth.notme.bot"\n', "");
     expect(configDrift(template, parseToml(live))).toEqual(["vars.SIGNET_AUTHORITY_URL: missing"]);
+  });
+
+  it("a head_sampling_rate below the template's is named, production and staging; unset is the default 1", () => {
+    const live = inLine()
+      .replace("[observability]\nenabled = true\nhead_sampling_rate = 1", "[observability]\nenabled = true\nhead_sampling_rate = 0.1")
+      .replace("[env.staging.observability]\nenabled = true\nhead_sampling_rate = 1", "[env.staging.observability]\nenabled = true");
+    expect(configDrift(template, parseToml(live))).toEqual(["observability.head_sampling_rate: below the template's (1)"]);
+    const logsLevel = inLine().replace(
+      "[env.staging.observability.logs]\nenabled = true",
+      "[env.staging.observability.logs]\nenabled = true\nhead_sampling_rate = 0.5",
+    );
+    expect(configDrift(template, parseToml(logsLevel))).toEqual([
+      "env.staging.observability.logs.head_sampling_rate: below the template's (1)",
+    ]);
   });
 
   it("no message carries a value from the live file", () => {

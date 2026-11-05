@@ -24,7 +24,10 @@
  *     this date both are defaults and workerd refuses the listing;
  *  6. any [env.staging.vars] key the template has and the live file lacks;
  *  7. no production [vars] SIGNET_AUTHORITY_URL (the public-Rekor guard in
- *     rekor-revocation.ts treats an unset authority as not production).
+ *     rekor-revocation.ts treats an unset authority as not production);
+ *  8. an [observability] head_sampling_rate below the template's, production
+ *     or staging: sampling drops whole invocations, console.* audit events
+ *     included (unset is Cloudflare's default, 1).
  *
  * ── WHAT IT NEVER DOES ──
  * Print a VALUE from the live file. The report names keys only: [vars] may
@@ -414,6 +417,23 @@ export function configDrift(template: TomlTable, live: TomlTable): string[] {
   // revocation pending.
   if ("SIGNET_AUTHORITY_URL" in table(template.vars) && !("SIGNET_AUTHORITY_URL" in table(live.vars))) {
     out.push("vars.SIGNET_AUTHORITY_URL: missing");
+  }
+
+  // 8. head_sampling_rate: never below the template's. Unset means 1.
+  for (const [where, t, l] of [
+    ["observability.head_sampling_rate", table(template.observability), table(live.observability)],
+    ["env.staging.observability.head_sampling_rate", table(tEnvStaging.observability), table(lEnvStaging.observability)],
+  ] as const) {
+    const want = t.head_sampling_rate;
+    if (typeof want !== "number") continue;
+    const got = l.head_sampling_rate === undefined ? 1 : l.head_sampling_rate;
+    if (typeof got !== "number" || got < want) out.push(`${where}: below the template's (${want})`);
+    // wrangler also accepts the rate under [observability.logs], for logs
+    // alone; a lower one there drops the same events.
+    const logs = table(l.logs).head_sampling_rate;
+    if (logs !== undefined && (typeof logs !== "number" || logs < want)) {
+      out.push(`${where.replace(/head_sampling_rate$/, "logs.head_sampling_rate")}: below the template's (${want})`);
+    }
   }
 
   return out;
