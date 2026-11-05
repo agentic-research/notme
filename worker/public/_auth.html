@@ -456,14 +456,25 @@
             &nbsp;&nbsp;-H "Authorization: Bearer
             ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value')<br />
             curl -sS https://auth.notme.bot/cert/gha \<br />
-            &nbsp;&nbsp;-H "Authorization: Bearer ${TOKEN}"
+            &nbsp;&nbsp;-H "Authorization: Bearer ${TOKEN}" \<br />
+            &nbsp;&nbsp;-H "Content-Type: application/json" \<br />
+            &nbsp;&nbsp;-d "${BODY}"
           </div>
           <button class="copy-btn" onclick="copyCmd(this)">&#9112; copy</button>
         </div>
+        <p style="margin: 0 0 12px">
+          <code>${BODY}</code> carries the two PUBLIC keys your job generated
+          and a proof of possession for each:
+          <code
+            >{"public_keys":{"mtls":…,"signing":…},"proofs":{"mtls":…,"signing":…}}</code
+          >. Each proof signs the binding pre-image
+          <code>mtls_spki ‖ signing_spki ‖ SHA-256(oidc_jwt)</code>.
+        </p>
         <p style="margin: 0">
           returns
-          <code>{ certificate, private_key, expires_at, subject }</code>. cert
-          is valid for 5 minutes — enough for one job.
+          <code>{ certificates: { mtls, signing }, identity, scopes, expires_at, binding }</code>.
+          <strong>No private key is sent, ever</strong> — yours never leaves
+          the runner. The certs are valid for 5 minutes, enough for one job.
         </p>
       </div>
 
@@ -480,15 +491,6 @@
         <tbody>
           <tr>
             <td><span class="method post">POST</span></td>
-            <td class="ep-path">/exchange-token</td>
-            <td class="ep-desc">
-              OIDC token → bridge cert<br /><span class="ep-note"
-                >human auth flow via signet CLI</span
-              >
-            </td>
-          </tr>
-          <tr>
-            <td><span class="method post">POST</span></td>
             <td class="ep-path">/cert/gha</td>
             <td class="ep-desc">
               GHA OIDC → bridge cert<br /><span class="ep-note"
@@ -498,10 +500,19 @@
           </tr>
           <tr>
             <td><span class="method post">POST</span></td>
-            <td class="ep-path">/api/cert/register</td>
+            <td class="ep-path">/cert/passkey</td>
             <td class="ep-desc">
-              GitHub PAT → bridge cert<br /><span class="ep-note"
-                >agent / headless registration</span
+              passkey session → bridge cert<br /><span class="ep-note"
+                >scopes intersected with an allowlist, never inherited</span
+              >
+            </td>
+          </tr>
+          <tr>
+            <td><span class="method post">POST</span></td>
+            <td class="ep-path">/token</td>
+            <td class="ep-desc">
+              session + DPoP proof → access token<br /><span class="ep-note"
+                >EdDSA, sender-constrained (RFC 9449)</span
               >
             </td>
           </tr>
@@ -530,8 +541,12 @@
           </tr>
           <tr>
             <td><span class="method get">GET</span></td>
-            <td class="ep-path">/healthz</td>
-            <td class="ep-desc">health check</td>
+            <td class="ep-path">/health</td>
+            <td class="ep-desc">
+              liveness<br /><span class="ep-note"
+                >also /healthz · edge-answered, not proxied</span
+              >
+            </td>
           </tr>
         </tbody>
       </table>

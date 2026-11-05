@@ -7,19 +7,22 @@
  * is shared across every concurrent and sequential caller in the isolate —
  * a second authenticate() silently swapped the first caller's identity.
  *
- * The fix puts heldCerts on `this`. These tests pin that invariant by
- * exercising two separate AuthService instances and asserting their state
- * does NOT cross-contaminate.
+ * The fix put heldCerts on `this`; since notme-153f03 they live on the
+ * AuthSession authenticate() returns. These tests pin that invariant by
+ * exercising separate sessions and asserting their state does NOT
+ * cross-contaminate.
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
+import { authenticateWithPop, makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
 
 // The Worker's transitive imports reach `cloudflare:workers` (DurableObject,
 // WorkerEntrypoint) which is not available in plain vitest. Stub the runtime
 // module with minimal shapes — these tests are about AuthService's INTERNAL
 // state isolation, not its DO/runtime integration.
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   DurableObject: class {},
   WorkerEntrypoint: class {
     ctx: unknown;
@@ -63,14 +66,13 @@ describe("Threat: a bound Worker asserts its own identity (notme-6ad276)", () =>
     const svc = makeAuthService();
     const real = await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]);
 
-    await svc.authenticate({
-      ...real,
+    const session = await authenticateWithPop(svc, real, {
       identity: "wimse://notme.bot/gha/agentic-research/cloister",
       scopes: ["bridgeCert", "sign:git", "sign:attestation", "authorityManage"],
       expiresAt: Math.floor(Date.now() / 1000) + 86_400,
-    } as never);
+    });
 
-    const id = await svc.identity();
+    const id = await session.identity();
     expect(id.identity).toBe("wimse://notme.bot/test/alice");
     expect(id.scopes).toEqual(["bridgeCert"]);
   });
@@ -84,23 +86,23 @@ describe("Threat: a bound Worker asserts its own identity (notme-6ad276)", () =>
       { attackerCA: true },
     );
 
-    await expect(svc.authenticate(forged as never)).rejects.toThrow(/signature|CA|trusted/i);
-    expect((await svc.identity()).authenticated).toBe(false);
+    // With a real challenge and proofs from the forged keys, so the refusal is
+    // the CA check and not the (now earlier) challenge check.
+    await expect(authenticateWithPop(svc, forged)).rejects.toThrow(/signature|CA|trusted/i);
   });
 });
 
 describe("Threat: AuthService credentials must not leak across RPC sessions", () => {
-  it("two AuthService instances hold independent credentials", async () => {
+  it("two sessions hold independent credentials", async () => {
     const svcA = makeAuthService();
     const svcB = makeAuthService();
 
-    await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
-    await svcB.authenticate(
-      await makeRealCreds("wimse://notme.bot/test/bob", ["bridgeCert", "sign:git"]),
+    const sessA = await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
+    const sessB = await authenticateWithPop(svcB, await makeRealCreds("wimse://notme.bot/test/bob", ["bridgeCert", "sign:git"]),
     );
 
-    const idA = await svcA.identity();
-    const idB = await svcB.identity();
+    const idA = await sessA.identity();
+    const idB = await sessB.identity();
 
     expect(idA.identity).toBe("wimse://notme.bot/test/alice");
     expect(idA.scopes).toEqual(["bridgeCert"]);
@@ -108,30 +110,29 @@ describe("Threat: AuthService credentials must not leak across RPC sessions", ()
     expect(idB.scopes).toEqual(["bridgeCert", "sign:git"]);
   });
 
-  it("unauthenticated instance never observes another instance's credentials", async () => {
-    const svcA = makeAuthService();
-    const svcB = makeAuthService();
+  it("two sessions from ONE AuthService instance are independent too", async () => {
+    // In-isolate a caller can hold one instance and authenticate twice; the
+    // second authenticate() makes a second session and leaves the first as it was.
+    const svc = makeAuthService();
+    const sessA = await authenticateWithPop(svc, await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
+    const sessB = await authenticateWithPop(svc, await makeRealCreds("wimse://notme.bot/test/bob", ["sign:git"]));
 
-    await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
-
-    const idB = await svcB.identity();
-    expect(idB.authenticated).toBe(false);
-    expect(idB.identity).toBe("");
-    expect(idB.scopes).toEqual([]);
+    expect((await sessA.identity()).identity).toBe("wimse://notme.bot/test/alice");
+    expect((await sessB.identity()).identity).toBe("wimse://notme.bot/test/bob");
   });
 
   it("authenticate() on one instance does not change another's signing identity", async () => {
     const svcA = makeAuthService();
     const svcB = makeAuthService();
 
-    await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice", []));
-    await svcB.authenticate(await makeRealCreds("wimse://notme.bot/test/bob", []));
+    await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice", []));
+    const sessB = await authenticateWithPop(svcB, await makeRealCreds("wimse://notme.bot/test/bob", []));
 
     // Now re-authenticate A — must not affect B.
-    await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice-rekeyed", []));
+    const sessA2 = await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice-rekeyed", []));
 
-    expect((await svcA.identity()).identity).toBe("wimse://notme.bot/test/alice-rekeyed");
-    expect((await svcB.identity()).identity).toBe("wimse://notme.bot/test/bob");
+    expect((await sessA2.identity()).identity).toBe("wimse://notme.bot/test/alice-rekeyed");
+    expect((await sessB.identity()).identity).toBe("wimse://notme.bot/test/bob");
   });
 
   it("concurrent authenticate→identity flows preserve per-session identity", async () => {
@@ -145,12 +146,12 @@ describe("Threat: AuthService credentials must not leak across RPC sessions", ()
 
     const [idA, idB] = await Promise.all([
       (async () => {
-        await svcA.authenticate(await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
-        return svcA.identity();
+        const s = await authenticateWithPop(svcA, await makeRealCreds("wimse://notme.bot/test/alice", ["bridgeCert"]));
+        return s.identity();
       })(),
       (async () => {
-        await svcB.authenticate(await makeRealCreds("wimse://notme.bot/test/bob", ["sign:git"]));
-        return svcB.identity();
+        const s = await authenticateWithPop(svcB, await makeRealCreds("wimse://notme.bot/test/bob", ["sign:git"]));
+        return s.identity();
       })(),
     ]);
 

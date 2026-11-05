@@ -1,0 +1,29 @@
+{
+  // Type-checks every plain (non-pool) test under src/__tests__ plus its
+  // helpers and setup files, and the repo-root scripts/ they exercise.
+  // tsconfig.json excludes __tests__, and tsconfig.test.json covers only
+  // *.do.test.ts, so these were transpiled by vitest and never checked
+  // (notme-c071be). A glob, not a list: a new test is covered by default.
+  // Run via `task worker:check`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // "node" FIRST. workers-types 5.20261019+ declares `var process: any`
+    // (Node globals are on by default from compat date 2026-08-04), and the
+    // first declaration loaded wins: with workers-types first, process.exit()
+    // is `any` rather than `never` and the scripts stop type-checking
+    // (notme-430ad1).
+    "types": ["node", "@cloudflare/workers-types"],
+    // scripts/ resolves from the repo root, where neither is hoisted; both
+    // are worker dependencies (reflect-metadata: notme-3ee3b0).
+    "paths": {
+      "@peculiar/x509": ["./node_modules/@peculiar/x509"],
+      "reflect-metadata": ["./node_modules/reflect-metadata"]
+    },
+    "noEmit": true
+  },
+  "include": [
+    "../scripts/**/*.ts",
+    "src/__tests__/**/*.ts"
+  ],
+  "exclude": ["node_modules"]
+}

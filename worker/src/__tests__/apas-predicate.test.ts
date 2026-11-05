@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   DurableObject: class {},
   WorkerEntrypoint: class {},
 }));
 
-const cacheMatch = vi.fn(async () => undefined);
+const cacheMatch = vi.fn(async (_request: Request): Promise<Response | undefined> => undefined);
 const cachePut = vi.fn(async () => undefined);
 vi.stubGlobal("caches", {
   default: {

@@ -1,0 +1,15 @@
+{
+  "WARNING": "TEST KEY ONLY. Generated 2026-10-26 for ct-full-cycle.do.test.ts so the local log's compiled-in roots file stays valid across runs. The workers test pool gives each run isolated storage, so without a fixed key the authority mints a new CA every run and the log can never be bootstrapped to trust it. This key signs nothing outside that test. It is NOT notme's CA \u2014 that is trust/notme-root.pem.",
+  "private_jwk": {
+    "key_ops": [
+      "sign"
+    ],
+    "ext": true,
+    "alg": "Ed25519",
+    "crv": "Ed25519",
+    "d": "8BerFCZ8MeHvZbIPXxOtEU930wmwDlXiamoKtKv2xxg",
+    "x": "8GeBIdjKGDYyFm0vTihPDwLzE9A2tPquj5QC4pfaf6o",
+    "kty": "OKP"
+  },
+  "public_spki_b64": "MCowBQYDK2VwAyEA8GeBIdjKGDYyFm0vTihPDwLzE9A2tPquj5QC4pfaf6o="
+}

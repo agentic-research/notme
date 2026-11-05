@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * rpc-surface.do.test.ts — pin the RPC-reachable method surface of every
  * WorkerEntrypoint and of the SigningAuthority DO.
@@ -23,8 +23,10 @@
  * of bug got in; reviewing a list is not.
  */
 
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { AuthService, JwtSigner, ReceiptSigner } from "../worker";
+import { AuthSession } from "./auth/auth-session";
 import { SigningAuthority } from "./signing-authority";
 
 /** What workerd will dispatch to. `constructor` is not callable over RPC. */
@@ -34,11 +36,14 @@ function rpcSurface(cls: { prototype: object }): string[] {
     .sort();
 }
 
-describe("RPC surface is an allow-list, not an accident", () => {
+describe("rpc.capability.isolation — RPC surface is an allow-list, not an accident", () => {
   it("ReceiptSigner exposes only receipt signing (ADR-014 least privilege)", () => {
     // The ADR claims a binding to ReceiptSigner "grants receipt signing and
     // nothing else". This is that claim, executable.
-    expect(rpcSurface(ReceiptSigner)).toEqual(["receiptFacts", "signReceipt"]);
+    // epochPublicKey (notme-a0cff4) is PUBLIC key material for one epoch, the
+    // same bytes /.well-known/epochs.json serves, so cloister can archive an
+    // epoch it never observed. Added deliberately; it signs nothing.
+    expect(rpcSurface(ReceiptSigner)).toEqual(["epochPublicKey", "receiptFacts", "signReceipt"]);
   });
 
   it("JwtSigner exposes only delegated JWT signing (ADR-015)", () => {
@@ -48,7 +53,7 @@ describe("RPC surface is an allow-list, not an accident", () => {
     expect(rpcSurface(JwtSigner)).toEqual(["issuerPublicKey", "signJwt"]);
   });
 
-  it("AuthService exposes no capability-handing method", () => {
+  it("rpc.data.boundary — AuthService exposes no capability-handing method", () => {
     const surface = rpcSurface(AuthService);
 
     // The specific regression. getAuthority() returned a DO stub; a stub is a
@@ -64,6 +69,10 @@ describe("RPC surface is an allow-list, not an accident", () => {
       "getPrivateKey",
       "exportKey",
       "getEnv",
+      // notme-d68da8: minted an at+jwt for a caller-chosen sub, scope and
+      // audience. Named here as well as absent from the pin above, so
+      // re-adding it fails with a reason rather than a diff.
+      "mintDPoPToken",
     ]) {
       expect(surface, `${forbidden} must not be RPC-reachable`).not.toContain(
         forbidden,
@@ -78,18 +87,70 @@ describe("RPC surface is an allow-list, not an accident", () => {
     // `fetch` is absent: it is inherited from WorkerEntrypoint, not an own
     // property of this prototype. Own properties are what an RPC caller
     // reaches by name, which is why this walks them specifically.
+    //
+    // 10 -> 9: mintDPoPToken REMOVED (notme-d68da8). The second removal in
+    // this file, and the second time the method NEXT TO mintBridgeCert turned
+    // out to believe its argument.
+    //
+    // Its signature was { sub, scope, audience, jkt } and it forwarded all
+    // four to the DO, which signed them with the master Ed25519 key. So a
+    // binding holder named the subject AND the scope AND the audience of a
+    // genuine at+jwt carrying notme's real iss. src/allowed-audiences.ts
+    // states the rule it broke in its own docstring — "every endpoint that
+    // mints an access token must check the requested audience against this
+    // set" — and both HTTP minting routes do; this one went around them,
+    // along with the notme_session cookie they both require.
+    //
+    // Measured consequence, not a hypothesis: rig/web verifies notme tokens
+    // on signature + exp alone (no aud, no iss, and cnf.jkt unread on the
+    // token-only path), sets identity.id = claims.sub, and compares that to
+    // ADMIN_USER_ID. One call named rig's admin.
+    //
+    // Deleted rather than hardened, per the sign() precedent in
+    // signing-authority.ts: zero callers anywhere (notme, rig, signet,
+    // cloister, ley-line, ley-line-open, rosary, mache), the live /token
+    // route calls the DO's mintDPoPTokenOnce directly, and an unused method
+    // here is one env.AUTH.mintDPoPToken() away from being reachable again.
+    //
+    // authChallenge ADDED (notme-fbbfbc). Reviewed: it returns a random,
+    // single-use, 60 s challenge and writes one pop_nonces row under an
+    // `authsvc:` key, nothing else. A binding holder can already make the DO
+    // write PoP-nonce rows (that is what /cert/nonce does for a session); the
+    // challenge buys nothing without both private keys for the certs.
+    //
+    // 10 -> 7: proxy, sign and identity MOVED to AuthSession (notme-153f03).
+    // Each top-level binding call is a fresh AuthService, so they read
+    // credentials authenticate() had stored on a `this` that no longer
+    // existed: over a binding proxy() and sign() refused everything and
+    // identity() said "not authenticated". authenticate() now returns the
+    // session that holds the credentials; the methods are pinned below.
+    // Removed rather than kept as refusals, so the entrypoint carries no name
+    // whose only behaviour is to point elsewhere.
     expect(rpcSurface(AuthService)).toEqual([
+      "authChallenge",
       "authenticate",
       "getAuthorityState",
       "getCACertificatePem",
       "getPublicKeyPem",
-      "identity",
       "mintBridgeCert",
-      "mintDPoPToken",
-      "proxy",
-      "sign",
       "verifySession",
     ]);
+  });
+
+  it("AuthSession's surface is exactly the reviewed set (notme-153f03)", () => {
+    // What a holder of a session STUB reaches. Over RPC a stub reaches the
+    // prototype's methods and its getters and public properties alike, so
+    // the held certs, the signing key and the env are `#private` and absent
+    // here. `Symbol.dispose` is the disposer workerd calls when the last stub
+    // is dropped; it is a symbol, so getOwnPropertyNames does not list it,
+    // and it is asserted separately. There is deliberately no method that
+    // re-authenticates or swaps the held identity.
+    expect(rpcSurface(AuthSession)).toEqual(["identity", "proxy", "sign"]);
+    expect(Object.getOwnPropertySymbols(AuthSession.prototype)).toEqual([Symbol.dispose]);
+    const getters = Object.entries(Object.getOwnPropertyDescriptors(AuthSession.prototype))
+      .filter(([, d]) => d.get || d.set)
+      .map(([n]) => n);
+    expect(getters, "a getter is RPC-reachable as a property").toEqual([]);
   });
 
   it("SigningAuthority's surface is pinned — it is what a leaked stub yields", () => {
@@ -149,7 +210,242 @@ describe("RPC surface is an allow-list, not an accident", () => {
       // of being called; this one cannot. A leaked stub learns only whether
       // an authority has an administrator, which /auth/passkey/status
       // already answers publicly.
-    ).toBe(43);
+      //
+      // 43 → 44: mintIssuingCa (ADR-019 D4). Reviewed: a leaked stub could
+      // already mint arbitrary LEAF certs via mintBridgeCertPair, so the new
+      // capability class is not "can mint" — it is post-leak PERSISTENCE: an
+      // Issuing CA cert keeps signing task certs offline after stub access is
+      // lost. Bounded two ways: the method refuses any TTL over 24h (the
+      // route sends none, so a long TTL is evidence of misuse, not clamped
+      // away), and pathlen=0 means verifiers reject anything a minted tier
+      // tries to issue below itself beyond one hop.
+      //
+      // 44 → 47: revokeCapability, listGrants, ensurePasskeyPrincipal
+      // (notme-77a024). Reviewed. revokeCapability only NARROWS — a leaked
+      // stub can strip authority, never add it, and the pre-existing
+      // createPrincipalWithCapabilities already let a stub grant anything,
+      // so the widening capability class is unchanged. listGrants returns
+      // scope strings, timestamps and principal ids: an audit view, no
+      // secrets. ensurePasskeyPrincipal is a GRANTING path, so it was
+      // reviewed hardest: it grants the admin triple only when the principal
+      // has no row AND isFirstUser is true — the same "first user is admin"
+      // rule verifyRegistration already enforced via is_admin, now expressed
+      // as revocable grants. Idempotent by construction: an existing
+      // principal's grants are returned, never re-granted, so it cannot
+      // restore a revoked scope.
+      //
+      // 47 → 48: bootstrapFromAttestation (notme-addef9). Reviewed hardest
+      // of any addition so far, because it CREATES AN ADMINISTRATOR. Three
+      // conditions gate it and a leaked stub satisfies none of them: the
+      // deployer must have set BOOTSTRAP_GHA_SUBJECT (unset means off, and
+      // that is the branch a pure predicate in auth/bootstrap-policy.ts now
+      // covers), the argument must equal it, and the authority must have no
+      // principal or authenticator — which any authority a stub was stolen
+      // FROM necessarily has. So on a live authority this method is a no-op
+      // by construction; on a fresh one, a caller holding a stub already had
+      // the deployment access needed to set the variable in the first place.
+      //
+      // 48 → 47: getOrCreateSigningKey REMOVED (notme-eedc9c). The first
+      // removal in this log, and the only one so far that was a live
+      // exposure rather than a reviewed addition.
+      //
+      // Its return type was { signingKey: CryptoKey; verifyKey: CryptoKey;
+      // keyId } — the CA's private key, handed to anyone holding a stub. The
+      // pin above never caught it because the pin asks what is REACHABLE,
+      // not what reachable things RETURN, and the surrounding documentation
+      // asserted (falsely) that "CryptoKey is not Structured Cloneable", so
+      // a method returning one read as harmless (notme-bcbd74).
+      //
+      // What actually stopped delivery was workerd refusing to serialize
+      // CryptoKey — measured, and a runtime behaviour no standard requires.
+      // Non-extractability did not cover it: the held key is non-extractable
+      // in every mode, which stops byte export but not USE, and a delivered
+      // key still signs as this CA.
+      //
+      // It is `#getOrCreateSigningKey()` now. All fourteen call sites were
+      // internal; the only external consumer was delegation-depth.do.test.ts,
+      // which reads the stored JWK directly instead — a test forging
+      // production's exact condition, not a caller being handed a key.
+      //
+      // The standard for the next removal: prefer taking a method off the
+      // surface over relying on any property of the boundary.
+      //
+      // 47 → 48: revokeEpoch (notme-77a024). Reviewed, and the review turns
+      // on a comparison rather than on the method alone: a leaked stub can
+      // already call `rotate()`, which voids the same credentials AND
+      // destroys the signing key. revokeEpoch is strictly the weaker of the
+      // two — it voids outstanding credentials and leaves every key intact,
+      // so receipts naming earlier epochs stay verifiable. The worst case
+      // available to a stub holder is therefore unchanged, and the new
+      // method is the non-destructive half of a capability already present.
+      //
+      // Not nothing, though: it is a denial of service a stub holder can
+      // trigger repeatedly, and each call publishes a bundle (one KV write).
+      // That is the honest cost of having the lever at all, and it is why
+      // there is no HTTP route onto it — an authentication bug on a public
+      // door would make mass revocation free, where a service binding is a
+      // deployment-time grant.
+      //
+      // NO COUNT CHANGE, but a TRUST-POSITION CHANGE worth recording here,
+      // because this file is where the question should have been asked
+      // (notme-51ccd7). `mintBridgeCert` kept its name and took a
+      // `MintBridgeCertProof` in place of `subject: string`.
+      //
+      // The old signature meant a holder of this surface could name ANY
+      // subject and receive a certificate for it — measured, not inferred:
+      // it returned `MINTED subject="wimse://notme.bot/i-am-whoever"`. This
+      // pin had reviewed the method for REACHABILITY ("may a service-binding
+      // holder call it") and never for ARGUMENT TRUST ("does it believe what
+      // it is told"). Both questions belong here.
+      //
+      // What settled it was not taste but signet's documented verification:
+      // it pins the identity URI and requires EQUALITY
+      // (`cosign verify-blob --certificate-identity`). So a caller that can
+      // assert the subject can mint a certificate matching that pin for a
+      // key it controls, and the published verification PASSES for an
+      // artifact it signed. Bounding the capability instead was considered
+      // and does not work: the only namespace notme emits is
+      // `principal/<sub>`, which is precisely what a verifier pins.
+      //
+      // THE STANDARD THIS SETS for the next addition: ask both questions.
+      // Reachability is about who may call; argument trust is about what the
+      // method concludes from what it is handed. A method can be perfectly
+      // safe to expose and still be unsafe to believe.
+      //
+      // 48 → 52: startTierEnrolment, getTierEnrolment, approveTierEnrolment,
+      // collectTierEnrolment (notme-486e8a). Reviewed on BOTH axes this file
+      // asks about, since notme-51ccd7 showed reachability alone is not a
+      // review.
+      //
+      //   start   — reachability: anyone, by design (the machine has no
+      //             credential yet). Argument trust: it believes nothing — it
+      //             stores a public key and grants nothing. Storage is bounded
+      //             (expired rows pruned per call, total capped).
+      //   get     — returns fingerprint, requested scopes, status, expiry for
+      //             a user code. No device code, no identity.
+      //   approve — the dangerous one: it records a caller-supplied principal
+      //             and scopes. The ROUTE decides both (live certMint grant,
+      //             scopes narrowed through certScopesForSession). A leaked
+      //             stub could approve for anyone — and could already call
+      //             mintIssuingCa for any subject directly, so the capability
+      //             class is unchanged.
+      //   collect — trusts nothing it is handed: it verifies the PoP itself,
+      //             against the key recorded at start, and consumes atomically.
+      //
+      // 52 → 54: issuePopNonce, consumePopNonce (notme-486e8a). The session
+      // term for cert-pair bindings, replacing SHA-256 of the HttpOnly cookie.
+      //   issue   — takes a caller-supplied principal. A leaked stub can mint
+      //             nonces for anyone; a nonce alone grants nothing — it only
+      //             lets a matching PoP be accepted at a route that has
+      //             ALREADY verified that principal's session.
+      //   consume — single-use, atomic, principal-bound. A leaked stub could
+      //             burn a principal's outstanding nonces (≤120s each): a
+      //             nuisance, strictly weaker than revokeEpoch.
+      //
+      // 54 → 55: migrateAdminSigningScopes (notme-486e8a). Grants ONLY
+      // sign:git / sign:attestation, ONLY to principals already holding the
+      // whole deployer set (authorityManage + certMint + bridgeCert), and
+      // never a scope the principal has any row for (so a revocation sticks).
+      // A leaked stub gains nothing: those principals could already mint and
+      // administer; signing purposes are a narrowing of bridgeCert.
+      //
+      // 55 → 59: bootstrapFromAttestation REMOVED; hasAdministrator,
+      // claimAvailable, markClaimRegistration, finalizeClaimRegistration,
+      // approveBootstrapClaim ADDED (notme-486e8a). The removed method made
+      // the attested workflow the admin, which no human could then act as.
+      //   hasAdministrator / claimAvailable — booleans, nothing secret.
+      //   mark / finalize — open or complete a claim holding ZERO grants;
+      //             bounded by a pending cap and TTLs.
+      //   approveBootstrapClaim — CREATES AN ADMINISTRATOR, so reviewed
+      //             hardest, as bootstrapFromAttestation was: it requires the
+      //             deployer to have set BOOTSTRAP_GHA_SUBJECT, the subject to
+      //             equal it (timing-safe), and NO live authorityManage holder
+      //             — which any authority a stub was stolen FROM has. On a
+      //             live authority it is a no-op by construction, the same
+      //             argument that admitted its predecessor.
+      //
+      // 59 → 62: renewTier, listTierEnrolments, revokeTierEnrolment
+      // (notme-337d82). Reviewed:
+      //   renewTier — verifies the PoP itself and every condition of the
+      //             human's approval (not revoked, inside the horizon, same
+      //             epoch, approver still holds certMint and the scopes). It
+      //             can only re-issue what was already approved, for the key
+      //             already approved, never past the horizon the human chose.
+      //   list    — fingerprints, horizons and scopes for a principal: an
+      //             audit view, nothing secret.
+      //   revoke  — only ever STOPS renewal (narrows). A leaked stub could
+      //             revoke machines: a denial of service strictly weaker than
+      //             revokeEpoch.
+      //
+      // 62 → 63: redeemInviteToken REMOVED; reserveInviteToken and
+      // joinInviteWithFederated added (notme-3dfe15). Reviewed:
+      //   redeemInviteToken — burned an invite without creating anything, so
+      //             the route that called it had to create the principal in a
+      //             second call; the gap between the two is the defect. Off
+      //             the surface.
+      //   reserve — writes a reservation row and grants nothing. The invite
+      //             is consumed only inside passkeyVerifyRegistration, by a
+      //             credential that verified. A stub holder needs the invite
+      //             token to reserve, and with it could already register.
+      //             It returns a fresh reservation secret (review M1) — the
+      //             caller's own, binding only the reservation it just made.
+      //   joinInviteWithFederated — redeems an invite and links an identity
+      //             the caller claims to have verified. A stub holder could
+      //             already do both (createPrincipalWithCapabilities,
+      //             linkFederatedId), so no new capability class; it also
+      //             refuses an identity that is already linked, which
+      //             linkFederatedId did not until review I1 (it now throws
+      //             on an existing link instead of moving it).
+      //
+      // 63 → 65: registrationIsFirstUser, beginFirstUserRegistration
+      // (review L2). Reviewed:
+      //   registrationIsFirstUser — a boolean read: "no passkey user and no
+      //             administrator with a linked identity". Strictly less than
+      //             getBootstrapState already tells an anonymous caller.
+      //   beginFirstUserRegistration — marks a userId as the deployer's
+      //             registration, but only after consumeBootstrapCode accepts
+      //             the code, which a stub holder could already call (and
+      //             with the code could already register as admin through
+      //             the route). It moves the admin decision OFF the
+      //             passkey_users count, which any stub-issued challenge on
+      //             an authority with no passkey user used to satisfy.
+      //             Since notme-a2e75d it (and markClaimRegistration)
+      //             returns the mark's fresh secret, as reserve does — the
+      //             caller's own, binding only the mark it just made.
+      //
+      // 65 → 66: loginWithFederated (review F1, notme-3dfe15 part 1).
+      // Reviewed: it returns the principal and scopes for an identity the
+      // caller claims to have verified, and spends a jti. A stub holder could
+      // already read both (findPrincipalByOIDC, getPrincipalScopes) and mint
+      // a session with getSessionSecret; the only write is a dpop_jtis row,
+      // which at worst pre-spends a token whose jti the holder already knows.
+      //
+      // 66 → 67: spendOidcJti (notme-b0d10f). The DO spend for /cert/gha,
+      // /cert (oidc proof), /token and /bootstrap/claim, which spent in KV
+      // alone. Reviewed: it takes no token, returns a boolean, and its only
+      // write is one dpop_jtis row under the `oidc:` prefix, kept to
+      // exp + 300s. A stub holder can pre-spend a token whose issuer and jti
+      // it already knows — the same reach loginWithFederated already gives,
+      // and a denial of service against one token, not a credential.
+      //
+      // 67 → 68: listNotDeliveredCerts (notme-b35676). Reviewed: read-only,
+      // takes only a row limit, and returns serials, a reason and a time —
+      // what /.well-known/ct-not-delivered.json publishes to anyone, about
+      // certificates whose precerts are already in the public log.
+      //
+      // 68 → 69: getSignedEpochHistory (notme-6a4f23). Reviewed: it signs a
+      // document of PUBLIC data (the listEpochKeys payload, the revocation
+      // records and the current epoch) with the root, and its only write is
+      // its own seqno counter. Not a signing oracle: the caller supplies no
+      // bytes, and the signing input leads with the domain tag
+      // "notme-epoch-history-v1" under CBOR map key 0, which no CABundle
+      // encoding carries, so the signature cannot pass as a bundle's. A stub
+      // holder can advance the document's seqno, as any GET of epochs.json
+      // does. Also reviewed with it: revokeEpoch() now takes an optional
+      // reason, published verbatim in epochs.json; a stub holder could
+      // already revoke, the reason is bounded (200 chars, no control
+      // characters, checked in the DO), and it adds no capability class.
+    ).toBe(69);
   });
 });
 
@@ -163,7 +459,8 @@ describe("RPC surface is an allow-list, not an accident", () => {
 // AuthService.heldCerts is the live instance of the pattern. It holds
 // per-session credential state, and the class is reachable by service binding.
 // The mitigations are real — workerd gives a fresh `this` per RPC session, so a
-// caller sees only their own, and CryptoKeys are not structured-cloneable — but
+// caller sees only their own, and workerd's serializer refuses CryptoKey (see
+// rpc.cryptokey.isolation below — a workerd behaviour, not a W3C one) — but
 // they are properties of the RUNTIME, not of the declaration, and the rule this
 // file exists to enforce is about the declaration: on an RPC-reachable class
 // write `#foo`, never `private foo`.
@@ -184,5 +481,240 @@ describe("instance fields are private too, not merely TypeScript-private", () =>
       `AuthService instance exposes ${ours.join(", ")} — a TypeScript \`private\` ` +
         `field is erased and stays readable on a stub. Use #private.`,
     ).toEqual([]);
+  });
+
+  it("AuthSession exposes no own state on an instance (notme-153f03)", async () => {
+    // The session holds the verified certs, the signing cert's public key and env. Its
+    // instance is what a stub points at, so a TS `private` field here would
+    // be readable as a property over the binding.
+    const { publicKey } = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const session = new AuthSession(
+      {
+        mtlsCert: "m",
+        signingCert: "s",
+        signingPublicKey: publicKey,
+        identity: "wimse://notme.bot/test/fields",
+        scopes: [],
+        expiresAt: 0,
+        epoch: 1,
+      },
+      { env: {}, authorityState: async () => ({ epoch: 1 }) },
+    );
+    expect(Object.getOwnPropertyNames(session)).toEqual([]);
+    expect(Object.getOwnPropertySymbols(session)).toEqual([]);
+  });
+});
+
+// ── rpc.cryptokey.isolation ─────────────────────────────────────────────────
+//
+// THREAT_MODEL's "CryptoKey extraction" row names this test. It did not
+// exist, and the mitigation the row asserted was wrong as stated: five sites
+// claimed "CryptoKey is not Structured Cloneable" as a PLATFORM property
+// needing no check. W3C WebCrypto declares `[Serializable] interface
+// CryptoKey`, and Node clones a non-extractable Ed25519 private key happily
+// — so as a statement about the web platform it is false, and a future
+// change reasoned against it reasons from a false premise (notme-bcbd74).
+//
+// What is true is narrower and had never been measured: WORKERD's serializer
+// refuses CryptoKey. Pinning it matters more than it first looks, because
+// this is not a redundant second line of defence —
+// `getOrCreateSigningKey()` is in the allow-list above and returns
+// `{ signingKey: CryptoKey, verifyKey: CryptoKey, keyId }`, so a stub holder
+// DOES reach a method that hands back the authority's private key, and the
+// serializer is the only thing that stops delivery. Non-extractability does
+// not cover it either: keys are non-extractable only in `ephemeral` mode and
+// production runs `cf-managed`.
+//
+// If workerd ever aligns with the IDL, that changes from "hardened" to "key
+// export endpoint", and it should break here loudly.
+/**
+ * Drive an RPC call expected to fail serialization, consuming BOTH rejections.
+ *
+ * `await expect(p).rejects.toThrow()` handles the promise it is given, but a
+ * workerd stub call that fails to serialize its argument leaves a second
+ * rejected promise behind, which vitest reports as an unhandled error and
+ * exits non-zero on — with every test still passing. That is how this file
+ * went green locally and red in the ship gate.
+ */
+async function expectRpcRefusesCryptoKey(call: () => Promise<unknown>) {
+  let message = "";
+  try {
+    const p = call();
+    // Attach a no-op handler before awaiting, so the duplicate rejection has
+    // an owner even if the await path takes the other one.
+    p.catch(() => {});
+    await p;
+  } catch (e) {
+    message = String((e as Error)?.message ?? e);
+  }
+  expect(message, "the call did not fail at all").not.toBe("");
+  expect(message).toMatch(/DataCloneError|serialize/i);
+}
+
+describe("rpc.cryptokey.isolation", () => {
+  const edKeys = () =>
+    crypto.subtle.generateKey({ name: "Ed25519" }, false, [
+      "sign",
+      "verify",
+    ]) as Promise<CryptoKeyPair>;
+
+  it("workerd refuses to serialize a CryptoKey at all", async () => {
+    const { privateKey } = await edKeys();
+    expect(privateKey.extractable).toBe(false);
+    expect(() => structuredClone(privateKey)).toThrow(/serialize|clone/i);
+  });
+
+  it("...so a CryptoKey cannot cross a real RPC boundary", async () => {
+    // The serializer runs before the method does, so the argument being of
+    // the wrong type for getEpochPublicKey is irrelevant — and deliberate:
+    // this probes the BOUNDARY, not a particular method's validation.
+    const { privateKey } = await edKeys();
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-isolation"),
+    );
+    await expectRpcRefusesCryptoKey(() =>
+      // @ts-expect-error probing the serializer with a deliberately wrong type
+      stub.getEpochPublicKey(privateKey),
+    );
+  });
+
+  it("...nor nested inside an argument object", async () => {
+    // AuthService.authenticate's parameter used to be exactly this shape:
+    // { mtlsCert, signingCert, mtlsKey: CryptoKey, signingKey: CryptoKey }.
+    // Nesting does not help; the whole argument fails to serialize. So the
+    // keys are optional now and possession is PROVED with signatures instead
+    // (notme-fbbfbc) — strings, which do cross a binding.
+    const { privateKey } = await edKeys();
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-isolation"),
+    );
+    await expectRpcRefusesCryptoKey(() =>
+      // @ts-expect-error probing the serializer with a deliberately wrong type
+      stub.getEpochPublicKey({
+        mtlsCert: "-----BEGIN CERTIFICATE-----",
+        signingCert: "-----BEGIN CERTIFICATE-----",
+        mtlsKey: privateKey,
+        signingKey: privateKey,
+      }),
+    );
+  });
+
+  it("THE FIX: no method returning the authority's private key is on the surface", () => {
+    // getOrCreateSigningKey() used to be here, returning
+    // { signingKey: CryptoKey, verifyKey, keyId }. A stub holder called it and
+    // the ONLY thing that stopped delivery was the serializer above — a
+    // workerd behaviour no standard requires. It is #getOrCreateSigningKey()
+    // now, so the property is "not returnable" rather than "undeliverable by
+    // a quirk" (notme-eedc9c).
+    expect(rpcSurface(SigningAuthority)).not.toContain("getOrCreateSigningKey");
+  });
+
+  it("...and no surface method hands back a CryptoKey by any other name", async () => {
+    // The generic form, so the next method with a CryptoKey in its return
+    // type is caught when it is written rather than when it is exploited.
+    //
+    // Restricted to methods declaring NO parameters. The first version called
+    // everything and passed — while leaving unhandled rejections in the DO
+    // isolate from methods dereferencing `params.x` on undefined. Vitest
+    // reports those as errors and exits non-zero NON-DETERMINISTICALLY, so
+    // the suite was green locally and red in the ship gate. A test that
+    // sometimes fails for a reason unrelated to its subject is worse than no
+    // test: it trains you to re-run.
+    //
+    // Arity is read from the prototype, not hand-listed, so a new zero-arg
+    // method is swept automatically. Methods that take arguments are covered
+    // by the compile-time check below, which does not have to call anything.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-return-sweep"),
+    );
+    const proto = SigningAuthority.prototype as unknown as Record<string, Function>;
+    const nullary = rpcSurface(SigningAuthority).filter(
+      (n) => typeof proto[n] === "function" && proto[n]!.length === 0,
+    );
+    expect(nullary.length, "arity filter matched nothing").toBeGreaterThan(5);
+
+    const leaks: string[] = [];
+    for (const name of nullary) {
+      let result: unknown;
+      try {
+        result = await (stub as unknown as Record<string, () => Promise<unknown>>)[
+          name
+        ]!();
+      } catch (e) {
+        const msg = String((e as Error).message ?? e);
+        if (/CryptoKey/.test(msg)) leaks.push(`${name}: ${msg}`);
+        continue;
+      }
+      // A delivered CryptoKey would mean workerd started serializing them —
+      // the day the old mitigation evaporates.
+      const values = result && typeof result === "object" ? Object.values(result) : [];
+      if (values.some((v) => v instanceof CryptoKey)) leaks.push(`${name}: returned a CryptoKey`);
+    }
+    expect(leaks, `methods returning key material: ${leaks.join(" | ")}`).toEqual([]);
+  });
+
+  it("...including the ones that take arguments — checked by the compiler", () => {
+    /**
+     * The half the runtime sweep cannot reach. `KeyReturning` resolves to the
+     * names of any public method whose resolved return type has a CryptoKey
+     * property; `satisfies never` fails the BUILD if that set is inhabited,
+     * so a method added with `Promise<{ key: CryptoKey }>` does not compile
+     * regardless of how many arguments it takes.
+     *
+     * tsc -p tsconfig.test.json runs in `task worker:check`, so this is a
+     * gate and not a comment.
+     */
+    type Await<T> = T extends Promise<infer U> ? U : T;
+    // `T[K] extends CryptoKey`, not the reverse. The reverse direction reads
+    // "could a CryptoKey be assigned here", which is true of every wide
+    // member type an array or index signature brings along — it flagged five
+    // methods returning plain arrays of strings.
+    type HasCryptoKey<T> = T extends CryptoKey
+      ? true
+      : T extends readonly unknown[] | Function
+        ? // Arrays are excluded deliberately: mapping over one walks its
+          // built-in members, and this flagged five methods that return
+          // plain string[]. No RPC method returns an array OF keys, and if
+          // one ever did the runtime sweep would still see it.
+          false
+        : T extends object
+          ? {
+              [K in keyof T]-?: T[K] extends CryptoKey ? true : never;
+            }[keyof T] extends never
+            ? false
+            : true
+          : false;
+    type KeyReturning = {
+      [K in keyof SigningAuthority]: SigningAuthority[K] extends (
+        ...args: never[]
+      ) => infer R
+        ? HasCryptoKey<Await<R>> extends true
+          ? K
+          : never
+        : never;
+    }[keyof SigningAuthority];
+
+    // Extract<..., string> because the mapped type also yields `undefined`
+    // for optional members, which is noise rather than a method name.
+    const keyReturningMethods: Extract<KeyReturning, string>[] = [];
+    keyReturningMethods satisfies never[];
+    expect(keyReturningMethods).toEqual([]);
+  });
+
+  it("the authority still signs — the key was hidden, not removed", async () => {
+    // Negative control for the two above. If #getOrCreateSigningKey had been
+    // broken by the rename rather than merely made private, every assertion
+    // in this describe would pass over a DO that can no longer do anything,
+    // and the file would look hardened because it was inert.
+    const stub = env.SIGNING_AUTHORITY.get(
+      env.SIGNING_AUTHORITY.idFromName("cryptokey-still-signs"),
+    );
+    const pem = await stub.getCACertificatePem();
+    expect(pem).toContain("BEGIN CERTIFICATE");
+    const jwk = await stub.getPublicKeyJwk();
+    expect(jwk.crv).toBe("Ed25519");
   });
 });

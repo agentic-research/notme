@@ -473,6 +473,13 @@
         line-height: 1.4;
       }
 
+      .stat-src {
+        display: block;
+        margin-top: 4px;
+        font-size: 0.75rem;
+        color: var(--ink-3);
+      }
+
       /* ── Thesis — big quote ── */
       .thesis {
         margin: 56px 0;
@@ -744,22 +751,19 @@
         </section>
 
         <!-- ── The numbers ── -->
+        <!-- Every tile carries a .stat-src link to where the number comes
+             from (notme-8639dd). A number nobody can check does not go here;
+             site-claims-honesty.test.ts enforces it. -->
         <div class="stats">
           <div class="stat">
             <span class="stat-num danger">9/10</span>
-            <span class="stat-label">AI coding tools use your credentials</span>
+            <span class="stat-label">AI coding tools we surveyed use your credentials</span>
+            <a class="stat-src" href="/research#agents-are-you">source: our survey of ten tools, march 2026</a>
           </div>
           <div class="stat">
             <span class="stat-num danger">24</span>
             <span class="stat-label">CVEs across major AI IDEs</span>
-          </div>
-          <div class="stat">
-            <span class="stat-num info">21%</span>
-            <span class="stat-label">of agents have their own identity</span>
-          </div>
-          <div class="stat">
-            <span class="stat-num warning">0</span>
-            <span class="stat-label">open-source agent identity standards</span>
+            <a class="stat-src" href="/research#agents-are-you">source: the IDEsaster vulnerability class</a>
           </div>
         </div>
 
@@ -834,12 +838,12 @@
             <tr>
               <td>identity</td>
               <td>your GitHub PAT</td>
-              <td>agent's own Ed25519 cert (ML-DSA-44 ready)</td>
+              <td>agent's own Ed25519 cert</td>
             </tr>
             <tr>
               <td>scope</td>
               <td>all your repos</td>
-              <td>per-repo scope in cert + orchestrator enforcement</td>
+              <td>repo identity in the cert subject; scopes in the cert chain, narrowing at each hop</td>
             </tr>
             <tr>
               <td>lifetime</td>
@@ -849,12 +853,12 @@
             <tr>
               <td>revocation</td>
               <td>rotate your token</td>
-              <td>near-real-time edge revoke</td>
+              <td>revoke the signing generation (within 5 min), or the principal's grants</td>
             </tr>
             <tr>
               <td>audit trail</td>
               <td>nothing</td>
-              <td>content-linked chain + in-toto/DSSE handoff envelopes</td>
+              <td>content-linked chain hash; in-toto/DSSE envelopes planned</td>
             </tr>
             <tr>
               <td>on compromise</td>

@@ -47,8 +47,10 @@ const config :Workerd.Config = (
 );
 
 const notmeWorker :Workerd.Worker = (
-  compatibilityDate = "2026-03-01",
-  compatibilityFlags = ["nodejs_compat"],
+  compatibilityDate = "2026-10-19",
+  # No compatibilityFlags: from 2026-08-04 the date enables nodejs_compat
+  # (and _v2), and workerd REFUSES to start with the redundant flag listed
+  # (notme-430ad1). Node.js compat is still on, as it always was here.
 
   modules = [
     ( name = "worker",
@@ -67,6 +69,15 @@ const notmeWorker :Workerd.Worker = (
     ( name = "GHA_ALLOWED_OWNERS",
       text = "agentic-research",
     ),
+    # Where AuthSession.proxy() may send an agent's requests (ADR-009,
+    # notme-baea8c): comma-separated hosts, `*.suffix` for subdomains, https
+    # only. Unset allows NOTHING, so proxy() refuses every destination until
+    # this is set. List only what agents need; never a wildcard over the
+    # authority's own zone. The authority's own host (SIGNET_AUTHORITY_URL,
+    # SITE_URL) is refused unless listed exactly. E.g.:
+    # ( name = "PROXY_ALLOWED_DESTINATIONS",
+    #   text = "api.github.com",
+    # ),
     # Key storage mode — ephemeral for local dev (no private key on disk)
     ( name = "NOTME_KEY_STORAGE",
       text = "ephemeral",

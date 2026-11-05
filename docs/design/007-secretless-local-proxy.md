@@ -5,7 +5,7 @@
 # 007: Secretless Local Proxy
 
 **Status:** Partially implemented (audited 2026-08-04)
-**Bead:** notme-ae3130 (open — Platform interface in this doc differs from the implementation)
+**Bead:** notme-ae3130 (Platform interface and Files-changed drift — resolved: the interface block and file list below match `worker/src/platform.ts` as of 2026-11-02)
 
 > **AUDIT NOTE (2026-08-04).** This doc had no Status line, so it read as a
 > live problem statement with no indication which problems were solved. State
@@ -22,6 +22,38 @@
 > holds whenever `NOTME_KEK_SECRET` is set, and is asserted by
 > `src/__tests__/key-encryption.test.ts`. It does NOT hold in `cf-managed` mode
 > without a secret, which relies solely on Cloudflare's encryption at rest.
+>
+> **NOTE (2026-09-25, `notme-41d0d3`): the secretless claim is currently
+> discharged by adding a secret, and that is worth saying out loud.**
+>
+> The Workers platform offers no keyless signing primitive. Checked rather
+> than assumed: an `mtls_certificate` binding yields a `Fetcher` whose only
+> operation is presenting a client certificate on outbound TLS — the Worker
+> truly never holds that key, and it cannot sign X.509 or JWS with it; and a
+> Secrets Store binding's `.get()` returns the value into Worker memory. So
+> whenever this authority signs, the private key is in the Worker's address
+> space, and no configuration avoids that.
+>
+> It follows that `NOTME_KEK_SECRET` defends exactly one surface: reading DO
+> storage WITHOUT code execution (a Cloudflare insider, a backup exfil, a
+> storage-layer bug). An attacker who can run Worker code reads the secret
+> from `env` and signs regardless. The cost on the other side is custody —
+> losing the secret bricks the authority, deliberately, because the
+> alternative is silently minting a new root.
+>
+> And it is not the cheapest forgery path. Per ADR-019 / `notme-8e8836`, the
+> CA is self-signed and the only thing binding "this CA" to "notme" is WebPKI
+> on the fetch to `auth.notme.bot`. Consumer trust already rests on hostname
+> control rather than on the key's secrecy.
+>
+> The property this ADR is reaching for is better served by making misuse
+> DETECTABLE than by making the key unreadable: an issuance transparency log
+> (`notme-907299`, `notme-1b46a8`) means a stolen key cannot mint unobserved,
+> and it is what would let the online key be ephemeral — this authority
+> already has an `ephemeral` storage mode, epoch rotation, retired-key
+> publication and five-minute leaf TTLs. What keeps the key persistent today
+> is that consumers pin the CA bundle; a log is the anchor that is not the
+> key.
 >
 > Also note the file references in "Problem" are stale: `cert-exchange.ts` no
 > longer exists.
@@ -146,7 +178,7 @@ graph LR
 
 **Ephemeral** (local dev, CI): `getOrCreateSigningKey()` generates the key with `extractable: false` and does NOT write the JWK to SQLite. The key lives only in `this.signingKey` as an opaque `CryptoKey` handle — the raw key bytes are inside BoringSSL, not on the V8 heap. `crypto.subtle.exportKey()` throws. `crypto.subtle.sign()` still works (BoringSSL signs internally). Restart = new key. `cat *.sqlite` yields nothing. No JS code path can exfiltrate the key material.
 
-**Encrypted** (self-hosted, not yet implemented): Designed but not built. Will derive a KEK from a machine-generated secret via HKDF (`vault/src/crypto.ts`), wrap the JWK before writing to SQLite, unwrap and re-import as non-extractable on read. Currently, setting `NOTME_KEY_STORAGE=encrypted` is a hard startup error to prevent a false sense of security.
+**Encrypted**: built since this was written (notme-41d0d3), in `worker/src/key-encryption.ts`. It derives a KEK via HKDF from an operator secret, `NOTME_KEK_SECRET` (the construction recovered from the retired `vault/src/crypto.ts`, ADR-012), and wraps the JWK before it is written to SQLite. Setting `NOTME_KEK_SECRET` selects this mode; `NOTME_KEY_STORAGE=encrypted` without it, or with a secret under 128 bits, is a hard startup error (`worker/src/platform.ts:84-118`). Production does not run it yet: turning it on waits on the KEK rehearsal (`scripts/kek-rehearsal.sh`), and notme-41d0d3 stays open until then.
 
 **CF-managed** (production): Current behavior, with one change: after importing the key from SQLite, re-import with `extractable: false`. CF handles encryption at rest for DO SQLite. The key is non-extractable in memory.
 
@@ -277,7 +309,7 @@ These are non-negotiable properties the implementation must maintain. Adversaria
 2. **No extractable CryptoKey in steady state.** After key generation/import completes, `crypto.subtle.exportKey()` on the signing key must throw. Extractable is only `true` during the wrap/persist instant.
 3. **Fail closed on mode misconfiguration.** `NOTME_KEY_STORAGE=encrypted` without a valid `NOTME_KEK_SECRET` is a hard startup error.
 4. **No private key material in any RPC response or error message.** No method on the signing authority DO returns `"d"`, `"k"`, PEM private key headers, or raw key bytes. Error messages must not leak key material.
-5. **JTI replay protection works on all platforms.** KV on CF, SQLite on local — same semantic guarantee.
+5. **JTI replay protection works on all platforms.** KV on CF, SQLite on local. (The guarantee is not the same: KV is eventually consistent, so a KV-only spend can accept one token twice on two edge nodes. Since 2026-11 `/join`, `/auth/oidc/login` and the AUTH binding spend OIDC jtis in the SigningAuthority DO; `/cert/gha`, `/cert` and `/token` are still KV-only, notme-b0d10f.)
 6. **Constant-time comparison for security-sensitive strings.** Bootstrap codes, session tokens, and any value whose timing could leak information use HMAC-based constant-time comparison.
 
 ## Adversarial test strategy
@@ -367,7 +399,7 @@ Every endpoint gets a "try to hack it" test alongside the happy path. Tests are 
 - `worker/src/__tests__/platform.test.ts` — Platform detection + validation tests
 - `worker/e2e/contract.spec.ts` — Playwright e2e contract tests with virtual authenticator
 - `worker/test-local.sh` — workerd smoke test script
-- `worker/test-e2e.sh` — Playwright e2e runner (starts workerd, extracts bootstrap code)
+- `worker/test-e2e.sh` — Playwright e2e runner (starts workerd with a generated BOOTSTRAP_CODE binding)
 - `packages/melange-notme-app.yaml` — Melange package for worker bundle + config
 
 ### Modified files

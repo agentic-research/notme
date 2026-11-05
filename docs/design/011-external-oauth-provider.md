@@ -9,7 +9,17 @@
 **Date:** 2026-06-25
 **Bead:** notme-0078a9 (open, P3) — was filed 2026-06-25 and scopes this exact file; the TBD note here predated it and was never updated.
 **Relates to:** notme `/oauth/token` (client_credentials) already shipped via cloister.capnp identity-bridge tenant; cloister ADR-0007 (Interlace substrate, the orthogonal internal trust layer); cloister ADR-0018 (notme co-location)
+> **CORRECTION (2026-11-02, `notme-c7819f`).** The first clause is wrong, and
+> this document's own inventory below says so: notme has no `/oauth/token`
+> path and no `client_credentials` grant. What ships is `POST /token`, which
+> mints DPoP-bound tokens (RFC 9449) for a first-party session cookie and,
+> as the one advertised grant, RFC 8693 token exchange with a GitHub Actions
+> OIDC subject token (`AUTHORITY_GRANT_TYPES`, `worker/src/as-metadata.ts`).
+> The proposed `token.ts` line and open question 4 inherited the false
+> premise; both are annotated below.
 **Companion reading:** [Cloudflare "OAuth for All" (2026-06)](https://blog.cloudflare.com/oauth-for-all/)
+
+> **Client registration: replacement PROPOSED in [ADR-022](./022-client-registration.md) (status: proposed, 2026-10-26).** ADR-022 proposes replacing the apps registry below (`client_id` / `client_secret` rows, `apps-registry.ts`, open question 2) with Client ID Metadata Documents, with DCR accepted and stored as notme-hosted CIMD and no client secrets. Until ADR-022 is accepted, this ADR's registry design stands as written; nothing in this banner is implemented. Consent, introspection and revocation remain this ADR's scope either way.
 
 ## Context
 
@@ -112,6 +122,7 @@ notme/
 │   ├── authorize.ts          // GET /oauth/authorize handler
 │   ├── consent.ts            // POST /oauth/consent handler + static HTML
 │   ├── token.ts              // POST /oauth/token (extends existing client_credentials with auth-code grant)
+│   │                         //   [2026-11-02: no client_credentials grant exists to extend — notme-c7819f]
 │   ├── introspect.ts         // POST /oauth/introspect (RFC 7662)
 │   ├── revoke.ts             // POST /oauth/revoke (RFC 7009)
 │   ├── apps-registry.ts      // CRUD over client_id / client_secret / redirect_uris / scopes
@@ -144,6 +155,13 @@ Recommend: **1:1 mirror initially**; add a curation layer when external develope
 2. **Apps-registry storage**: a new DO class, or extend notme's existing DO? (Recommend: extend existing DO — apps registry is small, append-mostly.)
 3. **Token-lifetime defaults**: align with CF's "multiple hours" or with Interlace's short-lease posture? (Recommend: aligned with Interlace — short access tokens + refresh-token rotation; the substrate principle is "short leases, frequent re-issuance.")
 4. **Compatibility with notme's existing `client_credentials` grant**: keep both grants on the same `/oauth/token` endpoint (RFC 6749-compliant — `grant_type` parameter disambiguates), or split? (Recommend: keep on one endpoint per spec.)
+
+   > **Restated (2026-11-02, `notme-c7819f`).** There is no existing
+   > `client_credentials` grant, so the question as posed has no subject. The
+   > real question: should a `client_credentials` grant be added at all, and
+   > if so on which path — a new `/oauth/token`, or alongside the existing
+   > DPoP mint at `/token`? The recommendation above is withdrawn until that
+   > is decided.
 
 ## Why P2
 

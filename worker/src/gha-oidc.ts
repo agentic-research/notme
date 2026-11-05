@@ -4,10 +4,28 @@
 // Spec: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect
 
 import { z } from "zod";
+import { GHA_REJECTED_EVENTS } from "@notme/contract";
+import { JWKS_FETCH_TIMEOUT_MS, JWKS_POLICY, JwksCache } from "./auth/jwks-cache";
 
-const GHA_ISSUER = "https://token.actions.githubusercontent.com";
+export const GHA_ISSUER = "https://token.actions.githubusercontent.com";
+
+/**
+ * Refuse a token minted for a GHA_REJECTED_EVENTS run (notme-fbb00e).
+ *
+ * `@notme/contract` says those tokens "MUST NOT receive a notme bridge
+ * cert" and nothing read `event_name`. `pull_request_target` runs FORK code
+ * in the UPSTREAM context, so its token names the upstream owner and clears
+ * GHA_ALLOWED_OWNERS; `pull_request` is listed so its refusal is loud too.
+ * Only GitHub-signed claims reach this, so the value is trustworthy. A token
+ * with no `event_name` is not refused here: GitHub always sets it, and the
+ * contract names events to reject, not ones to require.
+ */
+export function assertGhaEventAllowed(eventName: unknown): void {
+  if (typeof eventName === "string" && (GHA_REJECTED_EVENTS as readonly string[]).includes(eventName)) {
+    throw new Error(`event_name ${eventName} is not accepted (GHA_REJECTED_EVENTS)`);
+  }
+}
 const JWKS_URL = `${GHA_ISSUER}/.well-known/jwks`;
-const JWKS_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 export const GHAClaimsSchema = z.object({
   // Standard JWT
@@ -39,6 +57,24 @@ export const GHAClaimsSchema = z.object({
 
 export type GHAClaims = z.infer<typeof GHAClaimsSchema>;
 
+/**
+ * GHA_ALLOWED_OWNERS (CSV, case-insensitive) as a set. Empty or absent means
+ * NO owner is allowed. One parser for every GitHub-token path: /cert/gha,
+ * the /token exchange, and the AUTH binding's mintBridgeCert gha-oidc proof,
+ * which skipped the check until security review F7.
+ */
+export function getAllowedOwners(env: {
+  GHA_ALLOWED_OWNERS?: string;
+}): Set<string> {
+  const raw: string = env.GHA_ALLOWED_OWNERS ?? "";
+  return new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
 interface JWK {
   kty: string;
   kid: string;
@@ -49,21 +85,23 @@ interface JWK {
 }
 
 // Module-scope JWKS cache — lives for the lifetime of the Workers isolate.
-// GitHub rotates keys infrequently; a stale key causes a validation failure
-// on the next request, which will retry with a fresh fetch.
-let jwksCache: { keys: JWK[]; cachedAt: number } | null = null;
-
-async function fetchJWKS(): Promise<JWK[]> {
-  const now = Date.now();
-  if (jwksCache && now - jwksCache.cachedAt < JWKS_TTL_MS)
-    return jwksCache.keys;
+// An unknown kid refetches once (rate-limited, past the edge cache), and a
+// failed fetch serves the cached keys up to 24 h (notme-a36d10, review M2;
+// the old comment here promised the refetch, and nothing did it). The rules
+// are in auth/jwks-cache.ts.
+const jwksCache = new JwksCache<JWK>(async (_issuer, { bypassCache }) => {
   const res = await fetch(JWKS_URL, {
-    cf: { cacheTtl: 3600, cacheEverything: true },
+    ...(bypassCache ? { cache: "no-store" } : { cf: { cacheTtl: 3600, cacheEverything: true } }),
+    signal: AbortSignal.timeout(JWKS_FETCH_TIMEOUT_MS),
   } as RequestInit);
   if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
-  const body = (await res.json()) as { keys: JWK[] };
-  jwksCache = { keys: body.keys, cachedAt: now };
-  return body.keys;
+  const body = (await res.json()) as { keys?: unknown };
+  if (!Array.isArray(body.keys)) throw new Error("JWKS fetch failed: no keys array");
+  return body.keys as JWK[];
+}, JWKS_POLICY);
+
+function fetchJWKS(kid: string): Promise<JWK[]> {
+  return jwksCache.get(GHA_ISSUER, (keys) => keys.some((k) => k.kid === kid));
 }
 
 // b64urlDecode imported from SDK — single implementation for all JWT code
@@ -99,7 +137,7 @@ export async function validateGHAToken(
     throw new Error(`wrong audience: ${aud.join(",")}`);
 
   // RS256 signature verification
-  const keys = await fetchJWKS();
+  const keys = await fetchJWKS(header.kid);
   const jwk = keys.find((k) => k.kid === header.kid);
   if (!jwk) throw new Error(`unknown key id: ${header.kid}`);
 
@@ -119,6 +157,9 @@ export async function validateGHAToken(
     signingInput,
   );
   if (!valid) throw new Error("invalid signature");
+
+  // Fork-PR events buy nothing, on every path that calls this (notme-fbb00e).
+  assertGhaEventAllowed(rawPayload.event_name);
 
   // Zod parse — strong type guarantee on returned claims
   const parsed = GHAClaimsSchema.safeParse(rawPayload);

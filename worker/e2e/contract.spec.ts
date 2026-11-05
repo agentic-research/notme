@@ -18,21 +18,11 @@ import { test, expect, type CDPSession } from "@playwright/test";
 
 const BASE = "http://localhost:8788";
 
-// ── Helper: extract bootstrap code from workerd logs ──
-// The signing authority prints it to console on first passkey registration attempt.
-// We trigger it by POSTing to register/options without a code, then parse the 401 response.
-// The actual code is only in stdout — for e2e we get it via DO RPC (the register/options
-// flow generates it as a side effect, but doesn't return it).
-//
-// Workaround: we call register/options twice:
-//   1st: triggers code generation (returns 401 "bootstrap code required")
-//   2nd: with code from server logs... but we can't read server logs from Playwright.
-//
-// Real workaround: use the /auth/passkey/reset endpoint which echoes the code requirement,
-// OR add a test-only /__debug/bootstrap endpoint in local mode.
-//
-// For now: we use a two-phase approach where the test script starts workerd and
-// captures the bootstrap code from stdout, passing it via an env var.
+// ── Bootstrap code ──
+// The worker never mints or logs a bootstrap code (notme-addef9); an operator
+// sets BOOTSTRAP_CODE. test-e2e.sh plays the operator: it generates a code,
+// binds it into its copy of config.capnp, and passes the same value here as
+// NOTME_BOOTSTRAP_CODE (notme-05324c).
 
 const BOOTSTRAP_CODE = process.env.NOTME_BOOTSTRAP_CODE || "";
 
@@ -58,7 +48,7 @@ test.describe("discovery + public endpoints", () => {
     expect(key.crv).toBe("Ed25519");
     expect(key.use).toBe("sig");
     expect(key.alg).toBe("EdDSA");
-    expect(key.kid).toMatch(/^[0-9a-f]{8}$/);
+    expect(key.kid).toMatch(/^[0-9a-f]{32}$/); // 128-bit kid, src/key-id.ts
     expect(key.x).toBeTruthy();
     // Must NOT contain private key material
     expect(key.d).toBeUndefined();
@@ -275,7 +265,7 @@ test.describe("passkey registration + authenticated access", () => {
     });
     expect(res.status()).toBe(200);
     const body = await res.json();
-    expect(body.authority.keyId).toMatch(/^[0-9a-f]{8}$/);
+    expect(body.authority.keyId).toMatch(/^[0-9a-f]{32}$/); // 128-bit kid, src/key-id.ts
     expect(body.authority.epoch).toBeGreaterThanOrEqual(1);
     expect(body.passkey.users).toBeGreaterThanOrEqual(1);
     expect(body.passkey.credentials).toBeGreaterThanOrEqual(1);

@@ -1,19 +1,16 @@
 // @notme/contract — cross-repo contract for the notme ecosystem.
 //
-// Single source of truth for invariants shared between the two repos that
-// implement the notme protocol:
-//   - `notme`     (this package's home) — the CONSUMER side: GHA action,
-//                  worker that holds the bridge cert + AuthService, proxy.
-//   - `notme.bot` (separate repo) — the SERVER side: the signing authority,
-//                  passkey/OIDC login, /cert/* mint endpoints.
+// Single source of truth for invariants shared by the parts of this repo
+// that implement the notme protocol on both sides of the wire: the signing
+// authority and its /cert/* and login endpoints (worker/), and the
+// consumers that hold or present its credentials (action/, proxy/).
 //
-// Drift between the two is how confused-deputy bugs and silent breakage
-// slip in.
+// Drift between the two sides is how confused-deputy bugs and silent
+// breakage slip in.
 //
-// Consumed by notme components via the workspace alias `@notme/contract`.
-// notme.bot keeps a byte-identical mirror at src/contract.ts because it is
-// a separate git repo; its src/auth/contract.test.ts byte-diffs against
-// this file in CI when both repos are checked out side-by-side.
+// Consumed via the workspace alias `@notme/contract`. The separate
+// notme.bot repo once kept a byte-identical mirror of this file; it is
+// archived, so there is no mirror and no cross-repo check.
 //
 // Bump CONTRACT_VERSION on any breaking shape change; the consumer's pinned
 // version gates the upgrade. See ./README.md for the rules of the road.
@@ -60,10 +57,11 @@ export type OIDCAllowedAlg = (typeof OIDC_ALLOWED_ALGS)[number];
 //   - auth.notme.bot       — self-issued, always carries aud=notme.bot.
 //   - GitHub Actions       — workflows can mint tokens with arbitrary
 //                            audience via core.getIDToken(audience).
-// Google ID tokens carry aud=<client-id>.apps.googleusercontent.com and
-// would fail the audience check, so are intentionally omitted — including
-// them here would produce confusing "wrong audience" failures instead of
-// clear "untrusted issuer" rejections.
+// Google ID tokens carry aud=<client-id>.apps.googleusercontent.com, an
+// audience that belongs to a DEPLOYMENT, so Google cannot be in a baseline.
+// The worker adds it to its per-issuer audience map when the operator sets
+// GOOGLE_CLIENT_ID, pinned to that client id (notme-0a1ee8,
+// worker/src/auth/verify-proof.ts issuerAudiences).
 
 export const TRUSTED_ISSUERS = [
   "https://auth.notme.bot",
@@ -90,8 +88,17 @@ export type GHARejectedEvent = (typeof GHA_REJECTED_EVENTS)[number];
 // change — bump CONTRACT_VERSION.
 
 export const ERROR_STATUS = {
-  // /join, /auth/oidc/login: bad OIDC proof (signature, aud, issuer, nonce)
+  // /join: bad OIDC proof (signature, aud, issuer, nonce) offered to redeem
+  // an invite. 403, like the garbage-invite refusal beside it, so /join's
+  // refusals share one status and the proof check is no oracle for the rest.
   OIDC_PROOF_REJECTED: 403,
+  // /auth/oidc/login: bad OIDC proof (signature, aud, issuer, nonce).
+  // 401, not 403 (notme-778cbf): this is a login, and a refused credential
+  // is an authentication failure (RFC 9110 §15.5.2), the same answer as
+  // AUTH_FAILED and GHA_TOKEN_INVALID. OIDC_PROOF_REJECTED used to name this
+  // route too, but the route has always answered 401; the entry was wrong,
+  // not the route. Additive, so CONTRACT_VERSION is unchanged.
+  OIDC_LOGIN_REJECTED: 401,
   // /invites, scope grants: caller lacks the required scope
   SCOPE_INSUFFICIENT: 403,
   // /auth/passkey/reset on populated system without admin session

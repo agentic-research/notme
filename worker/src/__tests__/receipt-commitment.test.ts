@@ -259,6 +259,18 @@ describe("validateCommitment — timestamp bound (adversarial review of PR #61)"
     );
   });
 
+  it("refuses the extremes of the uint range: the epoch and MAX_SAFE_INTEGER", () => {
+    // notme-ad2a7a's acceptance criterion. Before the bound, requireUint
+    // admitted 0 .. 2^53-1 ms — 1970 to year 287396 — so a fabricated receipt
+    // could be dated anywhere in that span and still carry a valid signature.
+    for (const ts of [0, Number.MAX_SAFE_INTEGER]) {
+      expectCode(
+        () => validateCommitment(commitment({ timestamp_ms: ts }), FACTS),
+        "TIMESTAMP_OUT_OF_RANGE",
+      );
+    }
+  });
+
   it("refuses a postdated timestamp", () => {
     expectCode(
       () =>

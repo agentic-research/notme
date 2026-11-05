@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * import-public-key.do.test.ts — `importPublicKey` must return a key usable
  * for the algorithm it actually is.

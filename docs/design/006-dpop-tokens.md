@@ -75,6 +75,23 @@ Response: `{ "access_token": "<jwt>", "token_type": "DPoP", "expires_in": 300 }`
 **Response:** JWT access token bound to the DPoP key.
 **Rate limit:** 20 tokens/principal/hour via KV.
 
+> **CORRECTION (2026-11-02, `notme-c16e0d`).** The limit ships as **20 per
+> 60 seconds** per principal, through the `TOKEN_LIMITER` rate-limit binding
+> (`worker/wrangler.toml.example`, key `token:${principalId}`), not 20/hour
+> via KV — the KV limiter was removed as TOCTOU-prone. Cloudflare's
+> rate-limit `period` accepts only 10 or 60 seconds, so no hourly figure can
+> describe this binding. The effective ceiling is up to 1200 tokens per
+> principal per hour. The check runs only when the binding is present.
+>
+> **Order (2026-11-03, `notme-ed6114`).** Every check runs before the DO
+> call it guards. A request carrying a session cookie is first charged to
+> `token-ip:<source>` on the same binding (same 20/60 s; source is the IPv4
+> address, the IPv6 /64, or `none`, see THREAT_MODEL §4), because
+> the principal is unknown until the DO's session secret verifies the
+> cookie; the `token:${principalId}` check then runs before the live scopes
+> are read. A token exchange is keyed `token:${sub}` from the GitHub-signed
+> subject, before any DO call.
+
 ### GET /authorize (auth.notme.bot)
 
 **Redirect flow for cross-origin.** Query params: `redirect_uri`, `audience`, `state`.
@@ -82,7 +99,16 @@ If no session: redirects to /login. Otherwise: browser JS generates keypair, min
 
 ### GET /.well-known/jwks.json (auth.notme.bot)
 
-Ed25519 public key in JWK format. Cached 1hr. Updates on key rotation (epoch change).
+Ed25519 public key in JWK format.
+
+> **CORRECTION (2026-11-03, `notme-ed6114`).** This said "Cached 1hr.
+> Updates on key rotation (epoch change)." Nothing updates it: `rotate()`
+> purges neither the Cache API nor a client's copy, so a rotation reaches a
+> verifier only when both expire. It is now `Cache-Control: public,
+> max-age=300` (edge and client), so a verifier that reads only this
+> document sees a rotation within about 10 minutes (edge 300 s + client
+> 300 s), not about 2 hours. The CABundle at `/internal/ca-bundle` is the
+> 5-minute path (ADR-019 D7).
 
 ```json
 { "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": "<b64url>", "kid": "<keyId>", "use": "sig", "alg": "EdDSA" }] }
@@ -140,6 +166,18 @@ Server issues `DPoP-Nonce` header in responses. Client includes it in next proof
 
 On first request without nonce: server returns 401 with `{ "error": "use_dpop_nonce" }` + `DPoP-Nonce` header. Client retries with nonce. Subsequent responses include fresh nonces.
 
+> **CORRECTION (2026-11-02, `notme-c16e0d`).** The nonce is **opt-in and off
+> by default**. `dpopNonceRequired()` (`worker/src/auth/dpop-nonce.ts`) is
+> true only when `DPOP_REQUIRE_NONCE` is `true` or `1`, and that variable is
+> not set in any shipped wrangler config. With it off, `/token` issues no
+> challenge and no success-path nonce, and the only freshness control is the
+> client-written `iat`, accepted within ±60s (`worker/src/auth/dpop.ts`) —
+> so this section's "prevents clock manipulation" holds only when an
+> operator has turned the nonce on. When on: the challenge is **400**
+> `use_dpop_nonce` per RFC 9449 §8.1, not 401, and the nonce is a stateless
+> HMAC over its own timestamp (valid 300s), not over a server-side counter.
+> `worker/THREAT_MODEL.md` §4 already records this as "CLOSED, OPT-IN".
+
 ## Error Responses
 
 | Condition | Status | Error |
@@ -152,6 +190,13 @@ On first request without nonce: server returns 401 with `{ "error": "use_dpop_no
 | Nonce mismatch | 401 | `use_dpop_nonce` (+ new nonce in header) |
 | Rate limited | 429 | `rate_limit` |
 | Invalid audience | 400 | `invalid_audience` |
+
+> **CORRECTION (2026-11-02, `notme-c16e0d`).** Three rows differ from what
+> `/token` returns. An `iat` outside the window is reported as
+> `invalid_dpop_proof` (401) — there is no `proof_expired` code. A missing or
+> invalid nonce (only when the nonce is enabled) is **400** `use_dpop_nonce`.
+> The rate-limit error is `rate_limited`, not `rate_limit`. The other five
+> rows match.
 
 ## Files
 

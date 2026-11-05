@@ -86,7 +86,7 @@ async function buildDpopProof(opts: {
 
 // ── JWK Thumbprint (RFC 7638) ────────────────────────────────────────────────
 
-describe("computeJwkThumbprint", () => {
+describe("dpop.thumbprint.collision — computeJwkThumbprint (RFC 7638)", () => {
   it("computes correct SHA-256 thumbprint for a known EC key", async () => {
     const { computeJwkThumbprint } = await import("@agentic-research/dpop");
 
@@ -230,7 +230,7 @@ describe("validateDpopProof", () => {
     ).rejects.toThrow(/private/i);
   });
 
-  it("rejects invalid signature (tampered payload)", async () => {
+  it("dpop.signature.verification — rejects invalid signature (tampered payload)", async () => {
     const { validateDpopProof } = await import("../auth/dpop");
     const { keyPair, jwk } = await generateP256();
 
@@ -248,7 +248,7 @@ describe("validateDpopProof", () => {
     ).rejects.toThrow(/signature/i);
   });
 
-  it("rejects expired iat (>60s old)", async () => {
+  it("dpop.iat.expiry — rejects expired iat (>60s old)", async () => {
     const { validateDpopProof } = await import("../auth/dpop");
     const { keyPair, jwk } = await generateP256();
 
@@ -339,7 +339,7 @@ describe("validateDpopProof", () => {
     expect(bare.nonce).toBeUndefined();
   });
 
-  it("rejects htm mismatch", async () => {
+  it("dpop.htm-htu.mismatch — rejects htm mismatch", async () => {
     const { validateDpopProof } = await import("../auth/dpop");
     const { keyPair, jwk } = await generateP256();
 

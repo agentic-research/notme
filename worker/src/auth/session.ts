@@ -9,10 +9,47 @@ import { encodeBase64url, decodeBase64url } from "@oslojs/encoding";
 const SESSION_COOKIE_NAME = "notme_session";
 const SESSION_TTL_SECONDS = 86400; // 24 hours
 
+// ── AuthMethod: parsed once, here (notme-32003c) ─────────────────────────────
+//
+// "A cert's authMethod is DERIVED, never asserted" used to be carried by a
+// hand-written guard in each mint route, which agreed only by inspection; a
+// new mint path inherited none of them. AuthMethod is a branded string: the
+// mints take it, and the only ways to make one are parseAuthMethod and the
+// constants below. So an unchecked string reaching a mint is a compile
+// error at every call site, present and future, and verifySessionCookie
+// (the one place a cookie becomes a session) is where the check runs.
+//
+// The brand constrains PROVENANCE, not the value: any non-empty string
+// parses. What becomes unrepresentable is "an authMethod nobody checked".
+// Constraining the value too ("passkey" | "invite" | "bootstrap" |
+// "gha-oidc" | `oidc:${string}`) is the bead's stated follow-on.
+
+declare const authMethodBrand: unique symbol;
+/** An authMethod that has been checked. Obtain one only via parseAuthMethod, AUTH_METHOD or oidcAuthMethod. */
+export type AuthMethod = string & { readonly [authMethodBrand]: true };
+
+/** A non-empty string, or null. The sole cast to AuthMethod outside the constants below. */
+export function parseAuthMethod(v: unknown): AuthMethod | null {
+  return typeof v === "string" && v.length > 0 ? (v as AuthMethod) : null;
+}
+
+/** The fixed methods this authority's own routes issue. */
+export const AUTH_METHOD = {
+  passkey: "passkey" as AuthMethod,
+  invite: "invite" as AuthMethod,
+  bootstrap: "bootstrap" as AuthMethod,
+  ghaOidc: "gha-oidc" as AuthMethod,
+} as const;
+
+/** The issuer-qualified method of an OIDC login or proof. */
+export function oidcAuthMethod(issuer: string): AuthMethod {
+  return `oidc:${issuer}` as AuthMethod;
+}
+
 export interface SessionPayload {
   principalId: string;
   scopes: string[];
-  authMethod: string; // "passkey" | "oidc:<issuer>" | "bootstrap"
+  authMethod: AuthMethod; // "passkey" | "invite" | "oidc:<issuer>" | "bootstrap"
   exp: number;
   // v1 compat (deprecated — will be removed)
   userId?: string;
@@ -56,7 +93,10 @@ export async function createSessionCookieWithExp(
   secret: string,
   exp: number,
 ): Promise<string> {
-  const payload: SessionPayload = {
+  // The WIRE shape takes a plain string: the writer is not the boundary.
+  // verifySessionCookie parses authMethod on the way back in, so a cookie
+  // written with a bad one is refused there rather than trusted.
+  const payload: Omit<SessionPayload, "authMethod"> & { authMethod: string } = {
     principalId: session.principalId,
     scopes: session.scopes,
     authMethod: session.authMethod,
@@ -97,13 +137,19 @@ export async function verifySessionCookie(
 
   if (!(await hmacVerify(payloadBytes, sigBytes, secret))) return null;
 
-  let payload: SessionPayload;
+  // Unchecked until parsed: the HMAC proves WE signed it, not that whoever
+  // built it at the time filled every field.
+  let payload: Omit<SessionPayload, "authMethod"> & { authMethod?: unknown };
   try {
     payload = JSON.parse(new TextDecoder().decode(payloadBytes));
   } catch {
     return null;
   }
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
 
+  // A missing or non-numeric exp compares false against the clock, so it must
+  // be refused outright, or the session would never expire.
+  if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) return null;
   if (payload.exp < Math.floor(Date.now() / 1000)) return null;
 
   // Migrate v1 sessions
@@ -112,12 +158,37 @@ export async function verifySessionCookie(
     payload.scopes = payload.isAdmin
       ? ["bridgeCert", "authorityManage", "certMint"]
       : ["bridgeCert"];
-    payload.authMethod = "passkey";
+    payload.authMethod = AUTH_METHOD.passkey;
   }
 
-  return payload;
+  // A session that cannot state how it was authenticated is not a session
+  // (notme-32003c). Refusing here, rather than in each mint route, is what
+  // lets every route — including ones not yet written — rely on it.
+  const authMethod = parseAuthMethod(payload.authMethod);
+  if (authMethod === null) return null;
+
+  return { ...payload, authMethod };
 }
 
 export function clearSessionCookie(): string {
   return `${SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`;
+}
+
+/**
+ * Resolve a session's scopes against the grant store, LIVE.
+ *
+ * The cookie is a cache of the grant, never the source (notme-77a024). A
+ * grant revoked after the cookie was issued must take effect on the next
+ * request, not at cookie expiry 24h later — so every authority check reads
+ * the DO and INTERSECTS: a scope must be in the cookie (the session asked for
+ * it) AND in the grant store (the principal still holds it). Intersection,
+ * never either alone: cookie-only ignores revocation; store-only would widen
+ * a session past what it was issued with.
+ */
+export async function liveScopes(
+  session: Pick<SessionPayload, "principalId" | "scopes">,
+  authority: { getPrincipalScopes(principalId: string): Promise<string[]> },
+): Promise<string[]> {
+  const held = new Set(await authority.getPrincipalScopes(session.principalId));
+  return (session.scopes ?? []).filter((s) => held.has(s));
 }

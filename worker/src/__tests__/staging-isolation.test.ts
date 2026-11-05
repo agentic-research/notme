@@ -6,7 +6,7 @@
 // promise, and each fails silently if someone edits it later:
 //
 //   1. No vpc_services under env.staging. worker.ts guards `if (env.VPC_AUTH)`
-//      and falls through to a 503, so ADDING a VPC binding would quietly give
+//      and falls through to a constant 404, so ADDING a VPC binding would quietly give
 //      staging a live path to the production signet backend on Fly — the one
 //      thing staging must never reach.
 //   2. A distinct Worker name, so staging gets its own Durable Objects (its
@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const config = readFileSync(
-  fileURLToPath(new URL("../../wrangler.toml.example", import.meta.url)),
+  fileURLToPath(new URL("../../wrangler.toml.example", import.meta.url).href),
   "utf8",
 );
 
@@ -172,9 +172,37 @@ describe("[env.staging] isolation (ADR-018)", () => {
       .filter((s) => /(^|\.)ratelimits$/.test(s.header))
       .map((s) => s.body.match(/^\s*name\s*=\s*"([^"]+)"/m)?.[1])
       .filter(Boolean);
-    for (const name of ["TOKEN_LIMITER", "CERT_LIMITER", "PASSKEY_LIMITER"]) {
+    for (const name of ["TOKEN_LIMITER", "CERT_LIMITER", "PASSKEY_LIMITER", "SESSION_LIMITER", "PRINCIPAL_LIMITER"]) {
       expect(declared, `staging does not bind ${name}`).toContain(name);
     }
+  });
+
+  it("gives every staging limiter its OWN namespace_id, never production's (notme-a34dad)", () => {
+    // Cloudflare: a namespace_id is "unique to your Cloudflare account" and
+    // bindings that share one "share counters for a given key within each
+    // Cloudflare location, including across different Workers"
+    // (developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+    // When staging and production share an account, a shared id let a
+    // staging session for a principal spend that principal's production budget.
+    const ids = (sections: Array<{ body: string }>) =>
+      sections.map((s) => s.body.match(/^\s*namespace_id\s*=\s*"([^"]+)"/m)?.[1]).filter(Boolean) as string[];
+    const staging = ids(stagingSections().filter((s) => /(^|\.)ratelimits$/.test(s.header)));
+    const production: Array<{ body: string }> = [];
+    let cur: { body: string } | null = null;
+    for (const line of config.split("\n")) {
+      const h = line.match(/^\s*\[{1,2}\s*([^\]]+?)\s*\]{1,2}\s*$/);
+      if (h) {
+        cur = h[1] === "ratelimits" ? { body: "" } : null;
+        if (cur) production.push(cur);
+        continue;
+      }
+      if (cur) cur.body += line + "\n";
+    }
+    const prod = ids(production);
+    expect(prod.length).toBeGreaterThanOrEqual(5);
+    expect(staging.length).toBe(prod.length);
+    expect(staging.filter((id) => prod.includes(id))).toEqual([]);
+    expect(new Set(staging).size).toBe(staging.length);
   });
 
   it("binds its OWN kv namespace id, not production's", () => {

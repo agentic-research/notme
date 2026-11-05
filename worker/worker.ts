@@ -1,8 +1,14 @@
 // notme.bot — minimal Worker shell
 // Static assets served via ASSETS binding. Add routes here as needed.
 
+// FIRST, before any module that reaches @peculiar/x509 (notme-3ee3b0).
+// x509 2.0+ no longer loads a Reflect polyfill itself (PR #130); its tsyringe
+// container throws at module evaluation without one. ESM evaluates imports in
+// source order, so this line runs before the re-exports below pull in x509.
+import "reflect-metadata";
 export { RevocationAuthority } from "./src/revocation";
 export { SigningAuthority } from "./src/signing-authority";
+import type { MintBridgeCertProof } from "./src/signing-authority";
 
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
@@ -13,6 +19,7 @@ import {
 import {
   ensureCurrentCABundle,
   handleInternalCABundle,
+  invalidateCABundleMemo,
 } from "./src/internal-ca-bundle";
 import { ED25519, type Platform } from "./src/platform";
 
@@ -23,29 +30,19 @@ import { ED25519, type Platform } from "./src/platform";
 //   service = "notme-bot"
 //   entrypoint = "AuthService"
 //
-// Then call: await env.AUTH.mintBridgeCert(subject, publicKeyPem)
-// No HTTP, no public URL, no CORS, no tokens needed.
+// Then call, passing EVIDENCE rather than a subject (notme-51ccd7):
+//   await env.AUTH.mintBridgeCert({ kind: "gha-oidc", token }, publicKeyPem)
+//   await env.AUTH.mintBridgeCert({ kind: "session-cookie", cookie }, pem)
+// The authority re-verifies the proof and derives the subject itself, so a
+// binding holder cannot mint a certificate for an identity it has not
+// proved. No HTTP, no public URL, no CORS, no tokens needed.
 
-// ── Held credentials type ─────────────────────────────────────────────────
-// Per-RPC-session — stored on `this.#heldCerts` so concurrent / sequential
-// callers never see each other's principals. See contract test
-// "authenticate must not leak credentials across RPC sessions".
-type HeldCerts = {
-  mtlsCert: string;
-  signingCert: string;
-  mtlsKey: CryptoKey;
-  signingKey: CryptoKey;
-  identity: string;
-  scopes: string[];
-  expiresAt: number;
-};
-
-// Cloud metadata endpoints — hard-denied, not configurable
-const DENIED_HOSTS = new Set([
-  "169.254.169.254", // AWS/GCP metadata
-  "metadata.google.internal", // GCP metadata
-  "100.100.100.200", // Alibaba metadata
-]);
+// ── Held credentials ──────────────────────────────────────────────────────
+// Live on the AuthSession that authenticate() returns (notme-153f03), not on
+// AuthService: over a binding every top-level call is a fresh AuthService, so
+// `this` held nothing for the next call. See src/auth/auth-session.ts.
+import { AuthSession, type HeldCerts } from "./src/auth/auth-session";
+import { IsolateRateLimiter } from "./src/isolate-rate-limiter";
 
 // Audience allowlist — every endpoint that mints an access token must check
 // the requested audience against this set. Hoisted to module scope so /token
@@ -54,23 +51,31 @@ const DENIED_HOSTS = new Set([
 // Implementation in src/allowed-audiences.ts so unit tests can import it
 // without pulling in cloudflare:workers via worker.ts.
 import { getAllowedAudiences } from "./src/allowed-audiences";
+import { opaqueError } from "./src/error-body";
 import { dpopNonceRequired } from "./src/auth/dpop-nonce";
 import { verifyPopProofs } from "./src/auth/pop";
-import { buildInfo } from "./src/build-version";
-
-function isDeniedDestination(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    if (DENIED_HOSTS.has(parsed.hostname)) return true;
-    // fd00:ec2::254 and other IPv6 metadata
-    if (parsed.hostname.startsWith("fd00:")) return true;
-    // Link-local IPv4
-    if (parsed.hostname.startsWith("169.254.")) return true;
-    return false;
-  } catch {
-    return true; // unparseable URL = denied
-  }
-}
+import { AUTH_METHOD, oidcAuthMethod, type SessionPayload } from "./src/auth/session";
+import {
+  invalidateSessionSecret,
+  liveSessionSecret,
+  sessionLimiter,
+  verifySessionCached,
+} from "./src/auth/session-secret-cache";
+import { authorityStub } from "./src/authority-stub";
+import { principalIdentity } from "./src/cert-authority";
+import { CRITERIA, criteriaId, parseCriteriaId, type Criteria } from "./src/criteria";
+import { buildInfo, disclosedVersionId } from "./src/build-version";
+import { cacheKey, setCacheBuild, wantsJson } from "./src/cache-key";
+import {
+  disableForIsolate as disableEdgeCacheForIsolate,
+  edgeMatch,
+  edgePut,
+  NEGATIVE_CACHE_SECONDS,
+  noteUnavailable,
+  unavailableFor,
+} from "./src/edge-cache";
+import { clientIpBucket, clientNetworkBucket } from "./src/client-ip-key";
+import { markJtiSpentInKv } from "./src/jti-kv";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -99,7 +104,8 @@ function isDeniedDestination(url: string): boolean {
  * An earlier draft of this comment said to add the entrypoint to `NOTME` — that
  * instruction would have broken the first integrator to follow it.
  *
- * Both methods live on THIS entrypoint, so one dedicated binding is enough.
+ * All three methods live on THIS entrypoint, so one dedicated binding is
+ * enough.
  */
 export class ReceiptSigner extends WorkerEntrypoint<any> {
   /**
@@ -125,8 +131,10 @@ export class ReceiptSigner extends WorkerEntrypoint<any> {
    * Cloister needs both to build a commitment and `signReceipt` rejects any
    * that disagree, so serving them from the same authority that enforces them
    * removes a whole class of "receipt rejected, epoch drifted" failures.
-   * Cache it, but re-read on an EPOCH_MISMATCH rather than polling — rotation
-   * here is alarm-driven.
+   * Cache it, but re-read on an EPOCH_MISMATCH rather than polling. Neither
+   * field moves on a timer — `alarm()` calls `generateBundle()`, never
+   * `rotate()` or `revokeEpoch()`. `epoch` moves on `revokeEpoch()`;
+   * `actor_fp` moves on `rotate()` (ADR-014).
    */
   async receiptFacts(): Promise<{
     /**
@@ -167,6 +175,52 @@ export class ReceiptSigner extends WorkerEntrypoint<any> {
     const id = this.env.SIGNING_AUTHORITY.idFromName("default");
     const authority = this.env.SIGNING_AUTHORITY.get(id);
     return authority.signReceiptCommitment(owned);
+  }
+
+  /**
+   * Every public key that served `epoch`, current or retired (notme-a0cff4).
+   *
+   * Cloister builds its epoch archive from what it OBSERVES by polling
+   * /internal/ca-bundle, which carries only the current and previous key. A
+   * missed poll, or two rotations between polls, left that epoch absent from
+   * its archive for good, although notme still held the key in retired_keys.
+   * This hands it over on the binding cloister already holds.
+   *
+   * Public key material only, the same bytes /.well-known/epochs.json serves,
+   * so it widens what this binding can READ and not what it can sign.
+   *
+   * `EPOCH_UNKNOWN` is an answer, not a failure: notme has no key for that
+   * epoch. A transport failure rejects the call instead, so the two never
+   * look alike.
+   */
+  async epochPublicKey(
+    epoch: number,
+  ): Promise<import("./src/signing-authority").EpochPublicKeyResult> {
+    if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) {
+      return {
+        ok: false,
+        code: "EPOCH_INVALID",
+        message: `epoch must be a non-negative integer, got ${typeof epoch === "number" ? epoch : typeof epoch}`,
+      };
+    }
+    const id = this.env.SIGNING_AUTHORITY.idFromName("default");
+    const keys = await this.env.SIGNING_AUTHORITY.get(id).getEpochPublicKey(epoch);
+    if (keys.length === 0) {
+      return {
+        ok: false,
+        code: "EPOCH_UNKNOWN",
+        message: `no key of this authority served epoch ${epoch}`,
+      };
+    }
+    return {
+      ok: true,
+      epoch,
+      keys: keys.map((k: { keyId: string; publicRawB64: string; retiredAt: number | null }) => ({
+        publicRawB64: k.publicRawB64,
+        kid: k.keyId,
+        retiredAt: k.retiredAt,
+      })),
+    };
   }
 }
 
@@ -265,17 +319,32 @@ export class JwtSigner extends WorkerEntrypoint<any> {
   }
 }
 
+/** How long an authChallenge() challenge is good for (notme-fbbfbc). */
+const AUTH_CHALLENGE_TTL_S = 60;
+
+/**
+ * authChallenge()'s limiter when no CERT_LIMITER binding exists (notme-153f03):
+ * the binding's 10 / 60 s, counted in THIS isolate only. Module scope on
+ * purpose — a field on AuthService would reset with every binding call.
+ */
+const AUTH_CHALLENGE_FALLBACK_LIMITER = new IsolateRateLimiter({ limit: 10, periodSeconds: 60 });
+
+/**
+ * The cap shared by EVERY props-less caller in this isolate (review M1):
+ * 60 / 60 s, six identities' worth. Props-less callers are bucketed per
+ * claimed identity so one cannot drain another's budget; this bounds how
+ * many nonce rows they can make the authority write between them, since
+ * the identity is the caller's to choose. Per-isolate, like the fallback.
+ */
+const AUTH_CHALLENGE_NOPROPS_SHARED_CAP = new IsolateRateLimiter({ limit: 60, periodSeconds: 60 });
+
 export class AuthService extends WorkerEntrypoint<any> {
-  // RPC-session-scoped credentials. WorkerEntrypoint creates a fresh `this`
-  // per RPC session in workerd, so this field is naturally per-caller.
-  // DO NOT hoist to module scope — see notme/worker review Finding 1.
-  // `#`-private, NOT TypeScript `private`: this class is RPC-reachable, and
-  // TS `private` is erased at build time, so the field would stay readable on
-  // any stub someone obtains. The runtime mitigations are real — workerd gives
-  // a fresh `this` per RPC session, so a caller sees only their own, and
-  // CryptoKeys are not structured-cloneable — but they are properties of the
-  // RUNTIME, not of the declaration (notme-2154b8).
-  #heldCerts: HeldCerts | null = null;
+  // NO credential state on this class (notme-153f03). Each top-level binding
+  // call gets a fresh `this`, so a field here cannot carry anything from
+  // authenticate() to the next call; the verified certs live on the
+  // AuthSession authenticate() returns. Anything this class does declare must
+  // be ECMAScript `#private`: TS `private` is erased and stays callable and
+  // readable over RPC (notme-2154b8).
 
   /**
    * ECMAScript #private, NOT TypeScript `private`.
@@ -300,22 +369,61 @@ export class AuthService extends WorkerEntrypoint<any> {
     return this.env.SIGNING_AUTHORITY.get(id);
   }
 
-  /** Mint a bridge cert for a verified subject. */
-  async mintBridgeCert(subject: string, publicKeyPem: string, ttlMs?: number) {
+  /**
+   * Mint a bridge cert for the subject the PROOF names (notme-51ccd7).
+   *
+   * This used to read "for a verified subject" and take that subject as a
+   * string — nothing verified it, and the word was doing the work a check
+   * should have. A holder of this binding could name any subject; per
+   * ADR-009 that is every agent Worker.
+   *
+   * The envelope is passed through unexamined ON PURPOSE. This entrypoint
+   * must not be the thing that decides the subject is genuine, because it is
+   * the surface an attacker reaches; the DO re-verifies and derives it.
+   *
+   * Returns `{ ok: false, reason }` rather than throwing — switch on it. A
+   * rejected proof is an expected outcome, and a DO method that throws is
+   * double-reported by workerd (see `BridgeCertRefusal`).
+   */
+  async mintBridgeCert(
+    proof: MintBridgeCertProof,
+    publicKeyPem: string,
+    ttlMs?: number,
+  ) {
     const authority = this.#getAuthority();
-    return authority.mintBridgeCert(subject, publicKeyPem, ttlMs);
+    return authority.mintBridgeCert(proof, publicKeyPem, ttlMs);
   }
 
-  /** Mint a DPoP-bound access token. */
-  async mintDPoPToken(params: {
-    sub: string;
-    scope: string;
-    audience: string;
-    jkt: string;
-  }) {
-    const authority = this.#getAuthority();
-    return authority.mintDPoPToken(params);
-  }
+  /*
+   * mintDPoPToken WAS HERE AND IS DELETED (notme-d68da8).
+   *
+   * Its signature was `{ sub, scope, audience, jkt }` and it forwarded all
+   * four to the DO, which signed them with the master Ed25519 key. So a
+   * holder of this binding — per ADR-009, every agent Worker — named the
+   * subject, the scope AND the audience of a genuine `at+jwt` carrying
+   * notme's real issuer. src/allowed-audiences.ts states the rule it went
+   * around in its own docstring: "every endpoint that mints an access token
+   * must check the requested audience against this set." /token and
+   * /authorize/token both do, and both require a notme_session first.
+   *
+   * Measured, not hypothesised: rig/web verifies notme tokens on signature
+   * and exp alone — no aud, no iss, and cnf.jkt unread on the token-only
+   * path — sets `identity.id = claims.sub`, then compares that id to
+   * ADMIN_USER_ID. One call named rig's admin.
+   *
+   * THE SAME DEFECT AS mintBridgeCert ABOVE (notme-51ccd7), one method down,
+   * and the pin in rpc-surface.do.test.ts had already written the standard
+   * that catches it: reachability asks who may call, argument trust asks what
+   * the method concludes from what it is handed. That standard was stated for
+   * mintBridgeCert and not then applied to the rest of the list.
+   *
+   * Deleted rather than given a proof envelope, per the ADR-014 precedent for
+   * the arbitrary-sign() oracle: zero callers in notme, rig, signet, cloister,
+   * ley-line, ley-line-open, rosary or mache, and the live /token route calls
+   * the DO's own mintDPoPTokenOnce directly. An unused minting method here is
+   * one `env.AUTH.mintDPoPToken()` away from being reachable again, so it does
+   * not stay with a warning comment.
+   */
 
   /** Get the CA public key PEM. */
   async getPublicKeyPem() {
@@ -338,50 +446,152 @@ export class AuthService extends WorkerEntrypoint<any> {
   /** Verify a session cookie, return principal info. */
   async verifySession(cookie: string) {
     const authority = this.#getAuthority();
-    const { verifySessionCookie } = await import("./src/auth/session");
-    const secret = await authority.getSessionSecret();
-    return verifySessionCookie(cookie, secret);
+    // Through the isolate cache, as every cookie route is (notme-a34dad): a
+    // bound service passing a caller's junk cookie must not cost the DO.
+    const r = await verifySessionCached(cookie, authority);
+    return r.ok ? r.session : null;
   }
 
   // ── 009: Identity-gated runtime methods ──────────────────────────────────
 
   /**
-   * Store credentials for proxy/sign operations.
-   * Called after a successful 008 PoP exchange. Keys must be CryptoKey objects
-   * (non-extractable). Certs are PEM strings (public data).
+   * Issue a challenge for authenticate() (notme-fbbfbc): single-use, bound to
+   * the identity the caller says it will prove and to the calling binding's
+   * `props` (when the binding sets any), and good for AUTH_CHALLENGE_TTL_S.
    *
-   * `identity`, `scopes` and `expiresAt` are NOT parameters, deliberately.
-   * This method is reachable by any Worker holding an `AUTH` service binding,
-   * and it used to accept all three as caller-supplied fields and assign them
-   * verbatim — so a bound Worker could name itself any WIMSE principal and
-   * grant itself any scope, while `proxy()` gated on those scopes and the
-   * audit log recorded that identity as fact (notme-6ad276).
+   * Built on the authority's existing PoP-nonce store (issuePopNonce /
+   * consumePopNonce, the /cert/nonce primitive): a random 32-byte nonce kept
+   * in the DO, spent atomically, only for the principal key it was issued
+   * under. That key embeds the issue time, so the `<issuedAt>.` prefix of
+   * the challenge is authenticated by the row itself — editing it names a
+   * key no row has — and the 60 s bound needs no new secret. The `authsvc:`
+   * prefix keeps these rows out of /cert's principal-id space.
+   */
+  async authChallenge(identity: string): Promise<{ challenge: string; expires_in: number }> {
+    if (typeof identity !== "string" || !identity || identity.length > 1024) {
+      throw new Error("identity required — the WIMSE identity of the certs you will present");
+    }
+    // Throttled before the DO is touched (notme-153f03): any binding holder
+    // can call this unauthenticated, and each call writes one nonce row.
+    //
+    // Keyed by the calling binding's `props`, NOT by `identity`. The identity
+    // is whatever the caller types — keyed on it, a flood rotates names and
+    // never meets the limit. `props` is set per binding by the operator, so
+    // the caller cannot change its own bucket, and a noisy binding exhausts
+    // only its own budget. EVERY agent binding should set props.
+    //
+    // Without props (review M1) a single `null` bucket let one agent lock
+    // out every peer. Props-less calls are bucketed per CLAIMED identity
+    // instead (`authchallenge:null:id:<identity>`, on the same limiter), so
+    // identity A draining its budget does not refuse identity B, AND they
+    // spend AUTH_CHALLENGE_NOPROPS_SHARED_CAP, so rotating identities cannot
+    // make the authority write rows without bound. The identity bucket is
+    // checked first: a caller hammering its own exhausted identity never
+    // reaches the shared cap. A rotating flood can still exhaust the shared
+    // cap and, with it, every props-less caller — which is why props matter.
+    //
+    // CERT_LIMITER (10 / 60 s per key, wrangler.toml.example) is reused under
+    // its own `authchallenge:` prefix, as TOKEN_LIMITER carries `token:` and
+    // `token-ip:`: a key prefix is a separate counter, so this cannot spend a
+    // repository's /cert/gha budget. One authenticate() needs one challenge,
+    // and a bridge cert lives five minutes, so ten a minute is generous.
+    //
+    // Unbound (self-hosted workerd: config.capnp binds no limiter), it does
+    // NOT fail open the way the HTTP routes' limiters do: the same 10 / 60 s
+    // is enforced by AUTH_CHALLENGE_FALLBACK_LIMITER, in this isolate's
+    // memory. That is per-isolate — each isolate counts on its own — which
+    // on one workerd process is the whole service.
+    const limiter = this.env.CERT_LIMITER ?? AUTH_CHALLENGE_FALLBACK_LIMITER;
+    const props = this.#props();
+    const refused = () =>
+      new Error("rate limited — too many authChallenge() calls from this binding; retry in a minute");
+    if (props !== undefined && props !== null) {
+      const { success } = await limiter.limit({ key: `authchallenge:${JSON.stringify(props)}` });
+      if (!success) throw refused();
+    } else {
+      const { success } = await limiter.limit({ key: `authchallenge:null:id:${identity}` });
+      if (!success) throw refused();
+      const shared = await AUTH_CHALLENGE_NOPROPS_SHARED_CAP.limit({ key: "authchallenge:null" });
+      if (!shared.success) throw refused();
+    }
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const { nonce } = await this.#getAuthority().issuePopNonce(this.#challengeKey(identity, issuedAt));
+    return { challenge: `${issuedAt}.${nonce}`, expires_in: AUTH_CHALLENGE_TTL_S };
+  }
+
+  /** The PoP-nonce principal key a challenge lives under. */
+  #challengeKey(identity: string, issuedAt: number): string {
+    return `authsvc:v1:${issuedAt}:${JSON.stringify(this.#props() ?? null)}:${identity}`;
+  }
+
+  /** ctx.props is set per binding by the operator; absent in-isolate. */
+  #props(): unknown {
+    return (this.ctx as { props?: unknown } | null | undefined)?.props;
+  }
+
+  /**
+   * Verify a bridge cert pair and the caller's possession of both private
+   * keys (notme-fbbfbc), and RETURN an `AuthSession` holding them
+   * (notme-153f03). proxy(), sign() and identity() are the session's methods.
    *
-   * The certs are the only unforgeable thing a caller can present: they are
-   * CA-signed and already carry the subject and granted scopes. So the
-   * principal is DERIVED from them here and the caller's opinion of who it is
-   * never enters. Extra fields on the argument are structurally ignored.
+   * Over a binding the caller gets a stub to the session, and the session
+   * lives until that stub is disposed (`using session = await
+   * env.NOTME.authenticate(...)`, or `session[Symbol.dispose]()`) or the
+   * caller's execution context ends. Nothing is stored on this AuthService:
+   * each top-level binding call is a fresh instance, which is why storing
+   * the certs on `this` never worked over a binding.
    *
-   * @throws if either cert fails CA verification, is outside its validity
-   *         window, or names a different principal than its partner. On throw
-   *         the session stays unauthenticated — a failed authenticate() must
-   *         not leave stale creds from a previous successful one.
+   * `identity`, `scopes` and `expiresAt` are NOT parameters, deliberately
+   * (notme-6ad276): they are DERIVED from the CA-signed certs.
+   *
+   * Possession: this used to check only that the certs chained to the CA.
+   * Bridge certs are public — returned to clients, CT-logged when CT_LOG is
+   * bound — so any AUTH-binding holder could present a victim's pair and have
+   * proxy() audit its traffic as the victim. Now the caller first calls
+   * authChallenge(identity), then signs
+   * `authenticateBinding(mtlsSPKI, signingSPKI, challenge)`
+   * (src/auth/cert-pair-binding.ts) with EACH private key, and passes the
+   * proofs here. They are checked with the same verifyPopProofs /cert uses,
+   * against the public keys IN THE CERTS; the challenge is then spent.
+   *
+   * No private key is taken, in any form (notme-153f03). Private keys are
+   * never exported, and a CryptoKey cannot cross a binding anyway
+   * (`rpc.cryptokey.isolation`). The session keeps the signing cert's
+   * PUBLIC key; `session.sign()` calls back to a signer the caller passes
+   * and returns its signature only if it verifies under that key.
+   *
+   * @throws on a CA, validity, pairing or epoch failure; on a missing,
+   *         malformed, expired, replayed or wrongly-bound challenge; or on a
+   *         failed proof. On throw no session exists.
    */
   async authenticate(creds: {
     mtlsCert: string;
     signingCert: string;
-    mtlsKey: CryptoKey;
-    signingKey: CryptoKey;
-  }) {
+    challenge: string;
+    proofs: { mtls: string; signing: string };
+  }): Promise<AuthSession> {
+    // The challenge: present, well-formed, and young. Its age is checked
+    // here; that the timestamp is genuine is checked by the consume below.
+    // FIRST, because it is free (review I3): it reads only the caller's own
+    // string, so a junk call is refused before it costs a DO RPC or an X.509
+    // parse. Safe to move: nothing it decides depends on the certs, and the
+    // challenge is still spent only after every other check passes.
+    const m = /^(\d{1,12})\.([A-Za-z0-9_-]{16,128})$/.exec(
+      typeof creds.challenge === "string" ? creds.challenge : "",
+    );
+    if (!m) {
+      throw new Error("challenge required — call authChallenge(identity) and prove both keys over it");
+    }
+    const issuedAt = Number(m[1]);
+    const age = Math.floor(Date.now() / 1000) - issuedAt;
+    if (age < 0 || age > AUTH_CHALLENGE_TTL_S) {
+      throw new Error("challenge expired — request a new one");
+    }
+
     const { deriveCredentialsFromCerts } =
       await import("./src/auth/derive-credentials");
     const authority = this.#getAuthority();
     const caPublicKeyPem = await authority.getPublicKeyPem();
-
-    // Clear first: if verification throws, the session must not keep whatever
-    // it held before. Re-authenticating with a bad cert would otherwise leave
-    // the previous identity in place and look like it succeeded.
-    this.#heldCerts = null;
 
     const derived = await deriveCredentialsFromCerts(
       creds.signingCert,
@@ -389,172 +599,67 @@ export class AuthService extends WorkerEntrypoint<any> {
       caPublicKeyPem,
     );
 
-    this.#heldCerts = {
+    // Possession, against the keys the CERTS carry.
+    const { X509Certificate } = await import("@peculiar/x509");
+    const { importPublicKey } = await import("./src/cert-authority");
+    const { authenticateBinding } = await import("./src/auth/cert-pair-binding");
+    const spkiOf = (pem: string) => new Uint8Array(new X509Certificate(pem).publicKey.rawData);
+    const toPem = (der: Uint8Array) =>
+      `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...der))}\n-----END PUBLIC KEY-----`;
+    const mtlsSpki = spkiOf(creds.mtlsCert);
+    const signingSpki = spkiOf(creds.signingCert);
+    const signingPublicKey = await importPublicKey(toPem(signingSpki));
+    const pop = await verifyPopProofs(
+      await authenticateBinding(mtlsSpki, signingSpki, creds.challenge),
+      await importPublicKey(toPem(mtlsSpki)),
+      signingPublicKey,
+      creds.proofs ?? {},
+    );
+    if (!pop.ok) {
+      throw new Error(`${pop.algorithm} proof-of-possession failed`);
+    }
+
+    // Spent only after the proofs verify (as /cert), so a forged attempt
+    // cannot burn the holder's challenge. Bound to the DERIVED identity: a
+    // challenge asked for one identity does not authenticate another.
+    if (!(await authority.consumePopNonce(m[2]!, this.#challengeKey(derived.identity, issuedAt)))) {
+      throw new Error("challenge unknown, already used, or issued for another identity");
+    }
+
+    const held: HeldCerts = {
       mtlsCert: creds.mtlsCert,
       signingCert: creds.signingCert,
-      mtlsKey: creds.mtlsKey,
-      signingKey: creds.signingKey,
+      signingPublicKey,
       identity: derived.identity,
       scopes: derived.scopes,
       expiresAt: derived.expiresAt,
+      epoch: derived.epoch,
     };
-  }
-
-  /**
-   * Proxy an HTTP request with mTLS using the held P-256 bridge cert.
-   * The agent Worker calls this instead of fetch() (which is disabled).
-   */
-  async proxy(request: {
-    url: string;
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-  }): Promise<{
-    status: number;
-    headers: Record<string, string>;
-    body: string;
-  }> {
-    if (!this.#heldCerts) {
-      throw new Error("not authenticated — call authenticate() first");
-    }
-    if (this.#heldCerts.expiresAt <= Math.floor(Date.now() / 1000)) {
-      throw new Error("credentials expired — re-authenticate");
-    }
-
-    // Destination check
-    if (isDeniedDestination(request.url)) {
-      throw new Error(
-        "destination denied — cloud metadata endpoints are blocked",
-      );
-    }
-
-    // Scope check
-    if (!this.#heldCerts.scopes.includes("bridgeCert")) {
-      throw new Error("scope insufficient — bridgeCert required for proxy");
-    }
-
-    // Make the request
-    const start = Date.now();
-    const res = await fetch(request.url, {
-      method: request.method || "GET",
-      headers: request.headers || {},
-      body: request.body,
+    // The epoch is read through env on each proxy()/sign() call rather than through
+    // this call's DO stub, so the session does not lean on an I/O object
+    // belonging to the authenticate() call that created it.
+    const env = this.env;
+    return new AuthSession(held, {
+      env,
+      authorityState: () =>
+        env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default")).getAuthorityState(),
     });
-
-    const responseHeaders: Record<string, string> = {};
-    res.headers.forEach((v, k) => {
-      responseHeaders[k] = v;
-    });
-    const body = await res.text();
-
-    // Audit log — structured JSON, feeds into APAS attestations
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        type: "proxy",
-        identity: this.#heldCerts.identity,
-        destination: request.url,
-        method: request.method || "GET",
-        scope_checked: "bridgeCert",
-        allowed: true,
-        response_status: res.status,
-        duration_ms: Date.now() - start,
-      }),
-    );
-
-    return { status: res.status, headers: responseHeaders, body };
   }
 
-  /**
-   * Sign data with the held Ed25519 signing key.
-   * Returns the signature + the signing cert (public) + the WIMSE identity.
+
+  /*
+   * proxy(), sign() AND identity() WERE HERE AND ARE NOW ON AuthSession
+   * (notme-153f03, src/auth/auth-session.ts).
+   *
+   * They read credentials authenticate() had stored on `this`. Over a service
+   * binding each top-level call is a fresh AuthService instance, so the
+   * credentials were gone by the next call: proxy() and sign() refused
+   * everything, and identity() answered "not authenticated" to a caller that
+   * had just authenticated. authenticate() now returns the session holding
+   * them, and these are its methods. Removed here rather than left to refuse:
+   * a method that can only ever say "call the other thing" is surface with
+   * nothing behind it, and calling a name that is not there already fails.
    */
-  async sign(
-    payload: ArrayBuffer,
-    format: "raw" | "dsse" | "git-commit" = "raw",
-  ): Promise<{
-    signature: ArrayBuffer;
-    certificate: string;
-    identity: string;
-  }> {
-    if (!this.#heldCerts) {
-      throw new Error("not authenticated — call authenticate() first");
-    }
-
-    // Scope check for signing
-    const signingScopes = ["sign:git", "sign:attestation"];
-    const hasSignScope =
-      format === "raw"
-        ? true // raw signing doesn't require a specific scope
-        : this.#heldCerts.scopes.some((s) => signingScopes.includes(s));
-    if (!hasSignScope) {
-      throw new Error(
-        `scope insufficient — ${format} requires one of: ${signingScopes.join(", ")}`,
-      );
-    }
-
-    const signature = await crypto.subtle.sign(
-      ED25519,
-      this.#heldCerts.signingKey,
-      payload,
-    );
-
-    // Audit log
-    const payloadHash = Array.from(
-      new Uint8Array(await crypto.subtle.digest("SHA-256", payload)),
-    )
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        type: "sign",
-        identity: this.#heldCerts.identity,
-        format,
-        payload_hash: `sha256:${payloadHash}`,
-        scope_checked:
-          format === "raw"
-            ? "none"
-            : signingScopes.find((s) => this.#heldCerts!.scopes.includes(s)),
-        allowed: true,
-      }),
-    );
-
-    return {
-      signature,
-      certificate: this.#heldCerts.signingCert,
-      identity: this.#heldCerts.identity,
-    };
-  }
-
-  /** Get current identity and capabilities. */
-  async identity(): Promise<{
-    identity: string;
-    scopes: string[];
-    certificates: { mtls: string; signing: string };
-    expires_at: number;
-    authenticated: boolean;
-  }> {
-    if (!this.#heldCerts) {
-      return {
-        identity: "",
-        scopes: [],
-        certificates: { mtls: "", signing: "" },
-        expires_at: 0,
-        authenticated: false,
-      };
-    }
-    return {
-      identity: this.#heldCerts.identity,
-      scopes: this.#heldCerts.scopes,
-      certificates: {
-        mtls: this.#heldCerts.mtlsCert,
-        signing: this.#heldCerts.signingCert,
-      },
-      expires_at: this.#heldCerts.expiresAt,
-      authenticated: true,
-    };
-  }
 }
 
 // ── auth.notme.bot/cert/gha — GitHub Actions OIDC → bridge cert exchange ──
@@ -574,9 +679,13 @@ function getConfig(env: any) {
     ghaCertAudience: (env.GHA_CERT_AUDIENCE as string) ?? "notme.bot",
     ghaCertTtlMs: Number(env.GHA_CERT_TTL_MS ?? 300_000), // 5 min
     jtiMinTtlSeconds: Number(env.JTI_MIN_TTL_SECONDS ?? 60),
-    rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS ?? 3600_000), // 1 hour
-    rateLimitMaxCerts: Number(env.RATE_LIMIT_MAX_CERTS ?? 10),
-    rateLimitKvTtlSeconds: Number(env.RATE_LIMIT_KV_TTL_SECONDS ?? 3600),
+    // NO rate-limit tunables here. They existed for the KV limiter that the
+    // CERT_LIMITER binding replaced, and nothing read them afterwards — so
+    // RATE_LIMIT_MAX_CERTS=50 in a self-hosted wrangler.toml changed nothing
+    // while reading as the knob that set the limit. Their 1-hour/10-cert
+    // defaults are also where THREAT_MODEL's "10 certs/repo/hour" came from;
+    // the binding enforces 10 per 60 SECONDS (wrangler.toml [[ratelimits]]).
+    // notme-900e28.
   };
 }
 /**
@@ -589,17 +698,12 @@ function getConfig(env: any) {
  * config said nothing (notme-1532eb). An authority that has not declared
  * whose workflows it trusts must trust none.
  */
-export function getAllowedOwners(env: {
-  GHA_ALLOWED_OWNERS?: string;
-}): Set<string> {
-  const raw: string = env.GHA_ALLOWED_OWNERS ?? "";
-  return new Set(
-    raw
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean),
-  );
-}
+// Lives in src/gha-oidc.ts so the DO's mintBridgeCert applies the SAME
+// allowlist (security review F7); re-exported for the routes and tests.
+export { getAllowedOwners } from "./src/gha-oidc";
+import { getAllowedOwners } from "./src/gha-oidc";
+
+const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 
 function jsonErr(message: string, status: number): Response {
   return Response.json({ error: message }, { status });
@@ -616,16 +720,9 @@ async function handleCertGHA(
 
   const cfg = getConfig(env);
 
-  try {
-    // Ensure CA bundle is published to KV (lazy init — first request bootstraps)
-    await ensureCurrentCABundle(env, platform);
-  } catch (e: any) {
-    return jsonErr("authority unavailable: " + e.message, 503);
-  }
-
-  // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC)
-  const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-  const authority = env.SIGNING_AUTHORITY.get(authorityId);
+  // Get authority DO stub (signing happens inside the DO — CryptoKey can't cross RPC).
+  // Typed, so the mint's AuthMethod parameter is enforced here (notme-32003c).
+  const authority = authorityStub(env);
 
   const authHeader = request.headers.get("authorization") ?? "";
   if (!authHeader.startsWith("Bearer ")) {
@@ -638,7 +735,9 @@ async function handleCertGHA(
   try {
     claims = await validateGHAToken(token, cfg.ghaCertAudience);
   } catch (e: any) {
-    return jsonErr(`invalid token: ${e.message}`, 401);
+    // Constant body (notme-b567c9): the verifier's message names what it
+    // expected (audience, issuer, key id). Logged, not returned.
+    return opaqueError("cert-gha", "invalid token", 401, e);
   }
 
   // Allowlist check — only permitted owners can get certs from this authority
@@ -651,17 +750,11 @@ async function handleCertGHA(
   if (!claims.jti) {
     return jsonErr("jti claim required for replay protection", 400);
   }
-  {
-    const jtiKey = `jti:${claims.jti}`;
-    const seen = await platform.cache.get(jtiKey);
-    if (seen) {
-      return jsonErr("token already used", 401);
-    }
-    const ttl = Math.max(
-      cfg.jtiMinTtlSeconds,
-      claims.exp - Math.floor(Date.now() / 1000),
-    );
-    await platform.cache.put(jtiKey, "1", { expirationTtl: ttl });
+  // KV first, as the cheap cross-check: a token KV already knows is spent is
+  // refused without charging the repository's rate-limit budget.
+  const jtiKey = `jti:${claims.jti}`;
+  if (await platform.cache.get(jtiKey)) {
+    return jsonErr("token already used", 401);
   }
 
   // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
@@ -670,6 +763,17 @@ async function handleCertGHA(
     if (!allowed) {
       return jsonErr("rate limit exceeded", 429);
     }
+  }
+
+  try {
+    // Ensure CA bundle is published to KV (lazy init — first request
+    // bootstraps). AFTER the token, allowlist, jti and limiter checks
+    // (notme-ed6114): on a KV miss this is a generateBundle() on the
+    // singleton authority, and it used to run before the bearer token was
+    // read, so an anonymous or rate-limited request paid for it.
+    await ensureCurrentCABundle(env, platform);
+  } catch (e: any) {
+    return opaqueError("cert-gha", "authority unavailable", 503, e);
   }
 
   // ── Bridge cert pair via PoP exchange (008) ──
@@ -707,7 +811,7 @@ async function handleCertGHA(
     mtlsPubKey = await importPublicKey(body.public_keys.mtls);
     signingPubKey = await importPublicKey(body.public_keys.signing);
   } catch (e: any) {
-    return jsonErr(`invalid public key: ${e.message}`, 400);
+    return opaqueError("cert-gha", "invalid public key", 400, e);
   }
 
   // Compute binding payload: SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
@@ -743,8 +847,43 @@ async function handleCertGHA(
     return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
   }
 
+  // The authoritative spend (notme-b0d10f): the DO's `oidc:<iss>#<jti>`, the
+  // key /join, /auth/oidc/login, /cert, /token, /bootstrap/claim and the AUTH
+  // binding share. KV alone is eventually consistent, so it let one token
+  // win here and at another route at once.
+  //
+  // LAST before the mint, as /cert does (security review F1): every refusal
+  // this route can make — token, owner, limiter, CA bundle, body, keys, PoP —
+  // is made first, so a client error or a 503 leaves the token spendable and
+  // a corrected retry with the same token works. Only a mint that throws
+  // after this line burns it (THREAT_MODEL). Still after the limiter, which
+  // must precede any DO RPC (notme-ed6114).
+  if (!(await authority.spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
+    return jsonErr("token already used", 401);
+  }
+  // The KV cross-check; a failed write is logged, not a 500 (notme-a3804c).
+  await markJtiSpentInKv(
+    platform.cache,
+    jtiKey,
+    Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+    "/cert/gha",
+  );
+
   // Build WIMSE identity URI
-  const identity = `wimse://${wimseTrustDomain(env)}/gha/${claims.repository_owner}/${claims.repository.split("/").pop()}`;
+  // The identity names the stable subject — the OIDC `sub`, which is also
+  // the cert CN — rather than /gha/<owner>/<repo>, which encoded the
+  // ATTESTATION MECHANISM in the slot other routes filled with a ceremony
+  // (ADR-019 D2, notme-77438b). Owner and repo remain readable from `sub`
+  // and from the workflow claims; principal_kind = "workload" is stamped as
+  // its own extension.
+  // NO BOOTSTRAP HERE any more (notme-486e8a). This route used to make the
+  // attested workflow the administrator as a side effect of a cert request —
+  // and since a release job typically shares the bootstrap subject, the first
+  // /cert/gha on a fresh authority installed an admin no human could act as
+  // and closed registration to everyone. Bootstrap is now POST
+  // /bootstrap/claim: the workflow APPROVES a human's passkey claim.
+
+  const identity = principalIdentity(wimseTrustDomain(env), claims.sub);
 
   // Mint cert pair — both certs signed by CA, both carry the same identity + scopes
   let result;
@@ -755,11 +894,11 @@ async function handleCertGHA(
       mtlsPublicKeyPem: body.public_keys.mtls,
       signingPublicKeyPem: body.public_keys.signing,
       scopes: ["bridgeCert"],
-      authMethod: "gha-oidc",
+      authMethod: AUTH_METHOD.ghaOidc,
       ttlMs: cfg.ghaCertTtlMs,
     });
   } catch (e: any) {
-    return jsonErr(e.message || "cert minting failed", 500);
+    return opaqueError("cert-gha", "cert minting failed", 500, e);
   }
 
   return Response.json({
@@ -769,6 +908,9 @@ async function handleCertGHA(
     expires_at: result.expires_at,
     binding: result.binding,
     authority: result.authority,
+    // Present only when THIS call bootstrapped the authority. The cert still
+    // carries bridgeCert alone — capabilities live on the principal, and a
+    // cert carries only what is safe to export (passkey-cert-scopes.ts).
     claims: {
       repository: claims.repository,
       ref: claims.ref,
@@ -793,7 +935,9 @@ async function handlePasskey(
   }
 
   if (env.PASSKEY_LIMITER) {
-    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    // IPv6 by its /64, no address its own bucket — as /token (notme-ed6114,
+    // src/client-ip-key.ts).
+    const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
     const { success } = await env.PASSKEY_LIMITER.limit({
       key: `passkey:${ip}`,
     });
@@ -813,7 +957,10 @@ async function handlePasskey(
 
   try {
     if (pathname === "/auth/passkey/register/options") {
-      const body = (await request.json()) as { bootstrapCode?: string };
+      const body = (await request.json()) as {
+        bootstrapCode?: string;
+        inviteToken?: string;
+      };
       const userId = crypto.randomUUID();
       const result = await authority.passkeyRegistrationOptions(
         userId,
@@ -821,9 +968,33 @@ async function handlePasskey(
         host,
       );
 
+      // CLAIM REGISTRATION (notme-486e8a). No bootstrap code, no invite, and
+      // the authority has NO administrator while the attested-claim mechanism
+      // is armed: register the passkey as a claim holding nothing, to be
+      // approved by the workflow named in BOOTSTRAP_GHA_SUBJECT. Gated on "no
+      // administrator", not "first user" — otherwise whoever registered first
+      // and was never approved would lock the deployer out for good.
+      if (!body.bootstrapCode && !body.inviteToken && (await authority.claimAvailable())) {
+        const mark = await authority.markClaimRegistration(userId);
+        if (!mark.ok) {
+          return jsonErr(
+            mark.reason === "busy" ? "too many pending claims — retry shortly" : "claim unavailable",
+            mark.reason === "busy" ? 503 : 409,
+          );
+        }
+        // The claim belongs to THIS browser (notme-a2e75d), as an invite
+        // reservation does: verify must present the mark's secret.
+        const res = Response.json({ ...result, userId, scopes: [], claim: true });
+        res.headers.append("Set-Cookie", registrationCookie(mark.secret));
+        return res;
+      }
       // First user requires bootstrap code (proves deployer ownership)
       // Everyone else can register freely — gets bridgeCert scope only
-      if (result.isFirstUser && !body.bootstrapCode) {
+      // First-user standing is the authority's answer, not passkey.ts's
+      // "passkey_users is empty" (review L2): an authority whose admin signs
+      // in by OIDC has no passkey user, and that sent every invitee here.
+      const firstUser = await authority.registrationIsFirstUser();
+      if (firstUser && !body.bootstrapCode) {
         // A READ, not a mint (notme-addef9). This route is unauthenticated,
         // so calling getOrCreateBootstrapCode() here meant any stranger's
         // first request caused an admin credential to be minted and logged —
@@ -837,17 +1008,40 @@ async function handlePasskey(
         // cycle, so the documented recovery could simply fail.
         const bootstrap = await authority.getBootstrapState();
         switch (bootstrap.status) {
-          case "armed":
-            return jsonErr(
-              "bootstrap code required — supply the BOOTSTRAP_CODE this deployment was configured with",
-              401,
-            );
+          case "armed": {
+            // Name only the mechanisms actually armed. This branch used to
+            // say "bootstrap code required" unconditionally, and the
+            // unconfigured branch pointed at /cert/gha — a route that
+            // granted bridgeCert and created no principal, so the advice
+            // could not work (notme-addef9).
+            // Each offer is a standalone clause; the conjunction is added
+            // when joining. Baking "or " into the second one read as
+            // "bootstrap required — or run the workflow…" whenever gha-oidc
+            // was the only armed mechanism, which sounds like a first option
+            // went missing. Caught by running the thing and reading what it
+            // says, which is the only way this class of defect surfaces.
+            const offers: string[] = [];
+            if (bootstrap.methods.includes("secret")) {
+              offers.push(
+                "supply the BOOTSTRAP_CODE this deployment was configured with",
+              );
+            }
+            if (bootstrap.methods.includes("gha-oidc")) {
+              // Normally unreachable: with gha-oidc armed and no administrator,
+              // an unauthenticated registration becomes a claim above. Kept
+              // accurate for the one way here — a claim that was refused.
+              offers.push(
+                "register a passkey as a claim and approve it with the workflow named by BOOTSTRAP_GHA_SUBJECT (claim-authority.yml)",
+              );
+            }
+            return jsonErr(`bootstrap required — ${offers.join(", or ")}`, 401);
+          }
           case "unconfigured":
             // Fail closed AND fail informative. An authority nobody can
             // bootstrap is a recoverable operator error; one that silently
             // mints a credential into a log is not.
             return jsonErr(
-              "this authority has no administrator and no bootstrap secret — the deployer must set BOOTSTRAP_CODE (wrangler secret put BOOTSTRAP_CODE) and retry, or bootstrap via GitHub OIDC at /cert/gha",
+              "this authority has no administrator and no bootstrap mechanism is armed — the deployer must either set BOOTSTRAP_GHA_SUBJECT to the GitHub workflow identity allowed to bootstrap it (a var, not a secret: nothing to leak, nothing to read out of a log), or `wrangler secret put BOOTSTRAP_CODE`, and retry",
               401,
             );
           case "closed":
@@ -857,62 +1051,85 @@ async function handlePasskey(
             );
         }
       }
-      if (result.isFirstUser) {
-        const valid = await authority.consumeBootstrapCode(body.bootstrapCode!);
-        if (!valid) {
+      // The secret that binds this registration's mark to THIS browser
+      // (review M1 for an invite reservation, notme-a2e75d for the first-user
+      // mark): set below as an HttpOnly cookie, required at verify.
+      let markSecret: string | null = null;
+      if (firstUser) {
+        // Consumes the code AND marks this userId, so verify admits it as the
+        // admin — the mark, not a passkey count, is what verify trusts.
+        const mark = await authority.beginFirstUserRegistration(body.bootstrapCode!, userId);
+        if (!mark) {
           return jsonErr("invalid or already-used bootstrap code", 403);
         }
+        markSecret = mark.secret;
       }
 
-      // Determine scopes: deployer gets all, everyone else gets bridgeCert
-      const scopes = result.isFirstUser
-        ? ["bridgeCert", "authorityManage", "certMint"]
-        : ["bridgeCert"];
+      // REGISTRATION IS GATED (notme-2c4209, ADR-021). Until now everyone
+      // after the first user registered freely and walked away with a
+      // CA-signed cert pair — an open-registration certificate authority,
+      // written down nowhere but a comment.
+      //
+      // The invite is the mechanism TODAY. The decision is that registration
+      // is a policy question, and the eventual answer is signet's trust
+      // policy bundle (sigpol, ADR-011 §5.3: is this subject provisioned,
+      // is it active, what capabilities do its groups resolve to). notme
+      // must not grow a second subject registry to answer it — ADR-011 §2.1
+      // argues that case, and ADR-020 forbids it here.
+      //
+      // Scopes come from the INVITE, never from the request: a caller that
+      // could name its own scopes would make the gate decorative.
+      let invitedScopes: string[] | null = null;
+      if (!firstUser) {
+        if (!body.inviteToken) {
+          return jsonErr(
+            "registration is invite-only — ask an administrator for an invite link",
+            403,
+          );
+        }
+        // RESERVE, do not redeem (notme-3dfe15). Redeeming here burned the
+        // invite before the ceremony had happened, so a cancelled prompt
+        // spent it. The invite is consumed when THIS userId's credential
+        // verifies, and the principal is created with its scopes then.
+        const reserved = await authority.reserveInviteToken(
+          body.inviteToken,
+          userId,
+        );
+        if (!reserved) {
+          return jsonErr("invalid, expired or already-used invite", 403);
+        }
+        invitedScopes = reserved.scopes;
+        markSecret = reserved.secret;
+      }
 
-      return Response.json({ ...result, userId, scopes });
+      // Deployer gets all; an invited user gets exactly what the invite says.
+      const scopes = firstUser
+        ? [...(await import("./src/auth/admin-scopes")).ADMIN_SCOPES]
+        : (invitedScopes ?? ["bridgeCert"]);
+
+      const res = Response.json({ ...result, isFirstUser: firstUser, userId, scopes });
+      // The mark belongs to THIS browser: verify must present the secret,
+      // and HttpOnly keeps it out of page script, so learning the userId and
+      // challenge is no longer enough to finish someone else's ceremony.
+      res.headers.append("Set-Cookie", registrationCookie(markSecret!));
+      return res;
     }
 
     if (pathname === "/auth/passkey/register/verify") {
-      const body = (await request.json()) as {
-        userId: string;
-        scopes?: string[];
-        response: any;
-      };
-      if (!body.userId) {
-        return jsonErr("userId required (from register/options response)", 400);
+      // The mark's secret is single-use: whatever verify decides, the browser
+      // is told to drop it (notme-a2e75d) rather than carry it on every
+      // request for the rest of its Max-Age.
+      // A THROW is an outcome too (security review F2): a malformed body or
+      // a failing DO call used to reach the outer catch, which answered
+      // without the clear.
+      let res: Response;
+      try {
+        res = await passkeyRegisterVerify(request, authority, host, origin);
+      } catch (e) {
+        res = opaqueError("passkey", "passkey error", 500, e);
       }
-      const result = await authority.passkeyVerifyRegistration(
-        body.userId,
-        "user",
-        body.response,
-        host,
-        origin,
-      );
-      if (!result.verified) {
-        return jsonErr("registration verification failed", 400);
-      }
-
-      // Scopes derived server-side from admin status — NEVER from client body.
-      // Client-supplied body.scopes is intentionally ignored (scope escalation vector).
-      const scopes = result.isAdmin
-        ? ["bridgeCert", "authorityManage", "certMint"]
-        : ["bridgeCert"];
-
-      // Issue session immediately after registration
-      const { createSessionCookie } = await import("./src/auth/session");
-      const sessionSecret = await authority.getSessionSecret();
-      const cookie = await createSessionCookie(
-        { principalId: body.userId, scopes, authMethod: "passkey" },
-        sessionSecret,
-      );
-
-      return new Response(JSON.stringify({ verified: true, scopes }), {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json",
-          "Set-Cookie": cookie,
-        },
-      });
+      res.headers.append("Set-Cookie", CLEAR_REGISTRATION_COOKIE);
+      return res;
     }
 
     if (pathname === "/auth/passkey/login/options") {
@@ -930,8 +1147,10 @@ async function handlePasskey(
           origin,
         );
       } catch (verifyErr: any) {
+        // Logged, not returned: verifier messages can carry the expected
+        // challenge (review M1).
         console.error("[passkey] verify error:", verifyErr.message);
-        return jsonErr("verification error: " + verifyErr.message, 400);
+        return jsonErr("verification error", 400);
       }
       if (!result.verified || !result.userId) {
         return jsonErr(
@@ -940,13 +1159,17 @@ async function handlePasskey(
         );
       }
       const { createSessionCookie } = await import("./src/auth/session");
-      const sessionSecret = await authority.getSessionSecret();
-      // Principal model: userId is the principalId, scopes from capabilities
-      const scopes = result.isAdmin
-        ? ["bridgeCert", "authorityManage", "certMint"]
-        : ["bridgeCert"];
+      const sessionSecret = await liveSessionSecret(authority);
+      // Principal model: userId is the principalId, scopes from the grant
+      // store. A user registered before grants existed is enrolled on first
+      // login (is_admin decides ONLY then); after that, revoking a grant is
+      // what changes the answer here — logging in again does not restore it.
+      const scopes = await authority.ensurePasskeyPrincipal(
+        result.userId,
+        result.isAdmin,
+      );
       const cookie = await createSessionCookie(
-        { principalId: result.userId, scopes, authMethod: "passkey" },
+        { principalId: result.userId, scopes, authMethod: AUTH_METHOD.passkey },
         sessionSecret,
       );
       return new Response(
@@ -967,9 +1190,118 @@ async function handlePasskey(
 
     return jsonErr("not found", 404);
   } catch (e: any) {
-    return jsonErr(e.message || "passkey error", 500);
+    // A constant body (review M1). @simplewebauthn's challenge-mismatch error
+    // names the EXPECTED challenge, so returning e.message handed the secret
+    // half of an in-flight ceremony to anyone who sent a wrong one.
+    console.error("[passkey] error:", e?.message);
+    return jsonErr("passkey error", 500);
   }
 }
+
+/** POST /auth/passkey/register/verify — the route body; the caller clears the registration cookie. */
+async function passkeyRegisterVerify(
+  request: Request,
+  authority: any,
+  host: string,
+  origin: string,
+): Promise<Response> {
+  const body = (await request.json()) as {
+    userId: string;
+    scopes?: string[];
+    response: any;
+  };
+  if (!body.userId) {
+    return jsonErr("userId required (from register/options response)", 400);
+  }
+  const result = await authority.passkeyVerifyRegistration(
+    body.userId,
+    "user",
+    body.response,
+    host,
+    origin,
+    parseCookie(request.headers.get("cookie") || "", REGISTRATION_COOKIE) ?? undefined,
+  );
+  if (result.refused) {
+    // Verified, but not authorized: no live invite reservation (another
+    // registration consumed the invite first, or the window passed), no
+    // claim, not the first credential. Nothing was stored (notme-3dfe15).
+    return jsonErr("invalid, expired or already-used invite", 403);
+  }
+  if (!result.verified) {
+    return jsonErr("registration verification failed", 400);
+  }
+  // A claim registration holds NOTHING until the named workflow approves
+  // it (notme-486e8a) — even if it is the first credential, which
+  // verifyRegistration would otherwise treat as the admin.
+  const claim = await authority.finalizeClaimRegistration(body.userId);
+  if (claim) {
+    const { createSessionCookie } = await import("./src/auth/session");
+    const cookie = await createSessionCookie(
+      { principalId: body.userId, scopes: [], authMethod: AUTH_METHOD.passkey },
+      await liveSessionSecret(authority),
+    );
+    return new Response(
+      JSON.stringify({
+        verified: true,
+        scopes: [],
+        claim: {
+          code: claim.code,
+          expires_in: claim.expiresIn,
+          command: `gh workflow run claim-authority.yml -f code=${claim.code}`,
+          note: "Run this from the repository named by BOOTSTRAP_GHA_SUBJECT, then sign in again with this passkey.",
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json", "Set-Cookie": cookie } },
+    );
+  }
+
+  // Scopes come from the GRANT STORE — never from the client body (scope
+  // escalation vector) and no longer from the is_admin bit alone. The
+  // passkey user becomes a principal with grants here, so its authority
+  // has one source and one revoke path (notme-77a024 finding b). An
+  // invited registration's principal already exists by now, created
+  // with the INVITE's scopes when verification consumed the reservation
+  // (notme-3dfe15), so this returns those rather than enrolling it with
+  // bridgeCert.
+  const scopes = await authority.ensurePasskeyPrincipal(
+    body.userId,
+    result.isAdmin,
+  );
+
+  // Issue session immediately after registration
+  const { createSessionCookie } = await import("./src/auth/session");
+  const sessionSecret = await liveSessionSecret(authority);
+  const cookie = await createSessionCookie(
+    { principalId: body.userId, scopes, authMethod: AUTH_METHOD.passkey },
+    sessionSecret,
+  );
+
+  return new Response(JSON.stringify({ verified: true, scopes }), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Set-Cookie": cookie,
+    },
+  });
+}
+
+/**
+ * HttpOnly cookie binding a registration's mark — an invite reservation
+ * (review M1), a first-user mark or a claim mark (notme-a2e75d) — to the
+ * browser that ran options. Only the secret's SHA-256 is stored with the
+ * mark, and #admitRegistration requires it.
+ *
+ * `__Host-`: the browser accepts it only with Secure, Path=/ and no Domain,
+ * so a sibling subdomain or a plain-http response cannot plant or shadow it.
+ * The prefix forces Path=/ — the cookie used to be scoped to
+ * /auth/passkey/register — and that is the trade taken: a path is no
+ * boundary within one origin (any same-origin page can fetch that path), the
+ * cookie is HttpOnly and SameSite=Strict, lives 300 s, and verify clears it.
+ */
+const REGISTRATION_COOKIE = "__Host-notme_registration";
+const registrationCookie = (secret: string) =>
+  `${REGISTRATION_COOKIE}=${secret}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=300`;
+const CLEAR_REGISTRATION_COOKIE = `${REGISTRATION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
 
 function parseCookie(cookieHeader: string, name: string): string | null {
   const match = cookieHeader
@@ -979,6 +1311,30 @@ function parseCookie(cookieHeader: string, name: string): string | null {
   return match ? match.slice(name.length + 1) : null;
 }
 
+/**
+ * Verify a `notme_session` cookie without letting junk reach the
+ * SigningAuthority (notme-a34dad, overnight review C2). Every route that
+ * reads the cookie goes through here; see src/auth/session-secret-cache.ts for
+ * the cache and why a positive answer is still confirmed against the live
+ * secret.
+ *
+ * The limiter (sessionLimiter: SESSION_LIMITER, `session:<principalId>`) runs
+ * only once the HMAC has passed, so it charges the principal the cookie
+ * proved, never an address, and junk spends no one's budget. Its rate and
+ * why there is no per-IP backstop: SESSION_LIMIT_PER_MINUTE.
+ */
+async function checkSession(
+  env: any,
+  authority: { getSessionSecret(): Promise<string> },
+  cookie: string,
+): Promise<{ session: SessionPayload | null; limited: boolean }> {
+  const r = await verifySessionCached(cookie, authority, sessionLimiter(env));
+  return r.ok ? { session: r.session, limited: false } : { session: null, limited: r.limited };
+}
+
+const rateLimitedResponse = (): Response =>
+  Response.json({ error: "rate_limited" }, { status: 429, headers: { "Retry-After": "60" } });
+
 // ── GET /authorize — inline HTML page for cross-origin DPoP token issuance ──
 //
 // Browser POSTs to /authorize/token (same origin — session cookie automatic),
@@ -987,6 +1343,113 @@ function parseCookie(cookieHeader: string, name: string): string | null {
 //
 // All params are injected via data attributes on a hidden div — no inline
 // script variables, no eval. The JS reads them via dataset.
+
+/** The criteria ids an approver may grant at /enroll this phase (notme-bdc850). */
+const GRANTABLE_CRITERIA = [...CRITERIA.values()].filter((d) => d.grantable).map((d) => d.id);
+
+/**
+ * An approver's criteria: a non-empty list of distinct ids, each defined and
+ * grantable. Null otherwise — the route answers 400, never a partial grant.
+ */
+function grantedCriteria(ids: unknown): Criteria[] | null {
+  if (!Array.isArray(ids) || ids.length === 0 || new Set(ids).size !== ids.length) return null;
+  const out: Criteria[] = [];
+  for (const id of ids) {
+    if (typeof id !== "string" || !GRANTABLE_CRITERIA.includes(id)) return null;
+    const c = parseCriteriaId(id);
+    if (!c) return null;
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * The tier-enrolment approval page (notme-486e8a). The fingerprint is the
+ * point: device flow's known weakness is a human approving SOMEONE ELSE'S
+ * code, and comparing the key fingerprint the machine printed is the check
+ * that defeats it. Values reach the script as data attributes, never as
+ * script text.
+ */
+function enrolPageHtml(
+  userCode: string,
+  fingerprint: string,
+  scopes: string[],
+  status: string,
+): string {
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const fp = fingerprint.slice(0, 16).match(/..../g)!.join(" ");
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>enroll a machine — auth.notme.bot</title>
+  <style>
+    body { background:#1c1810; color:#e8dcc8; font-family:ui-monospace,monospace; max-width:560px; margin:10vh auto; padding:0 20px; line-height:1.6 }
+    code { color:#f0c674; font-size:1.25em }
+    button { margin-top:20px; padding:10px 18px; font:inherit; background:#e8dcc8; color:#1c1810; border:0; cursor:pointer }
+    .muted { color:#9a8f7c; font-size:.9em }
+  </style>
+</head>
+<body data-code="${esc(userCode)}">
+  <h1>Enroll a machine</h1>
+  <p>A machine is asking to act on your behalf. It will be able to mint task certificates offline, under your identity, for up to 24 hours.</p>
+  <p>Code: <code>${esc(userCode)}</code></p>
+  <p>Key fingerprint: <code>${esc(fp)}</code></p>
+  <p class="muted">Approve only if this fingerprint matches what the machine printed. If you did not start this, close the page.</p>
+  <p class="muted">Requested scopes: ${esc(scopes.join(", ") || "bridgeCert")} — certMint is never delegated.</p>
+  ${status === "pending" ? `<p>
+    <label>It may renew without asking you again for
+      <select id="renew">
+        <option value="1">1 day</option>
+        <option value="7" selected>7 days</option>
+        <option value="30">30 days</option>
+      </select></label>
+  </p>
+  <p class="muted">So a machine that pauses and resumes is not blocked on you. You can revoke it at any time; renewal stops at once.</p>
+  <p>
+    <label>Clone policy
+      <select id="clone">
+        <option value="singleton" selected>singleton — one copy of this key</option>
+        <option value="replicas:2">replicas:2 (break glass)</option>
+        <option value="replicas:4">replicas:4 (break glass)</option>
+        <option value="replicas:8">replicas:8 (break glass)</option>
+      </select></label>
+  </p>
+  <p class="muted">Replicas need authorityManage and a renewal horizon of at most 7 days. For now every line still acts as a singleton.</p>
+  <p>Criteria
+    ${GRANTABLE_CRITERIA.map((id) => `<label><input type="checkbox" name="criteria" value="${esc(id)}" checked> ${esc(id)}</label>`).join("\n    ")}
+  </p>
+  <p class="muted">What this machine's task certificates may say they are. Every tier it collects or renews carries these.</p>
+  <button id="approve">approve</button>` : `<p>This enrollment is already ${esc(status)}.</p>`}
+  <p id="out" class="muted"></p>
+  <script>
+    var b = document.getElementById('approve');
+    if (b) b.addEventListener('click', async function () {
+      b.disabled = true;
+      var res = await fetch('/cert/issuing-ca/device/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_code: document.body.dataset.code,
+          renew_days: Number(document.getElementById('renew').value),
+          clone_policy: document.getElementById('clone').value,
+          criteria: Array.prototype.map.call(
+            document.querySelectorAll('input[name=criteria]:checked'),
+            function (el) { return el.value; }
+          )
+        })
+      });
+      var data = await res.json().catch(function () { return {}; });
+      document.getElementById('out').textContent = res.ok
+        ? 'Approved. Return to the machine — it will collect the certificate.'
+        : (data.error || 'failed');
+    });
+  </script>
+</body>
+</html>`;
+}
 
 function authorizePageHtml(
   redirectUri: string,
@@ -1340,18 +1803,6 @@ const HANDOFF_SCHEMA = {
   },
 };
 
-function wantsJson(request: Request): boolean {
-  const accept = request.headers.get("Accept") || "";
-  // Explicitly request JSON, for API tools
-  if (
-    accept.includes("application/json") ||
-    accept.includes("application/schema+json")
-  ) {
-    return true;
-  }
-  // For all other requests (including browsers), default to HTML
-  return false;
-}
 
 function renderPredicateHtml(schema: Record<string, unknown>): Response {
   const title = schema.title as string;
@@ -1519,43 +1970,46 @@ export function wimseTrustDomain(env: { SITE_URL?: string }): string {
   return u.host;
 }
 
+/**
+ * The host this deployment canonicalizes to, from SITE_URL.
+ *
+ * Absent → "notme.bot", the documented production default, matching
+ * wimseTrustDomain's treatment of the same variable. Malformed → also
+ * "notme.bot", and deliberately NOT a throw: this runs on every request
+ * before any route matches, so throwing would turn one bad var into a total
+ * outage. wimseTrustDomain throws because minting under a domain nobody
+ * chose is worse than failing the mint; serving the wrong canonical host is
+ * an SEO defect, not a trust one.
+ */
+export function siteHostFromEnv(siteUrl: string | undefined): string {
+  if (!siteUrl) return "notme.bot";
+  try {
+    return new URL(siteUrl).host || "notme.bot";
+  } catch {
+    return "notme.bot";
+  }
+}
+
 // ── CF Edge Cache helpers ──
 // With run_worker_first = true, responses constructed in the Worker bypass CF
 // edge cache entirely. We use the Cache API to store and serve them at the edge.
 // Cache key includes Accept header for content-negotiated routes.
 
-function cacheKey(request: Request, vary?: string): Request {
-  // For content-negotiated routes, include Accept in the cache key so
-  // JSON and HTML responses are cached separately. Preserve caller query
-  // parameters so deployment verification can bypass entries created by an
-  // older Worker version. `_cache=v2` invalidates the v1 keys, which dropped
-  // the query string and classified application/schema+json as HTML.
-  if (vary === "Accept") {
-    const url = new URL(request.url);
-    url.searchParams.set("_accept", wantsJson(request) ? "json" : "html");
-    url.searchParams.set("_cache", "v2");
-    return new Request(url.toString(), request);
-  }
-  return request;
-}
 
-// Edge cache disabled when cacheApiOutbound is not configured (local workerd).
-let cacheEnabled = true;
+// A failure backs off and recovers rather than disabling the cache for the
+// isolate's lifetime (notme-a34dad, review M3; src/edge-cache.ts). Local
+// workerd, which has no Cache API, is switched off once per isolate below.
 
 async function cachePut(
   request: Request,
   response: Response,
   vary?: string,
+  // Only serveCachedPublic passes this, for its 503 (NEGATIVE_CACHE_SECONDS).
+  allowUnavailable = false,
 ): Promise<Response> {
-  if (!cacheEnabled || request.method !== "GET") return response;
-  if (!response.ok && response.status !== 301) return response;
-  try {
-    const cache = caches.default;
-    const toCache = response.clone();
-    await cache.put(cacheKey(request, vary), toCache);
-  } catch {
-    cacheEnabled = false; // Disable for remainder of isolate lifetime
-  }
+  if (request.method !== "GET") return response;
+  if (!response.ok && response.status !== 301 && !(allowUnavailable && response.status === 503)) return response;
+  await edgePut(cacheKey(request, vary), response.clone());
   return response;
 }
 
@@ -1563,18 +2017,80 @@ async function cacheMatch(
   request: Request,
   vary?: string,
 ): Promise<Response | undefined> {
-  if (!cacheEnabled || request.method !== "GET") return undefined;
-  try {
-    const cache = caches.default;
-    return cache.match(cacheKey(request, vary));
-  } catch {
-    cacheEnabled = false;
-    return undefined;
+  if (request.method !== "GET") return undefined;
+  return edgeMatch(cacheKey(request, vary));
+}
+
+/**
+ * Cache lifetime for documents a verifier reads a KEY from (jwks.json,
+ * ca-bundle.pem). Nothing purges the Cache API or a client's copy on
+ * rotate(), so a rotation reaches such a verifier only once the edge entry
+ * AND its own copy expire — up to twice this. 300 s matches
+ * BUNDLE_MAX_AGE_MS, the bound ADR-019 D7 sets for the CABundle; at 3600 s a
+ * compromised key stayed trusted for about two hours (review F3,
+ * notme-ed6114). With the method gate and query-free keys this costs at most
+ * one DO call per document per colo per 5 minutes.
+ */
+const ROTATION_BOUND_CACHE_CONTROL = "public, max-age=300";
+
+/**
+ * Serve a DO-backed public document through the Cache API (notme-ed6114,
+ * review F1). The Cache API stores and matches GET only, so a HEAD or POST
+ * used to miss every time and pay a call on the singleton authority — the
+ * same flood the query string bought before the key ignored it.
+ *
+ * GET and HEAD share the GET entry (HEAD gets its headers, no body; a cold
+ * HEAD warms it). Anything else is 405 before any DO work. `build` returns
+ * null to fall through to the caller's next handler.
+ */
+async function serveCachedPublic(
+  request: Request,
+  build: () => Promise<Response | null>,
+): Promise<Response | null> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return Response.json({ error: "method not allowed" }, { status: 405, headers: { Allow: "GET, HEAD" } });
   }
+  const asGet =
+    request.method === "GET" ? request : new Request(request.url, { method: "GET", headers: request.headers });
+  let resp = (await cacheMatch(asGet)) ?? null;
+  const left = resp ? 0 : unavailableFor(cacheKey(asGet));
+  if (left > 0) {
+    // This isolate saw this document's 503 under NEGATIVE_CACHE_SECONDS ago.
+    resp = Response.json(
+      { error: "authority unavailable" },
+      { status: 503, headers: { "Cache-Control": `public, max-age=${left}`, "Retry-After": String(left) } },
+    );
+  }
+  if (!resp) {
+    let built: Response | null;
+    try {
+      built = await build();
+    } catch (e) {
+      // A DO call that THROWS (overloaded, reset) is the same event as a
+      // builder's own 503, so it gets the same constant answer — and the
+      // same short negative cache — instead of escaping as a Worker error.
+      built = opaqueError("well-known", "authority unavailable", 503, e);
+    }
+    if (!built) return null;
+    if (built.status === 503) {
+      // Negatively cached for a few seconds, deliberately (M3): see
+      // NEGATIVE_CACHE_SECONDS in src/edge-cache.ts for why, and why only 503.
+      const headers = new Headers(built.headers);
+      headers.set("Cache-Control", `public, max-age=${NEGATIVE_CACHE_SECONDS}`);
+      headers.set("Retry-After", String(NEGATIVE_CACHE_SECONDS));
+      built = new Response(built.body, { status: 503, headers });
+      noteUnavailable(cacheKey(asGet));
+    }
+    resp = await cachePut(asGet, built, undefined, true);
+  }
+  return request.method === "HEAD" ? new Response(null, { status: resp.status, headers: resp.headers }) : resp;
 }
 
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
+    // Every cache key carries the build, so a deploy is never answered from
+    // the previous version's entries (notme-486e8a, src/cache-key.ts).
+    setCacheBuild(env);
     // ── CORS: handle preflight + restrict origins ──
     const requestOrigin = request.headers.get("Origin") || "";
     const CORS_ALLOWED_ORIGINS = new Set([
@@ -1644,7 +2160,7 @@ export default {
     const sub = getSubdomain(host);
     const envSiteUrl: string = env.SITE_URL || "";
     const isLocal = envSiteUrl.startsWith("http://localhost");
-    if (isLocal) cacheEnabled = false; // Cache API unavailable in local workerd
+    if (isLocal) disableEdgeCacheForIsolate(); // Cache API unavailable in local workerd
 
     // ── /health liveness probe ──
     // Host-agnostic, no auth, no DO access. Cloister + container orchestrators
@@ -1671,7 +2187,11 @@ export default {
     // Answered before host canonicalization for the same reason as /health —
     // probes from bare-IP or in-cluster hosts must get an answer, not a 301.
     if (pathname === "/.well-known/version") {
-      return Response.json(buildInfo(env), {
+      // version_id: which Cloudflare VERSION answered — what a pinned probe must
+      // compare, since two versions can share a commit (notme-325916). Only
+      // disclosed to a request whose override header already names it (N2).
+      const vid = disclosedVersionId(env, request.headers.get("Cloudflare-Workers-Version-Overrides"));
+      return Response.json({ ...buildInfo(env), ...(vid ? { version_id: vid } : {}) }, {
         status: 200,
         headers: {
           "Cache-Control": "no-store",
@@ -1699,7 +2219,18 @@ export default {
     // JSON CABundle. Host-agnostic by design: service bindings commonly use
     // synthetic hostnames such as https://notme-bot/.
     if (pathname === "/internal/ca-bundle") {
-      return handleInternalCABundle(request, env, platform);
+      // Edge-cached and single-flighted (notme-a34dad, review M1); a
+      // `Cache-Control: no-cache` read is per-IP limited — see the module.
+      return handleInternalCABundle(request, env, platform, {
+        edge: { match: (k) => edgeMatch(k), put: (k, v) => edgePut(k, v) },
+        edgeKey: cacheKey(request),
+        bypassAllowed: async () => {
+          if (!env.CERT_LIMITER) return true;
+          const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+          const { success } = await env.CERT_LIMITER.limit({ key: `ca-bundle-ip:${ip}` });
+          return success;
+        },
+      });
     }
 
     // Receipt signing is NOT an HTTP path (ADR-014). Refused explicitly rather
@@ -1724,22 +2255,50 @@ export default {
       );
     }
 
+    // The binding named here MUST be a dedicated one. This string used to say
+    // `entrypoint = "ReceiptSigner"` on the NOTME binding and `env.NOTME.
+    // signReceipt(...)` — the instruction ADR-014 retracted by name, because
+    // setting `entrypoint` on a binding already used as a fetch proxy
+    // silently routes that binding's fetch() to a class with no fetch
+    // handler, breaking the integrator's existing /identity/* traffic
+    // (ADR-016 rule 2). The correction reached the ADR and the ReceiptSigner
+    // docstring; it never reached the string an integrator actually reads,
+    // which is the only one of the three they ever see. notme-bd133e.
     if (pathname === "/internal/sign-receipt") {
       return Response.json(
         {
           error: "not_an_http_endpoint",
           error_description:
-            'Receipt signing is an RPC method, not a route. Bind with entrypoint = "ReceiptSigner" and call env.NOTME.signReceipt(commitmentBytes). See docs/design/014-receipt-signing.md.',
+            'Receipt signing is an RPC method, not a route. Add a dedicated binding — ( name = "NOTME_RECEIPTS", service = "notme-bot", entrypoint = "ReceiptSigner" ) — and call env.NOTME_RECEIPTS.signReceipt(commitmentBytes). Do NOT add entrypoint to an existing NOTME binding: that reroutes its fetch() to a class with no fetch handler (ADR-016 rule 2). See docs/design/014-receipt-signing.md.',
         },
         { status: 404 },
       );
     }
 
     // ── Canonical host enforcement ──
-    // Redirect any non-notme.bot host (e.g. workers.dev) to the canonical domain.
-    // This prevents Google from indexing the workers.dev URL as a duplicate.
-    if (!isLocal && !host.endsWith("notme.bot") && host !== "") {
-      const canonicalUrl = `https://notme.bot${pathname}${url.search}`;
+    // Redirect a host this deployment does not serve (e.g. workers.dev) to its
+    // canonical site. This prevents Google from indexing the workers.dev URL
+    // as a duplicate.
+    //
+    // DERIVED, not the literal "notme.bot" it used to test. The old rule was
+    // `!host.endsWith("notme.bot")`, which 301'd EVERY request of any
+    // deployment not under that registrable domain — a self-hosted authority
+    // at id.example.com answered nothing but redirects TO notme.bot, and the
+    // env-derived host selection that ADR-018 and notme-1532eb added below
+    // could never be reached to do its job. Found by a staging-impersonation
+    // test that minted under a third domain (notme-1532eb).
+    //
+    // Both the site host and the authority host are legitimate, and they
+    // differ (notme.bot vs auth.notme.bot). Subdomains of the site host stay
+    // allowed, which is what `endsWith` was expressing for production.
+    const canonicalHost = siteHostFromEnv(env.SITE_URL);
+    const authorityHostForCanon = authorityHostFromEnv(env.SIGNET_AUTHORITY_URL);
+    const hostIsServed =
+      host === canonicalHost ||
+      host.endsWith(`.${canonicalHost}`) ||
+      (authorityHostForCanon !== null && host === authorityHostForCanon);
+    if (!isLocal && !hostIsServed && host !== "") {
+      const canonicalUrl = `https://${canonicalHost}${pathname}${url.search}`;
       const redirect = new Response(null, {
         status: 301,
         headers: {
@@ -1768,15 +2327,15 @@ export default {
           "notme_session",
         );
         if (!cookie) {
-          return Response.redirect(`${siteUrl}/login`, 302);
+          return Response.redirect(`${authorityUrl}/login`, 302);
         }
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) {
-          return Response.redirect(`${siteUrl}/login`, 302);
+          return Response.redirect(`${authorityUrl}/login`, 302);
         }
         if (wantsJson(request)) {
           return Response.json({
@@ -1819,19 +2378,20 @@ export default {
         );
         const headers = new Headers(resp.headers);
         headers.set("Cache-Control", "public, max-age=3600");
-        // The asset hardcodes the production authority host. On any other
-        // environment (staging), rewrite it so the docs describe the host
-        // actually serving them — worker:verify treats a production URL
-        // rendered on staging as a config leak.
+        // The asset is a template that names the authority host only through
+        // a placeholder (notme-131c8e). Fill it on EVERY environment, so the
+        // docs describe the host actually serving them — worker:verify treats
+        // a production URL rendered on staging as a config leak. The host is
+        // authorityUrl's (the env var, defaulted as everywhere else in this
+        // block); the request's Host only if that does not parse.
         let body: BodyInit | null = resp.body;
-        if (
-          resp.ok &&
-          authorityHost !== null &&
-          authorityHost !== "auth.notme.bot"
-        ) {
-          const html = await resp.text();
-          body = html.replaceAll("auth.notme.bot", authorityHost);
-          // Stale after rewriting: length changed, and text() already
+        if (resp.ok) {
+          const { renderApiDocs } = await import("./src/api-docs");
+          body = renderApiDocs(
+            await resp.text(),
+            authorityHostFromEnv(authorityUrl) ?? host,
+          );
+          // Stale after rendering: length changed, and text() already
           // decoded any content-encoding.
           headers.delete("Content-Length");
           headers.delete("Content-Encoding");
@@ -1860,23 +2420,23 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
 
         const body = (await request.json()) as {
-          proof: { type: string; token?: string; cert?: string };
+          proof: { type: string; token?: string; cert?: string; chain?: unknown };
         };
         if (!body.proof?.type) return jsonErr("proof.type required", 400);
 
         // Narrow the request body to the Proof discriminated union before
         // handing off to verifyProof — keeps the unsafe cast at the trust
         // boundary (request input) rather than scattered through the call.
-        const { verifyProof } = await import("./src/auth/verify-proof");
+        const { verifyProof, issuerAudiences } = await import("./src/auth/verify-proof");
         type Proof =
           | { type: "oidc"; token: string }
-          | { type: "x509"; cert: string };
+          | { type: "x509"; cert: string; chain?: string[] };
         let typedProof: Proof;
         if (
           body.proof.type === "oidc" &&
@@ -1887,7 +2447,15 @@ export default {
           body.proof.type === "x509" &&
           typeof body.proof.cert === "string"
         ) {
-          typedProof = { type: "x509", cert: body.proof.cert };
+          // Optional intermediates: a cert signed by an Issuing CA tier
+          // (ADR-019 D4) verifies through the chain walker, which enforces
+          // pathlen, scope subsetting and the D5 namespace bound. Filtered
+          // to strings so a malformed array member fails as a bad chain,
+          // never as a type surprise deeper in.
+          const chain = Array.isArray(body.proof.chain)
+            ? body.proof.chain.filter((c: unknown): c is string => typeof c === "string")
+            : undefined;
+          typedProof = { type: "x509", cert: body.proof.cert, chain };
         } else {
           return jsonErr(`unsupported proof.type: ${body.proof.type}`, 400);
         }
@@ -1914,11 +2482,11 @@ export default {
           identity = await verifyProof(
             typedProof,
             caCertPem,
-            "notme.bot",
+            issuerAudiences(env),
             currentEpoch,
           );
         } catch (e: any) {
-          return jsonErr("proof verification failed: " + e.message, 401);
+          return opaqueError("connections", "proof verification failed", 401, e);
         }
 
         // Store the connection (via DO RPC, not the imported function)
@@ -1944,9 +2512,9 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
 
         const conns = await authority.getConnectionsForUser(session.userId);
@@ -1958,12 +2526,15 @@ export default {
       // GET  /admin/alarm-health        — is the bundle-refresh alarm alive?
       // POST /admin/alarm-health/reset  — clear the circuit breaker, re-arm
       //
-      // The alarm republishes the CA bundle every BUNDLE_REFRESH_MS. It has a
-      // circuit breaker that stops re-arming after repeated failures, and
-      // recovery requires resetAlarmHealth() — which was an RPC method with NO
-      // ROUTE, so the documented recovery procedure could not be invoked at
-      // all. Production ran with a dead alarm for 130 days and served a bundle
-      // every conformant consumer rejected (notme-77a024).
+      // The alarm republishes the CA bundle every BUNDLE_REFRESH_MS. After
+      // repeated failures its circuit breaker opens: it keeps exactly one
+      // probe alarm pending (15 min, doubling per consecutive trip to 2 h) and
+      // closes again when a probe succeeds (half-open, notme-a36d10), so it no
+      // longer needs a manual reset to recover. GET reports the breaker state
+      // and the Rekor revocation queue; POST reset still closes it at once.
+      // History: recovery once depended on resetAlarmHealth(), an RPC method
+      // with NO ROUTE, and production ran with a dead alarm for 130 days,
+      // serving a bundle every conformant consumer rejected (notme-77a024).
       //
       // authorityManage-gated, not public: alarm health leaks operational
       // state (how long the authority has been running, whether it is
@@ -1981,11 +2552,14 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
-        if (!(session.scopes ?? []).includes("authorityManage")) {
+        // LIVE against the grant store — a revoked grant shuts this door on
+        // the next request, not when the cookie expires (notme-77a024).
+        const { liveScopes } = await import("./src/auth/session");
+        if (!(await liveScopes(session, authority)).includes("authorityManage")) {
           return jsonErr("authorityManage scope required", 403);
         }
         // Method check now that the caller is known to be an admin.
@@ -2007,7 +2581,123 @@ export default {
         return Response.json(await authority.getAlarmHealth());
       }
 
+      // POST /admin/revoke-epoch — pull the mass-revocation lever
+      //
+      // `revokeEpoch()` advances the revocation generation and republishes
+      // the CA bundle synchronously. Per ADR-019 D7 it is the ONLY mass
+      // revocation notme has, and D7's whole subject was that the previous
+      // mechanism "could not be operated" because revoking cost the signing
+      // key and destroyed the evidence for every past receipt.
+      //
+      // It then shipped as an RPC method with NO ROUTE — the same defect, in
+      // the same bead, that left resetAlarmHealth() uninvocable while
+      // production served a rejected bundle for 130 days (see above). Fixing
+      // the mechanism and leaving it unreachable is not fixing it.
+      //
+      // authorityManage-gated and POST-only: this invalidates every
+      // outstanding credential of the current generation, so reachable
+      // unauthenticated it is a denial-of-service primitive against the whole
+      // authority. Gating is pinned by admin-revoke-epoch-route.do.test.ts.
+      if (pathname === "/admin/revoke-epoch") {
+        // AUTH BEFORE METHOD, same reason as /admin/alarm-health: answering
+        // 405 first would confirm to an anonymous caller that this authority
+        // exposes a mass-revocation endpoint.
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        if (!cookie) return jsonErr("sign in first", 401);
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
+        if (!session) return jsonErr("invalid session", 401);
+        // LIVE against the grant store, so a revoked grant shuts this door on
+        // the next request rather than when the cookie expires.
+        const { liveScopes } = await import("./src/auth/session");
+        if (!(await liveScopes(session, authority)).includes("authorityManage")) {
+          return jsonErr("authorityManage scope required", 403);
+        }
+        if (request.method !== "POST") {
+          return jsonErr("method not allowed", 405);
+        }
+        // Optional `{ "reason": "..." }` (notme-6a4f23). It is published in
+        // the signed /.well-known/epochs.json beside the revocation time, so
+        // a verifier can tell a declared compromise from a precaution. No
+        // body means "unspecified"; a body that is not a JSON object, or a
+        // reason that is empty, over 200 characters or carries control
+        // characters, is refused BEFORE anything moves.
+        const { normalizeRevocationReason } = await import("./src/epoch-history");
+        const raw = await request.text();
+        let reason: unknown;
+        if (raw.trim() !== "") {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            return jsonErr("body must be a JSON object", 400);
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            return jsonErr("body must be a JSON object", 400);
+          }
+          reason = (parsed as { reason?: unknown }).reason;
+        }
+        const why = normalizeRevocationReason(reason);
+        if (why === null) {
+          return jsonErr("reason must be 1-200 characters with no control characters", 400);
+        }
+        const result = await authority.revokeEpoch(why);
+        // The revocation republished the bundle; this isolate's copy is now
+        // the one thing that could still serve the old one (notme-a34dad).
+        invalidateCABundleMemo();
+        // Dynamic import to match this file's idiom — the constant is only
+        // needed on the one request that pulls the lever.
+        const { BUNDLE_MAX_AGE_MS } = await import("./src/revocation");
+        // Return the propagation bound with the result. An operator who pulls
+        // this needs to know WHEN it takes effect, and the honest answer is
+        // bounded only for verifiers that can reach the bundle — one
+        // BUNDLE_MAX_AGE_MS refresh. A verifier that cannot has TTL and
+        // nothing else (ADR-019 D7).
+        return Response.json({
+          ...result,
+          propagation: {
+            boundMs: BUNDLE_MAX_AGE_MS,
+            note: "Verifiers that can reach the CA bundle enforce the new generation within one refresh. Offline verifiers have TTL only.",
+          },
+        });
+      }
+
       // POST /invites — create an invite (requires authorityManage scope)
+      // GET /invites — the form. authorityManage-gated BEFORE the asset is
+      // served, so an unprivileged caller never sees it.
+      //
+      // POST /invites was API-only, so the only way to grant anyone authority
+      // was a fetch() pasted into a devtools console. In practice that means
+      // nobody does it — and an authority with one admin credential is one
+      // lost laptop from ungovernable (notme-4838ae, found live). Recovery
+      // exists now via BOOTSTRAP_CODE, but prevention that requires devtools
+      // is not prevention.
+      if ((pathname === "/invites" || pathname === "/invites/") && request.method === "GET") {
+        const cookie = parseCookie(
+          request.headers.get("cookie") || "",
+          "notme_session",
+        );
+        if (!cookie) return jsonErr("sign in first", 401);
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
+        if (!session) return jsonErr("invalid session", 401);
+        const { liveScopes } = await import("./src/auth/session");
+        if (!(await liveScopes(session, authority)).includes("authorityManage")) {
+          return jsonErr("authorityManage scope required", 403);
+        }
+        const baseUrl = env.SITE_URL || "https://notme.bot";
+        return env.ASSETS.fetch(new Request(`${baseUrl}/_invite`));
+      }
+
       if (pathname === "/invites" && request.method === "POST") {
         const cookie = parseCookie(
           request.headers.get("cookie") || "",
@@ -2016,11 +2706,16 @@ export default {
         if (!cookie) return jsonErr("sign in first", 401);
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) return jsonErr("invalid session", 401);
-        if (!(session.scopes ?? []).includes("authorityManage")) {
+        // LIVE scopes feed BOTH the gate and canGrant below: a granter whose
+        // own authority was revoked must not be able to pass it on from a
+        // cookie that still remembers it (notme-77a024).
+        const { liveScopes } = await import("./src/auth/session");
+        const granterScopes = await liveScopes(session, authority);
+        if (!granterScopes.includes("authorityManage")) {
           return jsonErr("authorityManage scope required", 403);
         }
 
@@ -2029,11 +2724,15 @@ export default {
           ttl?: number;
         };
         const scopes = body.scopes ?? ["bridgeCert"];
+        // The DO clamps the lifetime to INVITE_MAX_TTL_SECONDS (notme-2131e8);
+        // a ttl that is not a finite number is a caller error, not a 500.
+        if (body.ttl !== undefined && (typeof body.ttl !== "number" || !Number.isFinite(body.ttl))) {
+          return jsonErr("ttl must be a finite number of seconds", 400);
+        }
         // Delegated authorization — granter must hold authorityManage AND
         // the specific scope being granted. canGrant() is the single source
         // of truth for the predicate (was duplicated inline pre-rosary-8119d0).
         const { canGrant } = await import("./src/auth/principals");
-        const granterScopes = session.scopes ?? [];
         for (const s of scopes) {
           if (!canGrant(granterScopes, s)) {
             return jsonErr(`cannot grant scope you don't have: ${s}`, 403);
@@ -2048,81 +2747,187 @@ export default {
         const host = request.headers.get("host") || "auth.notme.bot";
         return Response.json({
           token: invite.token,
-          url: `https://${host}/join?t=${invite.token}`,
+          // The token rides in the FRAGMENT, which a browser never sends to
+          // the server (notme-3dfe15). As ?t= it was written into the
+          // invocation log of every request that opened the link.
+          url: `https://${host}/join#t=${invite.token}`,
           expiresAt: invite.expiresAt,
           scopes,
         });
       }
 
-      // GET /join?t=<token> — redeem an invite (shows registration page)
+      // POST /principals/:id/revoke — revoke one grant (notme-77a024).
+      //
+      // The revocation UNIT, finally: finer than rotation (every credential
+      // ever issued), a decision rather than expiry. Takes effect on the
+      // target's next request because every authority gate reads liveScopes.
+      //
+      // Self-revocation of authorityManage is refused: an authority whose
+      // last admin revoked themselves is ungovernable again (notme-4838ae),
+      // and BOOTSTRAP_CODE recovery should be the deliberate path, not the
+      // consequence of a mis-click.
+      {
+        const m = /^\/principals\/([^/]+)\/revoke$/.exec(pathname);
+        if (m && request.method === "POST") {
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          if (!cookie) return jsonErr("sign in first", 401);
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const { liveScopes } = await import("./src/auth/session");
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
+          if (!session) return jsonErr("invalid session", 401);
+          if (!(await liveScopes(session, authority)).includes("authorityManage")) {
+            return jsonErr("authorityManage scope required", 403);
+          }
+          const target = decodeURIComponent(m[1]!);
+          let body: { scope?: string } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+          if (!body.scope) return jsonErr("scope required", 400);
+          if (target === session.principalId && body.scope === "authorityManage") {
+            return jsonErr(
+              "refusing to revoke your own authorityManage — invite a second admin first",
+              409,
+            );
+          }
+          const result = await authority.revokeCapability(
+            target,
+            body.scope,
+            session.principalId,
+          );
+          console.log(
+            `[revoke] principal=${target} scope=${body.scope} by=${session.principalId} revoked=${result.revoked}`,
+          );
+          return Response.json({
+            revoked: result.revoked,
+            principal_id: target,
+            scope: body.scope,
+          });
+        }
+      }
+
+      // GET /join#t=<token> — the invite landing page. The token is in the
+      // fragment, so this request does not carry it (and must not require
+      // it); the page reads it from location.hash and POSTs it to /join.
       if (pathname === "/join" && request.method === "GET") {
-        const token = new URL(request.url).searchParams.get("t");
-        if (!token) return jsonErr("missing invite token", 400);
-        // Serve the login page — it will handle the invite token
         const baseUrl = env.SITE_URL || "https://notme.bot";
         return env.ASSETS.fetch(new Request(`${baseUrl}/_login`));
       }
 
-      // POST /join — redeem invite + register (passkey or OIDC)
+      // POST /join — start joining by invite (notme-3dfe15).
+      //
+      // WITHOUT a proof: reserve the invite and start a passkey registration
+      // — exactly /auth/passkey/register/options with this invite. Returns
+      // { options, userId, scopes } and NO session. The invite is consumed,
+      // and the principal created with its scopes, only when that passkey
+      // verifies at /auth/passkey/register/verify. This route used to redeem
+      // the invite and hand out a session immediately, for a principal with
+      // no authenticator at all: invisible to #hasAuthenticator, and the
+      // reason a failed passkey ceremony after it burned the invite.
+      //
+      // WITH an OIDC proof: the proof is verified FIRST — a bad one is 403
+      // (ERROR_STATUS.OIDC_PROOF_REJECTED) and spends nothing — and then the
+      // invite is redeemed, the principal created and the identity linked in
+      // one synchronous DO call. The link failure used to be swallowed, so a
+      // bad proof still burned the invite and returned a session.
       if (pathname === "/join" && request.method === "POST") {
         const body = (await request.json()) as {
           token: string;
           proof?: { type: string; token?: string };
         };
-        if (!body.token) return jsonErr("invite token required", 400);
+        if (!body.token || typeof body.token !== "string") {
+          return jsonErr("invite token required", 400);
+        }
+
+        if (!body.proof) {
+          // Forward ONLY what the delegate reads (review L3): the body is
+          // rebuilt and differs in length, so copying the original headers
+          // carried a stale Content-Length; cf-connecting-ip keys the
+          // registration rate limit.
+          const forwarded = new Headers({ "content-type": "application/json" });
+          const ip = request.headers.get("cf-connecting-ip");
+          if (ip) forwarded.set("cf-connecting-ip", ip);
+          return handlePasskey(
+            "/auth/passkey/register/options",
+            new Request(new URL("/auth/passkey/register/options", request.url), {
+              method: "POST",
+              headers: forwarded,
+              body: JSON.stringify({ inviteToken: body.token }),
+            }),
+            env,
+          );
+        }
+        if (body.proof.type !== "oidc" || !body.proof.token) {
+          return jsonErr("unsupported proof — omit it to join with a passkey, or send an oidc token", 400);
+        }
+
+        const { verifyOIDC, issuerAudiences } = await import("./src/auth/verify-proof");
+        let identity;
+        try {
+          identity = await verifyOIDC(body.proof.token, issuerAudiences(env));
+        } catch (e: any) {
+          // Logged, not returned (review L4): verifier messages describe
+          // what the server expected (audience, issuer, key id).
+          console.error("[join] oidc proof rejected:", e?.message);
+          return jsonErr("invalid oidc proof", 403);
+        }
+
+        // Single-use proof (notme-3dfe15 part 1, option A; the nonce-bound
+        // proof is notme-e3dede). Fail closed without a jti, as /cert/gha.
+        const jti = identity.claims?.jti;
+        if (typeof jti !== "string" || !jti) {
+          return jsonErr("jti claim required for replay protection", 400);
+        }
+        const exp = Number(identity.claims?.exp) || 0;
+        // One token, one spend, across routes: /join accepts the same
+        // aud-`notme.bot` tokens /cert/gha, /cert and /token spend into
+        // `jti:<jti>`. That keyspace is KV — eventually consistent — so it is
+        // READ here and passed in; the DO's own consume is what makes /join
+        // atomic, and it runs in the block that redeems the invite.
+        const jtiKey = `jti:${jti}`;
+        const spentElsewhere = Boolean(await platform.cache.get(jtiKey));
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-
-        // Create principal
-        const principalId = crypto.randomUUID();
-        const result = await authority.redeemInviteToken(
+        const joined = await authority.joinInviteWithFederated(
           body.token,
-          principalId,
+          identity.issuer,
+          identity.subject,
+          { jti, exp, spentElsewhere },
         );
-        if (!result) return jsonErr("invalid or expired invite", 403);
-
-        // Create principal with the invite's scopes
-        await authority.createPrincipalWithCapabilities(
-          principalId,
-          result.scopes,
-        );
-
-        // If OIDC proof provided, link it
-        if (body.proof?.type === "oidc" && body.proof.token) {
-          const { verifyOIDC } = await import("./src/auth/verify-proof");
-          try {
-            const identity = await verifyOIDC(body.proof.token, "notme.bot");
-            await authority.linkFederatedId(
-              principalId,
-              identity.issuer,
-              identity.subject,
-            );
-          } catch {
-            // OIDC link is optional — principal is created regardless
-          }
+        if (!joined.ok) {
+          if (joined.reason === "proof_reused") return jsonErr("token already used", 401);
+          return joined.reason === "already_linked"
+            ? jsonErr("this identity already belongs to a principal — sign in with it at /auth/oidc/login", 409)
+            : jsonErr("invalid or expired invite", 403);
         }
-
-        // Issue session
-        const { createSessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const cookie = await createSessionCookie(
-          { principalId, scopes: result.scopes, authMethod: "invite" },
-          sessionSecret,
+        // Spent in the shared keyspace only once the join succeeded, so the
+        // token cannot then buy a cert at /cert/gha, /cert or /token.
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
+          "/join",
         );
 
+        const { createSessionCookie } = await import("./src/auth/session");
+        const cookie = await createSessionCookie(
+          { principalId: joined.principalId, scopes: joined.scopes, authMethod: AUTH_METHOD.invite },
+          await liveSessionSecret(authority),
+        );
         return new Response(
-          JSON.stringify({
-            joined: true,
-            principalId,
-            scopes: result.scopes,
-          }),
+          JSON.stringify({ joined: true, principalId: joined.principalId, scopes: joined.scopes }),
           {
             status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              "Set-Cookie": cookie,
-            },
+            headers: { "Content-Type": "application/json", "Set-Cookie": cookie },
           },
         );
       }
@@ -2132,33 +2937,58 @@ export default {
         const body = (await request.json()) as { token: string };
         if (!body.token) return jsonErr("token required", 400);
 
-        const { verifyOIDC } = await import("./src/auth/verify-proof");
+        const { verifyOIDC, issuerAudiences } = await import("./src/auth/verify-proof");
         let identity;
         try {
-          identity = await verifyOIDC(body.token, "notme.bot");
+          identity = await verifyOIDC(body.token, issuerAudiences(env));
         } catch (e: any) {
-          return jsonErr("invalid token: " + e.message, 401);
+          // Logged, not returned (review F1, as in /join, L4): verifier
+          // messages describe what the server expected. (No apostrophe in
+          // this comment: error-body-guard.test.ts scans catch blocks with a
+          // quote-aware brace matcher that does not skip comments, and one
+          // here made it read every route to :3713 as inside this catch.)
+          console.error("[oidc-login] token rejected:", e?.message);
+          return jsonErr("invalid oidc proof", 401);
         }
+
+        // Single-use, exactly as /join (review F1): this mints a 24h
+        // session, so an unspent-jti check is the only thing stopping a
+        // spent or logged token from becoming one, again and again.
+        const jti = identity.claims?.jti;
+        if (typeof jti !== "string" || !jti) {
+          return jsonErr("jti claim required for replay protection", 400);
+        }
+        const exp = Number(identity.claims?.exp) || 0;
+        const jtiKey = `jti:${jti}`;
+        const spentElsewhere = Boolean(await platform.cache.get(jtiKey));
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
 
-        const principalId = await authority.findPrincipalByOIDC(
+        const loggedIn = await authority.loginWithFederated(
           identity.issuer,
           identity.subject,
+          { jti, exp, spentElsewhere },
         );
-        if (!principalId) {
-          return jsonErr("unknown identity — get an invite first", 403);
+        if (!loggedIn.ok) {
+          return loggedIn.reason === "proof_reused"
+            ? jsonErr("token already used", 401)
+            : jsonErr("unknown identity — get an invite first", 403);
         }
-
-        const scopes = await authority.getPrincipalScopes(principalId);
+        const { principalId, scopes } = loggedIn;
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
+          "/auth/oidc/login",
+        );
         const { createSessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
+        const sessionSecret = await liveSessionSecret(authority);
         const cookie = await createSessionCookie(
           {
             principalId,
             scopes,
-            authMethod: `oidc:${identity.issuer}`,
+            authMethod: oidcAuthMethod(identity.issuer),
           },
           sessionSecret,
         );
@@ -2168,7 +2998,7 @@ export default {
             authenticated: true,
             principalId,
             scopes,
-            authMethod: `oidc:${identity.issuer}`,
+            authMethod: oidcAuthMethod(identity.issuer),
           }),
           {
             status: 200,
@@ -2191,6 +3021,16 @@ export default {
       if (pathname === "/auth/passkey/reset" && request.method === "POST") {
         try {
           const body = (await request.json()) as { bootstrapCode?: string };
+          // Per-IP limit BEFORE the DO (notme-c3fdbc): any non-empty code
+          // used to buy a consumeBootstrapCode RPC on the singleton. Reset
+          // is a rare operator action, so the passkey budget (5 / 60 s per
+          // IP bucket) fits; its own prefix so a reset flood does not spend
+          // passkey logins. Unbound, it fails open like the other limiters.
+          if (body.bootstrapCode && env.PASSKEY_LIMITER) {
+            const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+            const { success } = await env.PASSKEY_LIMITER.limit({ key: `passkey-reset:${ip}` });
+            if (!success) return jsonErr("rate_limited", 429);
+          }
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
           if (
@@ -2201,15 +3041,17 @@ export default {
             return jsonErr("invalid or expired bootstrap code", 403);
           }
           const result = await authority.resetPasskeyData();
+          // The reset rotated the session secret; drop this isolate's copy so
+          // the next login here is not refused by it (notme-a34dad).
+          invalidateSessionSecret();
           return Response.json({ ok: true, ...result });
         } catch (e: any) {
-          return jsonErr("reset failed: " + e.message, 500);
+          return opaqueError("passkey-reset", "reset failed", 500, e);
         }
       }
 
       // Passkey diagnostics — requires admin session (leaks user/admin counts, epoch, keyId)
       if (pathname === "/auth/passkey/status") {
-        const { verifySessionCookie } = await import("./src/auth/session");
         const authId = env.SIGNING_AUTHORITY.idFromName("default");
         const authDO = env.SIGNING_AUTHORITY.get(authId);
         const statusCookie = parseCookie(
@@ -2217,16 +3059,15 @@ export default {
           "notme_session",
         );
         if (!statusCookie) return jsonErr("unauthorized", 401);
-        const statusSecret = await authDO.getSessionSecret();
-        const statusSession = await verifySessionCookie(
-          statusCookie,
-          statusSecret,
-        );
-        if (
-          !statusSession ||
-          !statusSession.scopes.includes("authorityManage")
-        ) {
-          return jsonErr("admin required", 403);
+        const sc = await checkSession(env, authDO, statusCookie);
+        if (sc.limited) return rateLimitedResponse();
+        const statusSession = sc.session;
+        if (!statusSession) return jsonErr("admin required", 403);
+        {
+          const { liveScopes } = await import("./src/auth/session");
+          if (!(await liveScopes(statusSession, authDO)).includes("authorityManage")) {
+            return jsonErr("admin required", 403);
+          }
         }
         try {
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
@@ -2244,7 +3085,7 @@ export default {
             rpId: request.headers.get("host") || "auth.notme.bot",
           });
         } catch (e: any) {
-          return jsonErr("status unavailable: " + e.message, 503);
+          return opaqueError("status", "status unavailable", 503, e);
         }
       }
 
@@ -2257,7 +3098,7 @@ export default {
       // This is the core signet protocol endpoint.
       if (pathname === "/cert" && request.method === "POST") {
         const { handleCertExchange } = await import("./src/cert-exchange");
-        return handleCertExchange(request, env);
+        return handleCertExchange(request, env, platform);
       }
 
       // POST /cert/passkey — authenticated session → bridge cert pair.
@@ -2287,6 +3128,21 @@ export default {
       // what a grant should cost — a human present, one touch, unphishable,
       // nothing transcribed. It also works on a phone, where a filesystem, a
       // keychain helper and the signet binary all do not.
+      // POST /cert/nonce — the session term for a cert-pair binding
+      // (notme-486e8a). Same-origin; the HttpOnly cookie is sent
+      // automatically, so the browser never needs to read it.
+      if (pathname === "/cert/nonce" && request.method === "POST") {
+        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        if (!cookie) return jsonErr("session_required", 401);
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
+        if (!session) return jsonErr("invalid_session", 401);
+        const { nonce, expiresIn } = await authority.issuePopNonce(session.principalId);
+        return Response.json({ nonce, expires_in: expiresIn }, { headers: { "Cache-Control": "no-store" } });
+      }
+
       if (pathname === "/cert/passkey" && request.method === "POST") {
         try {
           const cookie = parseCookie(
@@ -2301,6 +3157,7 @@ export default {
           }
 
           let body: {
+            nonce?: string;
             public_keys?: { mtls?: string; signing?: string };
             proofs?: { mtls?: string; signing?: string };
           } = {};
@@ -2308,6 +3165,9 @@ export default {
             body = (await request.json()) as typeof body;
           } catch {
             /* empty body */
+          }
+          if (typeof body.nonce !== "string" || !body.nonce) {
+            return jsonErr("nonce required — POST /cert/nonce first (notme-486e8a)", 400);
           }
           if (!body.public_keys?.mtls || !body.public_keys?.signing) {
             return jsonErr(
@@ -2322,11 +3182,11 @@ export default {
             );
           }
 
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const { verifySessionCookie } = await import("./src/auth/session");
-          const sessionSecret = await authority.getSessionSecret();
-          const session = await verifySessionCookie(cookie, sessionSecret);
+          // Typed stub: the mint below takes a parsed AuthMethod (notme-32003c).
+          const authority = authorityStub(env);
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
           if (!session) {
             return Response.json({ error: "invalid_session" }, { status: 401 });
           }
@@ -2338,7 +3198,7 @@ export default {
             mtlsPubKey = await importPublicKey(body.public_keys.mtls);
             signingPubKey = await importPublicKey(body.public_keys.signing);
           } catch (e: any) {
-            return jsonErr("invalid public key: " + e.message, 400);
+            return opaqueError("cert-passkey", "invalid public key", 400, e);
           }
 
           // Binding = SHA-256(mtls_spki || signing_spki || SHA-256(session
@@ -2357,18 +3217,14 @@ export default {
             "spki",
             signingPubKey,
           )) as ArrayBuffer;
-          const sessionHash = await crypto.subtle.digest(
-            "SHA-256",
-            new TextEncoder().encode(cookie),
-          );
-          const bindingInput = new Uint8Array(
-            mtlsSpki.byteLength + signingSpki.byteLength + 32,
-          );
-          bindingInput.set(new Uint8Array(mtlsSpki), 0);
-          bindingInput.set(new Uint8Array(signingSpki), mtlsSpki.byteLength);
-          bindingInput.set(
-            new Uint8Array(sessionHash),
-            mtlsSpki.byteLength + signingSpki.byteLength,
+          // The session term is a server-issued nonce, not SHA-256 of the
+          // cookie: the cookie is HttpOnly, so no browser could ever compute
+          // that, and this route was uncallable (notme-486e8a).
+          const { certPairBinding } = await import("./src/auth/cert-pair-binding");
+          const bindingInput = await certPairBinding(
+            new Uint8Array(mtlsSpki),
+            new Uint8Array(signingSpki),
+            body.nonce,
           );
           // PoP over the binding PRE-IMAGE — never its digest (notme-a011d2).
           const pop = await verifyPopProofs(
@@ -2380,10 +3236,19 @@ export default {
           if (!pop.ok) {
             return jsonErr(`${pop.algorithm} proof-of-possession failed`, 401);
           }
+          // Spend the nonce only AFTER the proofs verify, so a forged request
+          // cannot burn the real holder's nonce. Bound to THIS principal: a
+          // nonce issued to another session does not match — which is what
+          // defeats replaying a captured keys+proofs pair under it.
+          if (!(await authority.consumePopNonce(body.nonce, session.principalId))) {
+            return Response.json({ error: "invalid_nonce" }, { status: 401 });
+          }
 
+          // LIVE grants, not the cookie's copy (notme-486e8a).
+          const { liveScopes } = await import("./src/auth/session");
           const { certScopesForSession } =
             await import("./src/auth/passkey-cert-scopes");
-          const scopes = certScopesForSession(session.scopes);
+          const scopes = certScopesForSession(await liveScopes(session, authority));
           if (scopes.length === 0) {
             // The session holds nothing a cert may carry. Refuse rather than
             // mint an authority-less cert, which would look like success and
@@ -2398,30 +3263,22 @@ export default {
           // route: /join sets authMethod "invite" and /auth/oidc/login sets
           // "oidc:<issuer>", and this route accepts those sessions — so a
           // hardcoded "passkey" told verifiers a human touched an
-          // authenticator when none did (notme-ebc9af). encodeURIComponent
-          // keeps an issuer-qualified method one URI path segment.
+          // authenticator when none did (notme-ebc9af).
           //
-          // Validated, not defaulted. verifySessionCookie JSON.parses its
-          // payload with no shape check, so a future issuer that omits
-          // authMethod would otherwise reach the mint as undefined —
-          // stamping the literal "undefined" into a certificate's identity
-          // and extension. Defaulting to "passkey" would be worse: it
-          // re-creates the exact lie notme-ebc9af fixed. A cert that cannot
-          // state its provenance honestly must not be minted.
-          const sessionAuthMethod = session.authMethod;
-          if (
-            typeof sessionAuthMethod !== "string" ||
-            sessionAuthMethod.length === 0
-          ) {
-            return jsonErr("session carries no authMethod", 401);
-          }
+          // Validated, not defaulted, and at the BOUNDARY (notme-32003c):
+          // verifySessionCookie parses authMethod and refuses a session
+          // without one, so session.authMethod is an AuthMethod here and the
+          // mint accepts nothing else. A future issuer that omits it gets
+          // invalid_session, not a cert stamped "undefined" — and not a
+          // default of "passkey", which would re-create the lie notme-ebc9af
+          // fixed.
           const result = await authority.mintBridgeCertPair({
             subject: session.principalId,
-            identity: `wimse://${wimseTrustDomain(env)}/${encodeURIComponent(sessionAuthMethod)}/${session.principalId}`,
+            identity: principalIdentity(wimseTrustDomain(env), session.principalId),
             mtlsPublicKeyPem: body.public_keys.mtls,
             signingPublicKeyPem: body.public_keys.signing,
             scopes,
-            authMethod: sessionAuthMethod,
+            authMethod: session.authMethod,
             ttlMs: 5 * 60 * 1000,
           });
 
@@ -2436,14 +3293,532 @@ export default {
           return Response.json({
             ...result,
             principal_id: session.principalId,
-            auth_method: sessionAuthMethod,
+            auth_method: session.authMethod,
           });
         } catch (e: any) {
-          return jsonErr("passkey cert error: " + e.message, 500);
+          return opaqueError("cert-passkey", "passkey cert error", 500, e);
+        }
+      }
+
+      // POST /cert/issuing-ca — mint the MIDDLE tier (ADR-019 D4).
+      //
+      // The Issuing CA: CA=true so the holder signs task certs itself,
+      // offline, without asking this authority per task; pathlen=0 so every
+      // task cert is terminal. This is hop 1 of the delegation chain
+      // (human→machine); hop 2 (machine→task) happens client-side, which is
+      // the point of issuing a CA tier at all.
+      //
+      // Gated on certMint — this route is the scope's FIRST enforcement site.
+      // authorityManage deliberately does not suffice: administering the
+      // authority and minting delegation tiers are different powers, and
+      // bootstrap grants both precisely so they can diverge later.
+      //
+      // Scope narrowing is the leaf rule, applied harder: the tier's scopes
+      // bound every task cert below it (chain rule, auth/scope-chain.ts), and
+      // the artifact is long-lived and exportable — so requested scopes pass
+      // narrowScopes(session, requested) then CERT_ELIGIBLE_SCOPES, same as
+      // /cert and /cert/passkey. certMint itself is never carried.
+      // ── Tier enrolment by device authorization (notme-486e8a) ─────────
+      //
+      // The way a MACHINE gets a delegation tier. /cert/issuing-ca below binds
+      // its proof to SHA-256 of the HttpOnly session cookie, which no client
+      // can read — so it was never callable and a tier was never enrollable.
+      // Here the machine holds the key and the device code, and the human
+      // approves a short user code in a passkey session after comparing the
+      // key fingerprint shown on both screens (RFC 8628 shape).
+
+      // POST /cert/issuing-ca/device — machine starts. Unauthenticated by
+      // nature; it grants nothing until a human approves.
+      if (pathname === "/cert/issuing-ca/device" && request.method === "POST") {
+        // Unauthenticated and row-writing, so limited BEFORE the DO
+        // (notme-a36d10, review H1): CERT_LIMITER (10 / 60 s per key) under
+        // its own `enrol-ip:` prefix, by IP bucket as /token and passkey are.
+        // Unbound it fails open like the other HTTP limiters; the DO's
+        // per-network cap below holds either way.
+        const ip = request.headers.get("cf-connecting-ip");
+        if (env.CERT_LIMITER) {
+          const { success } = await env.CERT_LIMITER.limit({ key: `enrol-ip:${clientIpBucket(ip)}` });
+          if (!success) return jsonErr("rate_limited", 429);
+        }
+        let body: { public_key?: unknown; scopes?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        if (typeof body.public_key !== "string" || !body.public_key) {
+          return jsonErr("public_key required (Ed25519 SPKI PEM)", 400);
+        }
+        const requested =
+          Array.isArray(body.scopes) && body.scopes.every((x) => typeof x === "string")
+            ? (body.scopes as string[])
+            : ["bridgeCert"];
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.startTierEnrolment({
+          publicKeyPem: body.public_key,
+          requestedScopes: requested,
+          source: clientNetworkBucket(ip),
+        });
+        if (!r.ok) {
+          if (r.reason === "source_busy") {
+            return jsonErr("too many pending enrolments from your network — retry once one is approved or expires", 429);
+          }
+          return r.reason === "busy"
+            ? jsonErr("too many pending enrolments — retry shortly", 503)
+            : jsonErr("public_key must be an Ed25519 SPKI PEM", 400);
+        }
+        const origin = new URL(request.url).origin;
+        return Response.json({
+          device_code: r.deviceCode,
+          user_code: r.userCode,
+          verification_uri: `${origin}/enroll?code=${r.userCode}`,
+          key_fingerprint: r.keyFingerprint,
+          expires_in: r.expiresIn,
+          interval: 5,
+        });
+      }
+
+      // GET /enroll?code=XXXX-XXXX — the human's approval page. `/enrol`
+      // (the first spelling, which shipped in a live URL) stays an alias.
+      if ((pathname === "/enroll" || pathname === "/enrol") && request.method === "GET") {
+        const code = (new URL(request.url).searchParams.get("code") || "").toUpperCase();
+        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const sc = cookie ? await checkSession(env, authority, cookie) : null;
+        if (sc?.limited) return rateLimitedResponse();
+        const session = sc?.session ?? null;
+        if (!session) {
+          return Response.redirect(
+            // The AUTHORITY's /login, not SITE_URL's (notme-486e8a): the
+            // passkey ceremony and the session cookie live on this host.
+            // Every login redirect here used SITE_URL — in production
+            // https://notme.bot/login, a 404.
+            `${authorityUrl}/login?return_to=${encodeURIComponent(`/enroll?code=${code}`)}`,
+            302,
+          );
+        }
+        if (!/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/.test(code)) {
+          return jsonErr("malformed enrolment code", 400);
+        }
+        const e = await authority.getTierEnrolment(code);
+        if (!e) return jsonErr("no such enrolment — it may have expired", 404);
+        return new Response(enrolPageHtml(code, e.keyFingerprint, e.requestedScopes, e.status), {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Frame-Options": "DENY",
+          },
+        });
+      }
+
+      // POST /cert/issuing-ca/device/approve — the human approves. Same-origin
+      // with a SameSite=Strict session, so a cross-site page cannot submit it.
+      if (pathname === "/cert/issuing-ca/device/approve" && request.method === "POST") {
+        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        if (!cookie) return jsonErr("session_required", 401);
+        const authority = authorityStub(env);
+        const { liveScopes } = await import("./src/auth/session");
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
+        if (!session) return jsonErr("invalid_session", 401);
+        // LIVE grants, not the cookie's copy: a revoked certMint stops
+        // working now, not when the cookie expires.
+        const live = await liveScopes(session, authority);
+        if (!live.includes("certMint")) return jsonErr("certMint scope required", 403);
+        // No authMethod guard: verifySessionCookie refuses a session without
+        // one, and approveTierEnrolment takes only a parsed AuthMethod
+        // (notme-32003c).
+        let body: { user_code?: unknown; renew_days?: unknown; clone_policy?: unknown; criteria?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        const userCode = typeof body.user_code === "string" ? body.user_code.toUpperCase() : "";
+        // The renewal horizon (notme-337d82): how long this machine may renew
+        // its tier WITHOUT a human — so a VM that pauses and resumes is not
+        // blocked on a person for an action already approved. A fixed menu,
+        // default 7 days (survives a weekend pause); not a free number.
+        const renewDays = body.renew_days === undefined ? 7 : body.renew_days;
+        if (renewDays !== 1 && renewDays !== 7 && renewDays !== 30) {
+          return jsonErr("renew_days must be 1, 7 or 30", 400);
+        }
+        // Clone policy (notme-747cc7): singleton unless the approver, holding
+        // LIVE authorityManage, says otherwise. Phase 1 only records it.
+        const clonePolicy = body.clone_policy === undefined ? "singleton" : body.clone_policy;
+        if (
+          clonePolicy !== "singleton" &&
+          clonePolicy !== "replicas:2" &&
+          clonePolicy !== "replicas:4" &&
+          clonePolicy !== "replicas:8"
+        ) {
+          return jsonErr("clone_policy must be singleton, replicas:2, replicas:4 or replicas:8", 400);
+        }
+        if (clonePolicy !== "singleton") {
+          if (!live.includes("authorityManage")) return jsonErr("replicas requires authorityManage", 403);
+          if (renewDays === 30) return jsonErr("replicas allows a renewal horizon of at most 7 days", 400);
+        }
+        // Criteria (notme-bdc850): which units of identity this machine's
+        // tasks may be. Only definitions grantable this phase; default
+        // agent-session/1. Every tier the enrollment yields carries them.
+        const criteria = grantedCriteria(body.criteria === undefined ? ["agent-session/1"] : body.criteria);
+        if (!criteria) {
+          return jsonErr(`criteria must be grantable criteria ids: ${GRANTABLE_CRITERIA.join(", ")}`, 400);
+        }
+        const pending = await authority.getTierEnrolment(userCode);
+        if (!pending) return jsonErr("no such enrolment", 404);
+        const { narrowScopes } = await import("./src/auth/scope-chain");
+        const { certScopesForSession } = await import("./src/auth/passkey-cert-scopes");
+        // The tier is exportable and long-lived relative to a session, so it
+        // carries only what is safe to export — never certMint itself.
+        const scopes = certScopesForSession(narrowScopes(live, pending.requestedScopes));
+        if (scopes.length === 0) {
+          return jsonErr("no requested scope is cert-eligible and held (need bridgeCert)", 403);
+        }
+        const r = await authority.approveTierEnrolment({
+          userCode,
+          principalId: session.principalId,
+          identity: principalIdentity(wimseTrustDomain(env), session.principalId),
+          authMethod: session.authMethod,
+          scopes,
+          renewDays,
+          clonePolicy,
+          criteria,
+        });
+        if (!r.ok) {
+          return jsonErr(
+            r.reason === "expired" ? "enrolment expired" : r.reason === "not_found" ? "no such enrolment" : "enrolment already decided",
+            r.reason === "not_found" ? 404 : 409,
+          );
+        }
+        return Response.json({ ok: true, scopes, clone_policy: clonePolicy, criteria: criteria.map(criteriaId) });
+      }
+
+      // POST /cert/issuing-ca/device/token — the machine collects. Error
+      // names are RFC 8628 §3.5's, so a generic device-flow client can poll.
+      if (pathname === "/cert/issuing-ca/device/token" && request.method === "POST") {
+        let body: { device_code?: unknown; proof?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.collectTierEnrolment({
+          deviceCode: typeof body.device_code === "string" ? body.device_code : "",
+          proof: typeof body.proof === "string" ? body.proof : "",
+        });
+        if (!r.ok) {
+          return Response.json(
+            { error: r.reason === "invalid_proof" ? "invalid_proof" : r.reason },
+            { status: r.reason === "invalid_proof" ? 401 : 400 },
+          );
+        }
+        const { ok: _ok, principalId, authMethod, renewUntil, generation, enrollmentId, ...tier } = r;
+        return Response.json({
+          ...tier,
+          principal_id: principalId,
+          auth_method: authMethod,
+          renew_until: renewUntil,
+          generation,
+          // What a v3 renewal signs (notme-c9fc8c).
+          enrollment_id: enrollmentId,
+        });
+      }
+
+      // POST /cert/issuing-ca/renew — a machine renews its tier with no
+      // human, while the approval holds (notme-337d82). Body
+      // { public_key, iat, proof }; proof = Ed25519 over
+      // "notme/tier-renew/v1\0" || SPKI || uint64be(iat). v2 adds
+      // `generation` and signs "notme/tier-renew/v2\0" || SPKI ||
+      // uint64be(iat) || uint64be(generation); success returns the
+      // generation to sign next, and a copied key renewing is a 403
+      // fork_detected (notme-747cc7). v3 adds `enrollment_id` (returned at
+      // collect and by every renewal) and signs "notme/tier-renew/v3\0" ||
+      // SPKI || uint64be(iat) || uint64be(generation) || enrollment_id, so a
+      // request for one enrollment of a key never counts for a re-enrollment
+      // of it (notme-c9fc8c). Unauthenticated BY
+      // DESIGN: the proof of possession is the authentication, and the result
+      // is a public certificate for a key only the renewer holds.
+      if (pathname === "/cert/issuing-ca/renew" && request.method === "POST") {
+        let body: { public_key?: unknown; iat?: unknown; proof?: unknown; generation?: unknown; enrollment_id?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        const params = {
+          publicKeyPem: typeof body.public_key === "string" ? body.public_key : "",
+          iat: typeof body.iat === "number" ? body.iat : NaN,
+          proof: typeof body.proof === "string" ? body.proof : "",
+          // v2 (notme-747cc7): a generation in the body selects the v2
+          // binding; without one the request is v1.
+          ...(typeof body.generation === "number" ? { generation: body.generation } : {}),
+          // v3 (notme-c9fc8c): an enrollment_id selects the v3 binding. A
+          // non-string one still selects it, and fails as invalid_proof.
+          ...(body.enrollment_id !== undefined
+            ? { enrollmentId: typeof body.enrollment_id === "string" ? body.enrollment_id : "" }
+            : {}),
+        };
+        const refusalStatus = (reason: string) =>
+          reason === "unknown_key" ? 404
+          : reason === "invalid_key" || reason === "binding_v2_required" || reason === "binding_v3_required" ? 400
+          : reason === "stale_proof" || reason === "invalid_proof" ? 401
+          : 403;
+        // The bindings are request-only, so a forged proof is refused here,
+        // before it costs the singleton anything (notme-ed6114). The DO runs
+        // the same checks again; src/auth/renewal-precheck.ts mirrors them.
+        const { precheckRenewalProof } = await import("./src/auth/renewal-precheck");
+        const pre = await precheckRenewalProof(params);
+        if (!pre.ok) return Response.json({ error: pre.reason }, { status: refusalStatus(pre.reason) });
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.renewTier(params);
+        if (!r.ok) {
+          const status = refusalStatus(r.reason);
+          // revoked / horizon_passed / epoch_changed / approval_withdrawn /
+          // fork_detected all mean "a human must approve again" — named, so
+          // the machine can say which. binding_v2_required and
+          // binding_v3_required (400) are not: a request below the binding
+          // the enrollment speaks — update the client.
+          return Response.json({ error: r.reason }, { status });
+        }
+        const { ok: _ok, renewUntil, generation, enrollmentId, ...tier } = r;
+        return Response.json({ ...tier, renew_until: renewUntil, generation, enrollment_id: enrollmentId });
+      }
+
+      // GET /cert/issuing-ca/enrollments — the signed-in human's machines.
+      // POST /cert/issuing-ca/enrollments/revoke { key_fingerprint } — stop
+      // one renewing. Its own approver may; an administrator may revoke any.
+      if (pathname === "/cert/issuing-ca/enrollments" || pathname === "/cert/issuing-ca/enrollments/revoke") {
+        const cookie = parseCookie(request.headers.get("cookie") || "", "notme_session");
+        if (!cookie) return jsonErr("session_required", 401);
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const { liveScopes } = await import("./src/auth/session");
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
+        if (!session) return jsonErr("invalid_session", 401);
+        if (pathname === "/cert/issuing-ca/enrollments" && request.method === "GET") {
+          return Response.json(await authority.listTierEnrolments(session.principalId));
+        }
+        if (pathname === "/cert/issuing-ca/enrollments/revoke" && request.method === "POST") {
+          let body: { key_fingerprint?: unknown } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+          const fingerprint = typeof body.key_fingerprint === "string" ? body.key_fingerprint.toLowerCase() : "";
+          const isAdmin = (await liveScopes(session, authority)).includes("authorityManage");
+          const r = await authority.revokeTierEnrolment({
+            keyFingerprint: fingerprint,
+            byPrincipal: session.principalId,
+            anyPrincipal: isAdmin,
+          });
+          // 404, not 403, for someone else's machine: whether a fingerprint
+          // is enrolled under another principal is not this caller's business.
+          return r.ok ? Response.json({ ok: true }) : jsonErr("no such enrollment", 404);
+        }
+        return jsonErr("method not allowed", 405);
+      }
+
+      if (pathname === "/cert/issuing-ca" && request.method === "POST") {
+        try {
+          const cookie = parseCookie(
+            request.headers.get("cookie") || "",
+            "notme_session",
+          );
+          if (!cookie) {
+            return Response.json(
+              { error: "session_required" },
+              { status: 401 },
+            );
+          }
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
+          if (!session) {
+            return Response.json({ error: "invalid_session" }, { status: 401 });
+          }
+          // LIVE grant, not the cookie's copy (notme-486e8a). This read
+          // session.scopes, so a revoked certMint kept minting tiers until
+          // the cookie expired.
+          const { liveScopes } = await import("./src/auth/session");
+          if (!(await liveScopes(session, authority)).includes("certMint")) {
+            return jsonErr("certMint scope required", 403);
+          }
+
+          let body: {
+            public_key?: string;
+            proof?: string;
+            scopes?: string[];
+          } = {};
+          try {
+            body = (await request.json()) as typeof body;
+          } catch {
+            /* empty body */
+          }
+          if (!body.public_key) {
+            return jsonErr("public_key required (Ed25519 SPKI PEM)", 400);
+          }
+          if (!body.proof) {
+            return jsonErr(
+              "proof required (Ed25519 signature over the binding payload)",
+              400,
+            );
+          }
+
+          const { importPublicKey } = await import("./src/cert-authority");
+          let publicKey: CryptoKey;
+          try {
+            publicKey = await importPublicKey(body.public_key);
+          } catch (e: any) {
+            return opaqueError("issuing-ca", "invalid public key", 400, e);
+          }
+          if (publicKey.algorithm.name !== "Ed25519") {
+            // The tier signs certificates and the chain is Ed25519
+            // end-to-end; mintIssuingCaCert would refuse this anyway, but a
+            // 400 with the reason beats a 500 with a stack trace.
+            return jsonErr("issuing tier requires an Ed25519 key", 400);
+          }
+
+          // Binding = spki || SHA-256(session cookie) — the session term
+          // stops a captured public_key+proof pair being replayed under a
+          // different session, same construction as /cert/passkey. Pre-image
+          // only: this path is new, so no legacy digest window exists.
+          const spki = (await crypto.subtle.exportKey(
+            "spki",
+            publicKey,
+          )) as ArrayBuffer;
+          const cookieHash = await crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(cookie),
+          );
+          const bindingInput = new Uint8Array(spki.byteLength + 32);
+          bindingInput.set(new Uint8Array(spki), 0);
+          bindingInput.set(new Uint8Array(cookieHash), spki.byteLength);
+          const { verifyEd25519PopProof } = await import("./src/auth/pop");
+          if (!(await verifyEd25519PopProof(bindingInput, publicKey, body.proof))) {
+            return jsonErr("Ed25519 proof-of-possession failed", 401);
+          }
+
+          const { narrowScopes } = await import("./src/auth/scope-chain");
+          const { certScopesForSession } = await import(
+            "./src/auth/passkey-cert-scopes"
+          );
+          const scopes = certScopesForSession(
+            narrowScopes(session.scopes ?? [], body.scopes ?? ["bridgeCert"]),
+          );
+          if (scopes.length === 0) {
+            return jsonErr(
+              "no requested scope is cert-eligible and held (need bridgeCert)",
+              403,
+            );
+          }
+
+          // session.authMethod is parsed at the boundary: verifySessionCookie
+          // refuses a session without one (notme-32003c).
+          const result = await authority.mintIssuingCa({
+            subject: session.principalId,
+            identity: principalIdentity(wimseTrustDomain(env), session.principalId),
+            publicKeyPem: body.public_key,
+            scopes,
+            authMethod: session.authMethod,
+          });
+          return Response.json({
+            ...result,
+            principal_id: session.principalId,
+            auth_method: session.authMethod,
+          });
+        } catch (e: any) {
+          return opaqueError("issuing-ca", "issuing-ca error", 500, e);
         }
       }
 
       // POST /cert/gha — GHA OIDC JWT → bridge cert (legacy, kept for compat)
+      // POST /bootstrap/claim — the named workflow approves a passkey claim
+      // (notme-486e8a). `Authorization: Bearer <GitHub Actions OIDC token,
+      // aud=GHA_CERT_AUDIENCE>`, body `{ code }`. Run by
+      // .github/workflows/claim-authority.yml. The token is verified HERE
+      // (signature, audience, jti) and the DO checks the subject against
+      // BOOTSTRAP_GHA_SUBJECT, so the attestation is never decorative.
+      if (pathname === "/bootstrap/claim" && request.method === "POST") {
+        const auth = request.headers.get("authorization") || "";
+        const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+        if (!token) return jsonErr("Bearer GitHub Actions OIDC token required", 401);
+        const cfg = getConfig(env);
+        const { validateGHAToken } = await import("./src/gha-oidc");
+        let claims: any;
+        try {
+          claims = await validateGHAToken(token, cfg.ghaCertAudience);
+        } catch {
+          return jsonErr("invalid token", 401);
+        }
+        if (!claims.jti) return jsonErr("jti claim required for replay protection", 400);
+        // Every refusal the worker can make comes BEFORE the spend (security
+        // review F3), so a wrong workflow, a typo'd code or a 429 does not
+        // burn the token or cost the singleton a DO write. The DO repeats the
+        // subject check as the authority; this copy only orders the refusal.
+        const { bootstrapAttestedSubject } = await import("./src/auth/bootstrap-policy");
+        const expectedSubject = bootstrapAttestedSubject(env);
+        if (expectedSubject === null) {
+          return jsonErr("BOOTSTRAP_GHA_SUBJECT is not set on this deployment", 403);
+        }
+        const { timingSafeEqual } = await import("./src/auth/timing-safe");
+        if (!(await timingSafeEqual(String(claims.sub), expectedSubject))) {
+          return jsonErr("this workflow is not the one BOOTSTRAP_GHA_SUBJECT names", 403);
+        }
+        let body: { code?: unknown } = {};
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          /* empty body */
+        }
+        // The shape finalizeClaimRegistration issues: XXXX-XXXX over the
+        // RFC 8628 no-vowel alphabet, case-insensitive (the DO upper-cases).
+        const code = typeof body.code === "string" ? body.code.trim().toUpperCase() : "";
+        if (!/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/.test(code)) {
+          return jsonErr("code must be the XXXX-XXXX claim code /auth/passkey/register/verify returned", 400);
+        }
+        // Same keyspace as /cert/gha, /cert and /token: one token, one spend.
+        const jtiKey = `jti:${claims.jti}`;
+        if (await platform.cache.get(jtiKey)) return jsonErr("token already used", 401);
+        // Limited per repository, as /cert/gha, and before any DO RPC
+        // (notme-ed6114).
+        if (platform.rateLimit && !(await platform.rateLimit(`bootstrap:${claims.repository}`))) {
+          return jsonErr("rate limit exceeded", 429);
+        }
+        // The authoritative spend (notme-b0d10f), in the DO key every OIDC
+        // route shares; KV above is the cross-check. A refusal the DO makes
+        // after this (no_such_claim, governed) has used the token.
+        if (!(await authorityStub(env).spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
+          return jsonErr("token already used", 401);
+        }
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+          "/bootstrap/claim",
+        );
+        const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+        const r = await authority.approveBootstrapClaim(code, claims.sub);
+        if (!r.ok) {
+          const map = {
+            not_configured: [403, "BOOTSTRAP_GHA_SUBJECT is not set on this deployment"],
+            subject_mismatch: [403, "this workflow is not the one BOOTSTRAP_GHA_SUBJECT names"],
+            governed: [409, "this authority already has an administrator"],
+            no_such_claim: [404, "no such claim code — it may have expired; register again"],
+          } as const;
+          const [status, msg] = map[r.reason as keyof typeof map];
+          return jsonErr(msg, status);
+        }
+        return Response.json({ ok: true, principal_id: r.principalId });
+      }
+
       if (pathname === "/cert/gha") {
         return handleCertGHA(request, env, platform);
       }
@@ -2502,20 +3877,20 @@ export default {
           // No session — redirect to login, then come back
           const returnTo = `/authorize?${url.searchParams.toString()}`;
           return Response.redirect(
-            `${siteUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
+            `${authorityUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
             302,
           );
         }
 
         const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
         const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const { verifySessionCookie } = await import("./src/auth/session");
-        const sessionSecret = await authority.getSessionSecret();
-        const session = await verifySessionCookie(cookie, sessionSecret);
+        const sc = await checkSession(env, authority, cookie);
+        if (sc.limited) return rateLimitedResponse();
+        const session = sc.session;
         if (!session) {
           const returnTo = `/authorize?${url.searchParams.toString()}`;
           return Response.redirect(
-            `${siteUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
+            `${authorityUrl}/login?return_to=${encodeURIComponent(returnTo)}`,
             302,
           );
         }
@@ -2616,9 +3991,9 @@ export default {
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const { verifySessionCookie } = await import("./src/auth/session");
-          const sessionSecret = await authority.getSessionSecret();
-          const session = await verifySessionCookie(cookie, sessionSecret);
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
           if (!session) {
             return Response.json({ error: "invalid_session" }, { status: 401 });
           }
@@ -2636,7 +4011,7 @@ export default {
             expires_in: expiresAt - Math.floor(Date.now() / 1000),
           });
         } catch (e: any) {
-          return jsonErr("authorize code error: " + e.message, 500);
+          return opaqueError("authorize-code", "authorize code error", 500, e);
         }
       }
 
@@ -2696,6 +4071,17 @@ export default {
             );
           }
 
+          // Per-IP limit BEFORE the DO (notme-c3fdbc): a well-formed body
+          // with a random code used to buy a redeemAuthorizationCode RPC
+          // each. After the shape checks, so a malformed request spends no
+          // budget. One redeem per OAuth round trip, so CERT_LIMITER's
+          // 10 / 60 s per IP bucket fits, under its own prefix. Unbound, it
+          // fails open like the other limiters.
+          if (env.CERT_LIMITER) {
+            const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+            const { success } = await env.CERT_LIMITER.limit({ key: `redeem-ip:${ip}` });
+            if (!success) return jsonErr("rate_limited", 429);
+          }
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
           const result = await authority.redeemAuthorizationCode({
@@ -2717,7 +4103,7 @@ export default {
             expires_in: 300,
           });
         } catch (e: any) {
-          return jsonErr("authorize redeem error: " + e.message, 500);
+          return opaqueError("authorize-redeem", "authorize redeem error", 500, e);
         }
       }
 
@@ -2765,9 +4151,9 @@ export default {
 
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const { verifySessionCookie } = await import("./src/auth/session");
-          const sessionSecret = await authority.getSessionSecret();
-          const session = await verifySessionCookie(cookie, sessionSecret);
+          const sc = await checkSession(env, authority, cookie);
+          if (sc.limited) return rateLimitedResponse();
+          const session = sc.session;
           if (!session) {
             return Response.json({ error: "invalid_session" }, { status: 401 });
           }
@@ -2784,10 +4170,7 @@ export default {
             expires_in: 300,
           });
         } catch (e: any) {
-          return Response.json(
-            { error: "authorize token error: " + e.message },
-            { status: 500 },
-          );
+          return opaqueError("authorize-token", "authorize token error", 500, e);
         }
       }
 
@@ -2809,12 +4192,25 @@ export default {
               }
 
               // Parse body for audience — validated against module-scope ALLOWED_AUDIENCES
-              let audience = "";
+              // JSON (the first-party session flow) or form-encoded (RFC 8693
+              // token exchange, form-encoded per RFC 6749 §4.1.3).
+              let fields: Record<string, string> = {};
               try {
-                const body = (await request.json()) as { audience?: string };
-                audience = body.audience || "";
+                const ct = request.headers.get("content-type") || "";
+                fields = ct.includes("application/x-www-form-urlencoded")
+                  ? Object.fromEntries(new URLSearchParams(await request.text()))
+                  : ((await request.json()) as Record<string, string>);
               } catch {
                 /* empty body */
+              }
+              const audience = typeof fields.audience === "string" ? fields.audience : "";
+              const grantType = typeof fields.grant_type === "string" ? fields.grant_type : "";
+              // Discovery advertises exactly this grant (as-metadata.ts). An
+              // absent grant_type is the first-party session flow, which is
+              // deliberately not advertised; anything else is refused by its
+              // RFC 6749 §5.2 name rather than silently treated as a session.
+              if (grantType && grantType !== TOKEN_EXCHANGE_GRANT) {
+                return Response.json({ error: "unsupported_grant_type" }, { status: 400 });
               }
 
               if (!audience) {
@@ -2834,6 +4230,23 @@ export default {
               const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
               const authority = env.SIGNING_AUTHORITY.get(authorityId);
 
+              // Rate limit — atomic, edge-fast (replaces the KV-based,
+              // TOCTOU-vulnerable limiter). EVERY check runs before the DO
+              // call it guards (notme-ed6114): the limiter used to run after
+              // getSessionSecret(), so any value in notme_session bought a
+              // billed RPC on the singleton authority before anything could
+              // refuse it. Two keys, because the principal is not known
+              // until the secret is in hand:
+              //   token-ip:<ip>  — before the secret is read for a cookie;
+              //   token:<sub>    — once the caller is known, before any
+              //                    further DO work on its behalf.
+              const rateLimited = async (key: string): Promise<boolean> => {
+                if (!env.TOKEN_LIMITER) return false;
+                const { success } = await env.TOKEN_LIMITER.limit({ key });
+                return !success;
+              };
+              const tooMany = () => Response.json({ error: "rate_limited" }, { status: 429 });
+
               // ── Resolve identity: session cookie OR client cert ──
               let principalId: string | null = null;
               let scopes: string[] = [];
@@ -2841,44 +4254,89 @@ export default {
               // (src/auth/dpop-nonce.ts), and re-fetching it below would be a
               // second DO round-trip for a value already in hand.
               let sessionSecret: string | null = null;
+              // Set for token exchange: the subject token's jti and exp, spent
+              // only after the DPoP proof verifies.
+              let exchanged: { iss: string; jti: string; exp: number } | null = null;
 
-              // Try session cookie first (browser/passkey users)
-              const cookie = parseCookie(
-                request.headers.get("cookie") || "",
-                "notme_session",
-              );
-              if (cookie) {
-                const { verifySessionCookie } =
-                  await import("./src/auth/session");
-                const secret: string = await authority.getSessionSecret();
-                sessionSecret = secret;
-                const session = await verifySessionCookie(cookie, secret);
-                if (session) {
-                  principalId = session.principalId;
-                  scopes = session.scopes;
-                }
-              }
-
-              // X-Client-Cert path REMOVED — mTLS not configured in wrangler.toml,
-              // so the header is attacker-controlled. Re-enable only when CF mTLS
-              // bindings are active and CF injects the cert (not the client).
-
-              if (!principalId) {
-                return Response.json(
-                  { error: "session_required" },
-                  { status: 401 },
-                );
-              }
-
-              // Rate limit — atomic, edge-fast (replaces KV-based TOCTOU-vulnerable limiter)
-              if (env.TOKEN_LIMITER) {
-                const { success } = await env.TOKEN_LIMITER.limit({
-                  key: `token:${principalId}`,
-                });
-                if (!success) {
+              if (grantType === TOKEN_EXCHANGE_GRANT) {
+                // RFC 8693, a GitHub Actions OIDC token as the subject
+                // (notme-486e8a). Discovery used to advertise
+                // "github_actions_oidc" here while this endpoint accepted only
+                // a session cookie. The checks are /cert/gha's, because it is
+                // the same evidence buying a different artifact: GitHub's
+                // signature, our audience, the owner allowlist, a jti.
+                const tokenType = fields.subject_token_type || "";
+                if (
+                  tokenType !== "urn:ietf:params:oauth:token-type:id_token" &&
+                  tokenType !== "urn:ietf:params:oauth:token-type:jwt"
+                ) {
                   return Response.json(
-                    { error: "rate_limited" },
-                    { status: 429 },
+                    { error: "invalid_request", error_description: "subject_token_type must be id_token or jwt" },
+                    { status: 400 },
+                  );
+                }
+                const cfg = getConfig(env);
+                const { validateGHAToken } = await import("./src/gha-oidc");
+                let claims: any;
+                try {
+                  claims = await validateGHAToken(fields.subject_token || "", cfg.ghaCertAudience);
+                } catch {
+                  // Coarse on purpose, as mintBridgeCert's refusals are.
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                if (
+                  !claims.jti ||
+                  !getAllowedOwners(env).has(String(claims.repository_owner).toLowerCase())
+                ) {
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                // A workload identity, exactly as /cert/gha mints: the GitHub
+                // subject, carrying bridgeCert — enough to be mint evidence
+                // (rig's notme-access-token proof), nothing more.
+                principalId = claims.sub;
+                scopes = ["bridgeCert"];
+                exchanged = { iss: String(claims.iss), jti: claims.jti, exp: Number(claims.exp) || 0 };
+                // GitHub-signed, so the subject is known (and not the
+                // caller's to vary) without asking the DO.
+                if (await rateLimited(`token:${principalId}`)) return tooMany();
+                sessionSecret = await liveSessionSecret(authority);
+              } else {
+                // Session cookie (browser/passkey users)
+                const cookie = parseCookie(
+                  request.headers.get("cookie") || "",
+                  "notme_session",
+                );
+                if (cookie) {
+                  // Any string is a cookie until the secret says otherwise,
+                  // so this one is keyed on where it came from, not on what
+                  // it claims. No cookie, no DO call — and no budget spent.
+                  // IPv6 by its /64; no address is its own bucket (review F4,
+                  // src/client-ip-key.ts).
+                  const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+                  if (await rateLimited(`token-ip:${ip}`)) return tooMany();
+                  // Already limited by token-ip above, so no second limiter
+                  // here; the cache keeps junk off the DO (notme-a34dad).
+                  const { liveScopes } = await import("./src/auth/session");
+                  const checked = await verifySessionCached(cookie, authority);
+                  const session = checked.ok ? checked.session : null;
+                  if (checked.ok) sessionSecret = checked.secret;
+                  if (session) {
+                    principalId = session.principalId;
+                    if (await rateLimited(`token:${principalId}`)) return tooMany();
+                    // LIVE grants, not the cookie's copy (notme-486e8a): a
+                    // revoked scope must not keep appearing in fresh tokens.
+                    scopes = await liveScopes(session, authority);
+                  }
+                }
+
+                // X-Client-Cert path REMOVED — mTLS not configured in wrangler.toml,
+                // so the header is attacker-controlled. Re-enable only when CF mTLS
+                // bindings are active and CF injects the cert (not the client).
+
+                if (!principalId) {
+                  return Response.json(
+                    { error: "session_required" },
+                    { status: 401 },
                   );
                 }
               }
@@ -2948,6 +4406,25 @@ export default {
               // Atomically consume the proof JTI and mint inside the singleton DO.
               // SQLite uniqueness closes the cross-edge read/write race that an
               // eventually-consistent KV cache cannot.
+              if (exchanged) {
+                // Spent after the DPoP proof verified, in the keyspace /cert/gha
+                // and /cert's oidc proof use: one GitHub token, one spend.
+                const key = `jti:${exchanged.jti}`;
+                if (await platform.cache.get(key)) {
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                // The authoritative spend (notme-b0d10f): the DO key every
+                // OIDC route shares; KV above is the cross-check.
+                if (!(await authority.spendOidcJti(exchanged.iss, exchanged.jti, exchanged.exp))) {
+                  return Response.json({ error: "invalid_grant" }, { status: 400 });
+                }
+                await markJtiSpentInKv(
+                  platform.cache,
+                  key,
+                  Math.max(60, exchanged.exp - Math.floor(Date.now() / 1000)),
+                  "/token",
+                );
+              }
               const mintResult = await authority.mintDPoPTokenOnce({
                 sub: principalId,
                 scope: scopes.join(" "),
@@ -2981,11 +4458,15 @@ export default {
                   access_token: mintResult.accessToken,
                   token_type: "DPoP",
                   expires_in: 300,
+                  // RFC 8693 §2.2.1: REQUIRED in a token-exchange response.
+                  ...(exchanged
+                    ? { issued_token_type: "urn:ietf:params:oauth:token-type:access_token" }
+                    : {}),
                 },
                 { headers: successHeaders },
               );
             } catch (e: any) {
-              return jsonErr("token endpoint error: " + e.message, 500);
+              return opaqueError("token", "token endpoint error", 500, e);
             }
           })(),
         );
@@ -3009,45 +4490,79 @@ export default {
       // this is public key material, and an auditor is not a principal.
       // Requiring a credential to verify history would defeat the point.
       if (pathname === "/.well-known/epochs.json") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-        const authority = env.SIGNING_AUTHORITY.get(authorityId);
-        const epochs = await authority.listEpochKeys();
-        const resp = Response.json(
-          { epochs },
-          {
-            headers: {
-              // Short max-age: a rotation adds an entry, and an auditor
-              // fetching just after one should not be told the epoch is
-              // unknown. The set only ever grows, so a stale copy is
-              // incomplete rather than wrong.
-              "Cache-Control": "public, max-age=60",
-              "Access-Control-Allow-Origin": "*",
+        const served = await serveCachedPublic(request, async () => {
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          // Signed by the root, with what ended each epoch (notme-6a4f23):
+          // `epochs` exactly as before, plus `revocations` (epoch, revokedAt,
+          // reason — set only by /admin/revoke-epoch), `currentEpoch`, and
+          // the CABundle-style `seqno` / `issuedAt` / `signature`. Verifier
+          // rule and canonical form: ADR-019 D7, src/epoch-history.ts.
+          const history = await authority.getSignedEpochHistory();
+          return Response.json(
+            history,
+            {
+              headers: {
+                // Short max-age: a rotation adds an entry, and an auditor
+                // fetching just after one should not be told the epoch is
+                // unknown. The set only ever grows, so a stale copy is
+                // incomplete rather than wrong.
+                "Cache-Control": "public, max-age=60",
+                "Access-Control-Allow-Origin": "*",
+              },
             },
-          },
-        );
-        return cachePut(request, resp);
+          );
+        });
+        if (served) return served;
+      }
+
+      // GET /.well-known/ct-not-delivered.json — serials the authority signed
+      // and never delivered (notme-b35676). A CT monitor sees every precert
+      // in the log; a few belong to certificates nobody received (a mint
+      // refused after the log wait and retried under new serials, or a tier
+      // collect whose claim was taken over). This is how it tells them apart.
+      //
+      // Unauthenticated, like epochs.json and jwks.json: the serials are
+      // already in the public log, and a monitor is not a principal. Only the
+      // reason and time are new, and they disclose no subject or key.
+      if (pathname === "/.well-known/ct-not-delivered.json") {
+        const served = await serveCachedPublic(request, async () => {
+          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+          const authority = env.SIGNING_AUTHORITY.get(authorityId);
+          const notDelivered = await authority.listNotDeliveredCerts();
+          return Response.json(
+            { notDelivered },
+            {
+              headers: {
+                // The list only grows; a copy a minute old is incomplete,
+                // never wrong.
+                "Cache-Control": "public, max-age=60",
+                "Access-Control-Allow-Origin": "*",
+              },
+            },
+          );
+        });
+        if (served) return served;
       }
 
       if (pathname === "/.well-known/jwks.json") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        try {
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const jwk = await authority.getPublicKeyJwk();
-          const { buildJwksResponse } = await import("./src/auth/dpop-handler");
-          const resp = Response.json(buildJwksResponse(jwk), {
-            headers: {
-              "Cache-Control": "public, max-age=3600",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
-          return cachePut(request, resp);
-        } catch {
-          return jsonErr("authority unavailable", 503);
-        }
+        const served = await serveCachedPublic(request, async () => {
+          try {
+            const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+            const authority = env.SIGNING_AUTHORITY.get(authorityId);
+            const jwk = await authority.getPublicKeyJwk();
+            const { buildJwksResponse } = await import("./src/auth/dpop-handler");
+            return Response.json(buildJwksResponse(jwk), {
+              headers: {
+                "Cache-Control": ROTATION_BOUND_CACHE_CONTROL,
+                "Access-Control-Allow-Origin": "*",
+              },
+            });
+          } catch {
+            return jsonErr("authority unavailable", 503);
+          }
+        });
+        if (served) return served;
       }
 
       // Authority discovery — signet equivalent of openid-configuration.
@@ -3138,22 +4653,27 @@ export default {
       // CA certificate — self-signed X.509 from SigningAuthority DO.
       // CF mTLS trust store requires X.509 PEM, not raw public keys.
       if (pathname === "/.well-known/ca-bundle.pem") {
-        const cached = await cacheMatch(request);
-        if (cached) return cached;
-        try {
-          const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
-          const authority = env.SIGNING_AUTHORITY.get(authorityId);
-          const pem: string = await authority.getCACertificatePem();
-          const resp = new Response(pem, {
-            headers: {
-              "Content-Type": "application/x-pem-file",
-              "Cache-Control": "public, max-age=3600",
-            },
-          });
-          return cachePut(request, resp);
-        } catch {
-          // DO not available — fall through to VPC proxy
-        }
+        const served = await serveCachedPublic(request, async () => {
+          try {
+            const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+            const authority = env.SIGNING_AUTHORITY.get(authorityId);
+            const pem: string = await authority.getCACertificatePem();
+            return new Response(pem, {
+              headers: {
+                "Content-Type": "application/x-pem-file",
+                "Cache-Control": ROTATION_BOUND_CACHE_CONTROL,
+              },
+            });
+          } catch {
+            // DO not available. This used to return null and fall through to
+            // the VPC proxy — signet's OWN ca-bundle.pem, a different CA,
+            // answering for notme's. The passthrough is closed by default now
+            // (notme-a34dad), and serving another authority's CA was never
+            // right: say unavailable, as jwks.json does.
+            return jsonErr("authority unavailable", 503);
+          }
+        });
+        if (served) return served;
       }
 
       // Content-negotiated landing at /
@@ -3208,7 +4728,7 @@ export default {
       // unmatched path under the authority host answered with Cloudflare's
       // error 1101 — a Worker exception, not a routing answer (notme-cb0354,
       // live in production 2026-08-05 while known routes were healthy).
-      // Staging cannot catch this: with no VPC_AUTH binding it takes the 503
+      // Staging cannot catch this: with no VPC_AUTH binding it takes the 404
       // fallthrough below, so the environments diverge exactly at this branch
       // and a green staging run says nothing about this path.
       //
@@ -3219,13 +4739,46 @@ export default {
       // unauthenticated callers. The cause goes to the log, where an operator
       // can tell an outage from a typo; the caller learns only that nothing
       // answers here.
-      if (env.VPC_AUTH) {
+      //
+      // ALLOWLISTED, AND CLOSED BY DEFAULT (notme-a34dad, overnight review
+      // M4). This proxied EVERY unmatched path — method, headers, body — to
+      // signet on Fly, with no limiter, no WAF rule and no cache, so a flood
+      // of random paths cost about $0.92 per million here and passed straight
+      // through to the tunnel. What signet serves behind it
+      // (signet/cmd/signet/authority.go): /login, /.well-known/ca-bundle.pem,
+      // / and /healthz, all answered by this Worker first; /callback, which
+      // only follows signet's /login, unreachable here; and /exchange-token
+      // and /api/cert/register, which notme stopped advertising in 4a51a6d
+      // because nothing routes to them. Nothing notme ships calls a path that
+      // only this branch could serve — signet's own CI clients use /cert/gha,
+      // which this Worker serves — so no path passes by default. An operator
+      // who finds a real caller lists the EXACT path in
+      // SIGNET_PASSTHROUGH_PATHS (comma-separated, no prefixes), and each
+      // allowed request is per-IP limited before the tunnel is touched.
+      const passthrough = new Set(
+        String(env.SIGNET_PASSTHROUGH_PATHS || "")
+          .split(",")
+          .map((p: string) => p.trim())
+          .filter((p: string) => p.startsWith("/")),
+      );
+      if (env.VPC_AUTH && passthrough.has(pathname)) {
+        if (env.TOKEN_LIMITER) {
+          const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+          const { success } = await env.TOKEN_LIMITER.limit({ key: `vpc-ip:${ip}` });
+          if (!success) return rateLimitedResponse();
+        }
         const originUrl = `http://localhost${pathname}${url.search}`;
+        // No cookies cross to the origin (security review F3 of
+        // notme-a2e75d). The registration cookie is Path=/ and the session
+        // cookie always was, so both rode on every passthrough. signet reads
+        // no cookies, and nothing behind this tunnel should hold either.
+        const forwarded = new Headers(request.headers);
+        forwarded.delete("cookie");
         try {
           return await env.VPC_AUTH.fetch(
             new Request(originUrl, {
               method: request.method,
-              headers: request.headers,
+              headers: forwarded,
               body: request.body,
             }),
           );
@@ -3384,6 +4937,34 @@ export default {
       return cachePut(request, result, "Accept");
     }
 
+    // /why moved to the blog at q-q.dev.
+    //
+    // The page itself lives in the PRIVATE agentic-research/notme.bot repo,
+    // which declares a worker of the same name on these same two routes —
+    // so the two repos are two sources for ONE deployment and the last
+    // deploy wins. This repo is what is live (production's nav.js matches
+    // this repo's, and has no "why" entry), and this repo has no why.html,
+    // which is why /why has been 404ing. Nothing pointed at it: the
+    // deployed nav and sitemap predate the page, so only a typed URL
+    // reached the 404.
+    //
+    // 302 AND SHORT-CACHED, UNLIKE EVERY OTHER REDIRECT BELOW. Those are
+    // settled renames and use 301 with `max-age=31536000, immutable`. This
+    // destination is NOT settled: the post is not published on q-q.dev yet,
+    // so the target is the blog root and will become the post's own URL. An
+    // immutable 301 would make browsers ignore that change for a year.
+    // Flip both when the post lands (notme-4e02fb).
+    if (url.pathname === "/why") {
+      const resp = new Response(null, {
+        status: 302,
+        headers: {
+          Location: "https://q-q.dev/",
+          "Cache-Control": "public, max-age=600",
+        },
+      });
+      return cachePut(request, resp);
+    }
+
     // Redirects for renamed pages — cached at edge with long TTL
     if (url.pathname === "/stack") {
       const resp = new Response(null, {
@@ -3417,6 +4998,11 @@ export default {
     }
 
     // ── Static assets ──
+    // _api-docs is a template whose authority host is a placeholder that
+    // /api/docs fills (notme-131c8e). Served raw it would show the token.
+    if (url.pathname === "/_api-docs" || url.pathname === "/_api-docs.html") {
+      return new Response("Not found", { status: 404 });
+    }
     // Check CF edge cache first — avoids re-invoking ASSETS.fetch on cache hit.
     const cached = await cacheMatch(request);
     if (cached) return cached;

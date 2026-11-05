@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * challenge-freshness.do.test.ts — a WebAuthn REGISTRATION challenge must
  * expire on the same clock as an authentication challenge (notme-addef9, from
@@ -84,6 +84,7 @@ async function verifyClassified(
         "notme.bot",
         "https://notme.bot",
         sql,
+        () => false,
       );
       return "other" as const; // past the lookup — not the freshness path
     } catch (e: any) {
@@ -94,7 +95,7 @@ async function verifyClassified(
   });
 }
 
-describe("registration challenge freshness (notme-addef9 / audit N5)", () => {
+describe("passkey.challenge.expiry — registration challenge freshness (notme-addef9 / audit N5)", () => {
   it("rejects a registration challenge older than the 5-minute window", async () => {
     const stub = await seedChallenge("chal-stale", "user-stale", 10);
     expect(await verifyClassified(stub, "user-stale")).toBe("no-challenge");

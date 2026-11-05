@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * san-length.do.test.ts — the SubjectAltName URI must round-trip at any
  * length a real deployment can produce (notme-193368).
@@ -31,6 +31,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import * as x509 from "@peculiar/x509";
 import type { SigningAuthority } from "./signing-authority";
+import { AUTH_METHOD } from "./auth/session";
 
 async function keyPems() {
   const mtls = (await crypto.subtle.generateKey(
@@ -61,7 +62,7 @@ async function mintWithIdentity(name: string, identity: string) {
       mtlsPublicKeyPem: keys.mtls,
       signingPublicKeyPem: keys.signing,
       scopes: ["bridgeCert"],
-      authMethod: "passkey",
+      authMethod: AUTH_METHOD.passkey,
       ttlMs: 5 * 60 * 1000,
     }),
   );
