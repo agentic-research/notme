@@ -191,9 +191,24 @@ tasks:
       - cargo test --locked
       - cargo clippy --locked --tests -- -D warnings
 
+  worker:config-drift:
+    desc: "Refuse to deploy while the live worker/wrangler.toml lags wrangler.toml.example (names only, never values; skipped when absent unless STRICT=1)"
+    # What `wrangler deploy` reads is the gitignored live file, and nothing
+    # reviewed it: the 2026-11-04 review found production at an untested
+    # compatibility date, with no version_metadata, and a staging that would
+    # have logged revocations to the PUBLIC Rekor (notme-a3804c, H3). Every
+    # task that deploys or moves traffic depends on this one. worker:rollback
+    # deliberately does NOT: it is the emergency exit, and must never wait on
+    # a config fix. `run: once` so a ship-* that reaches it twice checks once.
+    run: once
+    deps: [deps:install]
+    cmds:
+      - pnpm exec tsx scripts/config-drift.ts
+
   worker:deploy-preview:
     desc: Upload new version without routing traffic to it
     dir: worker
+    deps: [worker:config-drift]
     cmds:
       # Stamp the build so the deployed Worker can say WHICH build it is
       # (notme-9f2f79). Deploys here are manual, so without this the git tree
@@ -209,6 +224,7 @@ tasks:
   worker:deploy:
     desc: Deploy to production (use ship for the safe path)
     dir: worker
+    deps: [worker:config-drift]
     cmds:
       # Stamp the build so the deployed Worker can say WHICH build it is
       # (notme-9f2f79). Deploys here are manual, so without this the git tree
@@ -313,6 +329,7 @@ tasks:
   worker:deploy-staging:
     desc: Deploy to the staging Worker (notme-bot-staging, isolated state)
     dir: worker
+    deps: [worker:config-drift]
     cmds:
       - pnpm exec wrangler deploy --env staging --var BUILD_SHA:$(git rev-parse HEAD)
 
@@ -337,6 +354,8 @@ tasks:
 
   ship-staging:
     desc: "Staging gate: preflight → install → check → docs → deploy staging → verify staging"
+    # First, so a stale live config fails in seconds, not after the check (notme-a3804c).
+    deps: [worker:config-drift]
     cmds:
       - task: node:preflight
       - task: worker:install
@@ -363,6 +382,7 @@ tasks:
   worker:canary:
     desc: "Split traffic: NEW=<version-id> OLD=<version-id> ENV=<production|staging> [PCT=10]"
     dir: worker
+    deps: [worker:config-drift]
     vars:
       PCT: '{{.PCT | default "10"}}'
       ENV_FLAG: '{{if eq .ENV "staging"}}--env staging{{end}}'
@@ -395,6 +415,7 @@ tasks:
 
   worker:promote:
     desc: "Route 100% to NEW=<version-id> ENV=<production|staging> — gated on a pinned verify of THAT version; rolls back on failure"
+    deps: [worker:config-drift]
     # The gate, the override (ALLOW_UNVERIFIED='<reason>' EXPECT=<sha>), and
     # the post-promote converge → pinned verify → rollback live in the script
     # so they are testable without a Cloudflare account (promote-gate.test.ts).
@@ -489,6 +510,8 @@ tasks:
 
   ship:
     desc: "Safe path: preflight → install → check → docs → preview → verify instructions"
+    # First, so a stale live config fails in seconds, not after the check (notme-a3804c).
+    deps: [worker:config-drift]
     cmds:
       - task: node:preflight
       - task: worker:install
@@ -539,6 +562,8 @@ tasks:
     # emergency exit), then `task worker:verify`. The path that rolls back by
     # itself is ship → canary → pinned verify → worker:promote.
     desc: "Full send: preflight → install → check → docs → deploy → converge → verify. NO auto-rollback: on failure run task worker:rollback"
+    # First, so a stale live config fails in seconds, not after the check (notme-a3804c).
+    deps: [worker:config-drift]
     vars:
       # The build worker:deploy stamps (BUILD_SHA = git HEAD).
       HEAD_SHA:

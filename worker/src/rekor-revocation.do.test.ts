@@ -254,6 +254,30 @@ describe("a Rekor outage never touches the revocation (notme-8befcc)", () => {
     expect(r.rekorLogIndex).toBe(log.get(r.rekorUuid!)!.logIndex);
   });
 
+  it("rekor.retry.hourly-cap — after many failures the backoff is at most an hour, not 6 h (notme-a3804c, review L2)", async () => {
+    mode = "503";
+    const { ended } = await revoke("long outage");
+    const setLast = (attempts: number, agoS: number) =>
+      runInDurableObject(authority(), async (_i, state) => {
+        state.storage.sql.exec(
+          "UPDATE epoch_revocations SET rekor_attempts = ?, rekor_last_attempt_at = ? WHERE epoch = ?",
+          attempts,
+          Math.floor(Date.now() / 1000) - agoS,
+          ended,
+        );
+      });
+    mode = "ok";
+    // 20 failures, last one 50 minutes ago: still inside the hour.
+    await setLast(20, 50 * 60);
+    await runAlarm();
+    expect(postsFor(ended)).toHaveLength(1);
+    // 61 minutes ago: due. Under the old 6 h cap it waited up to 6 h.
+    await setLast(20, 61 * 60);
+    await runAlarm();
+    expect(postsFor(ended)).toHaveLength(2);
+    expect((await history()).revocations.find((x) => x.epoch === ended)!.rekorLogIndex).not.toBeNull();
+  });
+
   it("a retry whose first answer was lost records the existing entry (409), not a second one", async () => {
     const { ended } = await revoke("lost answer");
     const uuid = (await history()).revocations.find((x) => x.epoch === ended)!.rekorUuid!;
@@ -270,6 +294,62 @@ describe("a Rekor outage never touches the revocation (notme-8befcc)", () => {
     const r = (await history()).revocations.find((x) => x.epoch === ended)!;
     expect(r.rekorUuid).toBe(uuid);
     expect(r.rekorLogIndex).toBe(log.get(uuid)!.logIndex);
+  });
+});
+
+// notme-a3804c (review H3): a staging authority with no REKOR_URL fell back
+// to the public Rekor. The guard is in submitToRekor; this is the DO path end
+// to end: the revocation commits, nothing is sent, the row stays pending and
+// alarm-health says why.
+describe("a non-production authority never writes to the public Rekor (notme-a3804c)", () => {
+  /** Run `fn` with the DO's own env pointed at the public Rekor from a staging host. */
+  async function asStagingOnPublicRekor<T>(fn: () => Promise<T>): Promise<T> {
+    const swap = (vals: Record<string, string | undefined>) =>
+      runInDurableObject(authority(), async (instance) => {
+        const e = (instance as unknown as { env: Record<string, string | undefined> }).env;
+        const before = { REKOR_URL: e.REKOR_URL, SIGNET_AUTHORITY_URL: e.SIGNET_AUTHORITY_URL };
+        Object.assign(e, vals);
+        return before;
+      });
+    const before = await swap({ REKOR_URL: "https://rekor.sigstore.dev", SIGNET_AUTHORITY_URL: "https://auth-staging.notme.bot" });
+    try {
+      return await fn();
+    } finally {
+      await swap(before);
+    }
+  }
+
+  it("rekor.public.production-only — the revocation commits, nothing reaches any log, the row is pending with the refusal", async () => {
+    const sentElsewhere: string[] = [];
+    const guard = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const host = new URL(new Request(input, init).url).hostname;
+      if (host !== REKOR_HOST) sentElsewhere.push(host);
+      return guard(input, init);
+    }) as typeof fetch;
+    try {
+      await asStagingOnPublicRekor(async () => {
+        const { ended } = await revoke("staging on public rekor");
+        const r = (await history()).revocations.find((x) => x.epoch === ended)!;
+        expect(r.statement).not.toBeNull(); // signed, so it can be sent once the config is fixed
+        expect(r.rekorLogIndex).toBeNull();
+        expect(postsFor(ended)).toHaveLength(0);
+        // The alarm's retry is refused the same way.
+        await ageAttempt(ended);
+        await runAlarm();
+        expect(postsFor(ended)).toHaveLength(0);
+        const row = await runInDurableObject(authority(), async (_i, state) =>
+          state.storage.sql
+            .exec("SELECT rekor_last_error, rekor_log_index FROM epoch_revocations WHERE epoch = ?", ended)
+            .toArray()[0] as { rekor_last_error: string; rekor_log_index: number | null },
+        );
+        expect(row.rekor_log_index).toBeNull();
+        expect(row.rekor_last_error).toMatch(/^refused: the public Rekor \(rekor\.sigstore\.dev\)/);
+      });
+      expect(sentElsewhere).not.toContain("rekor.sigstore.dev");
+    } finally {
+      globalThis.fetch = guard;
+    }
   });
 });
 

@@ -402,9 +402,9 @@ export interface CtHealth {
   /** Age in seconds of the oldest of those rows; null when none. */
   oldestUnloggedAgeS: number | null;
   /**
-   * Unlogged rows that hit 24 attempts. Still retried, at most once per 24 h
-   * per row (a root rotation or shard roll can strand them for longer than
-   * the fast retries last), and counted here until they are logged — or, 30
+   * Unlogged rows that hit 24 attempts. Still retried on the same backoff,
+   * at most an hour apart (notme-a3804c), and counted here until they are
+   * logged — or, 30
    * days after their mint, abandoned (then counted in `abandoned` instead).
    */
   gaveUp: number;
@@ -2780,19 +2780,35 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   /** Concurrent add-chain calls inside one fire: 20 rows / 4 = 5 waves of at
    *  most DEFAULT_TIMEOUT_MS (2 s), so a fire's drain is bounded at ~10 s. */
   static readonly CT_DRAIN_CONCURRENCY = 4;
-  /** After this many failed attempts a row is "gaveUp": retried only once per CT_SLOW_RETRY_S. */
+  /**
+   * After this many failed attempts a row is counted as "gaveUp" in health,
+   * and becomes eligible for abandonment (CT_ABANDON_AFTER_S). It is NOT
+   * retried any less often: the retry curve below is the same before and
+   * after (notme-a3804c, review L1).
+   */
   static readonly CT_MAX_ATTEMPTS = 24;
 
-  /** A row past CT_MAX_ATTEMPTS is retried at most this often (final review I2). */
-  static readonly CT_SLOW_RETRY_S = 24 * 60 * 60;
+  /**
+   * Per-row retry backoff (notme-a3804c, review L1): after the n-th failed
+   * attempt the row waits CT_RETRY_BASE_S * 2^(n-1), capped at
+   * CT_RETRY_MAX_S — 3, 6, 12, 24, 48 minutes, then hourly. It replaced a
+   * cliff: 24 retries on every fire (~96 minutes), then ONE a day, so after
+   * a 12 h log outage almost every row waited up to a day past recovery.
+   * Now no row waits more than an hour past it (plus the batch's turn:
+   * CT_DRAIN_BATCH rows per fire, fewest attempts first). The base is under
+   * the 4-minute alarm cadence, so a first failure retries on the next fire.
+   */
+  static readonly CT_RETRY_BASE_S = 3 * 60;
+  static readonly CT_RETRY_MAX_S = 60 * 60;
 
   /**
    * A gaveUp row is abandoned once it is this old (counted from its mint):
-   * no more retries, counted in health `abandoned` (notme-1b46a8 cost
-   * review). 30 days = the 96-minute fast window plus ~30 daily retries, so
-   * any fix an operator makes after a monthly review of `gaveUp` (a root
-   * appended to the log, a shard configured, an outage over) still drains
-   * the row; past that, retrying daily forever only costs requests.
+   * no more retries, counted in health `abandoned` and logged as
+   * `ct.backlog_abandoned` — never silently (notme-1b46a8 cost review).
+   * 30 days of hourly retries, so any fix an operator makes after a monthly
+   * review of `gaveUp` (a root appended to the log, a shard configured, an
+   * outage over) still drains the row within the hour; past that, retrying
+   * forever only costs requests.
    * Only gaveUp rows (attempts ≥ CT_MAX_ATTEMPTS) qualify: a row that was
    * never tried — minted while the pin was broken — is not abandoned.
    */
@@ -2894,10 +2910,27 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   //     minted (TIER_COLLECT_RECLAIM_S) discards its certificate, which with
   //     CT bound was logged or backlogged (collectTierEnrolment).
   // Each serial is kept here, durably, and published read-only at
-  // /.well-known/ct-not-delivered.json. Not pruned: a log entry is
-  // permanent, so its explanation must be too. Growth is bounded by what
-  // causes a row — an operator rotate/revokeEpoch inside a log wait, or a
-  // mint outlasting the 60 s reclaim window — not by request volume.
+  // /.well-known/ct-not-delivered.json, for CT_NOT_DELIVERED_RETENTION_S.
+  // Growth is bounded by what causes a row — an operator rotate/revokeEpoch
+  // inside a log wait, or a mint outlasting the 60 s reclaim window — not by
+  // request volume.
+
+  /**
+   * How long a not-delivered serial is kept and served (notme-a3804c, review
+   * L3): 400 days. The rows used to be kept forever and served capped at
+   * 1000, so once the table passed 1000 the oldest silently vanished from
+   * the route anyway. 400 days is over a year past the longest-lived
+   * certificate this authority logs (bridge pairs default to 5 minutes,
+   * tiers are capped at 24 h), and longer than a whole CT shard interval (a
+   * year, ct/config.notme.json) plus a month: past it the certificate is
+   * long expired and its shard closed, so no monitor still needs the
+   * explanation. Chosen over paginating the route, whose cursor would make
+   * every distinct query an uncached SigningAuthority call on a public
+   * route (the miss notme-ed6114 closed). ct/README.md documents it.
+   */
+  static readonly CT_NOT_DELIVERED_RETENTION_S = 400 * 24 * 60 * 60;
+  /** Most rows listNotDeliveredCerts returns; more logs ct.not_delivered_truncated. */
+  static readonly CT_NOT_DELIVERED_MAX = 1000;
 
   #notDeliveredReady = false;
   #ensureNotDeliveredSchema(): void {
@@ -2909,6 +2942,11 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         discarded_at INTEGER NOT NULL
       )
     `);
+    // The listing sorts and the prune filters by time (review L3: the sort
+    // had no index).
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS ct_not_delivered_by_time ON ct_not_delivered (discarded_at, serial)",
+    );
     this.#notDeliveredReady = true;
   }
 
@@ -2932,6 +2970,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         );
       }
       console.warn({ event: "ct.not_delivered", reason, serials });
+      // Pruned here, at the only point the table grows, so no alarm work is
+      // needed to keep it bounded; the listing filters by the same cutoff,
+      // so what is served is exact either way. Its own try: a failed prune
+      // is not a lost row.
+      try {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM ct_not_delivered WHERE discarded_at <= ?",
+          now - SigningAuthority.CT_NOT_DELIVERED_RETENTION_S,
+        );
+      } catch (err) {
+        console.error({ event: "ct.not_delivered_prune_failed", error: String(err) });
+      }
     } catch (err) {
       // The mint's outcome is already decided; losing this row loses only
       // the explanation, and the console line above is the fallback record.
@@ -2940,24 +2990,31 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   /**
-   * Every serial signed and never delivered, newest first, at most `limit`
-   * (default and cap 1000). Read-only; published unauthenticated at
+   * Every serial signed and never delivered within the last
+   * CT_NOT_DELIVERED_RETENTION_S, newest first, at most `limit` (default and
+   * cap CT_NOT_DELIVERED_MAX). Read-only; published unauthenticated at
    * /.well-known/ct-not-delivered.json, because what it names is already in
-   * the public log — it only explains it (notme-b35676).
+   * the public log — it only explains it (notme-b35676). A retained list
+   * longer than the cap is logged (`ct.not_delivered_truncated`), so rows
+   * never drop off the route silently (notme-a3804c).
    */
   async listNotDeliveredCerts(
-    limit = 1000,
+    limit = SigningAuthority.CT_NOT_DELIVERED_MAX,
   ): Promise<Array<{ serial: string; reason: string; discardedAt: number }>> {
     this.#ensureNotDeliveredSchema();
-    const n = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 1000)));
-    return (
-      this.ctx.storage.sql
-        .exec(
-          "SELECT serial, reason, discarded_at FROM ct_not_delivered ORDER BY discarded_at DESC, serial LIMIT ?",
-          n,
-        )
-        .toArray() as Array<{ serial: string; reason: string; discarded_at: number }>
-    ).map((r) => ({ serial: r.serial, reason: r.reason, discardedAt: r.discarded_at }));
+    const cap = SigningAuthority.CT_NOT_DELIVERED_MAX;
+    const n = Math.max(1, Math.min(cap, Math.floor(Number(limit) || cap)));
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT serial, reason, discarded_at FROM ct_not_delivered WHERE discarded_at > ? ORDER BY discarded_at DESC, serial LIMIT ?",
+        Math.floor(Date.now() / 1000) - SigningAuthority.CT_NOT_DELIVERED_RETENTION_S,
+        cap + 1,
+      )
+      .toArray() as Array<{ serial: string; reason: string; discarded_at: number }>;
+    if (rows.length > cap) {
+      console.error({ event: "ct.not_delivered_truncated", served: cap, retentionS: SigningAuthority.CT_NOT_DELIVERED_RETENTION_S });
+    }
+    return rows.slice(0, n).map((r) => ({ serial: r.serial, reason: r.reason, discardedAt: r.discarded_at }));
   }
 
   /** Record a CT observation for health. Never throws. */
@@ -2995,10 +3052,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   /**
    * Submit up to CT_DRAIN_BATCH backlog rows to the log via add-chain,
-   * CT_DRAIN_CONCURRENCY at a time. Rows under CT_MAX_ATTEMPTS come first,
-   * oldest first; rows past it ("gaveUp") fill what is left of the batch, each
-   * at most once per CT_SLOW_RETRY_S — an outage over ~96 minutes, a root
-   * rotation or a shard roll must not strand a row for good.
+   * CT_DRAIN_CONCURRENCY at a time. A row is due once its own backoff has
+   * passed (CT_RETRY_BASE_S doubling to CT_RETRY_MAX_S, one hour): one
+   * continuous curve, so an outage of any length, a root rotation or a
+   * shard roll is drained within about an hour of being fixed (notme-a3804c).
+   * Rows under CT_MAX_ATTEMPTS come first; rows past it ("gaveUp") fill what
+   * is left of the batch, least recently tried first.
    *
    * A row is marked logged only when the answer is an SCT from the pinned log
    * whose signature verifies over the x509_entry for that row's certificate.
@@ -3025,15 +3084,22 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
     const now = Math.floor(Date.now() / 1000);
     const max = SigningAuthority.CT_MAX_ATTEMPTS;
+    // Due: never tried, or its backoff (CT_RETRY_BASE_S * 2^(attempts-1),
+    // capped at CT_RETRY_MAX_S) has passed. The shift is clamped so a row
+    // with hundreds of attempts cannot overflow it. Order: rows under
+    // CT_MAX_ATTEMPTS first, then within each class the least recently
+    // tried — a round robin, so no due row starves behind a large backlog.
     const rows = this.ctx.storage.sql
       .exec(
         `SELECT id, chain_json FROM ct_backlog
            WHERE logged_at IS NULL AND abandoned_at IS NULL
-             AND (attempts < ? OR last_attempt_at IS NULL OR last_attempt_at <= ?)
-           ORDER BY (attempts >= ?), created_at, id
+             AND (last_attempt_at IS NULL
+                  OR last_attempt_at <= ? - MIN(? * (1 << MIN(MAX(attempts - 1, 0), 20)), ?))
+           ORDER BY (attempts >= ?), COALESCE(last_attempt_at, 0), created_at, id
            LIMIT ?`,
-        max,
-        now - SigningAuthority.CT_SLOW_RETRY_S,
+        now,
+        SigningAuthority.CT_RETRY_BASE_S,
+        SigningAuthority.CT_RETRY_MAX_S,
         max,
         SigningAuthority.CT_DRAIN_BATCH,
       )
@@ -4623,13 +4689,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // logged once in Rekor, AFTER revokeEpoch() commits. Pending rows are
   // retried from alarm() with bounded exponential backoff and never
   // abandoned: a revocation is rare and its log entry is permanent evidence,
-  // so a long outage costs a few requests a day, not the record.
+  // so a long outage costs about one request an hour per pending
+  // revocation, not the record.
 
   /** Requests are bounded per attempt; revokeEpoch's response waits at most this (x2 on a 409). */
   static readonly REKOR_TIMEOUT_MS = 5_000;
   /** Backoff after the n-th failure: REKOR_RETRY_BASE_S * 2^(n-1), capped at REKOR_RETRY_MAX_S. */
   static readonly REKOR_RETRY_BASE_S = 4 * 60;
-  static readonly REKOR_RETRY_MAX_S = 6 * 60 * 60;
+  // 1 h, not 6 h (notme-a3804c, review L2): at 6 h the first try after a
+  // long Rekor outage could come 6 h after it ended. Revocations are rare,
+  // so an hourly retry of each pending one costs nothing.
+  static readonly REKOR_RETRY_MAX_S = 60 * 60;
   /** Rows attempted per alarm fire. */
   static readonly REKOR_DRAIN_BATCH = 5;
 
@@ -4736,6 +4806,9 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       try {
         const result = await submitToRekor({
           baseUrl: this.env.REKOR_URL || DEFAULT_REKOR_URL,
+          // The public-Rekor guard (notme-a3804c): a non-production
+          // authority's statement never reaches the public log.
+          authorityUrl: this.env.SIGNET_AUTHORITY_URL,
           envelope: JSON.parse(cur.statement) as DsseEnvelope,
           rootPublicRawB64: cur.statement_key,
           timeoutMs: SigningAuthority.REKOR_TIMEOUT_MS,
@@ -4758,7 +4831,14 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
             result.reason.slice(0, 200),
             r.epoch,
           );
-          console.error({ event: "rekor.submit_failed", epoch: r.epoch, reason: result.reason });
+          // A refusal is its own event: nothing was sent, and only a config
+          // fix (REKOR_URL, or the authority host) clears it. The row stays
+          // pending either way, with the reason in alarm-health lastError.
+          console.error({
+            event: result.refused ? "rekor.submit_refused" : "rekor.submit_failed",
+            epoch: r.epoch,
+            reason: result.reason,
+          });
         }
       } finally {
         this.#rekorInFlight.delete(r.epoch);

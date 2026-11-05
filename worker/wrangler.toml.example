@@ -17,8 +17,25 @@ compatibility_date = "2026-10-19"
 
 workers_dev = false
 
+# Workers Logs (notme-a3804c). head_sampling_rate is the fraction of
+# INVOCATIONS whose logs are kept, 0 to 1, default 1; it sits under
+# [observability] (developers.cloudflare.com/workers/observability/logs/
+# workers-logs/). Sampling is per invocation, not per line: an unsampled
+# request loses its invocation log AND every console.* line it wrote. The
+# audit and refusal events (authority.epoch_revoked, mint.gha_proof_rejected,
+# rekor.submit_refused, ct.backlog_abandoned, ...) are console.* lines, so a
+# rate of 0.1 would drop 90% of them, and a rare one (one revocation, one
+# forged-token burst) can vanish entirely. So: 1, stated rather than
+# defaulted, so a cost edit has to meet this comment first. The cost lever
+# that keeps those events is `invocation_logs = false` (one event fewer per
+# request; the per-request record of status and path goes with it). Priced
+# per event, $0.60/M after 20M a month on Workers Paid, moving to
+# Observability pricing on 2026-12-01: docs/audits/2026-11-03-cost-estimate.md.
+# config-drift (task worker:config-drift) refuses a live file sampling lower,
+# here or under [observability.logs] (wrangler accepts the key in both).
 [observability]
 enabled = true
+head_sampling_rate = 1
 
 [observability.logs]
 enabled = true
@@ -286,8 +303,10 @@ new_sqlite_classes = ["SigningAuthority"]
 name = "notme-bot-staging"
 workers_dev = false
 
+# Same rate as production, for the same reason (see [observability] above).
 [env.staging.observability]
 enabled = true
+head_sampling_rate = 1
 
 [env.staging.observability.logs]
 enabled = true

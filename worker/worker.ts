@@ -75,6 +75,7 @@ import {
   unavailableFor,
 } from "./src/edge-cache";
 import { clientIpBucket, clientNetworkBucket } from "./src/client-ip-key";
+import { markJtiSpentInKv } from "./src/jti-kv";
 
 /**
  * ReceiptSigner — Interlace 0.2.0 receipt signing for cloister (ADR-014).
@@ -860,9 +861,13 @@ async function handleCertGHA(
   if (!(await authority.spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
     return jsonErr("token already used", 401);
   }
-  await platform.cache.put(jtiKey, "1", {
-    expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
-  });
+  // The KV cross-check; a failed write is logged, not a 500 (notme-a3804c).
+  await markJtiSpentInKv(
+    platform.cache,
+    jtiKey,
+    Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+    "/cert/gha",
+  );
 
   // Build WIMSE identity URI
   // The identity names the stable subject — the OIDC `sub`, which is also
@@ -2906,9 +2911,12 @@ export default {
         }
         // Spent in the shared keyspace only once the join succeeded, so the
         // token cannot then buy a cert at /cert/gha, /cert or /token.
-        await platform.cache.put(jtiKey, "1", {
-          expirationTtl: Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
-        });
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
+          "/join",
+        );
 
         const { createSessionCookie } = await import("./src/auth/session");
         const cookie = await createSessionCookie(
@@ -2968,9 +2976,12 @@ export default {
             : jsonErr("unknown identity — get an invite first", 403);
         }
         const { principalId, scopes } = loggedIn;
-        await platform.cache.put(jtiKey, "1", {
-          expirationTtl: Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
-        });
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(getConfig(env).jtiMinTtlSeconds, exp - Math.floor(Date.now() / 1000)),
+          "/auth/oidc/login",
+        );
         const { createSessionCookie } = await import("./src/auth/session");
         const sessionSecret = await liveSessionSecret(authority);
         const cookie = await createSessionCookie(
@@ -3010,6 +3021,16 @@ export default {
       if (pathname === "/auth/passkey/reset" && request.method === "POST") {
         try {
           const body = (await request.json()) as { bootstrapCode?: string };
+          // Per-IP limit BEFORE the DO (notme-c3fdbc): any non-empty code
+          // used to buy a consumeBootstrapCode RPC on the singleton. Reset
+          // is a rare operator action, so the passkey budget (5 / 60 s per
+          // IP bucket) fits; its own prefix so a reset flood does not spend
+          // passkey logins. Unbound, it fails open like the other limiters.
+          if (body.bootstrapCode && env.PASSKEY_LIMITER) {
+            const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+            const { success } = await env.PASSKEY_LIMITER.limit({ key: `passkey-reset:${ip}` });
+            if (!success) return jsonErr("rate_limited", 429);
+          }
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
           if (
@@ -3777,9 +3798,12 @@ export default {
         if (!(await authorityStub(env).spendOidcJti(claims.iss, claims.jti, Number(claims.exp)))) {
           return jsonErr("token already used", 401);
         }
-        await platform.cache.put(jtiKey, "1", {
-          expirationTtl: Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
-        });
+        await markJtiSpentInKv(
+          platform.cache,
+          jtiKey,
+          Math.max(cfg.jtiMinTtlSeconds, claims.exp - Math.floor(Date.now() / 1000)),
+          "/bootstrap/claim",
+        );
         const authority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
         const r = await authority.approveBootstrapClaim(code, claims.sub);
         if (!r.ok) {
@@ -4047,6 +4071,17 @@ export default {
             );
           }
 
+          // Per-IP limit BEFORE the DO (notme-c3fdbc): a well-formed body
+          // with a random code used to buy a redeemAuthorizationCode RPC
+          // each. After the shape checks, so a malformed request spends no
+          // budget. One redeem per OAuth round trip, so CERT_LIMITER's
+          // 10 / 60 s per IP bucket fits, under its own prefix. Unbound, it
+          // fails open like the other limiters.
+          if (env.CERT_LIMITER) {
+            const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+            const { success } = await env.CERT_LIMITER.limit({ key: `redeem-ip:${ip}` });
+            if (!success) return jsonErr("rate_limited", 429);
+          }
           const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
           const authority = env.SIGNING_AUTHORITY.get(authorityId);
           const result = await authority.redeemAuthorizationCode({
@@ -4383,9 +4418,12 @@ export default {
                 if (!(await authority.spendOidcJti(exchanged.iss, exchanged.jti, exchanged.exp))) {
                   return Response.json({ error: "invalid_grant" }, { status: 400 });
                 }
-                await platform.cache.put(key, "1", {
-                  expirationTtl: Math.max(60, exchanged.exp - Math.floor(Date.now() / 1000)),
-                });
+                await markJtiSpentInKv(
+                  platform.cache,
+                  key,
+                  Math.max(60, exchanged.exp - Math.floor(Date.now() / 1000)),
+                  "/token",
+                );
               }
               const mintResult = await authority.mintDPoPTokenOnce({
                 sub: principalId,

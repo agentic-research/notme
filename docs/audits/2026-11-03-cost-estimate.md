@@ -14,11 +14,28 @@ Tracked: rig-ed460e (WAF spend guard never applied; gates deploy), notme-ed6114 
 - **Unmatched auth-host paths proxied to signet (M4).** Fixed: closed by default behind an exact-path allowlist (`SIGNET_PASSTHROUGH_PATHS`), with per-IP limits.
 
 **Still NOT limited before the DO, as of this correction** (out of notme-a34dad's scope, recorded so the claim is not repeated):
-- `POST /auth/passkey/reset` (`consumeBootstrapCode` on any body)
-- `POST /authorize/redeem` (`redeemAuthorizationCode` once the body is well-formed)
+- `POST /auth/passkey/reset` (`consumeBootstrapCode` on any body). **Fixed 2026-11-04 (notme-c3fdbc):** `PASSKEY_LIMITER`, `passkey-reset:<ip bucket>`, before the DO.
+- `POST /authorize/redeem` (`redeemAuthorizationCode` once the body is well-formed). **Fixed 2026-11-04 (notme-c3fdbc):** `CERT_LIMITER`, `redeem-ip:<ip bucket>`, after the shape checks and before the DO.
 - `POST /cert/issuing-ca/device` and `/cert/issuing-ca/device/token` (enrolment start and collect; review H1, notme-a36d10)
 
 The stress scenario below ("/cert/nonce with a junk cookie") describes the pre-fix tree.
+
+**Correction (2026-11-04, notme-a3804c): the CT retry changed, and Workers Logs was missing.**
+- The CT drain no longer retries a row once a day after 24 attempts: each row backs off 3 minutes doubling to an hourly cap (`CT_RETRY_BASE_S`, `CT_RETRY_MAX_S`), until it is logged or abandoned at 30 days. The worst case is unchanged at 20 add-chain calls per 4-minute fire (216,000 a month), because the batch, not the curve, bounds it. `ct_backlog` IS pruned, contrary to the line under "Usage derived from code": logged and abandoned rows are deleted after 7 days. `ct_not_delivered` is now pruned at 400 days.
+- **Workers Logs is a line item, and was left out.** See "Workers Logs" below.
+
+## Workers Logs (added 2026-11-04, notme-a3804c)
+
+Source: https://developers.cloudflare.com/workers/observability/logs/workers-logs/ (fetched 2026-11-04).
+- Price: Workers Paid includes 20M log events a month, then **$0.60 per million**: twice the $0.30/M request price. Workers Free: 200,000 events a day. The page says this moves to Cloudflare Observability pricing on 2026-12-01; re-check then.
+- What counts: the page's own example, "Each request emits 1 invocation log and 1 `console.log`", is two events. So the cost per request is (1 if `invocation_logs`) + (console.* lines it writes), times the sampling rate.
+- Sampling: `head_sampling_rate` under `[observability]`, 0 to 1, default 1 (100%). Above 5 billion logs per account per day, Cloudflare samples the rest of that day at 1% regardless.
+- Sampling is per invocation: "All logs within the context of the request are collected", and an unsampled request keeps none, its console.* lines included. The page documents no separate rate for console logs; `invocation_logs = false` is the only per-type switch.
+
+**Decision: `head_sampling_rate = 1` in both environments (`worker/wrangler.toml.example`), invocation logs left on.** The audit and refusal events are console.* lines (`authority.epoch_revoked`, `bootstrap.claimed`, `mint.gha_proof_rejected`, `mint.gha_proof_reused`, `rekor.submit_refused`, `jti.kv_write_failed`, `ct.backlog_abandoned`, ...). A rate below 1 drops them in the same proportion as everything else, and the rare ones (a single revocation refused, a short burst of forged tokens) can vanish entirely. That is exactly the event an investigation needs. `task worker:config-drift` refuses a live config that samples lower than the template.
+- **The trade-off, priced.** Logs scale with requests, so under attack they cost at least as much as the requests themselves. At 2 events per request: idle (alarms only, about 10,800 DO invocations a month) is $0. Light (about 54k Worker requests, about 110k events) is $0, far under 20M. Stress (one IP at 10 rps, 25.92M requests) is about 52M events, so (52M - 20M) x $0.60/M = **$19.2**, on top of the ~$14 above. Each extra IP adds about 52M events, **about $31/mo**, against about $9/mo for its requests and DO calls. That more than triples the per-IP figure in the stress scenario: 100 IPs is about $4k/mo, not $900.
+- **The lever, if that is too much:** `invocation_logs = false` removes one event per request and keeps every console.* line, so the audit events survive. What goes is the per-request record (path, status, outcome) for requests that log nothing, such as most 429s. Request and error counts stay visible in Workers metrics, which are not billed as log events. Not taken here: during a flood, that per-request record is how you see who and where. Sampling is the lever that would cost the audit trail, so it stays at 1.
+- **What actually caps it:** the edge rules (rig-ed460e) and the pre-DO limiters bound requests, not log events. A limited request is still an invocation and still logged. Set the billing alerts above with logs in mind.
 
 
 Month = 30 d = 2,592,000 s. Prices fetched today.
@@ -34,7 +51,7 @@ Month = 30 d = 2,592,000 s. Prices fetched today.
 
 ## Usage derived from code
 Alarm (worker/src/signing-authority.ts): BUNDLE_REFRESH_MS = 4 min (:288). alarm() :4421 -> #publishBundle (generateBundle + 1 KV put "bundle:current") + alarm_health writes + re-arm via setAlarm (:4540). Per fire: ~3 rows written (state seqno UPDATE, alarm_health UPDATE, setAlarm), ~6 read, 1 KV write. Re-arm happens only after a completed fire; after 5 consecutive failures the breaker stops re-arming (:317, :4521-4531) -> a failing alarm does NOT run away. Fires/mo = 15*24*30 = 10,800.
-CT drain (only if CT_LOG bound): <=20 rows/fire, 4 concurrent (:2032-2035), 2 s timeout each, errors swallowed (:4489-4495). Worst case 20 service-binding calls + 20 UPDATEs per fire = 216,000 calls + 216,000 rows written/mo (~$0 on notme side). Rows past 24 attempts retried 1/24h forever; ct_backlog rows are never deleted (no DELETE FROM ct_backlog anywhere).
+CT drain (only if CT_LOG bound): <=20 rows/fire, 4 concurrent (:2032-2035), 2 s timeout each, errors swallowed (:4489-4495). Worst case 20 service-binding calls + 20 UPDATEs per fire = 216,000 calls + 216,000 rows written/mo (~$0 on notme side). Rows past 24 attempts retried 1/24h forever; ct_backlog rows are never deleted (no DELETE FROM ct_backlog anywhere). [Superseded 2026-11-04, notme-a3804c: per-row backoff capped at 1 h, abandoned at 30 days; logged and abandoned rows deleted after 7 days. Same 20-per-fire bound.]
 
 Per operation (CT unbound; W = Worker requests, D = DO RPC requests billed, R/Wr = SQL rows read/written approx):
 - Bridge pair mint (passkey session): /cert/nonce (W1, D2: getSessionSecret, issuePopNonce) + /cert/passkey (W1, D4: getSessionSecret, consumePopNonce, getPrincipalScopes, mintBridgeCertPair; getAuthorityState is internal, not billed). Total W2, D6, ~10 R, ~3 Wr. CT bound adds 2 add-pre-chain service-binding calls (one per cert; final chain is NOT submitted on the happy path, only via backlog add-chain on failure), up to 2 s wall in the DO.
@@ -73,7 +90,7 @@ CT log (azul ct_worker, ../azul/crates/ct_worker/wrangler.jsonc + generic_log_wo
 1. WAF ruleset as written is not valid on a Free zone: 2 rules (Free = 1), mitigation_timeout 60 (Free = 10 s fixed), expressions use http.host (Free = Path/Verified Bot only) - rig/tofu/modules/cloudflare/notme_waf.tf:35,49-69. It will likely be rejected at apply, leaving NO edge spend guard (or needs Pro, 2 rules). Also the WAF covers only /auth/passkey, /join, /connections, /invites, /me, /cert*, /auth/oidc/login.
 2. Unauthenticated per-request DO calls before any limit: /token calls getSessionSecret before TOKEN_LIMITER (worker.ts:3935 -> :3960); getSessionSecret does CREATE TABLE IF NOT EXISTS + SELECT per call (signing-authority.ts:3463) and is uncached in the Worker; /.well-known/jwks.json etc. cache key keeps query string so ?x=rand bypasses the Cache API to the DO (src/cache-key.ts:38, worker.ts:4133). Both uncapped and un-WAFed; also serialise through the single DO.
 3. CT: azul sequencer alarm every 1 s forever + empty checkpoint PUT per tick (generic_log_worker sequencer_do.rs:181, log_ops.rs:212) = ~2.6M R2 Class A/mo (~$7.4) and a DO resident 24x7 (~332k of the 400k GB-s) even with zero users; notme side ct_backlog never pruned and rows retried every 24 h indefinitely (signing-authority.ts:2032-2160).
-Minor: alarm itself is safe (breaker, getAlarm check, no re-arm after 5 failures), but breaker-open means bundle goes stale (>5 min) - outage, not cost. passkey_challenges 'authentication' rows are never deleted (storage growth, tiny $). observability invocation_logs on: 20M events incl.
+Minor: alarm itself is safe (breaker, getAlarm check, no re-arm after 5 failures), but breaker-open means bundle goes stale (>5 min) - outage, not cost. passkey_challenges 'authentication' rows are never deleted (storage growth, tiny $). observability invocation_logs on: 20M events incl. [Understated: see "Workers Logs", about $31/mo per attacking IP at 10 rps.]
 
 ## Pre-deploy actions
 - Set Usage Based Billing notifications (Alerts > Platform Notifications; check Workers requests + DO requests/duration are selectable; may need a plan that offers it) at ~$10 and ~$25; set a Cloudflare billing/budget alert too. No hard spend cap exists on Workers Paid.

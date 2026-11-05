@@ -359,3 +359,76 @@ describe("POST /cert/issuing-ca/renew rejects a forged proof before the DO", () 
     expect(spy.calls).toEqual(["renewTier"]);
   });
 });
+
+// notme-c3fdbc: two more unauthenticated routes that bought a singleton RPC
+// with no limiter first. /auth/passkey/reset called consumeBootstrapCode on
+// any non-empty code; /authorize/redeem called redeemAuthorizationCode on
+// any well-formed body. Same fix as handlePasskey: a per-IP bucket, checked
+// BEFORE the stub call.
+describe("POST /auth/passkey/reset is limited per IP before any SigningAuthority RPC (notme-c3fdbc)", () => {
+  const resetReq = () =>
+    new Request(`${ORIGIN}/auth/passkey/reset`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.21" },
+      body: JSON.stringify({ bootstrapCode: "guess-" + crypto.randomUUID() }),
+    });
+
+  it("passkey.reset.pre-do-limit — a limited reset makes no RPC at all", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => false);
+    const res = await call(resetReq(), { SIGNING_AUTHORITY: spy.binding, PASSKEY_LIMITER: rl.binding });
+    expect(res.status).toBe(429);
+    expect(spy.calls).toEqual([]);
+    // Its own prefix in the passkey budget (5/min/IP), by IP bucket.
+    expect(rl.keys).toEqual(["passkey-reset:198.51.100.21"]);
+  });
+
+  it("control: an allowed reset reaches the DO, which refuses the guessed code", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => true);
+    const res = await call(resetReq(), { SIGNING_AUTHORITY: spy.binding, PASSKEY_LIMITER: rl.binding });
+    expect(res.status).toBe(403);
+    expect(spy.calls).toEqual(["consumeBootstrapCode"]);
+  });
+});
+
+describe("POST /authorize/redeem is limited per IP before any SigningAuthority RPC (notme-c3fdbc)", () => {
+  const redeemReq = (body: Record<string, unknown>) =>
+    new Request(`${ORIGIN}/authorize/redeem`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "2001:db8:7:7::9" },
+      body: JSON.stringify(body),
+    });
+  const wellFormed = () => ({
+    code: crypto.randomUUID(),
+    code_verifier: "v".repeat(43),
+    redirect_uri: "https://rosary.bot/callback",
+  });
+
+  it("authorize.redeem.pre-do-limit — a limited redeem with a well-formed body makes no RPC at all", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => false);
+    const res = await call(redeemReq(wellFormed()), { SIGNING_AUTHORITY: spy.binding, CERT_LIMITER: rl.binding });
+    expect(res.status).toBe(429);
+    expect(spy.calls).toEqual([]);
+    // The IPv6 /64, as everywhere else (review F4).
+    expect(rl.keys).toEqual(["redeem-ip:2001:db8:7:7::/64"]);
+  });
+
+  it("a malformed body is still 400 without spending the budget or an RPC", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => false);
+    const res = await call(redeemReq({ code: "x" }), { SIGNING_AUTHORITY: spy.binding, CERT_LIMITER: rl.binding });
+    expect(res.status).toBe(400);
+    expect(spy.calls).toEqual([]);
+    expect(rl.keys).toEqual([]);
+  });
+
+  it("control: an allowed redeem reaches the DO, which refuses the unknown code", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => true);
+    const res = await call(redeemReq(wellFormed()), { SIGNING_AUTHORITY: spy.binding, CERT_LIMITER: rl.binding });
+    expect(res.status).toBe(400);
+    expect(spy.calls).toEqual(["redeemAuthorizationCode"]);
+  });
+});

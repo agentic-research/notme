@@ -58,6 +58,39 @@ export const ROOT_SUBJECT_PREFIX = "notme-authority-root:";
 /** The public sigstore Rekor; REKOR_URL overrides it. */
 export const DEFAULT_REKOR_URL = "https://rekor.sigstore.dev";
 
+/**
+ * The one authority host allowed to write to the PUBLIC Rekor (notme-a3804c,
+ * overnight review H3). A public entry is permanent, so a staging or local
+ * authority that reached DEFAULT_REKOR_URL — because its REKOR_URL was never
+ * set, as the live staging config was found — would leave a revocation
+ * nobody can take back, under a root that is not notme's.
+ */
+export const PRODUCTION_AUTHORITY_HOST = "auth.notme.bot";
+
+/**
+ * Why a submission to `rekorUrl` from the authority at `authorityUrl` must
+ * not be made, or null when it may. Only the public Rekor is guarded: any
+ * other log (Sigstore's staging Rekor, a test stub) is the operator's choice.
+ * Fails closed: an unset or unparseable authority URL is not production's.
+ */
+export function publicRekorRefusal(rekorUrl: string, authorityUrl: string | undefined): string | null {
+  let rekorHost: string;
+  try {
+    rekorHost = new URL(rekorUrl).hostname.toLowerCase();
+  } catch {
+    return null; // submitToRekor reports a malformed REKOR_URL itself
+  }
+  if (rekorHost !== new URL(DEFAULT_REKOR_URL).hostname) return null;
+  let authorityHost = "";
+  try {
+    authorityHost = authorityUrl ? new URL(authorityUrl).hostname.toLowerCase() : "";
+  } catch {
+    /* unparseable: not production */
+  }
+  if (authorityHost === PRODUCTION_AUTHORITY_HOST) return null;
+  return `refused: the public Rekor (${rekorHost}) takes entries only from ${PRODUCTION_AUTHORITY_HOST}, and this authority is ${authorityHost || "unset"}; set REKOR_URL (staging: https://rekor.sigstage.dev)`;
+}
+
 export interface EpochRevocationPredicate {
   epoch: number;
   /** unix seconds the revocation committed (epochs.json `revokedAt`) */
@@ -327,7 +360,8 @@ export interface RekorLogEntry {
 
 export type RekorSubmitResult =
   | { ok: true; uuid: string; logIndex: number; integratedTime: number }
-  | { ok: false; reason: string };
+  /** `refused`: nothing was sent (publicRekorRefusal); the row stays pending. */
+  | { ok: false; reason: string; refused?: true };
 
 /** Whether a Rekor `dsse` entry body records THIS envelope: its payload hash and its signature. */
 async function entryRecords(entry: RekorLogEntry, envelope: DsseEnvelope): Promise<string | null> {
@@ -382,12 +416,17 @@ export async function parseRekorEntry(json: unknown, envelope: DsseEnvelope): Pr
  */
 export async function submitToRekor(opts: {
   baseUrl: string;
+  /** SIGNET_AUTHORITY_URL. Required, so no caller can skip the public-Rekor guard. */
+  authorityUrl: string | undefined;
   envelope: DsseEnvelope;
   rootPublicRawB64: string;
   timeoutMs: number;
   fetch?: typeof fetch;
 }): Promise<RekorSubmitResult> {
   const doFetch = opts.fetch ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init));
+  // Before any request: a refused submission sends nothing at all.
+  const refusal = publicRekorRefusal(opts.baseUrl, opts.authorityUrl);
+  if (refusal) return { ok: false, reason: refusal, refused: true };
   try {
     const base = new URL(opts.baseUrl);
     if (base.protocol !== "https:" && base.protocol !== "http:") {

@@ -48,7 +48,9 @@ with a `CT_LOG` service binding, the online authority logs every bridge pair
 and every tier certificate; certs carry embedded SCTs when the log answers
 within 2000 ms. Otherwise the pair goes to the `ct_backlog` table and the
 refresh alarm drains it through `add-chain` (20 rows per fire, 4 concurrent).
-After 24 failed attempts a row is `gaveUp` and retried at most once a day;
+Each row backs off on its own, 3 minutes doubling to an hourly cap, so once
+the log is back every row is retried within the hour. After 24 failed
+attempts a row is counted as `gaveUp` (still retried hourly);
 30 days after its mint it is abandoned (`worker/src/signing-authority.ts:2450-2470`
 and the health table below). Health is served at
 `/admin/alarm-health` as a `ct` object. With no binding, behaviour is exactly
@@ -467,7 +469,7 @@ up means the timeout, not the log, is the problem.
 |---|---|
 | `backlog` | unlogged rows still being retried |
 | `oldestUnloggedAgeS` | age of the oldest such row, `null` when none |
-| `gaveUp` | unlogged rows that hit 24 attempts; still retried, at most once per 24 h per row, and counted here until logged or, 30 days after their mint, abandoned |
+| `gaveUp` | unlogged rows that hit 24 attempts; still retried on the same backoff (at most an hour apart), and counted here until logged or, 30 days after their mint, abandoned |
 | `abandoned` | `{count, lastAt}`: backlog rows given up on for good — gaveUp and minted over 30 days ago. Never retried again: those certificates are **permanently unlogged**. Monotonic |
 | `lastError` / `lastErrorAt` | last submission failure, with the reason: `HTTP <status>`, `timeout`, `invalid SCT`, `network error`, `wrong log` (SCT id is not `CT_LOG_ID`), `bad signature` (does not verify under `CT_LOG_KEY`), `no shard covers notAfter <time>` (no configured shard's interval holds the cert's `notAfter`; nothing was submitted); or `config: ...` from a mint that found the pin invalid and backlogged its chains. A drain fire skipped for an invalid pin does not overwrite it |
 | `unloggable` | `{count, lastAt, reason}`: mints that went out with no SCT and **no backlog row**: the root could not be read or parsed, or the backlog INSERT failed. (An invalid pin is not counted here: those mints are backlogged.) |
@@ -497,14 +499,16 @@ Alert on:
 - **`lastError` reading `wrong log` or `bad signature`.** The binding reaches
   something that is not the pinned log: check `CT_LOG_PATH`, the `service`
   name, and that the pin is the shard's current key.
-- **`gaveUp > 0`.** The alarm fires every 4 minutes and a row gets one attempt
-  per fire, so 24 attempts is about **96 minutes**. A log outage longer than
-  that moves every queued row to `gaveUp`, and `backlog` then reads **0**:
-  the healthiest-looking number during the worst outage. `gaveUp` rows are
-  retried at most once per 24 h each (normal rows first, still at most 20 rows
-  per fire), so once the cause is fixed they drain within a day; `gaveUp`
-  counts them until they do. The slow retry is bounded: 30 days after its
-  mint a gaveUp row is **abandoned** (`abandoned.count`), so fix the cause
+- **`gaveUp > 0`.** Each row's retries back off 3, 6, 12, 24, 48 minutes,
+  then hourly (notme-a3804c; it used to be 24 tries in ~96 minutes, then one
+  a day). A row reaches 24 attempts after about 20 hours of failures, and
+  then counts in `gaveUp` instead of `backlog`, so during a long outage
+  `backlog` can read **0**: the healthiest-looking number during the worst
+  outage. `gaveUp` rows keep the hourly retry (rows under 24 attempts first,
+  least recently tried next, at most 20 rows per fire), so once the cause is
+  fixed they drain within about an hour, plus 4 minutes per 20 rows queued.
+  The retry is bounded: 30 days after its mint a gaveUp row is **abandoned**
+  (`abandoned.count`, logged as `ct.backlog_abandoned`), so fix the cause
   within that window.
 - **`abandoned.count` increasing.** Certificates the log will never record.
   Same severity as `unloggable`.
@@ -553,12 +557,25 @@ curl -s https://auth.notme.bot/.well-known/ct-not-delivered.json
 ```
 
 `serial` is lowercase hex without the DER sign byte, as `openssl x509
--serial` prints it (case aside). The newest 1000 rows are served, newest
-first, cached for 60 s. The route is unauthenticated, like
-`/.well-known/epochs.json`: every serial is already public in the log, and a
-row adds only a reason and a time, no subject or key. Rows are never
-pruned, because a log entry is permanent. They arise only from an operator
-action inside a log wait or a mint slower than 60 s, so the list stays short.
+-serial` prints it (case aside). Rows from the last 400 days are served,
+newest first, at most 1000, cached for 60 s. The route is unauthenticated,
+like `/.well-known/epochs.json`: every serial is already public in the log,
+and a row adds only a reason and a time, no subject or key.
+
+**Retention: 400 days (`CT_NOT_DELIVERED_RETENTION_S`, notme-a3804c).** A row
+is deleted 400 days after the certificate was discarded. That is longer than
+any certificate this authority logs can live (bridge pairs default to 5
+minutes, tiers are capped at 24 h) by more than a year, and longer than a
+whole shard interval (a year in `ct/config.notme.json`) plus a month. Past
+it the certificate has been expired for over a year and its shard has
+closed, so a monitor reconciling that shard has long since had the answer.
+Pruning was chosen over paginating the route: a cursor on an unauthenticated,
+edge-cached `/.well-known` route reopens the query-in-the-cache-key miss that
+notme-ed6114 closed (every distinct cursor is a SigningAuthority call), and
+the list stays short anyway. Rows arise only from an operator action inside
+a log wait or a mint slower than 60 s. If the retained list ever exceeds
+1000 rows, the response is the newest 1000 and the authority logs
+`ct.not_delivered_truncated`, so the cap is never silent.
 A write failure loses the row but not the mint, and is logged as
 `ct.not_delivered_write_failed` with the serials.
 
