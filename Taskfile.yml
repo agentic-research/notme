@@ -445,6 +445,21 @@ tasks:
       # vendor; every file must match its pinned SHA-256 in SHA256SUMS and
       # every .bin must equal its .expected.hex (notme-1629fe).
       - pnpm exec tsx scripts/fixture-manifest.ts
+      # wasm/ vendors ley-line-open's released leyline_sign.wasm, the
+      # third-party verifier for notme credentials. It must be the bytes LLO
+      # released: SHA256SUMS and every asset match wasm/llo-release.json, and
+      # each asset matches its SHA256SUMS line (notme-bc4cd2). Offline.
+      - pnpm exec tsx scripts/fetch-llo-wasm.ts --check
+
+  llo:wasm:
+    desc: "Download the pinned ley-line-open wasm release, verify SHA256SUMS + pins, vendor into wasm/ (network; RE-PIN with -- --pin vX.Y.Z)"
+    # Not part of any gate: the vendored bytes are committed and checked
+    # offline by docs:check, so tests never download (the pools refuse the
+    # network). Run this to restore or re-pin them. Re-pinning is TOFU — LLO
+    # signs nothing it releases — so the llo-release.json diff is the review.
+    deps: [deps:install]
+    cmds:
+      - pnpm exec tsx scripts/fetch-llo-wasm.ts {{.CLI_ARGS}}
 
   pin:check:
     desc: Verify every external `uses:` in .github/workflows is SHA-pinned
