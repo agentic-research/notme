@@ -80,6 +80,9 @@ jobs:
       # audit never looks at action/dist/index.js — which is the file
       # `uses: agentic-research/notme/action@<sha>` actually executes.
       - run: task action:bundle-check
+      # bundle-check says the bundle matches its sources; this says it works:
+      # OIDC fetch, both PoP proofs verified by the stub, five outputs written.
+      - run: task action:smoke
 
       - run: task worker:check
       - run: task docs:check
