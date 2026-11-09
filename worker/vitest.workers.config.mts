@@ -1,7 +1,11 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { transformSync } from "esbuild";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { configDefaults, defineConfig } from "vitest/config";
+import { readPinnedAsset } from "../scripts/fetch-llo-wasm";
 
 // scripts/task-cert/lib.ts (repo root) is imported by fork-acceptance.do.test.ts
 // and resolves its deps from the repo root, where @peculiar/x509 is not hoisted.
@@ -158,9 +162,62 @@ export const NO_NETWORK_SETUP_FILES = ["./src/__tests__/setup/no-network.ts"];
  */
 export const REFLECT_SETUP_FILES = ["./src/__tests__/setup/reflect-metadata.ts"];
 
+/**
+ * LLO's released leyline_sign.wasm, running in workerd, for
+ * llo-cert-path.do.test.ts (notme-bc4cd2).
+ *
+ * Three facts force this shape, each observed on this toolchain:
+ *   - workerd refuses WebAssembly.compile(bytes): "Wasm code generation
+ *     disallowed by embedder". wasm has to arrive as a CompiledWasm MODULE;
+ *   - a modules-format worker takes no wasm BINDING (workerd refuses to start);
+ *   - the pool runs test files through vite, which cannot import a `.wasm`
+ *     (with or without `?module`) as a module.
+ * So the wasm lives in a small AUXILIARY worker, which miniflare loads
+ * without vite, and the test reaches it over an RPC service binding
+ * (env.LLO_SIGN). Its marshalling is the SAME llo-sign.ts the plain pool
+ * uses, transpiled here; the bytes are read through readPinnedAsset, so what
+ * workerd compiles is exactly what matched wasm/llo-release.json.
+ */
+const lloSignTs = join(dirname(fileURLToPath(import.meta.url)), "src/__tests__/helpers/llo-sign.ts");
+export const lloSignWorker = {
+  name: "llo-sign",
+  compatibilityDate: "2026-10-19",
+  modules: [
+    {
+      type: "ESModule" as const,
+      path: "entry.mjs",
+      contents: [
+        'import { WorkerEntrypoint } from "cloudflare:workers";',
+        'import wasm from "./leyline_sign.wasm";',
+        'import { lloSignFrom } from "./llo-sign.mjs";',
+        "const llo = lloSignFrom(wasm);",
+        "export class LloSign extends WorkerEntrypoint {",
+        "  verifyCertPath(leaf, intermediates, anchor, profile) { return llo.verifyCertPath(leaf, intermediates, anchor, profile); }",
+        "}",
+        "export default { fetch() { return new Response(null, { status: 404 }); } };",
+      ].join("\n"),
+    },
+    {
+      type: "ESModule" as const,
+      path: "llo-sign.mjs",
+      contents: transformSync(readFileSync(lloSignTs, "utf-8"), { loader: "ts", format: "esm" }).code,
+    },
+    { type: "CompiledWasm" as const, path: "leyline_sign.wasm", contents: readPinnedAsset("leyline_sign.wasm") },
+  ],
+};
+
 export default defineConfig({
   resolve: { alias: { "@peculiar/x509": x509Dir } },
-  plugins: [cloudflareTest({ main: "./worker.ts", miniflare: baseMiniflare })],
+  plugins: [
+    cloudflareTest({
+      main: "./worker.ts",
+      miniflare: {
+        ...baseMiniflare,
+        serviceBindings: { LLO_SIGN: { name: "llo-sign", entrypoint: "LloSign" } },
+        workers: [lloSignWorker],
+      },
+    }),
+  ],
   test: {
     include: ["src/**/*.do.test.ts"],
     setupFiles: [...REFLECT_SETUP_FILES, ...NO_NETWORK_SETUP_FILES, ...WARM_SETUP_FILES],

@@ -114,8 +114,10 @@ them.
    output, and the plain unit suite runs with `Buffer` present.
 11. **notme-bed754** closes when 1–10 are closed.
 
-Waiting on someone else: **notme-bc4cd2** (adopt LLO v0.21.0) waits for LLO
-to publish the tag.
+**notme-bc4cd2** (adopt LLO's wasm) no longer waits on LLO: v0.21.0 and
+v0.25.0 are published. It is implemented against v0.25.0 on branch
+`feat/notme-bc4cd2-llo-wasm` (vendored `wasm/leyline_sign.wasm`, pinned in
+`wasm/llo-release.json`) and closes when that merges.
 
 ## Stage 2: hardening
 
@@ -292,7 +294,7 @@ These stay open, honestly, until the reason goes away:
 | Bead | Why it may not close |
 |---|---|
 | notme-229dc3 | IANA's timeline, not ours. |
-| notme-bc4cd2, notme-396aff, notme-0f38fe | Wait on LLO publishing a tag and wasm artifacts. |
+| notme-396aff | No longer waits on LLO (its wasm is published and vendored, notme-bc4cd2). Waits on notme: there is no browser page or Σ-head surface for it to verify yet. Plan in the bead. |
 | notme-bdffc7 | Needs another project to agree a field (`.1.7`) and two other repos' verifiers to enforce. notme can only do its half. |
 | notme-be13b0 | Hardware custody depends on each host having a Secure Enclave or TPM. Hosts without one stay at "detected", not "refused". |
 | notme-1e067f | entire.io would have to list notme as a trusted issuer. That's outside our control. |
