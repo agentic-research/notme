@@ -432,3 +432,58 @@ describe("POST /authorize/redeem is limited per IP before any SigningAuthority R
     expect(spy.calls).toEqual(["redeemAuthorizationCode"]);
   });
 });
+
+// notme-e3dede survey finding: the OIDC-proof branch of /join, and
+// /auth/oidc/login, verified the token (which may fetch the issuer's JWKS)
+// and then called the singleton, with no limiter first. The no-proof branch
+// of /join was already limited (handlePasskey, `passkey:<ip>`). Same budget,
+// own prefixes, checked BEFORE verification and before any stub call.
+describe("OIDC-proof logins are limited per IP before verification or any SigningAuthority RPC (notme-e3dede)", () => {
+  const joinReq = (token: string) =>
+    new Request(`${ORIGIN}/join`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.33" },
+      body: JSON.stringify({ token: "not-an-invite-" + crypto.randomUUID(), proof: { type: "oidc", token } }),
+    });
+  const loginReq = (token: string) =>
+    new Request(`${ORIGIN}/auth/oidc/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "2001:db8:33::1" },
+      body: JSON.stringify({ token }),
+    });
+
+  it("join.oidc.pre-do-limit — a limited /join with a proof makes no RPC", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => false);
+    const res = await call(joinReq(await signer.token()), { SIGNING_AUTHORITY: spy.binding, PASSKEY_LIMITER: rl.binding });
+    expect(res.status).toBe(429);
+    expect(spy.calls).toEqual([]);
+    expect(rl.keys).toEqual(["join-oidc:198.51.100.33"]);
+  });
+
+  it("control: an allowed /join with a valid proof reaches the DO, which refuses the garbage invite", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => true);
+    const res = await call(joinReq(await signer.token()), { SIGNING_AUTHORITY: spy.binding, PASSKEY_LIMITER: rl.binding });
+    expect(res.status).toBe(403);
+    expect(spy.calls).toEqual(["joinInviteWithFederated"]);
+  });
+
+  it("oidc.login.pre-do-limit — a limited /auth/oidc/login makes no RPC", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => false);
+    const res = await call(loginReq(await signer.token()), { SIGNING_AUTHORITY: spy.binding, PASSKEY_LIMITER: rl.binding });
+    expect(res.status).toBe(429);
+    expect(spy.calls).toEqual([]);
+    // IPv6 by its /64, as every other per-IP bucket (src/client-ip-key.ts).
+    expect(rl.keys).toEqual(["oidc-login:2001:db8:33:0::/64"]);
+  });
+
+  it("control: an allowed /auth/oidc/login with a valid token reaches the DO", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => true);
+    const res = await call(loginReq(await signer.token()), { SIGNING_AUTHORITY: spy.binding, PASSKEY_LIMITER: rl.binding });
+    expect(spy.calls[0]).toBe("loginWithFederated");
+    expect(res.status).not.toBe(429);
+  });
+});

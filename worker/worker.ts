@@ -923,6 +923,20 @@ async function handleCertGHA(
   });
 }
 
+/**
+ * Per-IP limit for an OIDC-proof login (/join with a proof, /auth/oidc/login),
+ * checked BEFORE the token is verified (which may fetch the issuer's JWKS)
+ * and before any SigningAuthority RPC (notme-ed6114, notme-e3dede). Shares
+ * PASSKEY_LIMITER's budget, as the no-proof branch of /join does, under its
+ * own prefix. Returns the 429 to send, or null to continue.
+ */
+async function oidcLoginLimited(env: any, request: Request, prefix: "join-oidc" | "oidc-login"): Promise<Response | null> {
+  if (!env.PASSKEY_LIMITER) return null;
+  const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
+  const { success } = await env.PASSKEY_LIMITER.limit({ key: `${prefix}:${ip}` });
+  return success ? null : jsonErr("rate_limited", 429);
+}
+
 // ── Passkey route handler ──
 
 async function handlePasskey(
@@ -2868,6 +2882,8 @@ export default {
         if (body.proof.type !== "oidc" || !body.proof.token) {
           return jsonErr("unsupported proof — omit it to join with a passkey, or send an oidc token", 400);
         }
+        const joinLimited = await oidcLoginLimited(env, request, "join-oidc");
+        if (joinLimited) return joinLimited;
 
         const { verifyOIDC, issuerAudiences } = await import("./src/auth/verify-proof");
         let identity;
@@ -2936,6 +2952,8 @@ export default {
       if (pathname === "/auth/oidc/login" && request.method === "POST") {
         const body = (await request.json()) as { token: string };
         if (!body.token) return jsonErr("token required", 400);
+        const loginLimited = await oidcLoginLimited(env, request, "oidc-login");
+        if (loginLimited) return loginLimited;
 
         const { verifyOIDC, issuerAudiences } = await import("./src/auth/verify-proof");
         let identity;
