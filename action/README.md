@@ -144,7 +144,7 @@ tags are mutable. an attacker who pushes to the action repo can move `v1` to a m
 
 | file | role |
 |---|---|
-| `action.yml` | manifest GitHub reads — declares 5 inputs, 6 outputs, `runs: node20`, `main: dist/index.js` |
+| `action.yml` | manifest GitHub reads — declares 5 inputs, 6 outputs, `runs: node24`, `main: dist/index.js` |
 | `src/index.ts` | source — keypair generation, PoP construction, exchange, output wiring |
 | `dist/index.js` | committed bundle — what GitHub actually executes |
 
@@ -153,7 +153,7 @@ tags are mutable. an attacker who pushes to the action repo can move `v1` to a m
 ```bash
 cd action
 npm install
-npm run build      # esbuild src/index.ts → dist/index.js (bundled, node20)
+npm run build      # esbuild src/index.ts → dist/index.js (bundled, node24)
 git add dist/      # consumers run dist/, not src/
 ```
 

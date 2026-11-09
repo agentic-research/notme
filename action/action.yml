@@ -28,5 +28,5 @@ outputs:
   expires_at:
     description: 'Cert expiry (Unix timestamp)'
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'
