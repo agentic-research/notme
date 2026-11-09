@@ -27,8 +27,9 @@
  * `.1.9`) and LLO's check is `.any()`, so dropping `.1.1`/`.1.2` from a path
  * does NOT reclassify it — `.1.8` principal-kind, which every path also
  * emits, keeps it on the Signet profile. This file therefore does not test
- * LLO's classifier; pinning the marker SET waits for LLO to release, since
- * the set can still move.
+ * LLO's classifier. LLO has since released it, and
+ * src/__tests__/llo-cert-path.test.ts asks the released leyline_sign.wasm
+ * directly which profile it reads each mint path under (notme-bc4cd2).
  *
  * What it DOES test is notme's own guarantee: `.1.1` and `.1.2` are the
  * subject and issuance time that signet reads by name and that

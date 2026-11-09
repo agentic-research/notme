@@ -26,6 +26,17 @@ declare global {
       // Bound ONLY under vitest.workers.ct.config.mts (a stub transparency
       // log); absent in the main pool config, hence optional.
       CT_LOG?: Fetcher;
+      // LLO's released leyline_sign.wasm, in an auxiliary worker loaded from
+      // the pinned vendored bytes (notme-bc4cd2). Bound ONLY under
+      // vitest.workers.config.mts, hence optional.
+      LLO_SIGN?: {
+        verifyCertPath(
+          leafDer: Uint8Array,
+          intermediatesDer: Uint8Array[],
+          anchorRaw: Uint8Array,
+          expectedProfile: number,
+        ): Promise<import("./__tests__/helpers/llo-sign").LloVerifyResult>;
+      };
     }
   }
 }
