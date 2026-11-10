@@ -324,8 +324,11 @@ describe("checkCriteria rules", () => {
 });
 
 describe("registry", () => {
-  it("has exactly the three definitions", () => {
-    expect([...CRITERIA.keys()].sort()).toEqual(["agent-session/1", "deploy/1", "llo-run/1"]);
+  it("has exactly the four definitions (step-up/1 added by ADR-024)", () => {
+    expect([...CRITERIA.keys()].sort()).toEqual(["agent-session/1", "deploy/1", "llo-run/1", "step-up/1"]);
+    const su = CRITERIA.get("step-up/1")!;
+    expect(su).toMatchObject({ mintedBy: "authority", maxLifetimeS: 300, requiresConfinementDigest: false, grantable: false });
+    expect([...su.scopeCeiling]).toEqual(["bridgeCert"]);
     const as = CRITERIA.get("agent-session/1")!;
     expect(as).toMatchObject({ id: "agent-session/1", mintedBy: "tier", maxLifetimeS: 300, requiresConfinementDigest: false });
     expect(as.scopeCeiling).toBe(CERT_ELIGIBLE_SCOPES);

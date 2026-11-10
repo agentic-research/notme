@@ -51,6 +51,17 @@ const DEFINITIONS: CriteriaDefinition[] = [
     grantable: false,
   },
   {
+    // ADR-024: a human re-confirmed ONE action for one task's key. Minted
+    // online by the authority after a WebAuthn assertion over the action's
+    // digest; never renewed, never offered at /enroll.
+    id: "step-up/1",
+    mintedBy: "authority",
+    maxLifetimeS: 300,
+    scopeCeiling: BRIDGE_ONLY,
+    requiresConfinementDigest: false,
+    grantable: false,
+  },
+  {
     id: "deploy/1",
     mintedBy: "authority",
     maxLifetimeS: 900,

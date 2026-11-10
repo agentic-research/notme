@@ -25,7 +25,7 @@ import type { Criteria } from "./criteria";
 //
 // BasicConstraints CA=false marks both certs as end-entity (not CAs).
 // Marked critical per RFC 5280 §4.2.1.9.
-const BASIC_CONSTRAINTS_LEAF = new BasicConstraintsExtension(
+export const BASIC_CONSTRAINTS_LEAF = new BasicConstraintsExtension(
   false,
   undefined,
   true,
@@ -58,7 +58,7 @@ const CLIENT_AUTH_EKU = new ExtendedKeyUsageExtension(
 
 // Signing cert: digitalSignature is sufficient for arbitrary payload
 // signatures (ley-line manifests, git commits, attestations, DSSE).
-const SIGNING_KEY_USAGE = new KeyUsagesExtension(
+export const SIGNING_KEY_USAGE = new KeyUsagesExtension(
   KeyUsageFlags.digitalSignature,
   true,
 );
@@ -87,7 +87,7 @@ export const OID_SUBJECT = `${OID_PEN}.1.1`; // Subject identity
 export const OID_ISSUANCE_TIME = `${OID_PEN}.1.2`; // Issuance time (RFC3339)
 export const OID_SCOPES = `${OID_PEN}.1.3`; // Granted scopes
 export const OID_EPOCH = `${OID_PEN}.1.4`; // CA epoch at issuance
-const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
+export const OID_AUTH_METHOD = `${OID_PEN}.1.5`; // Authentication method
 export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed25519 SPKI)
 // `.1.7` IS NOT OURS. ley-line-open claimed it for `confinementDigest` — a
 // 32-byte BLAKE3-256 of the canonical ConfinementManifest — in LLO v0.7.6
@@ -116,6 +116,7 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 //   .1.8   principal kind               (recognised only)     —
 //   .1.9   task scope                   —                     —
 //   .1.10  criteria (SEQ OF SEQ{name,v}) —                     —
+//   .1.11  step-up approval (ADR-024)    —                     —      (free in all three, checked 2026-11-09)
 //
 // SIGNET'S .1.5/.1.6 COLLISION WAS LIVE, unlike LLO's. LLO's sat behind an
 // earlier RFC 5280 rejection (see below); nothing shielded signet's.
@@ -206,6 +207,7 @@ export const OID_PEER_BINDING = `${OID_PEN}.1.6`; // SHA-256(P-256 SPKI || Ed255
 export const OID_PRINCIPAL_KIND = `${OID_PEN}.1.8`; // UTF8String: human|agent|workload|organization
 export const OID_TASK_SCOPE = `${OID_PEN}.1.9`; // SEQUENCE { UTF8String task, OCTET STRING goalHash }
 export const OID_CRITERIA = `${OID_PEN}.1.10`; // SEQUENCE OF SEQUENCE { UTF8String name, INTEGER version } (criteria.ts)
+export const OID_APPROVAL = `${OID_PEN}.1.11`; // SEQUENCE { UTF8String approver, UTF8String method, GeneralizedTime assertedAt } (step-up.ts, ADR-024)
 
 /**
  * What the certificate's subject IS — a different axis from HOW it was
@@ -453,7 +455,7 @@ export async function mintGHABridgeCert(
 // ── Cert pair minting (008) ─────────────────────────────────────────────────
 
 // Encode ASN.1 SEQUENCE OF UTF8String for scope list
-function derScopeSequence(scopes: string[]): Uint8Array {
+export function derScopeSequence(scopes: string[]): Uint8Array {
   const encoded = scopes.map((s) => derUtf8String(s));
   const body = new Uint8Array(encoded.reduce((sum, e) => sum + e.length, 0));
   let offset = 0;
@@ -501,7 +503,7 @@ export function derIntegerBytes(n: number): Uint8Array {
   return new Uint8Array([0x02, body.length, ...body]);
 }
 
-const derInteger = derIntegerBytes;
+export const derInteger = derIntegerBytes;
 
 export async function mintBridgeCertPair(
   subject: string,
