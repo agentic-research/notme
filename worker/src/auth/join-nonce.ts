@@ -90,6 +90,16 @@ export function plainAudienceAllowed(issuer: string, requireNonce: boolean): boo
   return issuer === GOOGLE_ISSUER;
 }
 
+/**
+ * Whether a successful join counts toward `join.plainAudience` (D5). Only
+ * joins the flag would refuse: a challenged join is not plain, and a Google
+ * join is exempt from the flag, so counting it would keep the counter from
+ * ever reading zero on a deployment with GOOGLE_CLIENT_ID set (review F1).
+ */
+export function countsAsPlainAudience(challenged: boolean, issuer: string): boolean {
+  return !challenged && issuer !== GOOGLE_ISSUER;
+}
+
 /** `JOIN_REQUIRE_NONCE`, parsed as DPOP_REQUIRE_NONCE: only `true`/`1` enable it. */
 export function joinNonceRequired(env: { JOIN_REQUIRE_NONCE?: string }): boolean {
   const raw = env.JOIN_REQUIRE_NONCE?.trim().toLowerCase();

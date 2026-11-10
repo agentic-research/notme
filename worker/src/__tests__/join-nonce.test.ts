@@ -13,9 +13,10 @@ import {
   joinChallengeAudience,
   parseJoinChallengeAudience,
   plainAudienceAllowed,
+  countsAsPlainAudience,
   verifyJoinNonce,
 } from "../auth/join-nonce";
-import { issueDpopNonce, verifyDpopNonce } from "../auth/dpop-nonce";
+import { issueDpopNonce, issueMacNonce, verifyDpopNonce } from "../auth/dpop-nonce";
 
 const SECRET = "test-session-secret-0123456789abcdef";
 const T = 1_800_000_000;
@@ -67,6 +68,17 @@ describe("join nonce (ADR-023 D2)", () => {
     // Control: each verifies in its own domain.
     expect(await verifyDpopNonce(dpop, SECRET, T)).toBe(true);
   });
+
+  it("join.nonce.domain-separation — the DOMAIN separates them, not only the binding (review F3)", async () => {
+    // A join-domain nonce with no binding has the DPoP message shape; only the domain tells them apart.
+    expect(await verifyDpopNonce(await issueMacNonce("notme-join-nonce-v1", SECRET, T), SECRET, T)).toBe(false);
+    // A DPoP-domain nonce WITH this invite's binding has the join shape; only the domain tells them apart.
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("invite-a")));
+    const binding = btoa(String.fromCharCode(...digest)).replace(/\+/g, "-").replace(/\//g, "_");
+    expect(await verifyJoinNonce(await issueMacNonce("notme-dpop-nonce-v1", SECRET, T, binding), SECRET, "invite-a", T)).toBe(false);
+    // Control: the same binding under the join domain verifies.
+    expect(await verifyJoinNonce(await issueMacNonce("notme-join-nonce-v1", SECRET, T, binding), SECRET, "invite-a", T)).toBe(true);
+  });
 });
 
 describe("challenge audience (ADR-023 D1)", () => {
@@ -98,5 +110,12 @@ describe("plain notme.bot under JOIN_REQUIRE_NONCE (ADR-023 D5, D6)", () => {
     expect(plainAudienceAllowed("https://auth.notme.bot", true)).toBe(false);
     // Google's audience is the deployment's client id; it cannot carry a nonce (D6).
     expect(plainAudienceAllowed("https://accounts.google.com", true)).toBe(true);
+  });
+
+  it("join.plain.count-rule — counted only when the flag would refuse it: not challenged, not Google (review F1)", () => {
+    expect(countsAsPlainAudience(false, "https://token.actions.githubusercontent.com")).toBe(true);
+    expect(countsAsPlainAudience(false, "https://auth.notme.bot")).toBe(true);
+    expect(countsAsPlainAudience(true, "https://token.actions.githubusercontent.com")).toBe(false);
+    expect(countsAsPlainAudience(false, "https://accounts.google.com")).toBe(false);
   });
 });

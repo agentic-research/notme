@@ -2932,7 +2932,7 @@ export default {
         if (joinLimited) return joinLimited;
 
         const { verifyOIDC, issuerAudiences, CONTRACT_TRUSTED_ISSUERS } = await import("./src/auth/verify-proof");
-        const { parseJoinChallengeAudience, verifyJoinNonce, plainAudienceAllowed, joinNonceRequired } =
+        const { parseJoinChallengeAudience, verifyJoinNonce, plainAudienceAllowed, joinNonceRequired, countsAsPlainAudience } =
           await import("./src/auth/join-nonce");
         const joinAuthority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
 
@@ -2992,7 +2992,7 @@ export default {
           body.token,
           identity.issuer,
           identity.subject,
-          { jti, exp, spentElsewhere, plainAudience: !challenged },
+          { jti, exp, spentElsewhere, plainAudience: countsAsPlainAudience(challenged, identity.issuer) },
         );
         if (!joined.ok) {
           if (joined.reason === "proof_reused") return jsonErr("token already used", 401);

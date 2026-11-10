@@ -349,7 +349,6 @@ export type BridgeCertRefusal =
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
 export const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 
-/** Tier renewal health, reported under `renewal` by getAlarmHealth (notme-c9fc8c, review L1). */
 /**
  * /join (ADR-023 D5): successful joins whose OIDC proof carried the plain
  * shared `notme.bot` audience instead of a challenge audience. When this
@@ -359,6 +358,7 @@ export interface JoinHealth {
   plainAudience: { count: number; lastAt: number; lastIssuer: string };
 }
 
+/** Tier renewal health, reported under `renewal` by getAlarmHealth (notme-c9fc8c, review L1). */
 export interface RenewalHealth {
   /**
    * Renewals whose proof VERIFIED but whose binding is below what the

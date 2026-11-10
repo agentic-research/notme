@@ -184,6 +184,52 @@ describe("a challenge-audience token is useless at every other route (ADR-023 D3
   });
 });
 
+describe("a challenge-audience token is useless at /bootstrap/claim and /connections too (review F5)", () => {
+  async function challengeToken() {
+    const c = await challenge((await invite()).token);
+    return fresh(c.audience);
+  }
+  const claim = (t: string) =>
+    worker.fetch(
+      new Request(`${ORIGIN}/bootstrap/claim`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${t}` },
+        body: JSON.stringify({ code: "BBBB-BBBB" }),
+      }),
+      { ...env, ...LOCAL_ENV } as never,
+    );
+
+  it("join.challenge.refused-bootstrap-claim — refused as an invalid token; control: a plain token passes verification", async () => {
+    const r = await claim(await challengeToken());
+    expect(r.status).toBe(401);
+    expect(await r.json()).toMatchObject({ error: "invalid token" });
+    const ctl = await claim(await fresh("notme.bot"));
+    // Verified, then refused for the deployment's bootstrap config, not the token.
+    expect(ctl.status).toBe(403);
+  });
+
+  it("join.challenge.refused-connections — /connections refuses it; control: a plain token is recorded", async () => {
+    const inv = await invite();
+    const c = await challenge(inv.token);
+    const joined = await join(inv.token, await fresh(c.audience));
+    expect(joined.status).toBe(200);
+    const cookie = joined.headers.getSetCookie().find((x) => x.startsWith("notme_session="))!.split(";")[0]!;
+    const connect = (t: string) =>
+      worker.fetch(
+        new Request(`${ORIGIN}/connections`, {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({ proof: { type: "oidc", token: t } }),
+        }),
+        { ...env, ...LOCAL_ENV } as never,
+      );
+    const r = await connect(await challengeToken());
+    expect(r.status).toBeGreaterThanOrEqual(400);
+    const ctl = await connect(await fresh("notme.bot"));
+    expect(ctl.status, await ctl.clone().text()).toBeLessThan(300);
+  });
+});
+
 describe("plain notme.bot at /join (ADR-023 D5)", () => {
   it("join.plain.counted — still joins while JOIN_REQUIRE_NONCE is off, and is counted with its issuer", async () => {
     const before = await plainCount();
@@ -202,8 +248,12 @@ describe("plain notme.bot at /join (ADR-023 D5)", () => {
     const refused = await join(inv.token, plain, { JOIN_REQUIRE_NONCE: "true" });
     expect(refused.status).toBe(403);
     expect(await refused.json()).toMatchObject({ error: "invalid oidc proof" });
-    // Nothing spent: the invite joins under the flag through a challenge.
-    const c = await challenge(inv.token);
-    expect((await join(inv.token, await fresh(c.audience), { JOIN_REQUIRE_NONCE: "true" })).status).toBe(200);
+    // Nothing spent, neither the token nor the invite: the SAME token joins
+    // once the flag is off (review F4).
+    expect((await join(inv.token, plain)).status).toBe(200);
+    // And under the flag, a challenge joins a fresh invite.
+    const inv2 = await invite();
+    const c = await challenge(inv2.token);
+    expect((await join(inv2.token, await fresh(c.audience), { JOIN_REQUIRE_NONCE: "true" })).status).toBe(200);
   });
 });
