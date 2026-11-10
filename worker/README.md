@@ -167,6 +167,7 @@ note: discovery (`/.well-known/signet-authority.json`) and the JSON landing page
 | `ALLOWED_AUDIENCES`    | var (optional) | CSV override of token-mint audience allowlist (`allowed-audiences.ts`)       | optional                               |
 | `DELEGATED_JWT_ISSUERS` | var (optional) | CSV of issuers permitted to use `JwtSigner` (ADR-015). Empty = delegated JWT signing is off. An allowlist, not caller-supplied — a caller that could register an issuer could register this authority's own | optional |
 | `DPOP_REQUIRE_NONCE`   | var (optional) | `true`/`1` requires a server-issued nonce on `/token` DPoP proofs (RFC 9449 §8). Default off — enabling it 400s the first request of any client that doesn't handle the `use_dpop_nonce` retry | optional |
+| `JOIN_REQUIRE_NONCE`   | var (optional) | `true`/`1` refuses an OIDC proof at `/join` whose audience is the plain `notme.bot` rather than a `/join/challenge` audience (ADR-023). Google tokens are exempt: their audience cannot carry a nonce. Default off; turn on once `/admin/alarm-health` → `join.plainAudience.count` has read zero for 30 days | optional |
 | `NOTME_KEY_STORAGE`    | var            | `ephemeral` / `cf-managed` / `encrypted` (KEK-sealed; needs `NOTME_KEK_SECRET`, fails fast without it, and is selected automatically when that secret is set) | config.capnp sets `ephemeral`          |
 
 ## modules

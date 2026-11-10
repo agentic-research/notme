@@ -350,6 +350,15 @@ export type BridgeCertRefusal =
 export const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 
 /** Tier renewal health, reported under `renewal` by getAlarmHealth (notme-c9fc8c, review L1). */
+/**
+ * /join (ADR-023 D5): successful joins whose OIDC proof carried the plain
+ * shared `notme.bot` audience instead of a challenge audience. When this
+ * reads zero for 30 days in production, JOIN_REQUIRE_NONCE can be turned on.
+ */
+export interface JoinHealth {
+  plainAudience: { count: number; lastAt: number; lastIssuer: string };
+}
+
 export interface RenewalHealth {
   /**
    * Renewals whose proof VERIFIED but whose binding is below what the
@@ -4202,6 +4211,42 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     }
   }
 
+  /** /join health (ADR-023 D5): joins that used the plain shared audience. */
+  #ensureJoinHealth(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS join_health (
+        id                   TEXT PRIMARY KEY DEFAULT 'join',
+        plain_count          INTEGER NOT NULL DEFAULT 0,
+        plain_last_at        INTEGER NOT NULL DEFAULT 0,
+        plain_last_issuer    TEXT    NOT NULL DEFAULT ''
+      )
+    `);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO join_health (id) VALUES ('join')");
+  }
+
+  /** Log (issuer only, never the subject) and count a plain-audience join. Never throws. */
+  #recordPlainAudienceJoin(issuer: string): void {
+    console.warn({ event: "join.plain_audience", issuer });
+    try {
+      this.#ensureJoinHealth();
+      this.ctx.storage.sql.exec(
+        "UPDATE join_health SET plain_count = plain_count + 1, plain_last_at = ?, plain_last_issuer = ? WHERE id = 'join'",
+        Math.floor(Date.now() / 1000),
+        issuer,
+      );
+    } catch (err) {
+      console.error({ event: "join.health_write_failed", error: String(err) });
+    }
+  }
+
+  #readJoinHealth(): JoinHealth {
+    this.#ensureJoinHealth();
+    const h = this.ctx.storage.sql
+      .exec("SELECT plain_count, plain_last_at, plain_last_issuer FROM join_health WHERE id = 'join'")
+      .toArray()[0] as { plain_count: number; plain_last_at: number; plain_last_issuer: string };
+    return { plainAudience: { count: h.plain_count, lastAt: h.plain_last_at, lastIssuer: h.plain_last_issuer } };
+  }
+
   #readRenewalHealth(): RenewalHealth {
     this.#ensureRenewalHealth();
     const h = this.ctx.storage.sql
@@ -5121,11 +5166,32 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     token: string,
     provider: string,
     providerSub: string,
-    proof: { jti: string; exp: number; spentElsewhere: boolean },
+    proof: {
+      jti: string;
+      exp: number;
+      spentElsewhere: boolean;
+      /** The token carried the shared `notme.bot` audience, not a challenge (ADR-023 D5). */
+      plainAudience?: boolean;
+    },
   ): Promise<
     | { ok: true; principalId: string; scopes: string[] }
     | { ok: false; reason: "invalid_invite" | "already_linked" | "proof_reused" }
   > {
+    const result = this.#joinInviteWithFederated(token, provider, providerSub, proof);
+    // Counted on success only: the counter answers "does anything still join
+    // with plain notme.bot?", which decides when JOIN_REQUIRE_NONCE flips.
+    if (result.ok && proof.plainAudience) this.#recordPlainAudienceJoin(provider);
+    return result;
+  }
+
+  #joinInviteWithFederated(
+    token: string,
+    provider: string,
+    providerSub: string,
+    proof: { jti: string; exp: number; spentElsewhere: boolean },
+  ):
+    | { ok: true; principalId: string; scopes: string[] }
+    | { ok: false; reason: "invalid_invite" | "already_linked" | "proof_reused" } {
     const sql = this.ctx.storage.sql;
     this.#ensureSchema();
     ensurePrincipalSchema(sql);
@@ -6424,6 +6490,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     rekor: RekorHealth;
     ct: CtHealth;
     renewal: RenewalHealth;
+    join: JoinHealth;
   }> {
     const health = this.#readAlarmHealthRow();
     const b = this.#readBreakerRow();
@@ -6459,6 +6526,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       rekor: this.#readRekorHealth(),
       ct: await this.#readCtHealth(),
       renewal: this.#readRenewalHealth(),
+      join: this.#readJoinHealth(),
     };
   }
 }

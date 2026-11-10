@@ -923,6 +923,28 @@ async function handleCertGHA(
   });
 }
 
+/** This deployment's authority URL, as the passkey origin is derived (ADR-023 D1). */
+function joinAuthorityUrl(env: any): string {
+  return env.SIGNET_AUTHORITY_URL || env.SITE_URL || "https://auth.notme.bot";
+}
+
+/**
+ * One claim from a JWT's payload, UNVERIFIED. Only for choosing which pin a
+ * verifier then enforces; never a decision on its own. Undefined on any
+ * malformed input.
+ */
+function unverifiedJwtClaim(token: unknown, claim: string): unknown {
+  if (typeof token !== "string") return undefined;
+  const part = token.split(".")[1];
+  if (!part) return undefined;
+  try {
+    const payload = JSON.parse(atob(part.replace(/-/g, "+").replace(/_/g, "/"))) as unknown;
+    return payload && typeof payload === "object" ? (payload as Record<string, unknown>)[claim] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Per-IP limit for an OIDC-proof login (/join with a proof, /auth/oidc/login),
  * checked BEFORE the token is verified (which may fetch the issuer's JWKS)
@@ -930,7 +952,7 @@ async function handleCertGHA(
  * PASSKEY_LIMITER's budget, as the no-proof branch of /join does, under its
  * own prefix. Returns the 429 to send, or null to continue.
  */
-async function oidcLoginLimited(env: any, request: Request, prefix: "join-oidc" | "oidc-login"): Promise<Response | null> {
+async function oidcLoginLimited(env: any, request: Request, prefix: "join-oidc" | "oidc-login" | "join-challenge"): Promise<Response | null> {
   if (!env.PASSKEY_LIMITER) return null;
   const ip = clientIpBucket(request.headers.get("cf-connecting-ip"));
   const { success } = await env.PASSKEY_LIMITER.limit({ key: `${prefix}:${ip}` });
@@ -2836,6 +2858,30 @@ export default {
         return env.ASSETS.fetch(new Request(`${baseUrl}/_login`));
       }
 
+      // POST /join/challenge — the audience an automated caller requests its
+      // OIDC token with, to join this invite (ADR-023 D1, notme-e3dede):
+      // `<this authority>/join/<nonce>`, the nonce bound to the invite (D2).
+      // Answers a garbage invite exactly as a live one (D4): whether the
+      // invite exists is decided at /join, with its constant 403. Limited
+      // per source before the session-secret RPC (notme-ed6114).
+      if (pathname === "/join/challenge" && request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as { token?: unknown };
+        if (typeof body.token !== "string" || !body.token) {
+          return jsonErr("invite token required", 400);
+        }
+        const limited = await oidcLoginLimited(env, request, "join-challenge");
+        if (limited) return limited;
+        const { issueJoinNonce, joinChallengeAudience, JOIN_NONCE_TTL_SECONDS } = await import("./src/auth/join-nonce");
+        const authorityId = env.SIGNING_AUTHORITY.idFromName("default");
+        const authority = env.SIGNING_AUTHORITY.get(authorityId);
+        const now = Math.floor(Date.now() / 1000);
+        const nonce = await issueJoinNonce(await liveSessionSecret(authority), body.token, now);
+        return Response.json({
+          audience: joinChallengeAudience(joinAuthorityUrl(env), nonce),
+          expires_at: now + JOIN_NONCE_TTL_SECONDS,
+        });
+      }
+
       // POST /join — start joining by invite (notme-3dfe15).
       //
       // WITHOUT a proof: reserve the invite and start a passkey registration
@@ -2885,14 +2931,43 @@ export default {
         const joinLimited = await oidcLoginLimited(env, request, "join-oidc");
         if (joinLimited) return joinLimited;
 
-        const { verifyOIDC, issuerAudiences } = await import("./src/auth/verify-proof");
+        const { verifyOIDC, issuerAudiences, CONTRACT_TRUSTED_ISSUERS } = await import("./src/auth/verify-proof");
+        const { parseJoinChallengeAudience, verifyJoinNonce, plainAudienceAllowed, joinNonceRequired } =
+          await import("./src/auth/join-nonce");
+        const joinAuthority = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName("default"));
+
+        // Which audience the proof must carry (ADR-023). Read the claimed
+        // `aud` UNVERIFIED only to choose the pin; verifyOIDC then checks the
+        // signature against it. A challenge audience for this deployment
+        // whose nonce verifies for THIS invite narrows the contract issuers'
+        // pin to exactly that string (D1, D2); the issuer map stays the
+        // trust root and Google keeps its client-id pin. Anything else is
+        // checked against the shared audience, as before (D5).
+        let audiences = issuerAudiences(env);
+        let challenged = false;
+        const claimedAud = unverifiedJwtClaim(body.proof.token, "aud");
+        const nonce = parseJoinChallengeAudience(claimedAud, joinAuthorityUrl(env));
+        if (nonce && (await verifyJoinNonce(nonce, await liveSessionSecret(joinAuthority), body.token))) {
+          const narrowed: Record<string, string | readonly string[]> = { ...audiences };
+          for (const iss of CONTRACT_TRUSTED_ISSUERS) narrowed[iss] = claimedAud as string;
+          audiences = Object.freeze(narrowed);
+          challenged = true;
+        }
+
         let identity;
         try {
-          identity = await verifyOIDC(body.proof.token, issuerAudiences(env));
+          identity = await verifyOIDC(body.proof.token, audiences);
         } catch (e: any) {
           // Logged, not returned (review L4): verifier messages describe
           // what the server expected (audience, issuer, key id).
           console.error("[join] oidc proof rejected:", e?.message);
+          return jsonErr("invalid oidc proof", 403);
+        }
+        // JOIN_REQUIRE_NONCE (D5, D6): the plain audience is refused, except
+        // for Google, whose audience cannot carry a nonce. Same constant 403
+        // as any refused proof, and before anything is spent.
+        if (!challenged && !plainAudienceAllowed(identity.issuer, joinNonceRequired(env))) {
+          console.error("[join] oidc proof rejected: plain audience while JOIN_REQUIRE_NONCE is on");
           return jsonErr("invalid oidc proof", 403);
         }
 
@@ -2917,7 +2992,7 @@ export default {
           body.token,
           identity.issuer,
           identity.subject,
-          { jti, exp, spentElsewhere },
+          { jti, exp, spentElsewhere, plainAudience: !challenged },
         );
         if (!joined.ok) {
           if (joined.reason === "proof_reused") return jsonErr("token already used", 401);

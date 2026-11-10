@@ -54,6 +54,7 @@ Set via `NOTME_KEY_STORAGE` env var. Default: `cf-managed`, unless `NOTME_KEK_SE
 
 - WebAuthn implementation has not been independently audited
 - DPoP nonces on `/token` (RFC 9449 §8) are implemented but off by default; `DPOP_REQUIRE_NONCE=true` turns them on (`worker/src/auth/dpop-nonce.ts`)
+- An OIDC proof at `/join` can be bound to its invite: `POST /join/challenge` returns a per-deployment audience carrying a nonce bound to that invite, and a token minted for it works nowhere else (ADR-023). The plain `notme.bot` audience is still accepted and counted until `JOIN_REQUIRE_NONCE=true` (`worker/src/auth/join-nonce.ts`)
 - `encrypted` key storage mode is implemented but not yet turned on in production; that waits on the KEK rehearsal (`scripts/kek-rehearsal.sh`, `notme-41d0d3`, open). Selecting `encrypted` without `NOTME_KEK_SECRET` is a startup error
 - Older design-time threat tables live in `docs/design/007-secretless-local-proxy.md`; canonical threat model is `worker/THREAT_MODEL.md`.
 

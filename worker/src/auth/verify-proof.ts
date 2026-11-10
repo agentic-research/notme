@@ -2,6 +2,8 @@
 // No provider-specific code. If it has a JWKS, we can verify it.
 
 import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
+/** The contract's trusted issuers (ADR-023 narrows their pin to a challenge audience at /join). */
+export { CONTRACT_TRUSTED_ISSUERS };
 import { base64urlDecode } from "@agentic-research/dpop";
 import { OID_EPOCH } from "../cert-authority";
 import { assertGhaEventAllowed, GHA_ISSUER as GHA_OIDC_ISSUER } from "../gha-oidc";

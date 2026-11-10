@@ -237,6 +237,7 @@ notme certs carry their meaning in custom X.509 extensions. **the arc they sit u
 | `GET` | `/me` | current session info (JSON or HTML) |
 | `POST` | `/invites` | create scoped invite (requires authorityManage) |
 | `GET/POST` | `/join` | join by invite: `POST` reserves it and returns passkey registration options (consumed when the passkey verifies), or joins with a verified OIDC proof |
+| `POST` | `/join/challenge` | the audience an automated caller requests its OIDC token with to join an invite: `<authority>/join/<nonce>`, bound to that invite (ADR-023) |
 | `GET/POST` | `/connections` | link an OIDC identity or X.509 cert to your passkey |
 | `GET` | `/.well-known/signet-authority.json` | authority discovery |
 | `GET` | `/.well-known/jwks.json` | Ed25519 public key (JWK Set) |

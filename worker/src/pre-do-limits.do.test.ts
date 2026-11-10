@@ -487,3 +487,29 @@ describe("OIDC-proof logins are limited per IP before verification or any Signin
     expect(res.status).not.toBe(429);
   });
 });
+
+describe("POST /join/challenge is limited per IP before the session-secret RPC (ADR-023 D4)", () => {
+  const challengeReq = () =>
+    new Request(`${ORIGIN}/join/challenge`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.44" },
+      body: JSON.stringify({ token: "any-" + crypto.randomUUID() }),
+    });
+
+  it("join.challenge.pre-do-limit — a limited challenge makes no RPC", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => false);
+    const res = await call(challengeReq(), { SIGNING_AUTHORITY: spy.binding, PASSKEY_LIMITER: rl.binding });
+    expect(res.status).toBe(429);
+    expect(spy.calls).toEqual([]);
+    expect(rl.keys).toEqual(["join-challenge:198.51.100.44"]);
+  });
+
+  it("control: an allowed challenge reads the session secret and answers 200", async () => {
+    const spy = spiedAuthority();
+    const rl = limiter(() => true);
+    const res = await call(challengeReq(), { SIGNING_AUTHORITY: spy.binding, PASSKEY_LIMITER: rl.binding });
+    expect(res.status).toBe(200);
+    expect(spy.calls.length).toBeGreaterThan(0);
+  });
+});

@@ -1,6 +1,6 @@
 <!--
 @doc-check
-@endpoints: POST /join, POST /cert/gha
+@endpoints: POST /join, POST /join/challenge, POST /cert/gha
 -->
 # ADR-023: An OIDC proof at /join names its invite in the audience
 
