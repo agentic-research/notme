@@ -191,7 +191,7 @@ scripts/task-cert/  machine-side CLI — enroll, renew, mint tasks and subtasks,
 gen/ts/             TypeScript types generated from schema/ (task schema:ts; drift-checked in CI)
 schema/             cap'n proto type definitions (CABundle, GHAClaims, etc.)
 packages/           container image pipeline (melange + apko) + workspace libs (contract, dpop)
-docs/design/        ADRs 005–023
+docs/design/        ADRs 005–024
 ```
 
 see [ARCHITECTURE.md](ARCHITECTURE.md) for the full subsystem map, data flow, and security model.
@@ -340,7 +340,7 @@ cd worker && bash test-e2e.sh     # Playwright e2e (virtual authenticator)
 | `wasm/` | Empty and superseded — `leyline_sign.wasm` ships from ley-line-open instead. Kept as history. | [wasm/README.md](wasm/README.md) |
 | `scripts/` | Standalone tooling: `task-cert/` (machine-side CLI), `doc-check.ts`, etc. | [scripts/README.md](scripts/README.md) |
 | `packages/` | melange + apko signed container bundles, plus the `contract` and `dpop` workspace libraries. | [packages/README.md](packages/README.md) |
-| `docs/design/` | ADRs 005–023. | [docs/README.md](docs/README.md) |
+| `docs/design/` | ADRs 005–024. | [docs/README.md](docs/README.md) |
 
 ## related
 
