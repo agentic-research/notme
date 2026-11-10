@@ -1,6 +1,6 @@
 # ADR-024: Step-up presence is a certificate notme mints for one action
 
-**Status:** proposed (2026-11-09)
+**Status:** accepted (2026-11-09; owner: "These make sense I think")
 **Beads:** `notme-070b21` (this decision); related: `notme-8eb592` (a human
 acceptor cannot sign DSSE), `notme-bdeeb5` (mint path phase 4: deploy
 approval from a phone), `notme-1b46a8` (issuance log)

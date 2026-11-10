@@ -4,7 +4,7 @@
 -->
 # ADR-023: An OIDC proof at /join names its invite in the audience
 
-**Status:** proposed (2026-11-09)
+**Status:** accepted (2026-11-09; owner: "These make sense I think")
 **Beads:** `notme-e3dede` (this decision), `notme-3dfe15` (option A, shipped:
 single-use `jti` at /join)
 **Composes:** ADR-020 (compose, do not invent), ADR-021 (registration
