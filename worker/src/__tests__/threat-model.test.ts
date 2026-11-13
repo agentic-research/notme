@@ -21,13 +21,15 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
+import { authenticateWithPop, makeCA, mintCreds, stubEnv } from "./helpers/mint-creds";
 
 // AuthService lives in worker.ts which imports cloudflare:workers at the
 // top of the module. Mock it so we can construct the class in pure Node
 // vitest without spinning up workerd. The mock only needs the shape worker.ts
 // references at module-evaluation time (the base classes).
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   WorkerEntrypoint: class WorkerEntrypoint {
     ctx: any;
     env: any;
@@ -49,14 +51,15 @@ vi.mock("cloudflare:workers", () => ({
 import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
 import { AuthService } from "../../worker";
 import { validateRedirectUri } from "../auth/redirect-uri";
-import { verifyOIDC } from "../auth/verify-proof";
+import { issuerAudiences, verifyOIDC } from "../auth/verify-proof";
+import { fakeIssuer } from "./helpers/oidc-issuer";
 import { validateDpopProof } from "../auth/dpop";
 import {
   type CABundle,
   bundleCanonical,
   verifyBundleSignature,
 } from "../revocation";
-import { CertScope } from "../../../gen/ts/identity";
+import { CertScopeSchema } from "../../../gen/ts/identity.zod";
 
 // Constructor under cloudflare:workers' real types expects 0 args; our mock
 // supplies (ctx, env). Cast through the mock-friendly shape so the TS checker
@@ -99,33 +102,27 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    await a.authenticate(await makeCreds("wimse://notme.bot/gha/alice"));
-    await b.authenticate(await makeCreds("wimse://notme.bot/gha/bob"));
+    const sessA = await authenticateWithPop(a, await makeCreds("wimse://notme.bot/gha/alice"));
+    const sessB = await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
 
-    const idA = await a.identity();
-    const idB = await b.identity();
+    const idA = await sessA.identity();
+    const idB = await sessB.identity();
 
     expect(idA.identity).toBe("wimse://notme.bot/gha/alice");
     expect(idB.identity).toBe("wimse://notme.bot/gha/bob");
   });
 
-  it("a fresh AuthService instance must report authenticated=false even if another instance authenticated", async () => {
-    const kp = (await crypto.subtle.generateKey(
-      { name: "Ed25519" },
-      false,
-      ["sign", "verify"],
-    )) as CryptoKeyPair;
-
+  it("a fresh AuthService instance holds no credentials to observe — they live on the session (notme-153f03)", async () => {
     const authenticated = newAuthService();
-    await authenticated.authenticate(
-      await makeCreds("wimse://notme.bot/gha/leaked"),
+    await authenticateWithPop(authenticated, await makeCreds("wimse://notme.bot/gha/leaked"),
     );
 
-    const fresh = newAuthService();
-    const freshIdentity = await fresh.identity();
-
-    expect(freshIdentity.authenticated).toBe(false);
-    expect(freshIdentity.identity).toBe("");
+    // There is no identity()/proxy()/sign() on the entrypoint any more, so a
+    // fresh instance has nothing that could report another caller's identity.
+    const fresh = newAuthService() as unknown as Record<string, unknown>;
+    expect(fresh.identity).toBeUndefined();
+    expect(fresh.proxy).toBeUndefined();
+    expect(fresh.sign).toBeUndefined();
   });
 
   it("sign() on instance A must use A's identity even after B authenticates", async () => {
@@ -138,11 +135,15 @@ describe("auth-service.state.session-isolation > regression guard", () => {
     const a = newAuthService();
     const b = newAuthService();
 
-    await a.authenticate(await makeCreds("wimse://notme.bot/gha/alice"));
-    await b.authenticate(await makeCreds("wimse://notme.bot/gha/bob"));
+    const alice = await mintCreds(TM_CA, "wimse://notme.bot/gha/alice", ["bridgeCert", "sign:attestation"]);
+    const sessA = await authenticateWithPop(a, alice);
+    await authenticateWithPop(b, await makeCreds("wimse://notme.bot/gha/bob"));
 
+    // The caller signs (notme-153f03); the session verifies and attributes.
     const payload = new TextEncoder().encode("hello").buffer as ArrayBuffer;
-    const signed = await a.sign(payload, "raw");
+    const signed = await sessA.sign(payload, "raw", (bytes: ArrayBuffer) =>
+      crypto.subtle.sign({ name: "Ed25519" }, alice.signingKey, bytes),
+    );
     expect(signed.identity).toBe("wimse://notme.bot/gha/alice");
   });
 });
@@ -204,7 +205,7 @@ describe("contract.oidc.audience-identity", () => {
       aud: "other-service",
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, issuerAudiences({}))).rejects.toThrow(
       /wrong audience/,
     );
   });
@@ -216,24 +217,21 @@ describe("contract.oidc.audience-identity", () => {
       aud: ["other-a", "other-b"],
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, issuerAudiences({}))).rejects.toThrow(
       /wrong audience/,
     );
   });
 
   it("accepts the audience check (and proceeds past it) when aud matches", async () => {
-    const body = ENC({
-      iss: "https://auth.notme.bot",
-      sub: "test",
-      aud: "notme.bot",
-      exp: FUTURE_EXP,
-    });
-    // Audience check passes; verifier proceeds to JWKS fetch (which will fail
-    // in vitest). We only care that the failure reason is NOT a wrong-audience
-    // error — that proves the audience check was satisfied.
-    await expect(
-      verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot"),
-    ).rejects.not.toThrow(/wrong audience/);
+    // "Proceeds past it" used to mean fetching live JWKS from
+    // auth.notme.bot and passing on any error that was not the audience one
+    // (notme-3fc74b). The issuer is now a local fixture, so passing the
+    // audience check is shown by the token VERIFYING, with the keys fetched
+    // from the fixture.
+    const issuer = await fakeIssuer("https://auth.notme.bot");
+    const token = await issuer.token({ sub: "test", aud: "notme.bot" });
+    await expect(verifyOIDC(token, issuerAudiences({}))).resolves.toMatchObject({ subject: "test" });
+    expect(issuer.requests).toContain("https://auth.notme.bot/.well-known/jwks");
   });
 });
 
@@ -248,8 +246,9 @@ describe("contract.oidc.trusted-issuers", () => {
       .replace(/=+$/, "");
   const HEADER = ENC({ alg: "RS256", typ: "JWT", kid: "test" });
 
-  // Issuer check runs in fetchJWKS, AFTER audience check passes. So we must
-  // pass audience to reach the issuer guard.
+  // The issuer check runs FIRST since notme-0a1ee8: the token's own iss
+  // selects its audience pin, so an issuer with no pin is refused before the
+  // audience is looked at, and before any JWKS fetch.
   it("rejects an untrusted issuer even when audience matches", async () => {
     const body = ENC({
       iss: "https://attacker.example",
@@ -257,33 +256,27 @@ describe("contract.oidc.trusted-issuers", () => {
       aud: "notme.bot",
       exp: FUTURE_EXP,
     });
-    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot")).rejects.toThrow(
+    await expect(verifyOIDC(`${HEADER}.${body}.AAAA`, issuerAudiences({}))).rejects.toThrow(
       /untrusted issuer/,
     );
   });
 
+  // Both issuers are local fixtures (notme-3fc74b): trusted means the token
+  // verifies, not that the failure was some error other than the trust one.
   it("accepts a known issuer (GHA) past the trust check", async () => {
-    const body = ENC({
-      iss: "https://token.actions.githubusercontent.com",
-      sub: "repo:agentic-research/notme",
-      aud: "notme.bot",
-      exp: FUTURE_EXP,
+    const issuer = await fakeIssuer("https://token.actions.githubusercontent.com");
+    const token = await issuer.token({ sub: "repo:agentic-research/notme", aud: "notme.bot" });
+    await expect(verifyOIDC(token, issuerAudiences({}))).resolves.toMatchObject({
+      issuer: "https://token.actions.githubusercontent.com",
     });
-    await expect(
-      verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot"),
-    ).rejects.not.toThrow(/untrusted issuer/);
+    expect(issuer.requests).toContain("https://token.actions.githubusercontent.com/.well-known/jwks");
   });
 
   it("accepts auth.notme.bot as a trusted self-issuer", async () => {
-    const body = ENC({
-      iss: "https://auth.notme.bot",
-      sub: "test",
-      aud: "notme.bot",
-      exp: FUTURE_EXP,
-    });
-    await expect(
-      verifyOIDC(`${HEADER}.${body}.AAAA`, "notme.bot"),
-    ).rejects.not.toThrow(/untrusted issuer/);
+    const issuer = await fakeIssuer("https://auth.notme.bot");
+    const token = await issuer.token({ sub: "test", aud: "notme.bot" });
+    await expect(verifyOIDC(token, issuerAudiences({}))).resolves.toMatchObject({ issuer: "https://auth.notme.bot" });
+    expect(issuer.requests).toContain("https://auth.notme.bot/.well-known/jwks");
   });
 
   // Cross-repo: @notme/contract is the single source of truth — both the
@@ -393,38 +386,13 @@ describe("contract.cabundle.signing-canonical", () => {
 });
 
 // ── 4. Revocation seqno monotonicity ───────────────────────────────────────
-
-describe("contract.revocation.seqno-monotonic", () => {
-  // The DO has an atomic SetLastSeenSeqnoIfGreater. We exercise the same
-  // decision rule the DO uses, without standing up a workerd DO instance
-  // (the runInDurableObject pool config is tracked separately as notme-c38bb6).
-  function applySeqnoRule(last: number, incoming: number): "advance" | "noop" | "rollback" {
-    if (typeof incoming !== "number" || !Number.isFinite(incoming) || incoming < 1) {
-      return "rollback";
-    }
-    if (incoming < last) return "rollback";
-    if (incoming > last) return "advance";
-    return "noop";
-  }
-
-  it("advances when seqno strictly increases", () => {
-    expect(applySeqnoRule(100, 101)).toBe("advance");
-  });
-
-  it("is a no-op when seqno equals the last-seen value", () => {
-    expect(applySeqnoRule(100, 100)).toBe("noop");
-  });
-
-  it("rejects a rollback (seqno < last)", () => {
-    expect(applySeqnoRule(100, 99)).toBe("rollback");
-  });
-
-  it("rejects a non-positive or NaN seqno", () => {
-    expect(applySeqnoRule(100, 0)).toBe("rollback");
-    expect(applySeqnoRule(100, -1)).toBe("rollback");
-    expect(applySeqnoRule(100, NaN)).toBe("rollback");
-  });
-});
+//
+// Not asserted here. This block used to define its own `applySeqnoRule` and
+// test that copy, never RevocationAuthority.handleSeqno (notme-8fb37f). The
+// rule is tested against the real DO under workerd in
+// src/revocation.do.test.ts ("RevocationAuthority": first / same / higher
+// seqno accepted, rollback refused, per-issuer isolation, and non-positive or
+// non-numeric seqno refused).
 
 // ── 5. DPoP proof shape ────────────────────────────────────────────────────
 
@@ -519,7 +487,7 @@ describe("contract.scopes.vocabulary", () => {
     // Adding a scope here means: also document it in THREAT_MODEL.md, also
     // update any consumer that allowlists scopes locally. This test pins
     // the vocabulary so additions are intentional.
-    expect(Object.values(CertScope).sort()).toEqual(
+    expect([...CertScopeSchema.options].sort()).toEqual(
       ["authorityManage", "bridgeCert", "certMint"].sort(),
     );
   });
@@ -528,11 +496,11 @@ describe("contract.scopes.vocabulary", () => {
     // The worker.ts proxy() handler checks `heldCerts.scopes.includes("bridgeCert")`
     // with a bare literal. Pin the literal to the enum so a future enum
     // rename without a worker.ts update fails here, not at runtime.
-    expect(CertScope.bridgeCert).toBe("bridgeCert");
+    expect(CertScopeSchema.parse("bridgeCert")).toBe("bridgeCert");
   });
 
   it("admin gating uses the authorityManage scope literal", () => {
-    expect(CertScope.authorityManage).toBe("authorityManage");
+    expect(CertScopeSchema.parse("authorityManage")).toBe("authorityManage");
   });
 });
 
@@ -545,19 +513,30 @@ describe("contract.auth-service.rpc-surface", () => {
     const methods = Object.getOwnPropertyNames(AuthService.prototype).filter(
       (n) => n !== "constructor" && !n.startsWith("_"),
     );
+    // mintDPoPToken IS DELIBERATELY ABSENT (notme-d68da8). It was listed
+    // here, and this list says "a rename or removal is a breaking change to
+    // the consumer protocol" — so note what that framing did: it is a
+    // COMPATIBILITY pin, and the method it was protecting signed a
+    // caller-chosen `sub`, `scope` and `audience` with the master key. A
+    // backwards-compatibility assertion will defend a security defect as
+    // readily as a feature, and this one would have failed the fix.
+    //
+    // Removal was checked, not assumed: `grep -rn "mintDPoPToken"` over
+    // notme, rig, signet, cloister, ley-line, ley-line-open, rosary and mache
+    // finds no consumer. So nothing is broken by its absence, and this list
+    // now pins what SHOULD be callable rather than what happened to be.
     const expected = [
       // Authority lookups
       "mintBridgeCert",
-      "mintDPoPToken",
       "getPublicKeyPem",
       "getCACertificatePem",
       "getAuthorityState",
       "verifySession",
-      // Identity-gated runtime methods
+      // Identity-gated runtime methods. proxy, sign and identity moved to
+      // the AuthSession authenticate() returns (notme-153f03): over a binding
+      // they could not see what authenticate() had verified.
+      "authChallenge",
       "authenticate",
-      "proxy",
-      "sign",
-      "identity",
     ];
     for (const name of expected) {
       expect(methods, `AuthService.${name} must remain a public RPC method`).toContain(
@@ -633,9 +612,8 @@ describe("contract.gha-oidc.fork-pr-boundary", () => {
   // (b) we re-document the assumption as "use branch protection + required
   // reviewers, not server-side filtering". Either resolution is a
   // deliberate decision — that's the point of the test.
-  it.todo(
-    "server rejects GHA OIDC tokens whose event_name is pull_request_target (needs handleCertGHA filter)",
-  );
+  // The server half is enforced now (notme-fbb00e): validateGHAToken and
+  // verifyOIDC refuse GHA_REJECTED_EVENTS — gha-rejected-events.do.test.ts.
   it.todo(
     "consumer Action refuses to run on pull_request_target context (needs guard in action/src/index.ts)",
   );

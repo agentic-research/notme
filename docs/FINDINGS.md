@@ -3,6 +3,11 @@
 A working note on defect *patterns* — the kind that survive review, ship to
 production, and stay invisible because everything reports green.
 
+*First written 2026-08-06; brought up to date 2026-11-03. The first five
+sections are the August audit as it stood then. [A second pass](#a-second-pass-2026-11)
+adds what the November hardening work found, and [What is still open](#what-is-still-open-stated-plainly)
+is current.*
+
 Context: notme is a small identity authority (Cloudflare Workers, X.509 +
 WebAuthn + OIDC). It had tests, threat-model rows linked to those tests, ADRs,
 and a CI gate that verified documentation claims. It looked done.
@@ -20,11 +25,11 @@ that stayed flat would mean nobody looked.
 
 The metric that matters is severity, and it moved the other way:
 
-| | At audit start | Now |
-|---|---|---|
-| **P0** | 5 | 5 addressed — 4 fixed and deployed, 1 awaiting external confirmation |
-| Tests | — | 662 passing (538 unit + 124 real-Durable-Object) |
-| Commits | — | 109 (29 fixes, 7 features, 20 doc corrections, 1 CI gate) |
+| | At audit start | 2026-08-06 | 2026-11-03 |
+|---|---|---|---|
+| **P0** | 5 | 4 fixed and deployed, 1 awaiting external confirmation | 0 open: the last one was confirmed against the live trust anchor |
+| Tests | — | 662 (538 unit + 124 real-Durable-Object) | 1736 at ccc2cab (1042 unit + 638 real-Durable-Object + 56 CT-bound, against a stub log that signs real SCTs) |
+| Commits | — | 109 | 305 more since the August note |
 
 ---
 
@@ -133,14 +138,64 @@ Not more tests. Tests were the *source* of several false signals.
 
 ---
 
+## A second pass (2026-11)
+
+The November work was hardening: security reviews of each batch of fixes
+before merge. The August patterns showed up again, and three new ones did too.
+
+**The guard that wasn't installed where it mattered.** The test suite had a
+no-network guard, but only in one of its two pools. The Durable Object pool
+ran without it, and OIDC tests there were quietly reaching the live
+production issuer. Separately, the alarm-defence tests passed whether or not
+the defences were present: they never drove the alarm into the state the
+defence exists for. Both are pattern 2 again, but here the *tests themselves*
+were the path production never takes.
+
+**A check on one door that its sibling door skips.** `/cert/gha` refused a
+GitHub repository owner outside the allowlist. The internal binding that
+mints the same certificate did not, so any repository's token handed to a
+binding holder bought a cert. Single-use was the same: `/join` spent an OIDC
+token once, and `/auth/oidc/login` turned a replayed token into a 24-hour
+session. One endpoint carrying a guard tells a reader the property holds,
+and the sibling inherits the reputation without the code. The fix that keeps
+working is a parsed type or a single shared function that every path *has*
+to go through, not a second copy of the check.
+
+**Atomic on paper, racy at the await.** A bootstrap code could be spent twice
+by two requests interleaving at an `await`, and a CT-logged mint could sign
+with a key that rotated while it waited on the log. Durable Objects serialise
+storage, not your logic across an `await`. Each read-decide-write had to
+become a compare-and-swap or a capture-and-recheck.
+
+**Fixes interact.** Two independent fixes each made sense, and together they
+made a new defect: one moved the token spend earlier, and the other added a
+re-check after it. A refused re-check now burned the caller's token and threw.
+Neither review could see it alone; it surfaced only when the second review
+was told what the first branch did. Reviewing a batch against the branch it
+will merge on top of is worth the extra step.
+
+---
+
 ## What is still open, stated plainly
 
-Nothing here revokes a credential before its TTL expires. The revocation module
-is complete, tested, and **has no call sites**; separately, capability grants
-are read from a session cookie rather than re-checked. Two documents describe
-revocation as working. That is the largest remaining gap, it is now known and
-enumerated, and it is gated on a design decision rather than effort.
+*As of 2026-11-03. The ordered list, with reasons, is
+[REMAINING-WORK.md](REMAINING-WORK.md).*
 
-The documentation-honesty pass is the one unbounded item. It found five
-artifacts asserting unverified properties in a cycle where nobody was looking
-for them systematically.
+Revocation is no longer all-or-nothing. A machine's enrolment can be
+revoked, an expired tier refuses, a copied machine is shut off at renewal,
+and `POST /admin/revoke-epoch` revokes everything while keeping the evidence.
+The standalone revocation module is still exported with no production
+caller.
+
+What remains is mostly outside the code:
+
+- **Trust still bottoms out in TLS to the issuer** until the release job
+  signs the trust anchor from a tag.
+- **Issuance transparency is built but inert.** Every mint can be logged to a
+  Static CT log, proven end to end against a real azul log run locally
+  (`task ct:acceptance`, not part of CI), but nothing is logged until the log
+  is provisioned and `CT_LOG` is bound.
+- **Owner actions gate the release:** branch protection, the KEK rehearsal,
+  the staging rehearsal and the production deploy.
+- **Known residuals are documented, not hidden:** for example, three routes
+  still record a spent OIDC token only in eventually consistent KV.

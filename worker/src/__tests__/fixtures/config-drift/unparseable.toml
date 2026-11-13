@@ -1,0 +1,3 @@
+# Fixture (notme-a3804c): line 3 is not TOML, and carries a value the
+# report must not echo.
+GHA_ALLOWED_OWNERS = "fixture-secret-unterminated

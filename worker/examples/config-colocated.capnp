@@ -60,8 +60,10 @@ const config :Workerd.Config = (
 
 # ── notme Worker: full identity authority ──
 const notmeWorker :Workerd.Worker = (
-  compatibilityDate = "2026-03-01",
-  compatibilityFlags = ["nodejs_compat"],
+  compatibilityDate = "2026-10-19",
+  # No compatibilityFlags: from 2026-08-04 the date enables nodejs_compat
+  # (and _v2), and workerd REFUSES to start with the redundant flag listed
+  # (notme-430ad1). Node.js compat is still on, as it always was here.
 
   modules = [
     ( name = "worker",
@@ -108,7 +110,10 @@ const notmeWorker :Workerd.Worker = (
 
 # ── Agent Worker: network-isolated, service binding only ──
 const agentWorker :Workerd.Worker = (
-  compatibilityDate = "2026-03-01",
+  # From 2026-08-04 this date turns Node.js compat on for the agent too. It
+  # gives the agent no new reach: node:net/node:http still go through
+  # globalOutbound, which it does not have (notme-430ad1).
+  compatibilityDate = "2026-10-19",
 
   modules = [
     ( name = "agent",
@@ -117,9 +122,21 @@ const agentWorker :Workerd.Worker = (
   ],
 
   bindings = [
-    # The ONLY way the agent can interact with the outside world
+    # The ONLY way the agent can interact with the outside world.
+    #
+    # `props` names THIS agent to notme, and every agent's NOTME binding
+    # must set distinct props (notme-153f03, review M1). authChallenge() is
+    # rate limited per binding props (10 / 60 s), so a binding with its own
+    # props has its own budget. Bindings WITHOUT props are limited per
+    # claimed identity plus one cap they all share, so one props-less agent
+    # can still crowd out its props-less peers. Give a second agent Worker
+    # its own value, e.g. "{\"agent\":\"reviewer\"}".
     ( name = "NOTME",
-      service = (name = "notme", entrypoint = "AuthService"),
+      service = (
+        name = "notme",
+        entrypoint = "AuthService",
+        props = (json = "{\"agent\":\"example-agent\"}"),
+      ),
     ),
   ],
 

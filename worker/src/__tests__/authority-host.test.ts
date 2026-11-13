@@ -19,6 +19,8 @@ import { describe, expect, it, vi } from "vitest";
 // WorkerEntrypoint), unavailable in plain vitest. Stub minimal shapes — this
 // file tests a pure host-resolution helper, not runtime integration.
 vi.mock("cloudflare:workers", () => ({
+  // AuthSession (src/auth/auth-session.ts) extends it (notme-153f03).
+  RpcTarget: class RpcTarget {},
   DurableObject: class {},
   WorkerEntrypoint: class {
     ctx: unknown;
@@ -60,6 +62,30 @@ describe("authorityHostFromEnv", () => {
 
   it("returns null on a malformed URL instead of throwing in the fetch path", () => {
     expect(authorityHostFromEnv("not a url")).toBeNull();
+  });
+
+  // notme-159805. These PARSE — new URL() does not throw — and yield host "".
+  // Returning "" would collapse the caller's `host === authorityHost` into
+  // `host === ""`, which the canonical-host redirect deliberately exempts for
+  // bare-IP health probes: an empty Host header would then be served the
+  // whole authority surface. "Parses" is not "names a host"; both must fail
+  // closed to null.
+  it.each([
+    "file:///x",
+    "about:blank",
+    "data:text/plain,hi",
+    "mailto:a@b.c",
+    "javascript:alert(1)",
+    "foo:bar",
+  ])("returns null, not \"\", for the hostless URL %s", (value) => {
+    expect(authorityHostFromEnv(value)).toBeNull();
+  });
+
+  it("returns null for a non-http(s) scheme even when it carries a host", () => {
+    // ftp://auth.notme.bot has a real host, but it is not an authority URL —
+    // it would also become the advertised issuer. Scheme is part of the gate.
+    expect(authorityHostFromEnv("ftp://auth.notme.bot")).toBeNull();
+    expect(authorityHostFromEnv("ws://auth.notme.bot")).toBeNull();
   });
 });
 

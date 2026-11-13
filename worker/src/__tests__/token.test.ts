@@ -231,7 +231,7 @@ describe("verifyAccessToken", () => {
       keyId,
     });
 
-    const claims = await verifyAccessToken(token, verifyKey);
+    const claims = await verifyAccessToken(token, verifyKey, "https://auth.notme.bot");
     expect(claims.sub).toBe("principal:alice");
     expect(claims.scope).toBe("bridgeCert");
     expect(claims.aud).toBe("https://rosary.bot");
@@ -271,7 +271,7 @@ describe("verifyAccessToken", () => {
     const sigB64 = encodeBase64urlNoPadding(sig);
     const token = `${headerB64}.${payloadB64}.${sigB64}`;
 
-    await expect(verifyAccessToken(token, verifyKey)).rejects.toThrow(/expired/i);
+    await expect(verifyAccessToken(token, verifyKey, "https://auth.notme.bot")).rejects.toThrow(/expired/i);
   });
 
   it("rejects tampered payload", async () => {
@@ -291,7 +291,7 @@ describe("verifyAccessToken", () => {
     );
     const tamperedToken = `${parts[0]}.${tamperedPayloadB64}.${parts[2]}`;
 
-    await expect(verifyAccessToken(tamperedToken, verifyKey)).rejects.toThrow(
+    await expect(verifyAccessToken(tamperedToken, verifyKey, "https://auth.notme.bot")).rejects.toThrow(
       /signature/i,
     );
   });
@@ -307,7 +307,7 @@ describe("verifyAccessToken", () => {
     // Generate a different keypair
     const otherKp = await generateEd25519Keypair();
 
-    await expect(verifyAccessToken(token, otherKp.publicKey)).rejects.toThrow(
+    await expect(verifyAccessToken(token, otherKp.publicKey, "https://auth.notme.bot")).rejects.toThrow(
       /signature/i,
     );
   });
@@ -326,7 +326,7 @@ describe("mintAccessToken + verifyAccessToken roundtrip", () => {
       keyId: "roundtrip-kid",
     });
 
-    const claims = await verifyAccessToken(token, kp.publicKey);
+    const claims = await verifyAccessToken(token, kp.publicKey, "https://auth.notme.bot");
     expect(claims.sub).toBe("principal:roundtrip");
     expect(claims.scope).toBe("bridgeCert authorityManage");
     expect(claims.aud).toBe("https://mcp.rosary.bot");

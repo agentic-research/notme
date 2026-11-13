@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const publicDir = fileURLToPath(new URL("../../public/", import.meta.url));
+const publicDir = fileURLToPath(new URL("../../public/", import.meta.url).href);
 const apas = readFileSync(`${publicDir}/apas.html`, "utf8");
 const home = readFileSync(`${publicDir}/index.html`, "utf8");
 

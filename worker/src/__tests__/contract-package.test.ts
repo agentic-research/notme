@@ -67,6 +67,7 @@ describe("@notme/contract — exported shape", () => {
 
   it("ERROR_STATUS uses standard 4xx codes for documented failure classes", () => {
     expect(contract.ERROR_STATUS.OIDC_PROOF_REJECTED).toBe(403);
+    expect(contract.ERROR_STATUS.OIDC_LOGIN_REJECTED).toBe(401);
     expect(contract.ERROR_STATUS.SCOPE_INSUFFICIENT).toBe(403);
     expect(contract.ERROR_STATUS.RESET_NOT_PERMITTED).toBe(403);
     expect(contract.ERROR_STATUS.GHA_TOKEN_INVALID).toBe(401);

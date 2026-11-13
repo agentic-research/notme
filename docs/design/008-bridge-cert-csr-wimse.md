@@ -65,15 +65,39 @@ Issue **proof-of-possession bridge certificates** via a nonce-based exchange. Th
 
 Adopt WIMSE identity URIs as the canonical format. The same URI appears in X.509 SAN, WIT `sub` claims, git signatures, and APAS attestations:
 
+> **CORRECTION (2026-08-29, `notme-77438b` / ADR-019 D2).** The `{context}`
+> segment below is **retired**. It held the auth ceremony for session-minted
+> certs and the attestation mechanism for CI certs, so one principal's
+> identity changed with the door they came through, and the subject's
+> position in the path differed by route. The format is now:
+>
+> ```
+> wimse://{trust-domain}/principal/{stable-id}
+> ```
+>
+> Kind (`principal_kind`, OID `.1.8`) and mechanism (`authMethod`, OID `.1.5`)
+> are signed extensions. The examples and `{context}` discussion below are
+> kept as the historical record of what shipped first; read them as history.
+
 ```
 wimse://notme.bot/gha/agentic-research/notme        (GHA workflow)
 wimse://notme.bot/user/james                         (passkey-authenticated human)
 wimse://notme.bot/agent/dev-agent/dispatch/abc123    (dispatched agent)
 ```
 
-Format: `wimse://{trust-domain}/{context}/{identity}`
+Format: `wimse://{trust-domain}/{context}/{identity}` — **superseded, see the
+correction above.**
 
 The trust domain is a FQDN. The path is scoped within the trust domain. This follows `draft-ietf-wimse-arch-02` Section 3.1 and is compatible with SPIFFE ID conventions.
+
+> **CORRECTION (2026-11-02, `notme-c07956`).** Both halves of that sentence
+> overstate. `draft-ietf-wimse-arch-02` §3.1 deliberately does not define a
+> URI scheme (it names SPIFFE ID only as an example of a conforming format),
+> so the `wimse` scheme is notme's own, not the draft's. The identifier is
+> *structurally* conformant to WIMSE §3.1 — a URI whose authority is the trust
+> domain — and no more. It is deliberately **not** a SPIFFE ID: the SPIFFE ID
+> standard requires the `spiffe` scheme, so SPIFFE implementations such as
+> SPIRE will not accept `wimse://notme.bot/...` as one.
 
 #### `{context}` encoding, and which copy is canonical
 
@@ -122,6 +146,8 @@ The exchange is NOT a PKCS#10 Certificate Signing Request. It is a **proof-of-po
 
 This is analogous to ACME challenge-response (RFC 8555) and FIDO2/WebAuthn registration — prove you hold the key, get a credential.
 
+**Small-order Ed25519 keys are refused** (notme-48226d). A key in the order-8 torsion subgroup has no private key, yet signatures under it can be forged with none: R a small-order point, S = 0. workerd imports all 8 such keys and its `crypto.subtle.verify` accepts those forgeries; for the identity key it accepts one over every message. So a proof "for" such a key proves nothing. `importPublicKey` refuses one (400 `invalid public key`), and every caller-key Ed25519 verify (`verifyPopProofs`, `verifyEd25519PopProof`, `AuthSession.sign()`) goes through `verifyEd25519`, which refuses one again. The check is libsodium's `has_small_order` and is pinned by `worker/src/ed25519-small-order.do.test.ts`.
+
 ### Dual-cert model
 
 Each exchange produces **two certificates** from one request. The caller generates two keypairs in-process (`extractable: false`, never serialized) and proves possession of both:
@@ -154,16 +180,16 @@ sequenceDiagram
     participant G as GitHub OIDC
 
     Note over C: Generate P-256 + Ed25519 keypairs<br/>(extractable: false)
-    Note over C: binding_payload = SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
-    Note over C: Sign binding_payload with both private keys
+    Note over C: binding_input = mtls_spki || signing_spki || SHA-256(oidc_jwt)
+    Note over C: Sign binding_input ITSELF with both keys — never its digest
 
     C->>G: (pre-step) Request OIDC JWT
     G-->>C: OIDC JWT (one-time JTI)
 
     C->>A: POST /cert/gha<br/>Authorization: Bearer {oidc_jwt}<br/>Body: {public_keys, proofs}
     Note over A: 1. Verify OIDC JWT signature + JTI (replay check)
-    Note over A: 2. Verify ES256 proof over binding_payload
-    Note over A: 3. Verify EdDSA proof over binding_payload
+    Note over A: 2. Verify ES256 proof over binding_input
+    Note over A: 3. Verify EdDSA proof over binding_input
     Note over A: 4. Issue P-256 cert + Ed25519 cert<br/>   signed by CA (extractable:false)
     A-->>C: {certificates: {mtls, signing}, identity, scopes, expires_at}
 
@@ -181,18 +207,19 @@ Content-Type: application/json
     "signing": "<Ed25519 SPKI PEM>"
   },
   "proofs": {
-    "mtls": "<ES256 signature over binding_payload>",
-    "signing": "<EdDSA signature over binding_payload>"
+    "mtls": "<ES256 signature over binding_input>",
+    "signing": "<EdDSA signature over binding_input>"
   }
 }
 ```
 
-Where `binding_payload = SHA-256(mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt))`.
+Where `binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)`.
 
-> **CORRECTION (2026-08-06, `notme-bd68f2`).** The outer `SHA-256(…)` is wrong,
-> in both this definition and the sequence diagram above. **Signers must sign
-> the concatenation itself — the pre-image — never its digest.** The normative
-> encoding is:
+> **CORRECTION (2026-08-06, amended 2026-09-18, `notme-bd68f2`).** This
+> definition and the sequence diagram above both used to specify
+> `binding_payload = SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))`.
+> The outer `SHA-256(…)` is wrong. **Signers must sign the concatenation
+> itself — the pre-image — never its digest.** The normative encoding is:
 >
 > ```
 > binding_input = mtls_spki_der || signing_spki_der || SHA-256(oidc_jwt)
@@ -217,11 +244,36 @@ Where `binding_payload = SHA-256(mtls_spki_der || signing_spki_der || SHA-256(oi
 > described above is not merely wrong, it is being withdrawn. Build against the
 > pre-image.
 
+> **SESSION ROUTES BIND A NONCE (2026-10-28, `notme-486e8a`).** The above is
+> the `/cert/gha` binding. The session routes — `/cert/passkey` and `/cert`'s
+> session branch — bind a server-issued nonce, fetched first with
+> `POST /cert/nonce` (same-origin; the session cookie is sent automatically):
+>
+> ```
+> binding_input = "notme/cert-pair/v1\0" || mtls_spki_der || signing_spki_der || SHA-256(nonce)
+> ```
+>
+> with `nonce` echoed in the request body. Normative source:
+> `worker/src/auth/cert-pair-binding.ts`. The nonce is single-use, expires in
+> 120 s, is bound to the session's principal, and is spent only after the
+> proofs verify.
+>
+> What it replaced, and why: `/cert/passkey` bound `SHA-256(notme_session)`,
+> but that cookie is HttpOnly and every session is issued only as
+> `Set-Cookie`, so no browser could compute the binding and the route was
+> uncallable. `/cert`'s session branch bound `mtls_spki || signing_spki` with
+> no session term at all, so a captured keys+proofs pair could be replayed
+> under another session to bind the victim's keys to the attacker's identity.
+
 Each proof is a signature over the same binding payload, proving:
 - The caller holds the P-256 private key
 - The caller holds the Ed25519 private key
 - Both keys are bound to this specific OIDC identity
-- The exchange cannot be replayed (OIDC JWT is one-time via JTI)
+- The exchange cannot be replayed (OIDC JWT is one-time via JTI). On
+  `/cert/gha` that spend is recorded in KV only, which is eventually
+  consistent, so two edge nodes can each accept the same token inside the
+  propagation window (notme-b0d10f, open; `/join`, `/auth/oidc/login` and the
+  AUTH binding spend in the Durable Object)
 
 Response:
 ```json
@@ -296,6 +348,26 @@ for each cert in chain (leaf to root):
 ```
 
 If any step fails, reject the entire chain.
+
+> **CORRECTION (2026-11-02, `notme-c07956`).** Read literally, step 3 rejects
+> every chain notme issues: the self-signed root carries only
+> BasicConstraints and KeyUsage, no scopes extension, so `parent.scopes` is
+> empty at the top hop, and an empty parent admits only an empty child
+> (`worker/src/auth/scope-chain.ts`). The rule applies only at hops whose
+> parent is a **delegation tier** — an issuing-CA cert from
+> `mintIssuingCaCert` (ADR-019), which carries `.1.3` scopes. That is what
+> notme's own chain walker does: `verifyCertChain`
+> (`worker/src/auth/verify-chain.ts`) checks `child.scopes ⊆ parent.scopes`
+> for each tier→child hop, refuses a tier with no scope list, and does not
+> treat the root as a scope parent. What the root grants the first cert below
+> it is bounded at issuance by the minting route (for session-minted certs,
+> narrowed from the session's live scopes) — not by anything a verifier can
+> check from the chain. A bridge cert signed directly by the root has no hop to which the
+> rule applies.
+>
+> Not yet: the Go reference verifier does not run this step.
+> `VerifyClientCert` (`gen/go/verify/identity.go`) validates the X.509 path
+> and extracts identity; `VerifyScopeSubset` exists there with no caller.
 
 ### BasicConstraints and path length
 
@@ -526,7 +598,7 @@ The scopes in the cert extensions are **claims offered by the identity provider*
 | Git commit signing | Ed25519 cert, `gpg.format=x509`, `gpgsm` 2.3+ |
 | APAS / in-toto | Ed25519 cert in DSSE envelope (`signingCert` field) |
 | WIMSE-aware services | SAN URI is a valid WIMSE identity |
-| SPIFFE/SPIRE | SAN URI follows SPIFFE URI convention |
+| SPIFFE/SPIRE | SAN URI follows SPIFFE URI convention — **corrected 2026-11-02 (`notme-c07956`): it does not.** `wimse://` is not a SPIFFE ID and SPIRE will not accept it; see the correction under the URI format |
 | Kubernetes | Projected SA token → cert exchange (same as GHA OIDC) |
 | Sigstore/Fulcio | Parallel model (OIDC → short-lived cert) |
 

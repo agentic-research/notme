@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 import { getAllowedAudiences } from "../allowed-audiences";
 
-describe("getAllowedAudiences", () => {
+describe("dpop.audience.allowlist — getAllowedAudiences", () => {
   it("falls back to defaults when env.ALLOWED_AUDIENCES is missing", () => {
     const set = getAllowedAudiences({});
     expect(set.has("https://rosary.bot")).toBe(true);

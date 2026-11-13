@@ -7,13 +7,20 @@
 // SQLite schema:
 //   keys  — singleton authority keypair (Ed25519)
 //   state — epoch, seqno, keyId for bundle generation
-//   dpop_jtis — atomically consumed DPoP proof identifiers
+//   dpop_jtis — atomically consumed single-use proof identifiers (DPoP proof
+//               jtis, and OIDC proof jtis spent at /join or /auth/oidc/login,
+//               both under the one `oidc:<issuer>#<jti>` key)
 //
 // The DO owns the full lifecycle: key generation, bundle signing, rotation.
 // The Worker writes signed bundles to KV for the revocation verifier.
 
 import { DurableObject } from "cloudflare:workers";
 import {
+  bootstrapAttestedSubject,
+  mayBootstrapFromAttestation,
+} from "./auth/bootstrap-policy";
+import {
+  type Extension,
   X509CertificateGenerator,
   BasicConstraintsExtension,
   KeyUsagesExtension,
@@ -24,6 +31,34 @@ import { encodeBase64urlNoPadding } from "@oslojs/encoding";
 // clients run the SAME implementation — see the RFC 7636 section there.
 import { sha256Base64url } from "@agentic-research/dpop";
 import { bundleCanonical, type CABundle } from "./revocation";
+import {
+  type EpochHistory,
+  type EpochKeyEntry,
+  type EpochRevocation,
+  epochHistoryCanonical,
+  normalizeRevocationReason,
+} from "./epoch-history";
+import {
+  DEFAULT_REKOR_URL,
+  type DsseEnvelope,
+  type PublishedEpochRevocation,
+  signRevocationStatement,
+  submitToRekor,
+} from "./rekor-revocation";
+import {
+  ctPoisonExtension,
+  sctListExtension,
+  serialiseSct,
+  type SctResponse,
+} from "./ct/sct";
+import {
+  DEFAULT_TIMEOUT_MS,
+  postChain,
+  postPreChain,
+  type SubmitResult,
+} from "./ct/log-client";
+import { notAfterOf, precertTbs, serialOf, spkiOf, verifySct } from "./ct/verify-sct";
+import { parseShards, selectShard, shardEndHealth, type CtShard } from "./ct/shards";
 import { detectKeyStorage, type KeyStorageMode, ED25519 } from "./platform";
 import {
   deriveKek,
@@ -33,6 +68,20 @@ import {
 
 interface SigningAuthorityEnv {
   CA_BUNDLE_CACHE?: KVNamespace;
+  /**
+   * Expected `aud` for a GitHub OIDC token presented to `mintBridgeCert`.
+   *
+   * READ FROM THE DO'S OWN ENV, never from the caller's proof envelope
+   * (notme-51ccd7). An audience a caller can supply is an audience a caller
+   * can widen, which would hand back the whole defect in a new wrapper —
+   * so `MintBridgeCertProof` deliberately has no `audience` field. Same
+   * default as the route's `getConfig` so the two cannot disagree.
+   */
+  GHA_CERT_AUDIENCE?: string;
+  /** Owner allowlist for the gha-oidc proof — the same var /cert/gha reads (security review F7). */
+  GHA_ALLOWED_OWNERS?: string;
+  /** Upper bound on a gha-oidc bridge cert's lifetime — /cert/gha's bound (rig-e3549f). */
+  GHA_CERT_TTL_MS?: string;
   NOTME_KEY_STORAGE?: string;
   NOTME_KEK_SECRET?: string;
   /**
@@ -46,11 +95,83 @@ interface SigningAuthorityEnv {
    */
   BOOTSTRAP_CODE?: string;
   /**
+   * The one GitHub workflow identity permitted to bootstrap this authority —
+   * the full OIDC `sub`, e.g. `repo:owner/name:ref:refs/heads/main`.
+   *
+   * A `[vars]` entry, NOT a secret, and the distinction is the point: it is
+   * an identity, so there is nothing to leak and nothing to read out of a
+   * log. Security comes from GitHub's signature over the token, not from
+   * hiding this value — which is exactly the posture notme argues for
+   * everywhere else and did not practise at first boot (notme-addef9).
+   */
+  BOOTSTRAP_GHA_SUBJECT?: string;
+  /**
    * This deployment's authority origin. Tokens minted here carry it as `iss`
    * (notme-28baf2) — a DO that hardcoded the issuer made staging assert the
    * production one while signing with the staging key.
    */
   SIGNET_AUTHORITY_URL?: string;
+  /**
+   * CSV of resource servers this deployment's tokens may be addressed to.
+   * Read here, not only in the routes, because `mintBridgeCert`'s
+   * `notme-access-token` proof accepts a token WITHOUT a route in front of it
+   * (rig-098326) — and src/allowed-audiences.ts's rule is that every path
+   * which mints or spends an access token checks this set. Empty or absent
+   * falls back to DEFAULT_ALLOWED_AUDIENCES.
+   */
+  ALLOWED_AUDIENCES?: string;
+  /**
+   * Service binding to notme's Static CT log (notme-1b46a8). Absent, minting
+   * is exactly what it was before CT: no poison, no SCT, no backlog row, so
+   * production deploys safely before the log exists. Present, every online
+   * mint is logged or backlogged — never refused because of the log.
+   */
+  CT_LOG?: Fetcher;
+  /** The log's base path behind CT_LOG. Defaults to `/logs/notme`. */
+  CT_LOG_PATH?: string;
+  /**
+   * The pinned log (final review I1): base64 log id, and base64 SPKI DER of
+   * its P-256 key. REQUIRED when CT_LOG is bound — an SCT is embedded, or a
+   * backlog row marked logged, only if it carries this id and its signature
+   * verifies under this key. Missing or malformed: nothing is submitted, the
+   * mint goes out unlogged with its final chains backlogged (they drain
+   * once the pin is fixed), and health reports `configError`.
+   */
+  CT_LOG_ID?: string;
+  /**
+   * "on" hands out enrollment ids, at collect and on every renewal, so
+   * clients start signing renewal binding v3 (notme-c9fc8c, review M1).
+   * Anything else (the default): no ids go out and a re-enrolled key
+   * collects at v2, but a v3 request a client sends is still ACCEPTED, so
+   * turning it off later strands nobody. Turn it on only once the release
+   * that understands v3 is promoted to 100%: a front from before it drops
+   * `enrollment_id` and answers a v3 request invalid_proof. With it on, do
+   * not roll back past that release.
+   */
+  RENEWAL_BINDING_V3?: string;
+  CT_LOG_KEY?: string;
+  /**
+   * The shard set (notme-afa9d8), in place of CT_LOG_ID / CT_LOG_KEY /
+   * CT_LOG_PATH: a JSON array (or a wrangler [vars] array) of
+   * `{path, log_id, key, temporal_interval: {start_inclusive, end_exclusive}}`.
+   * Each certificate goes to the shard whose interval holds its notAfter;
+   * one that no shard covers is backlogged, never sent to the wrong shard.
+   * Setting it together with the single-pin variables is a configError.
+   * See src/ct/shards.ts and ct/README.md.
+   */
+  CT_LOG_SHARDS?: string | unknown[];
+  /**
+   * Where each revoke-epoch statement is logged (notme-8befcc): a Rekor v1
+   * base URL. Defaults to the public sigstore instance, DEFAULT_REKOR_URL.
+   */
+  REKOR_URL?: string;
+  /**
+   * "off" stops submission (tests, self-hosters with no outbound path to a
+   * log). The statement is still signed and published in epochs.json; only
+   * the log entry is skipped, so epochs.json shows `rekorLogIndex: null`.
+   * Anything else, or absent: on.
+   */
+  REKOR_SUBMIT?: string;
 }
 
 /**
@@ -109,6 +230,8 @@ function bootstrapSecret(env: { BOOTSTRAP_CODE?: string }): string | null {
   return raw && raw.length >= 16 ? raw : null;
 }
 
+
+
 /**
  * What a caller may learn about bootstrap WITHOUT causing anything to happen
  * (notme-addef9).
@@ -122,15 +245,220 @@ export type BootstrapReadState =
   | { status: "closed" }
   /** No authenticator, and no operator has armed one. Nobody can bootstrap. */
   | { status: "unconfigured" }
-  /** No authenticator, and a bootstrap secret is set. Present it to register. */
-  | { status: "armed" };
+  /**
+   * No authenticator, and at least one bootstrap mechanism is armed.
+   *
+   * `methods` says WHICH, because the register/options 401 is written from
+   * this and used to name a path that could not do the job: it told a fresh
+   * deployer to "bootstrap via GitHub OIDC at /cert/gha" when that route
+   * granted bridgeCert and created no principal at all. A message may only
+   * offer what is actually armed (notme-addef9).
+   */
+  | { status: "armed"; methods: BootstrapMethod[] };
+
+/** `secret` = BOOTSTRAP_CODE; `gha-oidc` = an attested workflow identity. */
+export type BootstrapMethod = "secret" | "gha-oidc";
+
+/** GitHub's OIDC issuer — the provider recorded for an attested bootstrap. */
+const GHA_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
+
+/**
+ * Evidence that entitles a caller to a subject — NOT the subject itself
+ * (notme-51ccd7).
+ *
+ * `mintBridgeCert` used to take `subject: string`, so a holder of the AUTH
+ * service binding could name any subject and get a certificate for it.
+ * Measured before the fix: it returned
+ * `MINTED subject="wimse://notme.bot/i-am-whoever"`. The docstring said "for
+ * a verified subject" — an assumption about the caller standing in for a
+ * check.
+ *
+ * WHY THAT MATTERS, AND IT IS NOT ABOUT CODE STYLE. signet verifies a
+ * release by pinning the identity URI and requiring EQUALITY
+ * (`cosign verify-blob --certificate-identity`). Its security therefore
+ * rests entirely on that URI being unforgeable. If a binding holder can
+ * assert the subject, it can mint a certificate whose identity equals
+ * signet's pin for a key it controls, and the documented verification
+ * PASSES for an artifact that holder signed. That is a forged release
+ * signature, not a convenience.
+ *
+ * Keeping the capability and merely bounding it does not work either: the
+ * only namespace notme emits is `principal/<sub>`, which is exactly what a
+ * verifier pins, so "refuse the reserved namespaces" leaves nothing useful
+ * to assert.
+ *
+ * NO `audience` FIELD, deliberately — see `GHA_CERT_AUDIENCE` above.
+ */
+export type MintBridgeCertProof =
+  | { kind: "gha-oidc"; token: string }
+  | { kind: "session-cookie"; cookie: string }
+  /**
+   * An `at+jwt` THIS authority signed, presented back to it (rig-098326).
+   *
+   * The kind exists because a bound Worker legitimately has nothing else to
+   * present. rig/web holds an AUTH binding and used to pass a `userId`; it has
+   * no GitHub Actions token, and `notme_session` is scoped to notme.bot so a
+   * browser never sends it to rosary.bot. What it can hold is a token notme
+   * already minted to an authenticated principal — session-gated and
+   * audience-checked at `/token` and `/authorize/token` — which the DO
+   * re-verifies against its own key, reading the subject out of the claims.
+   *
+   * NOT SAFE BEFORE notme-d68da8. `AuthService.mintDPoPToken` let a binding
+   * holder sign a caller-chosen `sub` with the master key, so a token could be
+   * forged and fed straight back in here. Deleting that method is what makes
+   * a signature mean something; the two changes ship together on purpose.
+   */
+  | { kind: "notme-access-token"; token: string };
+
+/**
+ * Why a mint was refused. Exhaustive; switch on it.
+ *
+ * A RETURNED REASON, NOT A THROWN ERROR, for two reasons.
+ *
+ * The house pattern: `mintDPoPTokenOnce` returns
+ * `{ ok: false, reason: "proof_reused" }` and `signReceiptCommitment`
+ * returns a code union. A failed proof is an EXPECTED outcome of a
+ * well-formed call, not programmer error, and the caller needs to map it to
+ * a status code rather than parse an error string.
+ *
+ * And the runtime forces it: when a DO RPC method throws, workerd delivers
+ * the rejection to the caller AND raises it in the DO's own isolate. The
+ * caller's `.catch()` cannot own the second one, so vitest counted them as
+ * unhandled errors and the workers suite exited 1 with all 300 tests
+ * passing. Measured across three runs. Returning leaves nothing to reject.
+ *
+ * Deliberately COARSE: a caller learns that its evidence was rejected, not
+ * which claim failed. `validateGHAToken` throws messages like
+ * "wrong audience: <value>", and echoing those back to whoever supplied the
+ * token is free reconnaissance. The detail goes to the log.
+ */
+export type BridgeCertRefusal =
+  | "invalid_gha_token"
+  /** The GHA token's jti was already spent — here, at /cert/gha, /join, /auth/oidc/login, /cert or /token (notme-f850f2). */
+  | "gha_token_reused"
+  | "invalid_session"
+  | "invalid_access_token"
+  | "unknown_proof_kind"
+  /**
+   * The signing key or epoch changed between capture and signature twice
+   * running (a rotate or revokeEpoch in flight). The proof may be spent;
+   * retry with a fresh one (notme-b54368, review L2).
+   */
+  | "authority_state_changed";
 
 // Bundle refresh interval — must be shorter than BUNDLE_MAX_AGE_MS (5 min) in revocation.ts
-const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
+export const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
+
+/**
+ * /join (ADR-023 D5): successful joins whose OIDC proof carried the plain
+ * shared `notme.bot` audience instead of a challenge audience. When this
+ * reads zero for 30 days in production, JOIN_REQUIRE_NONCE can be turned on.
+ */
+export interface JoinHealth {
+  plainAudience: { count: number; lastAt: number; lastIssuer: string };
+}
+
+/** Tier renewal health, reported under `renewal` by getAlarmHealth (notme-c9fc8c, review L1). */
+export interface RenewalHealth {
+  /**
+   * Renewals whose proof VERIFIED but whose binding is below what the
+   * enrollment speaks (v1/v2 against a v3 row): a copied key without
+   * tier.json, or an old binary. Refused (binding_v3_required), never
+   * revoked; `last` says which key, binding and generation.
+   */
+  belowBinding: { count: number; lastAt: number; last: string };
+}
+
+/**
+ * The alarm circuit breaker, reported under `breaker` by getAlarmHealth
+ * (notme-a36d10). Times are epoch ms, as lastFireAt.
+ */
+export interface AlarmBreakerHealth {
+  /**
+   * closed: the loop runs at cadence. open: inside a cool-off, no work until
+   * nextProbeAt. half_open: open with its probe due (the next fire runs the
+   * full work; success closes it, failure re-opens it with a longer cool-off).
+   */
+  state: "closed" | "open" | "half_open";
+  /** When the breaker last tripped or re-opened; 0 if never. Kept after it closes. */
+  lastTrippedAt: number;
+  /** When the probe fires; 0 while closed. */
+  nextProbeAt: number;
+  /** Trips since the last success: sets the cool-off (base x 2^(n-1), capped). */
+  consecutiveTrips: number;
+}
+
+/**
+ * Revocation statements not yet in Rekor, reported under `rekor` by
+ * getAlarmHealth (notme-d8cf4e), the way `ct.backlog` reports the CT queue.
+ */
+export interface RekorHealth {
+  /** Revocations with no Rekor log index yet (signed or not). */
+  pending: number;
+  /** Seconds since the oldest of those was revoked; null when none. */
+  oldestPendingAgeS: number | null;
+  /** The most recent submission error among pending rows, and when (epoch s); "" / 0 when none. */
+  lastError: string;
+  lastAttemptAt: number;
+  /** False under REKOR_SUBMIT=off: pending rows are then expected and never sent. */
+  submitEnabled: boolean;
+}
+
+/** CT backlog health, reported under `ct` by getAlarmHealth (notme-1b46a8). */
+export interface CtHealth {
+  /** Unlogged rows still being retried (attempts < 24). */
+  backlog: number;
+  /** Age in seconds of the oldest of those rows; null when none. */
+  oldestUnloggedAgeS: number | null;
+  /**
+   * Unlogged rows that hit 24 attempts. Still retried on the same backoff,
+   * at most an hour apart (notme-a3804c), and counted here until they are
+   * logged — or, 30
+   * days after their mint, abandoned (then counted in `abandoned` instead).
+   */
+  gaveUp: number;
+  /** Last failure: what failed and why — "HTTP 503", "timeout", "invalid SCT", "wrong log", "bad signature". */
+  lastError: string;
+  lastErrorAt: number;
+  /**
+   * Mints that went out unlogged with NO backlog row, and the last reason:
+   * the root could not be read or parsed, or the backlog INSERT failed. The
+   * drain cannot recover these. (CT_LOG_ID / CT_LOG_KEY missing or malformed
+   * is NOT counted here: those mints are backlogged and drain once the pin
+   * is fixed — see configError, notme-c0c9a2.)
+   */
+  unloggable: { count: number; lastAt: number; reason: string };
+  /** Mints whose SCTs verified but could not be embedded; backlogged instead. */
+  embedFailed: { count: number; lastAt: number };
+  /**
+   * Backlog rows given up on for good: gaveUp and minted over 30 days ago
+   * (CT_ABANDON_AFTER_S). Never retried again; permanently unlogged.
+   * Monotonic, like `unloggable`.
+   */
+  abandoned: { count: number; lastAt: number };
+  /**
+   * Why CT_LOG_ID / CT_LOG_KEY, or CT_LOG_SHARDS, cannot be trusted; null when
+   * bound and valid, or unbound. While set, mints are backlogged and the drain submits
+   * nothing. A drain fire skipped for it does not touch lastError; each mint
+   * under it overwrites lastError with "config: …; chains backlogged".
+   */
+  configError: string | null;
+  /**
+   * end_exclusive of the configured shard that ends LAST (notme-a806d0): after
+   * it no certificate has a shard to go to and every mint is backlogged. Null
+   * for the single pin (no interval), unbound, or a configError.
+   */
+  shardEndsAt: string | null;
+  /** Whole days until shardEndsAt, floored; zero or negative once passed. */
+  shardEndsInDays: number | null;
+  /** True inside SHARD_WARN_DAYS (60) of shardEndsAt, and after it: configure the next shard. */
+  shardClosingSoon: boolean;
+}
 
 // Circuit-breaker threshold for the alarm() loop. After this many consecutive
-// generateBundle() failures, alarm() stops re-arming itself. Manual recovery
-// via resetAlarmHealth() RPC. Defends against the runaway-alarm-bills failure
+// generateBundle() failures the breaker opens: alarm() stops the 4-minute loop
+// and arms only a half-open probe (below). resetAlarmHealth() RPC recovers at
+// once. Defends against the runaway-alarm-bills failure
 // mode (per notme-5c2511 EPIC and the reddit cautionary tale that motivated it):
 // if generateBundle starts throwing — DO storage corruption, key import failure,
 // KV unavailable, signing-key state desync — without this, we'd fire every 4
@@ -139,7 +467,41 @@ const BUNDLE_REFRESH_MS = 4 * 60 * 1000; // 4 minutes
 // 5 strikes ≈ 20 minutes of failure before kill switch fires. Tunable.
 const MAX_CONSECUTIVE_ALARM_FAILURES = 5;
 
+// The half-open breaker (notme-a36d10, overnight review H2). An open breaker
+// used to latch: no alarm until an operator called resetAlarmHealth(), which
+// silently stopped the Rekor retry and the CT drain along with the bundle,
+// and nothing watched it. Now a trip arms ONE probe a cool-off out; the probe
+// fire does the full work, and success closes the breaker while failure
+// re-opens it with the cool-off doubled, up to the cap. Cost while open is
+// one fire per cool-off (at the cap, 12 a day) instead of one per 4 minutes.
+export const ALARM_BREAKER_COOLOFF_BASE_MS = 15 * 60 * 1000;
+export const ALARM_BREAKER_COOLOFF_MAX_MS = 2 * 60 * 60 * 1000;
+
 import { keyIdFromSpki } from "./key-id";
+import { ADMIN_SCOPES, PRIOR_ADMIN_SCOPES, SIGNING_SCOPES } from "./auth/admin-scopes";
+import {
+  consumeInviteReservation,
+  createPrincipal,
+  ensurePrincipalSchema,
+  findPrincipalByFederated,
+  getCapabilities,
+  grantCapability,
+  linkFederatedIdentity,
+  liveInvite,
+  redeemInvite,
+  reserveInvite,
+} from "./auth/principals";
+
+/**
+ * How long a consumed OIDC proof jti is kept PAST the token's `exp` (review
+ * F2). verifyOIDC still accepts a token at `now == exp`, and the worker that
+ * verified it and this DO read different clocks, so a row that expired AT
+ * `exp` could be swept by the replay's own consume and re-inserted. Must
+ * exceed any verifier leeway plus clock skew. Not the worker's
+ * `jtiMinTtlSeconds`: that is a KV TTL floor (default 60s) the DO cannot
+ * read, and a configurable 0 there would reopen this window.
+ */
+const OIDC_JTI_RETAIN_PAST_EXP_SECONDS = 300;
 import type { CommitmentErrorCode } from "./receipts/commitment";
 import type { DelegatedJwtErrorCode } from "./jwt/delegated-claims";
 
@@ -175,6 +537,39 @@ export type ReceiptSignResult =
     };
 
 /**
+ * Why `ReceiptSigner.epochPublicKey` resolved nothing (notme-a0cff4).
+ * Neither is retryable: an unknown epoch stays unknown, and an invalid one
+ * means the caller must change what it sent. A transport failure is a REJECTED
+ * call, never one of these, so an auditor can tell "notme does not have this
+ * key" apart from "the question did not arrive".
+ */
+export type EpochPublicKeyErrorCode =
+  | "EPOCH_UNKNOWN" // a valid epoch no key of this authority served
+  | "EPOCH_INVALID"; // not a non-negative safe integer
+
+/**
+ * Every key that served one epoch, PUBLIC material only (ADR-016 rule 5).
+ *
+ * A SET, not the single key notme-a0cff4 first sketched: since notme-77a024
+ * rotations no longer move the epoch, so several keys can sign under one
+ * generation. The receipt's `actor_fp` = SHA-256(publicRawB64 bytes) picks
+ * the one that signed it.
+ */
+export type EpochPublicKeyResult =
+  | {
+      ok: true;
+      epoch: number;
+      keys: Array<{
+        /** Raw 32-byte Ed25519 public key, base64 — what `actor_fp` hashes. */
+        publicRawB64: string;
+        kid: string;
+        /** Epoch ms the key was retired, or null while it is still serving. */
+        retiredAt: number | null;
+      }>;
+    }
+  | { ok: false; code: EpochPublicKeyErrorCode; message: string };
+
+/**
  * Outcome of a delegated JWT signing attempt (ADR-015).
  *
  * Union rather than throw, for the reasons on ReceiptSignResult: an RPC
@@ -191,6 +586,120 @@ export type DelegatedJwtSignResult =
       kid: string;
     }
   | { ok: false; code: DelegatedJwtErrorCode; message: string };
+
+/**
+ * The root's pathLenConstraint: room for exactly ONE intermediate tier
+ * (CA → Issuing CA → task; ADR-008 §BasicConstraints, ADR-019 D4). The
+ * served root must carry this value, not just "some BasicConstraints" —
+ * getCACertificatePem re-issues under the same key when it does not.
+ */
+const CA_PATH_LEN = 1;
+
+const CLAIM_REGISTRATION_TTL_S = 600; // options → verify of one WebAuthn ceremony
+const CLAIM_CODE_TTL_S = 1800; // long enough to go run a workflow
+const CLAIM_CAP = 100; // pending claim registrations; storage-exhaustion bound
+const POP_NONCE_TTL_S = 120; // fetched and spent in one page interaction
+const TIER_ENROLMENT_TTL_S = 600; // RFC 8628 device codes are minutes, not hours
+export const TIER_ENROLMENT_CAP = 500; // pending + approved rows; storage-exhaustion bound
+/**
+ * In-flight enrolments one SOURCE (a network: IPv4 /24, IPv6 /48, see
+ * clientNetworkBucket) may hold at once (notme-a36d10, review H1). Far below
+ * TIER_ENROLMENT_CAP, so one network can hold at most 1/31 of it; generous
+ * for one operator, who enrols a handful of machines inside one 10-minute
+ * device-code window. A distributed flood that still fills the global cap
+ * meets fair-share eviction in startTierEnrolment instead.
+ */
+export const TIER_ENROLMENT_PER_SOURCE_CAP = 16;
+// A collect claim older than this is abandoned (its isolate was evicted
+// mid-mint) and may be reclaimed (notme-d06b7b). Far above any mint: the CT
+// path is bounded by its 2 s submission timeouts.
+const TIER_COLLECT_RECLAIM_S = 60;
+const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"; // RFC 8628 §6.1: no vowels
+
+/** A positive 128-bit serial, hex — the same shape cert-authority mints. */
+function randomSerialHex(): string {
+  const s = crypto.getRandomValues(new Uint8Array(16));
+  s[0]! &= 0x7f; // RFC 5280: serial must be a positive INTEGER
+  return hex(s);
+}
+
+/** PEM certificate → base64 DER, as a CT chain carries it. */
+function pemToB64(pem: string): string {
+  return pem.replace(/-----[A-Z ]+-----|\s/g, "");
+}
+
+function b64ToBytes(b64: string): Uint8Array {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+/** A first-user mark lives as long as the registration challenge (passkey.ts, 5 min). */
+const FIRST_USER_REGISTRATION_TTL_S = 300;
+
+async function sha256Hex(s: string): Promise<string> {
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s))));
+}
+
+function hex(b: Uint8Array): string {
+  return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/** Even-length lowercase hex back to bytes (callers validate the shape). */
+function unhex(s: string): Uint8Array {
+  return Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
+}
+
+/** A row's granted criteria (notme-bdc850); null for a pre-phase-2 enrollment. */
+function storedCriteria(json: string | null): import("./criteria").Criteria[] | null {
+  return json === null ? null : (JSON.parse(json) as import("./criteria").Criteria[]);
+}
+
+function b64url(b: Uint8Array): string {
+  return btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * A registration-mark secret (review M1, notme-a2e75d): `secret` goes to the
+ * reserving browser in an HttpOnly cookie and is required at verify; only
+ * `hash` (SHA-256 hex) is stored with the mark. One generator for all three
+ * marks — invite reservation, first-user, claim — so they cannot drift.
+ */
+async function newMarkSecret(): Promise<{ secret: string; hash: string }> {
+  const secret = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  return { secret, hash: await sha256Hex(secret) };
+}
+
+function randomUserCode(): string {
+  // Rejection-free: 20 symbols, so take each byte mod 20 only when it falls
+  // below 240 (the largest multiple of 20 under 256), avoiding modulo bias.
+  const out: string[] = [];
+  while (out.length < 8) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(16))) {
+      if (byte < 240 && out.length < 8) out.push(USER_CODE_ALPHABET[byte % 20]!);
+    }
+  }
+  return `${out.slice(0, 4).join("")}-${out.slice(4).join("")}`;
+}
+
+/**
+ * Thrown by #refuseIfMintStateMoved: the key or epoch a mint captured moved
+ * before it signed. Its own class so #withMintRetry retries exactly this and
+ * nothing else (notme-b54368, review L2).
+ */
+class MintStateMovedError extends Error {}
+
+/** Raw 32-byte Ed25519 public key, base64 (the CABundle.keys encoding). */
+async function rawPublicKeyB64(verifyKey: CryptoKey): Promise<string> {
+  const raw = (await crypto.subtle.exportKey("raw", verifyKey)) as ArrayBuffer;
+  return btoa(String.fromCharCode(...new Uint8Array(raw)));
+}
+
+/** The `keys` row (one, id = 'authority'). `private_jwk` is '' in ephemeral mode. */
+type KeyRow = {
+  private_jwk: string;
+  public_spki: string;
+  key_id: string;
+  from_epoch: number;
+};
 
 export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #initialized = false;
@@ -219,6 +728,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * Cached per DO instance because HKDF runs on every call otherwise and
    * `ensureKeys` is on the hot path for every sign. Null is a real answer, not
    * a failure: `cf-managed` and `ephemeral` both legitimately have no KEK.
+   * A failed derivation is not cached; see #getKek.
    */
   #kekPromise: Promise<CryptoKey> | null = null;
   /**
@@ -232,7 +742,19 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   #getKek(): Promise<CryptoKey> | null {
     const secret = this.env.NOTME_KEK_SECRET;
     if (!secret) return null;
-    this.#kekPromise ??= deriveKek(secret);
+    if (!this.#kekPromise) {
+      // Cache only a success (notme-051544). The promise is shared while it
+      // is in flight, so concurrent loads still derive once, but a rejection
+      // clears the cache: a transient failure, such as the secret briefly
+      // unavailable at deploy, must not poison every later key load for the
+      // life of this instance. The identity check keeps a late rejection from
+      // clearing a newer attempt.
+      const attempt = deriveKek(secret);
+      this.#kekPromise = attempt;
+      attempt.catch(() => {
+        if (this.#kekPromise === attempt) this.#kekPromise = null;
+      });
+    }
     return this.#kekPromise;
   }
 
@@ -266,6 +788,29 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO state (id, epoch, seqno) VALUES ('authority', 1, 1)",
     );
+    // Migration (v2 → v3): which epoch the LIVE key started serving.
+    //
+    // Needed because epoch and key identity were decoupled (notme-77a024):
+    // one key may now serve several epochs, so "the epoch" is no longer a
+    // property of the key and has to be recorded as the span it covered.
+    //
+    // The backfill is the current epoch, not 1. Under the old coupling
+    // `rotate()` bumped the epoch in the same statement that replaced the
+    // key, so an existing key began serving exactly at the epoch now
+    // current — and for a deployment that never rotated, that is epoch 1
+    // anyway. Defaulting to 1 instead would claim the live key served every
+    // earlier epoch too, which over-matches: `getEpochPublicKey(1)` would
+    // offer today's key for an epoch an archived key actually signed.
+    try {
+      this.ctx.storage.sql.exec("SELECT from_epoch FROM keys LIMIT 0");
+    } catch {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE keys ADD COLUMN from_epoch INTEGER NOT NULL DEFAULT 0",
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE keys SET from_epoch = (SELECT epoch FROM state WHERE id = 'authority') WHERE from_epoch = 0",
+      );
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS dpop_jtis (
         jti        TEXT PRIMARY KEY,
@@ -293,14 +838,62 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // for good, while a discovery endpoint can be added at any time. Serving
     // these at /.well-known/interlace/index.json per §2.3 is tracked
     // separately; persisting them cannot wait for it.
+    //
+    // KEYED ON THE KEY, NOT THE EPOCH (notme-77a024). The original shape was
+    // `epoch INTEGER PRIMARY KEY`, which is only sound while a rotation and
+    // an epoch bump are the same event. They are not any more: epoch is the
+    // revocation generation and moves only on `revokeEpoch()`, so a second
+    // rotation inside one epoch would collide on that primary key — and the
+    // archive write is `INSERT OR IGNORE`, so the collision is SILENT and the
+    // second key's bytes are simply lost. That is precisely the audit-defeat
+    // failure §2.3 names, reintroduced by the decoupling if the key stays.
+    //
+    // `from_epoch`/`until_epoch` are the inclusive span of epochs the key
+    // served. One key may cover several (it keeps signing across a
+    // revocation), and one epoch may have been served by several keys (it
+    // survives rotations) — so neither side is a function of the other, and
+    // resolution at audit time is by `actor_fp`, with the span as the filter.
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS retired_keys (
-        epoch      INTEGER PRIMARY KEY,
-        key_id     TEXT NOT NULL,
-        public_raw TEXT NOT NULL,
-        retired_at INTEGER NOT NULL
+        key_id      TEXT PRIMARY KEY,
+        public_raw  TEXT NOT NULL,
+        from_epoch  INTEGER NOT NULL,
+        until_epoch INTEGER NOT NULL,
+        retired_at  INTEGER NOT NULL
       )
     `);
+    // Migration (v1 → v2): rebuild an epoch-keyed archive onto the key.
+    //
+    // `CREATE TABLE IF NOT EXISTS` above is a no-op when the v1 table is
+    // already there, so the old shape has to be detected and rewritten.
+    // from_epoch = until_epoch = the recorded epoch is EXACT for v1 rows
+    // rather than a guess: under the coupling that wrote them, a key served
+    // exactly the one epoch it was retired at.
+    let retiredKeysIsV1 = false;
+    try {
+      this.ctx.storage.sql.exec("SELECT until_epoch FROM retired_keys LIMIT 0");
+    } catch {
+      retiredKeysIsV1 = true;
+    }
+    if (retiredKeysIsV1) {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE retired_keys_v2 (
+          key_id      TEXT PRIMARY KEY,
+          public_raw  TEXT NOT NULL,
+          from_epoch  INTEGER NOT NULL,
+          until_epoch INTEGER NOT NULL,
+          retired_at  INTEGER NOT NULL
+        )
+      `);
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO retired_keys_v2 (key_id, public_raw, from_epoch, until_epoch, retired_at) " +
+          "SELECT key_id, public_raw, epoch, epoch, retired_at FROM retired_keys",
+      );
+      this.ctx.storage.sql.exec("DROP TABLE retired_keys");
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE retired_keys_v2 RENAME TO retired_keys",
+      );
+    }
     // Delegated JWT signing keys, one per issuer (ADR-015).
     //
     // SEPARATE from the CA master, and that separation is the entire security
@@ -348,7 +941,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         expires_at     INTEGER NOT NULL
       )
     `);
+    // Certificates minted while the CT log was unreachable (notme-1b46a8).
+    // Each row is a FINAL chain — [leaf, issuer], base64 DER — that carries
+    // no SCT and still has to be recorded by the log via add-chain. Created
+    // unconditionally (an empty table is free); rows are written only when
+    // CT_LOG is bound and a submission failed, or the pin is invalid.
+    this.#ensureCtBacklogSchema();
     this.#initialized = true;
+    // Once per DO start: existing deployers get the signing scopes the admin
+    // set now includes (notme-486e8a). Idempotent and revocation-respecting.
+    this.#migrateAdminSigningScopes();
   }
 
   static async #keyIdFromSpki(spkiB64: string): Promise<string> {
@@ -356,7 +958,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   // Load or generate the authority keypair. Cached in memory for the DO lifetime.
-  async getOrCreateSigningKey(): Promise<{
+  async #getOrCreateSigningKey(): Promise<{
     signingKey: CryptoKey;
     verifyKey: CryptoKey;
     keyId: string;
@@ -387,143 +989,238 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     this.#ensureSchema();
 
-    const rows = this.ctx.storage.sql
+    // COLD START CONVERGES (notme-b54368). Two first callers used to both
+    // find no row, both generate, and then the second INSERT either hit the
+    // primary key (persistent) or silently replaced the first caller's key
+    // while the first caller went on signing with it (ephemeral). Now every
+    // attempt does its async work first and then, synchronously, either
+    // adopts what is already in memory, adopts the row it wrote, or reports
+    // that storage moved under it — in which case the next attempt loads the
+    // winner's row. A handful of attempts is generous: the loser of a race
+    // finds the winner's key on its second.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const got = await this.#loadOrCreateKeyOnce();
+      if (!got) continue;
+      if (got.created) await this.scheduleNextRefresh();
+      return got.key;
+    }
+    throw new Error(
+      "authority key did not settle under concurrent creation; retry the request",
+    );
+  }
+
+  /** The authority key row, read synchronously; undefined when there is none. */
+  #readKeyRow(): KeyRow | undefined {
+    return this.ctx.storage.sql
       .exec(
-        "SELECT private_jwk, public_spki, key_id FROM keys WHERE id = 'authority'",
+        "SELECT private_jwk, public_spki, key_id, from_epoch FROM keys WHERE id = 'authority'",
       )
-      .toArray() as Array<{
-      private_jwk: string;
-      public_spki: string;
-      key_id: string;
-    }>;
+      .toArray()[0] as KeyRow | undefined;
+  }
 
-    if (rows.length > 0) {
-      const row = rows[0]!;
+  /** The in-memory key with the stored kid, when one is loaded. */
+  #heldKey(): { signingKey: CryptoKey; verifyKey: CryptoKey; keyId: string } | null {
+    if (!this.#signingKey || !this.#verifyKey) return null;
+    return {
+      signingKey: this.#signingKey,
+      verifyKey: this.#verifyKey,
+      keyId: this.#getKeyId(),
+    };
+  }
 
-      // Ephemeral mode: private_jwk is empty — key only exists in memory.
-      // If we restarted, we need to generate a new key (fall through below).
-      if (!row.private_jwk) {
-        // Fall through to key generation
-      } else {
-        // May be a sealed envelope or a legacy bare JWK — readStoredJwk
-        // discriminates on an explicit marker and throws if a sealed row is
-        // met with no KEK, rather than falling through to key generation and
-        // silently invalidating every cert and token ever issued.
-        const kek = this.#getKek();
-        const resolvedKek = kek ? await kek : null;
-        const { jwk, wasSealed } = await readStoredJwk(
-          row.private_jwk,
-          resolvedKek,
-        );
+  /**
+   * One attempt at loading or creating the authority key. Every await comes
+   * first; the decision and every write after it are synchronous, so no
+   * other request can interleave between "what is stored" and "what this
+   * isolate signs with". null means storage moved during the awaits: try
+   * again.
+   */
+  async #loadOrCreateKeyOnce(): Promise<{
+    key: { signingKey: CryptoKey; verifyKey: CryptoKey; keyId: string };
+    created: boolean;
+  } | null> {
+    const row = this.#readKeyRow();
 
-        // Migrate in place. An operator who sets NOTME_KEK_SECRET on an
-        // existing deployment expects the key to become sealed; without this
-        // it would stay in cleartext until the next rotation, which may be
-        // never. Best-effort: a failure here must not take down signing, since
-        // the key itself is loaded fine either way.
-        if (!wasSealed && resolvedKek) {
-          try {
-            this.ctx.storage.sql.exec(
-              "UPDATE keys SET private_jwk = ? WHERE id = 'authority'",
-              await serialiseJwkForStorage(jwk, resolvedKek),
-            );
-          } catch (e) {
-            console.error("authority key re-seal failed (key still usable)", e);
-          }
+    // Ephemeral mode stores no private key, so a row with an empty one is a
+    // previous isolate's public half and is replaced below.
+    if (row && row.private_jwk) {
+      // May be a sealed envelope or a legacy bare JWK — readStoredJwk
+      // discriminates on an explicit marker and throws if a sealed row is
+      // met with no KEK, rather than falling through to key generation and
+      // silently invalidating every cert and token ever issued.
+      const kek = this.#getKek();
+      const resolvedKek = kek ? await kek : null;
+      const { jwk, wasSealed } = await readStoredJwk(row.private_jwk, resolvedKek);
+      // Migrate in place. An operator who sets NOTME_KEK_SECRET on an
+      // existing deployment expects the key to become sealed; without this
+      // it would stay in cleartext until the next rotation, which may be
+      // never. Best-effort: a failure here must not take down signing, since
+      // the key itself is loaded fine either way.
+      let resealed: string | null = null;
+      if (!wasSealed && resolvedKek) {
+        try {
+          resealed = await serialiseJwkForStorage(jwk, resolvedKek);
+        } catch (e) {
+          console.error("authority key re-seal failed (key still usable)", e);
         }
+      }
+      const signingKey = await crypto.subtle.importKey(
+        "jwk",
+        jwk,
+        ED25519,
+        false, // NON-EXTRACTABLE after import
+        ["sign"],
+      );
+      const spkiBytes = Uint8Array.from(atob(row.public_spki), (c) => c.charCodeAt(0));
+      const verifyKey = await crypto.subtle.importKey(
+        "spki",
+        spkiBytes,
+        ED25519,
+        true, // public key stays extractable (needed for JWKS, raw export)
+        ["verify"],
+      );
+      const keyId = row.key_id || (await SigningAuthority.#keyIdFromSpki(row.public_spki));
 
-        this.#signingKey = await crypto.subtle.importKey(
-          "jwk",
-          jwk,
-          ED25519,
-          false, // NON-EXTRACTABLE after import
-          ["sign"],
-        );
-        const spkiBytes = Uint8Array.from(atob(row.public_spki), (c) =>
-          c.charCodeAt(0),
-        );
-        this.#verifyKey = await crypto.subtle.importKey(
-          "spki",
-          spkiBytes,
-          ED25519,
-          true, // public key stays extractable (needed for JWKS, raw export)
-          ["verify"],
-        );
-        let keyId = row.key_id;
-        if (!keyId) {
-          keyId = await SigningAuthority.#keyIdFromSpki(row.public_spki);
+      // ── Synchronous from here. ──
+      const held = this.#heldKey();
+      if (held) return { key: held, created: false };
+      // The row must still be the one decrypted: a rotate() that committed
+      // during the awaits replaced it, and adopting the old key now would
+      // sign with a retired key under the new kid.
+      if (this.#readKeyRow()?.public_spki !== row.public_spki) return null;
+      // Guarded on the public key for the same reason: never write one
+      // key's sealed bytes or kid over another key's row.
+      try {
+        if (resealed) {
           this.ctx.storage.sql.exec(
-            "UPDATE keys SET key_id = ? WHERE id = 'authority'",
-            keyId,
+            "UPDATE keys SET private_jwk = ? WHERE id = 'authority' AND public_spki = ?",
+            resealed,
+            row.public_spki,
           );
         }
-        return {
-          signingKey: this.#signingKey,
-          verifyKey: this.#verifyKey,
-          keyId,
-        };
+      } catch (e) {
+        console.error("authority key re-seal failed (key still usable)", e);
       }
+      if (!row.key_id) {
+        this.ctx.storage.sql.exec(
+          "UPDATE keys SET key_id = ? WHERE id = 'authority' AND public_spki = ?",
+          keyId,
+          row.public_spki,
+        );
+      }
+      this.#signingKey = signingKey;
+      this.#verifyKey = verifyKey;
+      return { key: { signingKey, verifyKey, keyId }, created: false };
     }
 
-    // Generate the authority keypair
+    const fresh = await this.#generateKeyMaterial();
+
+    // ── Synchronous from here. ──
+    // A concurrent caller finished first: its key is the authority's.
+    const held = this.#heldKey();
+    if (held) return { key: held, created: false };
+
+    // The epoch this key begins serving (notme-77a024). The epoch moves on
+    // `revokeEpoch()` alone, so a new key INHERITS the current generation
+    // rather than defining one — which is what lets `rotate()` leave the
+    // revocation state untouched.
+    const startEpoch =
+      (
+        this.ctx.storage.sql
+          .exec("SELECT epoch FROM state WHERE id = 'authority'")
+          .toArray() as Array<{ epoch: number }>
+      )[0]?.epoch ?? 1;
+    this.ctx.storage.transactionSync(() => {
+      // A previous isolate's ephemeral public half is stale by definition:
+      // its private key died with that isolate. A row WITH a private key is
+      // never removed here — it is somebody's live key.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM keys WHERE id = 'authority' AND private_jwk = ''",
+      );
+      // Create-if-absent, then re-read: the stored row decides.
+      this.ctx.storage.sql.exec(
+        "INSERT INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+        fresh.storedPrivate,
+        fresh.publicSpkiB64,
+        fresh.keyId,
+        startEpoch,
+      );
+    });
+    if (this.#readKeyRow()?.key_id !== fresh.keyId) return null;
+    this.#signingKey = fresh.signingKey;
+    this.#verifyKey = fresh.verifyKey;
+    return {
+      key: { signingKey: fresh.signingKey, verifyKey: fresh.verifyKey, keyId: fresh.keyId },
+      created: true,
+    };
+  }
+
+  /**
+   * Generate a new authority keypair and everything storing it needs — the
+   * async half of key creation, with no storage access, so callers can do
+   * all of it before a synchronous commit (notme-b54368).
+   *
+   * `storedPrivate` is the value for `keys.private_jwk`: '' in ephemeral
+   * mode (no private key material on disk), otherwise the JWK — sealed when
+   * a KEK is configured (notme-41d0d3), bare otherwise, which is the
+   * cf-managed behaviour and relies solely on Cloudflare's encryption at
+   * rest. The signing key returned is non-extractable in both modes.
+   */
+  async #generateKeyMaterial(): Promise<{
+    signingKey: CryptoKey;
+    verifyKey: CryptoKey;
+    publicSpkiB64: string;
+    keyId: string;
+    storedPrivate: string;
+  }> {
     const isEphemeral = this.#keyStorageMode === "ephemeral";
     const kp = (await crypto.subtle.generateKey(
       ED25519,
       !isEphemeral, // extractable:false in ephemeral mode
       ["sign", "verify"],
     )) as CryptoKeyPair;
-
     // Always extract public key (for key ID + JWKS)
-    const publicSpki = (await crypto.subtle.exportKey(
-      "spki",
-      kp.publicKey,
-    )) as ArrayBuffer;
-    const publicSpkiB64 = btoa(
-      String.fromCharCode(...new Uint8Array(publicSpki)),
-    );
+    const publicSpki = (await crypto.subtle.exportKey("spki", kp.publicKey)) as ArrayBuffer;
+    const publicSpkiB64 = btoa(String.fromCharCode(...new Uint8Array(publicSpki)));
     const keyId = await SigningAuthority.#keyIdFromSpki(publicSpkiB64);
-
     if (isEphemeral) {
-      // Store public key + key ID only — no private key material on disk
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', '', ?, ?)",
+      return {
+        signingKey: kp.privateKey,
+        verifyKey: kp.publicKey,
         publicSpkiB64,
         keyId,
-      );
-      this.#signingKey = kp.privateKey;
-      this.#verifyKey = kp.publicKey;
-    } else {
-      // Persistent: export JWK, store, then re-import as non-extractable.
-      // Sealed when a KEK is configured (notme-41d0d3); a bare JWK otherwise,
-      // which is the pre-existing cf-managed behaviour and relies solely on
-      // Cloudflare's encryption at rest.
-      const privateJwk = (await crypto.subtle.exportKey(
-        "jwk",
-        kp.privateKey,
-      )) as JsonWebKey;
-      const kekForWrite = this.#getKek();
-      this.ctx.storage.sql.exec(
-        "INSERT INTO keys (id, private_jwk, public_spki, key_id) VALUES ('authority', ?, ?, ?)",
-        await serialiseJwkForStorage(
-          privateJwk,
-          kekForWrite ? await kekForWrite : null,
-        ),
-        publicSpkiB64,
-        keyId,
-      );
-      // Re-import as non-extractable — JWK is stored, no need to keep extractable
-      this.#signingKey = await crypto.subtle.importKey(
-        "jwk",
-        privateJwk,
-        ED25519,
-        false,
-        ["sign"],
-      );
-      this.#verifyKey = kp.publicKey;
+        storedPrivate: "",
+      };
     }
+    const privateJwk = (await crypto.subtle.exportKey("jwk", kp.privateKey)) as JsonWebKey;
+    const kek = this.#getKek();
+    const storedPrivate = await serialiseJwkForStorage(privateJwk, kek ? await kek : null);
+    // Re-import as non-extractable — the JWK is what gets stored.
+    const signingKey = await crypto.subtle.importKey("jwk", privateJwk, ED25519, false, ["sign"]);
+    return { signingKey, verifyKey: kp.publicKey, publicSpkiB64, keyId, storedPrivate };
+  }
 
-    await this.scheduleNextRefresh();
-    return { signingKey: this.#signingKey, verifyKey: this.#verifyKey, keyId };
+  /**
+   * When the current authority key began signing, from `keys.created_at`.
+   *
+   * SQLite's `datetime('now')` is "YYYY-MM-DD HH:MM:SS" in UTC with no zone
+   * marker, so it is normalised to ISO-8601 before parsing. null when there
+   * is no key row or the value does not parse — never a guess, because a
+   * wrong start date is exactly the defect this exists to prevent.
+   *
+   * Every write that keeps a key keeps its created_at: re-sealing under a KEK
+   * and the key_id backfill are UPDATEs of other columns, and the only row
+   * a cold start deletes is an ephemeral one, whose key is genuinely new on
+   * each start.
+   */
+  #keyStart(): Date | null {
+    this.#ensureSchema();
+    const row = this.ctx.storage.sql
+      .exec("SELECT created_at FROM keys WHERE id = 'authority'")
+      .toArray()[0] as { created_at?: string } | undefined;
+    if (!row?.created_at) return null;
+    const d = new Date(row.created_at.replace(" ", "T") + "Z");
+    return Number.isNaN(d.getTime()) ? null : d;
   }
 
   #getKeyId(): string {
@@ -536,7 +1233,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   // Return the authority's public key as PEM.
   async getPublicKeyPem(): Promise<string> {
-    const { verifyKey } = await this.getOrCreateSigningKey();
+    const { verifyKey } = await this.#getOrCreateSigningKey();
     const spki = (await crypto.subtle.exportKey(
       "spki",
       verifyKey,
@@ -555,7 +1252,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     use: string;
     alg: string;
   }> {
-    const { verifyKey, keyId } = await this.getOrCreateSigningKey();
+    const { verifyKey, keyId } = await this.#getOrCreateSigningKey();
     const raw = (await crypto.subtle.exportKey(
       "raw",
       verifyKey,
@@ -582,7 +1279,16 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         key_id TEXT NOT NULL
       )
     `);
-    const currentKeyId = this.#getKeyId();
+    // The key FIRST, then its id (notme-7aa6dd). Read the other way round, a
+    // fresh authority cached its first root under the id of a key that did
+    // not exist yet ("unknown"), and the next call saw the mismatch and
+    // re-issued: same key and subject, new serial â a root that changed
+    // bytes once at boot under anything pinning it. Its start comes from
+    // the same row, so a first issue's notBefore is the key's own start.
+    const { signingKey, verifyKey, keyId: currentKeyId } = await this.#getOrCreateSigningKey();
+    // The root's validity window belongs to the KEY, not to the moment the
+    // root happens to be (re-)issued (notme-0c494f). See keyStart below.
+    const keyStart = this.#keyStart();
     const cached = this.ctx.storage.sql
       .exec("SELECT pem, key_id FROM ca_cert WHERE id = 'cert'")
       .toArray() as Array<{ pem: string; key_id: string }>;
@@ -592,22 +1298,56 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       cached[0]!.key_id === currentKeyId &&
       cached[0]!.pem.includes("BEGIN CERTIFICATE")
     ) {
-      // Check if cached cert has BasicConstraints by looking for the extension marker
-      // If it was generated without extensions (v1), regenerate
+      // The cached cert must carry the budget the CODE mints, not merely a
+      // BasicConstraints extension. The previous check asked only whether
+      // the extension existed (the v1→v2 guard) — so when 9c75d93 moved the
+      // root to pathlen=1, production kept serving its March-2026 pathlen:0
+      // cert for five months, and every Issuing CA tier minted under it was
+      // unverifiable by any stock validator (notme-1b1db4). Re-issuing here
+      // keeps the key and the epoch. It is only non-destructive because the
+      // re-issued root keeps the KEY's notBefore — this comment used to say
+      // "leaves verify by key, so nothing in flight is invalidated", and the
+      // heal minted with notBefore=now, which stranded every signature made
+      // before it under RFC 5280 path validation (notme-0c494f).
       try {
-        const { X509Certificate } = await import("@peculiar/x509");
+        const { X509Certificate, BasicConstraintsExtension } = await import(
+          "@peculiar/x509"
+        );
         const x = new X509Certificate(cached[0]!.pem);
-        const bc = x.getExtension("2.5.29.19"); // BasicConstraints OID
-        if (bc) return cached[0]!.pem;
+        const bc = x.getExtension(BasicConstraintsExtension);
+        // A root that starts AFTER its key began signing strands everything
+        // signed in between: RFC 5280 path validation requires the anchor to
+        // be valid at the verification time, and cosign verifies at the
+        // signing time. Production served exactly that — the heal below had
+        // minted with `notBefore: now` (notme-0c494f) — so this check is also
+        // what makes production self-heal on the first fetch after deploy.
+        const startsLate =
+          keyStart !== null && x.notBefore.getTime() > keyStart.getTime();
+        if (bc?.ca && bc.pathLength === CA_PATH_LEN && !startsLate) {
+          return cached[0]!.pem;
+        }
+        console.warn(
+          startsLate
+            ? `[ca] cached root notBefore ${x.notBefore.toISOString()} is after the key's start ${keyStart!.toISOString()} — re-issuing under the same key`
+            : `[ca] cached root has pathlen ${bc?.pathLength ?? "none"}, code mints ${CA_PATH_LEN} — re-issuing under the same key`,
+        );
       } catch {
         /* regenerate */
       }
     }
 
-    const { signingKey, verifyKey } = await this.getOrCreateSigningKey();
-    const now = new Date();
+    // notBefore = when this key began signing. Nothing it signed predates
+    // that, so no re-issue under the same key can leave an earlier signature
+    // outside the anchor's window. The 1b1db4 heal used `now` and called it
+    // "non-destructive … leaves verify by key" — true for a signature check,
+    // false for path validation, which is what cosign does. A fresh key's
+    // start IS now, so the first issue is unchanged.
+    //
+    // Fallback is `now` only when the key row has no parseable start — a
+    // fresh row always has one (`created_at DEFAULT datetime('now')`).
+    const notBefore = keyStart ?? new Date();
     const notAfter = new Date(
-      now.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
+      notBefore.getTime() + 10 * 365.25 * 24 * 60 * 60 * 1000,
     );
     const serial = crypto
       .getRandomValues(new Uint8Array(16))
@@ -615,13 +1355,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
     const cert = await X509CertificateGenerator.createSelfSigned({
       name: caSubjectForEnv(this.env),
-      notBefore: now,
+      notBefore,
       notAfter,
       signingAlgorithm: ED25519,
       keys: { privateKey: signingKey, publicKey: verifyKey },
       serialNumber: serial,
       extensions: [
-        new BasicConstraintsExtension(true, 1, true), // pathlen=1: CA → orchestrator → agent
+        new BasicConstraintsExtension(true, CA_PATH_LEN, true),
         new KeyUsagesExtension(
           KeyUsageFlags.keyCertSign | KeyUsageFlags.cRLSign,
           true,
@@ -641,12 +1381,8 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   // Return the raw 32-byte Ed25519 public key as base64 (for CABundle.keys).
   async getPublicKeyRawB64(): Promise<string> {
-    const { verifyKey } = await this.getOrCreateSigningKey();
-    const raw = (await crypto.subtle.exportKey(
-      "raw",
-      verifyKey,
-    )) as ArrayBuffer;
-    return btoa(String.fromCharCode(...new Uint8Array(raw)));
+    const { verifyKey } = await this.#getOrCreateSigningKey();
+    return rawPublicKeyB64(verifyKey);
   }
 
   // `sign(data: ArrayBuffer)` — "sign arbitrary data with the authority key" —
@@ -672,7 +1408,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     audience: string;
     jkt: string; // JWK thumbprint of the DPoP proof key
   }): Promise<string> {
-    const { signingKey, keyId } = await this.getOrCreateSigningKey();
+    const { signingKey, keyId } = await this.#getOrCreateSigningKey();
     const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
       issuer: issuerFromEnv(this.env),
@@ -683,6 +1419,25 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       signingKey,
       keyId,
     });
+  }
+
+  /**
+   * Consume a single-use identifier: true the first time `key` is seen
+   * before `expiresAt` (unix seconds), false on every later call. SYNCHRONOUS
+   * on purpose: SQLite's PRIMARY KEY, not a read-then-write, decides the
+   * winner, and a caller can put it inside the same block as the write the
+   * identifier licenses. Shared by DPoP proofs (`mintDPoPTokenOnce`) and
+   * OIDC proofs (`joinInviteWithFederated`, `loginWithFederated`, the
+   * `gha-oidc` proof of `mintBridgeCert`, and `spendOidcJti` for /cert/gha,
+   * /cert and /token), which all spend the one
+   * `oidc:<issuer>#<jti>` key from `#oidcJtiKey`.
+   */
+  #consumeJti(key: string, expiresAt: number): boolean {
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM dpop_jtis WHERE expires_at <= ?", Math.floor(Date.now() / 1000));
+    sql.exec("INSERT OR IGNORE INTO dpop_jtis (jti, expires_at) VALUES (?, ?)", key, expiresAt);
+    const [change] = [...sql.exec<{ inserted: number }>("SELECT changes() AS inserted")];
+    return change.inserted === 1;
   }
 
   /**
@@ -707,21 +1462,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     const now = Math.floor(Date.now() / 1000);
     const replayTtlSeconds = params.replayTtlSeconds ?? 600;
 
-    this.ctx.storage.sql.exec(
-      "DELETE FROM dpop_jtis WHERE expires_at <= ?",
-      now,
-    );
-    this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO dpop_jtis (jti, expires_at) VALUES (?, ?)",
-      params.proofJti,
-      now + replayTtlSeconds,
-    );
-    const [change] = [
-      ...this.ctx.storage.sql.exec<{ inserted: number }>(
-        "SELECT changes() AS inserted",
-      ),
-    ];
-    if (change.inserted !== 1) {
+    if (!this.#consumeJti(params.proofJti, now + replayTtlSeconds)) {
       return { ok: false, reason: "proof_reused" };
     }
 
@@ -745,8 +1486,21 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * the commitment is rejected if it disagrees — the notme-6ad276 invariant:
    * facts about this authority are never taken from the caller.
    *
-   * Returns the signature and the epoch. It cannot return key material:
-   * `CryptoKey` is not Structured Cloneable and cannot cross the RPC boundary.
+   * Returns the signature and the epoch, and no key material.
+   *
+   * It used to add "`CryptoKey` is not Structured Cloneable and cannot cross
+   * the RPC boundary" as though that were a standing guarantee. It is not
+   * (notme-bcbd74): W3C WebCrypto marks CryptoKey `[Serializable]`, and
+   * workerd merely happens to refuse it — measured by
+   * `rpc.cryptokey.isolation`, a runtime behaviour no standard requires.
+   *
+   * That mattered because the class did not otherwise hold the line:
+   * `getOrCreateSigningKey()` was RPC-reachable and returned the signing
+   * CryptoKey, so the serializer was the only thing between a stub holder
+   * and a key that still signs as this CA (non-extractability stops byte
+   * export, not USE). It is `#getOrCreateSigningKey()` now — off the surface
+   * entirely, so the property is "not returnable" rather than "undeliverable
+   * by a quirk" (notme-eedc9c). The serializer test stays as a backstop.
    */
 
   /**
@@ -774,10 +1528,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * answer for the current epoch, and it is keyed by keyId rather than epoch,
    * so historical resolution needs its own lookup.
    *
-   * Returns raw base64 Ed25519 public key bytes — the same form `actor_fp` is
-   * computed over — or null when the epoch is unknown. Null is honest rather
-   * than an error: an auditor must be able to distinguish "notme does not have
-   * this" from a transport failure.
+   * Returns EVERY key that served the epoch, raw base64 Ed25519 public key
+   * bytes — the same form `actor_fp` is computed over — and an empty array
+   * when none did. Empty is honest rather than an error: an auditor must be
+   * able to distinguish "notme does not have this" from a transport failure.
+   *
+   * A SET, not one key, since notme-77a024 decoupled the epoch from key
+   * identity: rotations no longer move the epoch, so several keys can have
+   * signed under one generation. The caller disambiguates by `actor_fp` =
+   * SHA-256(public key), which the receipt carries — so the fingerprint was
+   * always the real index and the epoch is the filter. Returning any single
+   * member would be a coin flip wearing a lookup's clothes.
    */
   /**
    * Every epoch's signing key — current and retired — for third-party
@@ -794,97 +1555,257 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * unauthenticated — it is exactly what gets published — which is also why
    * it is safe on the RPC surface.
    */
-  async listEpochKeys(): Promise<
-    Array<{
-      epoch: number;
-      keyId: string;
-      publicRawB64: string;
-      retiredAt: number | null;
-    }>
-  > {
+  async listEpochKeys(): Promise<EpochKeyEntry[]> {
     this.#ensureSchema();
+    // The live id is read BEFORE the key is loaded (kek-rehearsal.sh relies
+    // on comparing the bytes, not the id, for exactly this reason).
+    const liveKeyId = this.#getKeyId();
+    return this.#epochKeyEntries(liveKeyId, await this.getPublicKeyRawB64());
+  }
 
+  /**
+   * The epochs.json key list, read synchronously so a caller can take it in
+   * the same run as the rest of a signed document (getSignedEpochHistory).
+   */
+  #epochKeyEntries(liveKeyId: string, livePubB64: string): EpochKeyEntry[] {
     const retired = this.ctx.storage.sql
       .exec(
-        "SELECT epoch, key_id, public_raw, retired_at FROM retired_keys ORDER BY epoch ASC",
+        "SELECT key_id, public_raw, from_epoch, until_epoch, retired_at FROM retired_keys ORDER BY from_epoch ASC, key_id ASC",
       )
       .toArray() as Array<{
-      epoch: number;
       key_id: string;
       public_raw: string;
+      from_epoch: number;
+      until_epoch: number;
       retired_at: number;
     }>;
 
-    const out: Array<{
-      epoch: number;
-      keyId: string;
-      publicRawB64: string;
-      retiredAt: number | null;
-    }> = retired.map((r) => ({
-      epoch: r.epoch,
+    const out: EpochKeyEntry[] = retired.map((r) => ({
+      epoch: r.from_epoch,
+      untilEpoch: r.until_epoch,
       keyId: r.key_id,
       publicRawB64: r.public_raw,
       retiredAt: r.retired_at,
     }));
 
-    // The live epoch is not in retired_keys — it has not been retired.
-    const current = this.ctx.storage.sql
-      .exec("SELECT epoch FROM state WHERE id = 'authority'")
-      .toArray() as Array<{ epoch: number }>;
-    const currentEpoch = current[0]?.epoch;
-    if (typeof currentEpoch === "number") {
+    // The live key is not in retired_keys — it has not been retired. Its span
+    // is open-ended: `untilEpoch: null` means "still serving", which is
+    // different from "served up to the current epoch" and will stay true
+    // through the next revokeEpoch().
+    const live = this.ctx.storage.sql
+      .exec("SELECT from_epoch FROM keys WHERE id = 'authority'")
+      .toArray() as Array<{ from_epoch: number }>;
+    const liveFrom = live[0]?.from_epoch;
+    if (typeof liveFrom === "number") {
       out.push({
-        epoch: currentEpoch,
-        keyId: this.#getKeyId(),
-        publicRawB64: await this.getPublicKeyRawB64(),
+        epoch: liveFrom,
+        untilEpoch: null,
+        keyId: liveKeyId,
+        publicRawB64: livePubB64,
         retiredAt: null,
       });
     }
     return out;
   }
 
-  async getEpochPublicKey(
-    epoch: number,
-  ): Promise<{
-    keyId: string;
-    publicRawB64: string;
-    retiredAt: number | null;
-  } | null> {
-    this.#ensureSchema();
+  // ── Signed epoch history (notme-6a4f23, ADR-019 D7) ──
+  //
+  // `epoch_revocations` is the record of what `revokeEpoch()` ended: the
+  // epoch, when, and the operator's stated reason. Written in the same
+  // transaction as the epoch bump, so an epoch can never have moved without
+  // its revocation recorded. Never pruned and never rewritten (plain INSERT:
+  // an epoch is ended once). Epochs ended before this table existed have no
+  // row; the verifier rule refuses them rather than guessing a time.
+  //
+  // `epoch_history_state.seqno` is the epochs.json document's own monotonic
+  // counter, kept apart from the CABundle's `state.seqno` so serving one
+  // document never moves the other's rollback counter.
+  #epochHistoryReady = false;
+  #ensureEpochHistorySchema(): void {
+    if (this.#epochHistoryReady) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS epoch_revocations (
+        epoch      INTEGER PRIMARY KEY,
+        revoked_at INTEGER NOT NULL,
+        reason     TEXT NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS epoch_history_state (
+        id    TEXT PRIMARY KEY,
+        seqno INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO epoch_history_state (id, seqno) VALUES ('authority', 0)",
+    );
+    // The transparency columns (notme-8befcc), added the way ct_backlog's
+    // are. `history_seqno`: an epochs.json seqno reserved with the
+    // revocation, so every document signed after it carries it. `statement`:
+    // the root-signed DSSE envelope (JSON), and `statement_key` the raw public
+    // key that signed it (Rekor's verifier). `rekor_*`: where the log put it,
+    // and the retry bookkeeping. A row is PENDING while rekor_log_index is
+    // NULL; nothing here is ever rewritten once logged.
+    for (const [col, ddl] of [
+      ["history_seqno", "INTEGER"],
+      ["statement", "TEXT"],
+      ["statement_key", "TEXT"],
+      ["rekor_log_index", "INTEGER"],
+      ["rekor_uuid", "TEXT"],
+      ["rekor_integrated_time", "INTEGER"],
+      ["rekor_attempts", "INTEGER NOT NULL DEFAULT 0"],
+      ["rekor_last_attempt_at", "INTEGER"],
+      ["rekor_last_error", "TEXT"],
+    ] as const) {
+      try {
+        this.ctx.storage.sql.exec(`SELECT ${col} FROM epoch_revocations LIMIT 0`);
+      } catch {
+        this.ctx.storage.sql.exec(`ALTER TABLE epoch_revocations ADD COLUMN ${col} ${ddl}`);
+      }
+    }
+    // Rows from before history_seqno existed: reserve one seqno now and give
+    // it to all of them. True by construction — the rows exist, so every
+    // document signed from here on reads them — and it lets their statements
+    // be signed like any other.
+    this.ctx.storage.transactionSync(() => {
+      const unseq = this.ctx.storage.sql
+        .exec("SELECT COUNT(*) AS n FROM epoch_revocations WHERE history_seqno IS NULL")
+        .toArray()[0] as { n: number };
+      if (unseq.n === 0) return;
+      const seqno = this.#reserveHistorySeqno();
+      this.ctx.storage.sql.exec(
+        "UPDATE epoch_revocations SET history_seqno = ? WHERE history_seqno IS NULL",
+        seqno,
+      );
+    });
+    this.#epochHistoryReady = true;
+  }
 
+  /** Take the next epochs.json seqno without signing a document with it. Synchronous. */
+  #reserveHistorySeqno(): number {
+    this.ctx.storage.sql.exec(
+      "UPDATE epoch_history_state SET seqno = seqno + 1 WHERE id = 'authority'",
+    );
+    const [{ seqno }] = this.ctx.storage.sql
+      .exec("SELECT seqno FROM epoch_history_state WHERE id = 'authority'")
+      .toArray() as Array<{ seqno: number }>;
+    return seqno;
+  }
+
+  /**
+   * The epochs.json document, signed by the root (notme-6a4f23).
+   *
+   * The CABundle's discipline (generateBundle): every signing takes a fresh
+   * seqno and issuedAt, and the signature is over canonical CBOR
+   * (epoch-history.ts). Public data only, so it is safe on the RPC surface;
+   * the domain tag in the signing input means the signature it returns can
+   * never pass as a CABundle's, so a leaked stub gains no signing oracle.
+   */
+  async getSignedEpochHistory(): Promise<EpochHistory> {
+    // Restart once if a rotate() committed during the key export, as
+    // generateBundle does (review L4).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const doc = await this.#signEpochHistoryOnce();
+      if (doc) return doc;
+    }
+    throw new Error(
+      "epoch history refused: the authority key changed twice while it was built; retry",
+    );
+  }
+
+  async #signEpochHistoryOnce(): Promise<EpochHistory | null> {
+    const { signingKey, verifyKey, keyId } = await this.#getOrCreateSigningKey();
+    const livePub = await rawPublicKeyB64(verifyKey);
+    if (this.#getKeyId() !== keyId) return null;
+    this.#ensureSchema();
+    this.#ensureEpochHistorySchema();
+
+    // SYNCHRONOUS from here to issuedAt, so nothing commits in between. That
+    // is what makes `issuedAt` a coverage claim: a revocation whose
+    // revokedAt is earlier than issuedAt committed before these reads, so it
+    // is in this document. The verifier rule leans on it (t < issuedAt).
+    const epochs = this.#epochKeyEntries(keyId, livePub);
+    // Beside each signed revocation, its transparency record (notme-8befcc):
+    // the root-signed statement and where Rekor logged it. NOT in the signing
+    // input (epochHistoryCanonical reads only epoch/revokedAt/reason): the
+    // statement is signed on its own, and the log fields are pointers a
+    // verifier checks against the log.
+    const revocations = (
+      this.ctx.storage.sql
+        .exec(
+          "SELECT epoch, revoked_at, reason, statement, rekor_log_index, rekor_uuid, rekor_integrated_time FROM epoch_revocations ORDER BY epoch ASC",
+        )
+        .toArray() as Array<{
+        epoch: number;
+        revoked_at: number;
+        reason: string;
+        statement: string | null;
+        rekor_log_index: number | null;
+        rekor_uuid: string | null;
+        rekor_integrated_time: number | null;
+      }>
+    ).map(
+      (r): PublishedEpochRevocation => ({
+        epoch: r.epoch,
+        revokedAt: r.revoked_at,
+        reason: r.reason,
+        statement: r.statement === null ? null : (JSON.parse(r.statement) as DsseEnvelope),
+        rekorLogIndex: r.rekor_log_index,
+        rekorUuid: r.rekor_uuid,
+        rekorIntegratedTime: r.rekor_integrated_time,
+      }),
+    );
+    const [{ epoch: currentEpoch }] = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    const seqno = this.#reserveHistorySeqno();
+    const unsigned = {
+      epochs,
+      revocations,
+      currentEpoch,
+      seqno,
+      issuedAt: Math.floor(Date.now() / 1000),
+    };
+
+    const sig = await crypto.subtle.sign(ED25519, signingKey, epochHistoryCanonical(unsigned));
+    return { ...unsigned, signature: btoa(String.fromCharCode(...new Uint8Array(sig))) };
+  }
+
+  async getEpochPublicKey(epoch: number): Promise<
+    Array<{
+      keyId: string;
+      publicRawB64: string;
+      retiredAt: number | null;
+    }>
+  > {
+    this.#ensureSchema();
+    // An epoch the authority has never reached has no keys, even though the
+    // live key's span is open-ended. `untilEpoch: null` means "has not
+    // retired", NOT "serves every number" — and answering for a future epoch
+    // would hand a verifier a working key for a generation that does not
+    // exist, which is the over-matching half of the same mistake the archive
+    // schema made in the other direction.
     const current = this.ctx.storage.sql
       .exec("SELECT epoch FROM state WHERE id = 'authority'")
       .toArray() as Array<{ epoch: number }>;
-    if (current[0]?.epoch === epoch) {
-      return {
-        keyId: this.#getKeyId(),
-        publicRawB64: await this.getPublicKeyRawB64(),
-        retiredAt: null, // still active
-      };
-    }
+    if (epoch > (current[0]?.epoch ?? 0)) return [];
 
-    const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT key_id, public_raw, retired_at FROM retired_keys WHERE epoch = ?",
-        epoch,
+    const keys = await this.listEpochKeys();
+    return keys
+      .filter(
+        (k) =>
+          epoch >= k.epoch && (k.untilEpoch === null || epoch <= k.untilEpoch),
       )
-      .toArray() as Array<{
-      key_id: string;
-      public_raw: string;
-      retired_at: number;
-    }>;
-    const row = rows[0];
-    if (!row) return null;
-    return {
-      keyId: row.key_id,
-      publicRawB64: row.public_raw,
-      retiredAt: row.retired_at,
-    };
+      .map((k) => ({
+        keyId: k.keyId,
+        publicRawB64: k.publicRawB64,
+        retiredAt: k.retiredAt,
+      }));
   }
 
   async getReceiptFacts(): Promise<{ actorFp: Uint8Array; epoch: number }> {
     this.#ensureSchema();
-    const { verifyKey } = await this.getOrCreateSigningKey();
+    const { verifyKey } = await this.#getOrCreateSigningKey();
 
     // actor_fp per RECEIPTS.md §2.1: SHA-256 of the actor's master PUBLIC key.
     // Over the RAW Ed25519 key, which is what a verifier resolving
@@ -1039,7 +1960,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   async signReceiptCommitment(
     commitment: Uint8Array,
   ): Promise<ReceiptSignResult> {
-    const { signingKey } = await this.getOrCreateSigningKey();
+    const { signingKey } = await this.#getOrCreateSigningKey();
     const { actorFp, epoch } = await this.getReceiptFacts();
 
     const { validateCommitment, CommitmentError } =
@@ -1203,7 +2124,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     scope: string;
     audience: string;
   }): Promise<string> {
-    const { signingKey, keyId } = await this.getOrCreateSigningKey();
+    const { signingKey, keyId } = await this.#getOrCreateSigningKey();
     const { mintAccessToken, issuerFromEnv } = await import("./auth/token");
     return mintAccessToken({
       issuer: issuerFromEnv(this.env),
@@ -1217,29 +2138,209 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   }
 
   // Mint a bridge cert inside the DO — CryptoKey never crosses the RPC boundary.
+  /**
+   * Mint a bridge cert for the subject the EVIDENCE names (notme-51ccd7).
+   *
+   * The DO re-verifies the proof inside its own method body and derives the
+   * subject from the verified claims. A caller cannot assert a subject, and
+   * there is no overload that lets it.
+   *
+   * DOUBLE-VERIFY IS INTENTIONAL. The worker in front of this may already
+   * have validated the same token or cookie; that check exists for early
+   * rejection and clean 401/403 responses. This one is the trust kernel. If
+   * only one may be trusted it is this one, because the worker is reachable
+   * by anything holding the binding and the DO is not.
+   *
+   * FORWARD-PORTED from the private agentic-research/notme.bot repo, which
+   * diagnosed and fixed the same defect on 2026-05-18 (commit 1d1ec7e, bead
+   * notme.bot-69a3a9) in a repo whose code never ran. Verified against
+   * signet's documented verification before porting rather than taken on
+   * that repo's authority — see the `MintBridgeCertProof` docstring.
+   */
   async mintBridgeCert(
-    subject: string,
+    proof: MintBridgeCertProof,
     publicKeyPem: string,
     ttlMs?: number,
-  ): Promise<{
-    certificate: string;
-    expires_at: number;
-    subject: string;
-    authority: { epoch: number; key_id: string };
-  }> {
-    const { signingKey } = await this.getOrCreateSigningKey();
-    const state = await this.getAuthorityState();
-    const { mintGHABridgeCert } = await import("./cert-authority");
-    const result = await mintGHABridgeCert(
-      subject,
-      publicKeyPem,
-      signingKey,
-      ttlMs,
-    );
-    return {
-      ...result,
-      authority: { epoch: state.epoch, key_id: state.keyId },
-    };
+  ): Promise<
+    | {
+        ok: true;
+        certificate: string;
+        expires_at: number;
+        subject: string;
+        authority: { epoch: number; key_id: string };
+      }
+    | { ok: false; reason: BridgeCertRefusal }
+  > {
+    // Derive the subject. Every branch ends in a value this DO computed from
+    // something it checked itself, or in a refusal.
+    let subject: string;
+    if (proof?.kind === "gha-oidc") {
+      // Audience from OUR env, never the envelope (notme-51ccd7).
+      const expectedAudience = this.env.GHA_CERT_AUDIENCE ?? "notme.bot";
+      const { validateGHAToken, getAllowedOwners } = await import("./gha-oidc");
+      let claims: Awaited<ReturnType<typeof validateGHAToken>>;
+      try {
+        claims = await validateGHAToken(proof.token, expectedAudience);
+      } catch (e) {
+        console.warn({
+          event: "mint.gha_proof_rejected",
+          detail: (e as Error)?.message,
+        });
+        return { ok: false, reason: "invalid_gha_token" };
+      }
+      // SINGLE USE (notme-f850f2). Re-verifying the token was not spending
+      // it: one already used at /cert/gha, /join or /auth/oidc/login — or
+      // here — kept buying certs through the binding until it expired.
+      // Fail closed without a jti, as /cert/gha does.
+      if (!claims.jti) {
+        console.warn({ event: "mint.gha_proof_rejected", detail: "jti claim required" });
+        return { ok: false, reason: "invalid_gha_token" };
+      }
+      // OWNER ALLOWLIST (security review F7, pre-existing): /cert/gha and the
+      // /token exchange refuse a repository owner outside GHA_ALLOWED_OWNERS,
+      // and this path did not — any GitHub repo's aud=notme.bot token handed
+      // to a binding holder bought a cert. Checked BEFORE the jti consume, so
+      // a refusal spends nothing.
+      if (!getAllowedOwners(this.env).has(String(claims.repository_owner).toLowerCase())) {
+        console.warn({ event: "mint.gha_proof_rejected", detail: "repository owner not permitted" });
+        return { ok: false, reason: "invalid_gha_token" };
+      }
+      // The caller's ttlMs is capped at /cert/gha's bound (rig-e3549f): the
+      // binding must not mint a longer-lived workload cert than the route.
+      const ghaTtlBound = Number(this.env.GHA_CERT_TTL_MS ?? 300_000);
+      ttlMs =
+        typeof ttlMs === "number" && Number.isFinite(ttlMs) && ttlMs > 0
+          ? Math.min(ttlMs, ghaTtlBound)
+          : ghaTtlBound;
+      // Spent in BOTH keyspaces the routes use. KV `jti:<jti>` is the one
+      // /cert/gha, /cert, /token and /join share — eventually consistent, so
+      // read here and written after. The DO's `oidc:<iss>#<jti>` is the
+      // /join and /auth/oidc/login key; its PRIMARY KEY decides between two
+      // binding calls racing on the same token.
+      const kv = this.env.CA_BUNDLE_CACHE;
+      const kvKey = `jti:${claims.jti}`;
+      if (kv && (await kv.get(kvKey))) {
+        console.warn({ event: "mint.gha_proof_reused", where: "kv" });
+        return { ok: false, reason: "gha_token_reused" };
+      }
+      this.#ensureSchema();
+      if (!this.#consumeJti(
+        SigningAuthority.#oidcJtiKey(claims.iss, claims.jti),
+        claims.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS,
+      )) {
+        console.warn({ event: "mint.gha_proof_reused", where: "do" });
+        return { ok: false, reason: "gha_token_reused" };
+      }
+      if (kv) {
+        // KV's floor is 60 s; kept past exp for the same leeway reason as the DO key.
+        const ttl = claims.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS - Math.floor(Date.now() / 1000);
+        // The DO key above is the authoritative spend; KV only narrows the
+        // window for the KV-only routes. A failed write is logged, not
+        // thrown: the token is already spent, and a refusal-or-result method
+        // must not turn that into an RPC exception (security review F5).
+        try {
+          await kv.put(kvKey, "1", { expirationTtl: Math.max(60, ttl) });
+        } catch (e) {
+          console.error({ event: "mint.gha_jti_kv_write_failed", detail: (e as Error)?.message });
+        }
+      }
+      subject = claims.sub;
+    } else if (proof?.kind === "session-cookie") {
+      // The secret is read inside the DO and does not leave it.
+      const { verifySessionCookie } = await import("./auth/session");
+      const session = await verifySessionCookie(
+        proof.cookie,
+        await this.getSessionSecret(),
+      );
+      if (!session) {
+        console.warn({ event: "mint.session_proof_rejected" });
+        return { ok: false, reason: "invalid_session" };
+      }
+      subject = session.principalId;
+    } else if (proof?.kind === "notme-access-token") {
+      // Verified against THIS authority's own key, so a token from another
+      // deployment (or another DO id, which owns a different master key) is
+      // refused on signature rather than believed on its claims.
+      //
+      // AUDIENCE AND SCOPE ARE CHECKED HERE, not upstream, because this path
+      // has no route in front of it. `/token` and `/authorize/token` both call
+      // getAllowedAudiences(env) and both require a session cookie first; a
+      // service binding goes around both. Without these two checks a token
+      // minted for one resource server is spendable at every other, and a
+      // read-only token becomes a certificate.
+      const { verifyKey } = await this.#getOrCreateSigningKey();
+      const { verifyAccessToken, issuerFromEnv } = await import("./auth/token");
+      const { getAllowedAudiences } = await import("./allowed-audiences");
+      try {
+        const claims = await verifyAccessToken(
+          proof.token,
+          verifyKey,
+          issuerFromEnv(this.env),
+        );
+        // Every mint site asserts a subject; a token without one must not
+        // become a certificate named "".
+        if (!claims.sub) throw new Error("missing sub");
+        if (!getAllowedAudiences(this.env).has(claims.aud)) {
+          throw new Error("audience not allowed");
+        }
+        // `scope` is a space-delimited list (RFC 6749 §3.3). SPLIT it — a
+        // substring test would accept "notbridgeCertish".
+        if (!(claims.scope ?? "").split(" ").includes("bridgeCert")) {
+          throw new Error("missing bridgeCert scope");
+        }
+        subject = claims.sub;
+      } catch (e) {
+        console.warn({
+          event: "mint.access_token_proof_rejected",
+          detail: (e as Error)?.message,
+        });
+        return { ok: false, reason: "invalid_access_token" };
+      }
+    } else {
+      // Exhaustive at RUNTIME as well as in the type. A caller reaching this
+      // DO over RPC is not bound by our types — `proof` may be a string, as
+      // it was under the old signature, or a shape invented today — so a
+      // third kind is refused rather than falling through to an undefined
+      // subject. `proof?.kind` rather than `proof.kind` because a string
+      // argument has no `kind` and a null one would throw on the read.
+      console.warn({
+        event: "mint.unknown_proof_kind",
+        kind: typeof proof === "object" ? (proof as { kind?: unknown })?.kind : typeof proof,
+      });
+      return { ok: false, reason: "unknown_proof_kind" };
+    }
+
+    // The proof may already be SPENT here (the gha-oidc jti, notme-f850f2),
+    // so a rotate() or revokeEpoch() landing between the capture and the
+    // re-check must neither burn it for nothing nor escape as an RPC
+    // exception from a refusal-or-result method (security review F5). One
+    // retry under a fresh capture, then a refusal result (review L2).
+    // The issuer is the root's subject (notme-7ec6fb). Read once, before the
+    // capture: the subject is the authority's name, not a property of the
+    // key, and a rotate re-issues the root under the same one. (No CT chain
+    // rides on this path, so nothing key-bound is read here.)
+    const root = await this.#rootForMint({ ct: false });
+    try {
+      return await this.#withMintRetry(async (cap) => {
+        const { mintGHABridgeCert } = await import("./cert-authority");
+        this.#refuseIfMintStateMoved(cap);
+        const result = await mintGHABridgeCert(
+          subject,
+          publicKeyPem,
+          cap.signingKey,
+          ttlMs,
+          root.subject,
+        );
+        return {
+          ok: true as const,
+          ...result,
+          authority: { epoch: cap.epoch, key_id: cap.keyId },
+        };
+      });
+    } catch (e) {
+      if (!(e instanceof MintStateMovedError)) throw e;
+      return { ok: false, reason: "authority_state_changed" };
+    }
   }
 
   // Mint a bridge cert PAIR (P-256 mTLS + Ed25519 signing) — 008 PoP exchange.
@@ -1250,33 +2351,2061 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     mtlsPublicKeyPem: string;
     signingPublicKeyPem: string;
     scopes: string[];
-    authMethod: string;
+    authMethod: import("./auth/session").AuthMethod; // parsed, never raw (notme-32003c)
     ttlMs?: number;
   }): Promise<
     import("./cert-authority").BridgeCertPairResult & {
       authority: { epoch: number; key_id: string };
     }
   > {
-    const { signingKey } = await this.getOrCreateSigningKey();
-    const state = await this.getAuthorityState();
-    const { mintBridgeCertPair } = await import("./cert-authority");
-    const result = await mintBridgeCertPair(
-      params.subject,
-      params.identity,
-      params.mtlsPublicKeyPem,
-      params.signingPublicKeyPem,
-      signingKey,
-      {
-        scopes: params.scopes,
-        epoch: state.epoch,
-        authMethod: params.authMethod,
-        ttlMs: params.ttlMs,
-      },
+    // Key, kid and epoch in ONE synchronous read (notme-b54368); #mintLogged
+    // re-checks them immediately before every signature, and a refusal is
+    // retried once under a fresh capture (#withMintRetry, review L2).
+    return this.#withMintRetry(async (cap) => {
+      // Bridge pairs are root-issued, so the issuer name is the ROOT's
+      // subject — which on a non-production authority is not the production
+      // literal (notme-7ec6fb). The root is read HERE, right after the key
+      // that signs the pair, and its PEM handed to #mintLogged — so the CT
+      // chain names the root of the key that signed rather than whatever a
+      // later, independent read returns (and if a rotate lands in between,
+      // the re-check refuses the mint).
+      const root = await this.#rootForMint();
+      const issuerPem = root.ctPem;
+      const { mintBridgeCertPair } = await import("./cert-authority");
+      const ttlMs = params.ttlMs ?? 5 * 60 * 1000;
+      const notBefore = new Date();
+      const result = await this.#mintLogged({
+        pin: {
+          serialMtls: randomSerialHex(),
+          serialSigning: randomSerialHex(),
+          notBefore,
+          notAfter: new Date(notBefore.getTime() + ttlMs),
+        },
+        mint: (pin, ct) =>
+          mintBridgeCertPair(
+            params.subject,
+            params.identity,
+            params.mtlsPublicKeyPem,
+            params.signingPublicKeyPem,
+            cap.signingKey,
+            {
+              scopes: params.scopes,
+              epoch: cap.epoch,
+              authMethod: params.authMethod,
+              ttlMs: params.ttlMs,
+              issuerName: root.subject,
+              pin,
+              // Per cert: each certificate carries its OWN SCT. Order matches
+              // `pems` below — 0 is mTLS, 1 is signing.
+              perCertExtensions: { mtls: ct(0), signing: ct(1) },
+            },
+          ),
+        pems: (r) => [r.certificates.mtls, r.certificates.signing],
+        issuerPem,
+        captured: cap,
+      });
+      return {
+        ...result,
+        authority: { epoch: cap.epoch, key_id: cap.keyId },
+      };
+    });
+  }
+
+  /**
+   * Mint one or more certificates so each is recorded in the CT log
+   * (notme-1b46a8). Shared by every ONLINE mint point: a bridge pair passes
+   * two certificates, a tier passes one.
+   *
+   * `mint(pin, ct)` mints every certificate under `pin` and gives certificate
+   * i the extensions `ct(i)`; `pems` lists the result's certificates in that
+   * same order, all issued by the CA in `issuerPem`.
+   *
+   * With CT_LOG bound:
+   *   1. mint precertificates (`ct(i)` = the poison) under the pin;
+   *   2. submit every [precert, root] chain concurrently, each bounded;
+   *   3. ALL returned SCTs → re-mint under the SAME pin with each
+   *      certificate's own SCT list, so the SCT signs the final cert's bytes;
+   *   4. any failure → mint with no CT extension and backlog every final
+   *      chain. A partially logged set is never issued, and the mint is never
+   *      refused because of the log.
+   *
+   * Steps 3 and 4 sign AFTER the add-pre-chain await, which is non-storage
+   * I/O: per Cloudflare's rules of Durable Objects other requests interleave
+   * there, so rotate() or revokeEpoch() can complete inside it. `captured` is
+   * the key id and epoch `mint` closes over; immediately before each final
+   * mint they are re-read and, if either moved, the mint is REFUSED (throws)
+   * rather than signed with a retired key or a revoked epoch (notme-b52d7c).
+   * That refusal is about the authority, not the log: the log never causes one.
+   *
+   * With CT_LOG absent: one mint, no pin, no extension, no row — byte for
+   * byte what minting did before CT.
+   *
+   * ECMAScript #private: the DO's public surface is pinned (rpc-surface.do.test.ts).
+   */
+  async #mintLogged<P, R>(p: {
+    pin: P;
+    mint: (pin: P | undefined, ct: (i: number) => Extension[]) => Promise<R>;
+    pems: (r: R) => string[];
+    /** The issuing CA's PEM, read alongside the signing key; null if unread. */
+    issuerPem: string | null;
+    /** The key id and epoch `mint` signs with, re-checked after the log await. */
+    captured: { keyId: string; epoch: number };
+  }): Promise<R> {
+    // Every path signs only after this re-check (notme-b54368): the caller
+    // captured key and epoch, then awaited (the root read, a module import),
+    // and the no-log and no-issuer paths below used to sign unchecked.
+    this.#refuseIfMintStateMoved(p.captured);
+    const log = this.env.CT_LOG;
+    if (!log) return p.mint(undefined, () => []);
+    if (p.issuerPem === null) {
+      // No issuer, no chain to submit or backlog. Never refuse on the log's
+      // account; #readRootForCt already logged why.
+      return p.mint(p.pin, () => []);
+    }
+    // Bound but unpinned: an SCT could not be checked, so nothing is
+    // submitted. The mint goes out unlogged — never refused — and its final
+    // chains are backlogged: the drain skips while the pin is invalid and
+    // logs them, verified, once CT_LOG_ID / CT_LOG_KEY are fixed, so a
+    // fixable deploy mistake does not leave them unlogged for good
+    // (notme-c0c9a2). health.configError is the alert.
+    const shardSet = await this.#ctShards();
+    const rootB64 = pemToB64(p.issuerPem);
+    // The root is parsed BEFORE the pin branch (review L3): a chain ending in
+    // a root that cannot be parsed can never be logged, so it is counted
+    // unloggable here rather than backlogged into gaveUp for good.
+    let issuerSpki: Uint8Array;
+    try {
+      issuerSpki = spkiOf(b64ToBytes(rootB64));
+    } catch (err) {
+      this.#ctRecord("unloggable", `root unparseable: ${String(err)}`);
+      // Also past the #ctShards await: re-check before signing.
+      this.#refuseIfMintStateMoved(p.captured);
+      return p.mint(p.pin, () => []);
+    }
+    if ("error" in shardSet) {
+      console.error({ event: "ct.config_invalid", error: shardSet.error });
+      this.#ctRecord("error", `config: ${shardSet.error}; chains backlogged`);
+      // #ctShards awaited (import + digest on a pin not seen before): the
+      // same re-check as the log path before signing (review I3).
+      this.#refuseIfMintStateMoved(p.captured);
+      return this.#mintUnloggedAndBacklog(p, rootB64);
+    }
+
+    // Past the #ctShards await: re-check before the precertificate signature.
+    this.#refuseIfMintStateMoved(p.captured);
+    const pre = await p.mint(p.pin, () => [ctPoisonExtension()]);
+    // From here a precertificate exists and may reach the log. If this mint
+    // then delivers nothing — refused because the key or epoch moved during
+    // the log wait (the retry mints new serials), or failing outright — the
+    // serials are recorded as not delivered, so a CT monitor can match the
+    // logged precerts to an issuance that never happened (notme-b35676).
+    const preSerials = p.pems(pre).flatMap((pem) => {
+      try {
+        return [serialOf(b64ToBytes(pemToB64(pem)))];
+      } catch {
+        return [];
+      }
+    });
+    try {
+      return await this.#finishLogged(p, pre, shardSet.shards, rootB64, issuerSpki, log);
+    } catch (err) {
+      this.#recordNotDelivered(
+        preSerials,
+        err instanceof MintStateMovedError ? "mint_state_moved" : "mint_failed",
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * #mintLogged after the precertificate is signed: submit, then embed or
+   * backlog. Split out so every way it can end without a certificate is seen
+   * by the one catch that records the precert serials (notme-b35676).
+   */
+  async #finishLogged<P, R>(
+    p: {
+      pin: P;
+      mint: (pin: P | undefined, ct: (i: number) => Extension[]) => Promise<R>;
+      pems: (r: R) => string[];
+      captured: { keyId: string; epoch: number };
+    },
+    pre: R,
+    shards: CtShard[],
+    rootB64: string,
+    issuerSpki: Uint8Array,
+    log: Fetcher,
+  ): Promise<R> {
+    const shardSet = { shards };
+    // Each certificate goes to the shard whose temporal interval holds ITS
+    // notAfter (notme-afa9d8). One that no shard covers is not submitted to
+    // any — a shard refuses it, and the wrong shard's SCT would be worthless —
+    // so the whole set is backlogged; the drain picks again by the same rule.
+    const targets = p.pems(pre).map((pem) => {
+      const precertB64 = pemToB64(pem);
+      let notAfter: number;
+      try {
+        notAfter = notAfterOf(b64ToBytes(precertB64));
+      } catch {
+        notAfter = Number.NaN;
+      }
+      return { precertB64, notAfter, shard: selectShard(shardSet.shards, notAfter) };
+    });
+    const uncovered = targets.find((t) => t.shard === null);
+    if (uncovered) {
+      const at = Number.isNaN(uncovered.notAfter) ? "unreadable" : new Date(uncovered.notAfter).toISOString();
+      console.warn({ event: "ct.no_shard", notAfter: at });
+      this.#ctRecord("error", `no shard covers notAfter ${at}; chains backlogged`);
+      this.#refuseIfMintStateMoved(p.captured);
+      return this.#mintUnloggedAndBacklog(p, rootB64);
+    }
+    // Each submission is bounded by its timeout; verification after it is
+    // local crypto. postPreChain and verifySct never throw.
+    const results = await Promise.all(
+      targets.map(async ({ precertB64, shard }): Promise<SubmitResult> => {
+        const r = await postPreChain(log, [precertB64, rootB64], DEFAULT_TIMEOUT_MS, shard!.path);
+        if (!r.ok) return r;
+        let tbs: Uint8Array;
+        try {
+          tbs = precertTbs(b64ToBytes(precertB64));
+        } catch (err) {
+          return { ok: false, reason: `precert unparseable: ${String(err)}` };
+        }
+        const v = await verifySct(r.sct, { kind: "precert", tbs, issuerSpki }, shard!.pin);
+        return v === "ok" ? r : { ok: false, reason: v };
+      }),
     );
-    return {
-      ...result,
-      authority: { epoch: state.epoch, key_id: state.keyId },
+
+    // ↑ The await above is where other requests interleave. Nothing captured
+    // before it — the key, the epoch — is trusted past it unchecked.
+    this.#refuseIfMintStateMoved(p.captured);
+
+    if (results.every((r) => r.ok)) {
+      const scts = results.map((r) => (r as { sct: SctResponse }).sct);
+      try {
+        return await p.mint(p.pin, (i) => [sctListExtension([serialiseSct(scts[i]!)])]);
+      } catch (err) {
+        console.error({ event: "ct.embed_failed", error: String(err) });
+        this.#ctRecord("embedFailed", `embed failed: ${String(err)}`);
+      }
+    } else {
+      const failed = results.flatMap((r, i) => (r.ok ? [] : [`cert ${i}: ${r.reason}`]));
+      console.warn({ event: "ct.unlogged", failed, of: results.length });
+      this.#ctRecord(
+        "error",
+        `add-pre-chain failed (${failed.join(", ")}); chains backlogged`,
+      );
+    }
+
+    // Again: a failed embed above awaited, so check once more before signing.
+    this.#refuseIfMintStateMoved(p.captured);
+    return this.#mintUnloggedAndBacklog(p, rootB64);
+  }
+
+  /**
+   * Mint with no CT extension and write every final chain to ct_backlog for
+   * the drain. A failed INSERT is counted as unloggable; the mint stands.
+   */
+  async #mintUnloggedAndBacklog<P, R>(
+    p: {
+      pin: P;
+      mint: (pin: P | undefined, ct: (i: number) => Extension[]) => Promise<R>;
+      pems: (r: R) => string[];
+    },
+    rootB64: string,
+  ): Promise<R> {
+    const fin = await p.mint(p.pin, () => []);
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      for (const pem of p.pems(fin)) {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO ct_backlog (chain_json, created_at) VALUES (?, ?)",
+          JSON.stringify([pemToB64(pem), rootB64]),
+          now,
+        );
+      }
+    } catch (err) {
+      console.error({ event: "ct.backlog_write_failed", error: String(err) });
+      this.#ctRecord("unloggable", `backlog write failed: ${String(err)}`);
+    }
+    return fin;
+  }
+
+  /**
+   * The signing key, its kid and the current epoch, read together in one
+   * synchronous run (notme-b54368). Every cert mint captures with this right
+   * after loading the key and passes the result to #refuseIfMintStateMoved
+   * immediately before each signature. rotate() switches the stored row and
+   * the in-memory key in one synchronous block, so the three always agree.
+   */
+  #captureMintState(): { signingKey: CryptoKey; keyId: string; epoch: number } {
+    const signingKey = this.#signingKey;
+    if (!signingKey) {
+      throw new Error("mint refused: the authority key is not loaded; retry the request");
+    }
+    const keyId = this.#getKeyId();
+    const [row] = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    return { signingKey, keyId, epoch: row?.epoch ?? 1 };
+  }
+
+  /**
+   * Run `mint` under a fresh capture; if a re-check refuses it, capture again
+   * and run it ONCE more (review L2). A refusal means the key or epoch moved
+   * after the capture — an operator rotate() or revokeEpoch() — and nothing
+   * was delivered, so minting again under the new state is what the caller
+   * asked for. Callers whose proof is already spent by then (the gha-oidc
+   * jti, a /cert/gha or /token jti, a renewal generation) would otherwise
+   * lose it to an event they did not cause. A second refusal propagates.
+   */
+  async #withMintRetry<T>(
+    mint: (cap: { signingKey: CryptoKey; keyId: string; epoch: number }) => Promise<T>,
+  ): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      await this.#getOrCreateSigningKey();
+      const cap = this.#captureMintState();
+      try {
+        return await mint(cap);
+      } catch (e) {
+        if (!(e instanceof MintStateMovedError) || attempt >= 1) throw e;
+        console.warn({ event: "mint.retry_after_state_change", captured: { keyId: cap.keyId, epoch: cap.epoch } });
+      }
+    }
+  }
+
+  /**
+   * Throw unless the authority's signing key id and epoch are still the ones
+   * a mint captured (notme-b52d7c). Synchronous storage reads only, so the
+   * answer is current at the instant the caller goes on to sign. Applied on
+   * every cert mint path before every signature (notme-b54368), not only
+   * after the CT log await.
+   *
+   * With no key row #getKeyId() returns "unknown", which differs from any
+   * captured id, so that refuses too.
+   */
+  #refuseIfMintStateMoved(captured: { keyId: string; epoch: number }): void {
+    const keyId = this.#getKeyId();
+    const [row] = this.ctx.storage.sql
+      .exec("SELECT epoch FROM state WHERE id = 'authority'")
+      .toArray() as Array<{ epoch: number }>;
+    const epoch = row?.epoch;
+    if (keyId === captured.keyId && epoch === captured.epoch) return;
+    console.warn({
+      event: "ct.mint_refused_state_changed",
+      captured: { keyId: captured.keyId, epoch: captured.epoch },
+      current: { keyId, epoch },
+    });
+    throw new MintStateMovedError(
+      `mint refused: the authority's signing key or epoch changed while the mint was in flight ` +
+        `(key ${captured.keyId} -> ${keyId}, epoch ${captured.epoch} -> ${epoch}); retry the request`,
+    );
+  }
+
+  /**
+   * The pinned shard set — CT_LOG_SHARDS, or the single pin CT_LOG_ID /
+   * CT_LOG_KEY / CT_LOG_PATH — or why it cannot be trusted (notme-afa9d8).
+   * Cached per value: the imports and digests run once per DO lifetime.
+   */
+  #ctShardCache: { k: string; v: { shards: CtShard[] } | { error: string } } | null = null;
+  async #ctShards(): Promise<{ shards: CtShard[] } | { error: string }> {
+    const raw = this.env.CT_LOG_SHARDS;
+    const k = JSON.stringify([
+      typeof raw === "string" || raw === undefined ? raw ?? null : JSON.stringify(raw),
+      this.env.CT_LOG_ID ?? null,
+      this.env.CT_LOG_KEY ?? null,
+      this.env.CT_LOG_PATH ?? null,
+    ]);
+    if (this.#ctShardCache?.k !== k) {
+      this.#ctShardCache = { k, v: await parseShards(this.env) };
+    }
+    return this.#ctShardCache.v;
+  }
+
+  /**
+   * The root a root-issued mint names as issuer (notme-7ec6fb), and its PEM
+   * for the CT chain when a log is bound and the path logs (`ct`, default
+   * true; the legacy GHA cert is not logged).
+   *
+   * The issuer name is the STORED root's subject, not caSubjectForEnv(): the
+   * root is created once, so an authority older than notme-1532eb keeps the
+   * production-shaped subject it was born with, and naming the env-derived
+   * one would break its chains in the other direction. On production both
+   * are the literal "CN=signet-authority,O=notme", so its bytes do not move.
+   *
+   * If the root cannot be read, the mint is not refused for it (the log
+   * never is, and neither is the name): the env-derived subject is what any
+   * root this code creates carries.
+   */
+  async #rootForMint(
+    opts: { ct?: boolean } = {},
+  ): Promise<{ subject: string; ctPem: string | null }> {
+    const ct = (opts.ct ?? true) && Boolean(this.env.CT_LOG);
+    let pem: string | null;
+    if (ct) {
+      pem = await this.#readRootForCt();
+    } else {
+      try {
+        pem = await this.getCACertificatePem();
+      } catch (err) {
+        console.error({ event: "mint.root_unreadable", error: String(err) });
+        pem = null;
+      }
+    }
+    let subject = caSubjectForEnv(this.env);
+    if (pem) {
+      const { X509Certificate } = await import("@peculiar/x509");
+      try {
+        subject = new X509Certificate(pem).subject;
+      } catch (err) {
+        // An unparseable root is the CT path's to report (#mintLogged counts
+        // it unloggable); the name falls back like an unreadable root's.
+        console.error({ event: "mint.root_unparseable", error: String(err) });
+      }
+    }
+    return { subject, ctPem: ct ? pem : null };
+  }
+
+  /**
+   * The root PEM for a CT chain, or null (logged) if it cannot be read. A
+   * failure here must not fail the mint — the log is never a reason to refuse.
+   */
+  async #readRootForCt(): Promise<string | null> {
+    try {
+      return await this.getCACertificatePem();
+    } catch (err) {
+      console.error({ event: "ct.root_unreadable", error: String(err) });
+      // Visible in health (`ct.unloggable`): this mint proceeds with no SCT and
+      // NO backlog row — there is no chain to record — so without a counter it
+      // would be invisible. Counting never changes the mint.
+      this.#ctRecord("unloggable", `root unreadable: ${String(err)}`);
+      return null;
+    }
+  }
+
+  // ── CT backlog drain + health (notme-1b46a8, Task 4) ──────────────────────
+
+  /** Rows submitted per alarm fire. */
+  static readonly CT_DRAIN_BATCH = 20;
+  /** Concurrent add-chain calls inside one fire: 20 rows / 4 = 5 waves of at
+   *  most DEFAULT_TIMEOUT_MS (2 s), so a fire's drain is bounded at ~10 s. */
+  static readonly CT_DRAIN_CONCURRENCY = 4;
+  /**
+   * After this many failed attempts a row is counted as "gaveUp" in health,
+   * and becomes eligible for abandonment (CT_ABANDON_AFTER_S). It is NOT
+   * retried any less often: the retry curve below is the same before and
+   * after (notme-a3804c, review L1).
+   */
+  static readonly CT_MAX_ATTEMPTS = 24;
+
+  /**
+   * Per-row retry backoff (notme-a3804c, review L1): after the n-th failed
+   * attempt the row waits CT_RETRY_BASE_S * 2^(n-1), capped at
+   * CT_RETRY_MAX_S — 3, 6, 12, 24, 48 minutes, then hourly. It replaced a
+   * cliff: 24 retries on every fire (~96 minutes), then ONE a day, so after
+   * a 12 h log outage almost every row waited up to a day past recovery.
+   * Now no row waits more than an hour past it (plus the batch's turn:
+   * CT_DRAIN_BATCH rows per fire, fewest attempts first). The base is under
+   * the 4-minute alarm cadence, so a first failure retries on the next fire.
+   */
+  static readonly CT_RETRY_BASE_S = 3 * 60;
+  static readonly CT_RETRY_MAX_S = 60 * 60;
+
+  /**
+   * A gaveUp row is abandoned once it is this old (counted from its mint):
+   * no more retries, counted in health `abandoned` and logged as
+   * `ct.backlog_abandoned` — never silently (notme-1b46a8 cost review).
+   * 30 days of hourly retries, so any fix an operator makes after a monthly
+   * review of `gaveUp` (a root appended to the log, a shard configured, an
+   * outage over) still drains the row within the hour; past that, retrying
+   * forever only costs requests.
+   * Only gaveUp rows (attempts ≥ CT_MAX_ATTEMPTS) qualify: a row that was
+   * never tried — minted while the pin was broken — is not abandoned.
+   */
+  static readonly CT_ABANDON_AFTER_S = 30 * 24 * 60 * 60;
+
+  /**
+   * Logged and abandoned rows are deleted this long after logged_at /
+   * abandoned_at. Not at once: a week is the window to look at what an
+   * outage backlogged and how it drained (the log itself is the durable
+   * record of what was logged). A row that is neither is never deleted.
+   */
+  static readonly CT_RETENTION_S = 7 * 24 * 60 * 60;
+
+  /**
+   * ct_backlog, its last_attempt_at column (added the way the keys table's
+   * columns are), and the drain's index. Idempotent; called from init and
+   * from #ensureCtSchema.
+   */
+  #ensureCtBacklogSchema(): void {
+    const sql = this.ctx.storage.sql;
+    // Each row is a FINAL chain — [leaf, issuer], base64 DER — that carries
+    // no SCT and still has to be recorded by the log via add-chain. Created
+    // unconditionally (an empty table is free); rows are written only when
+    // CT_LOG is bound and a submission failed, or the pin is invalid.
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS ct_backlog (
+        id              INTEGER PRIMARY KEY,
+        chain_json      TEXT NOT NULL,
+        created_at      INTEGER NOT NULL,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        logged_at       INTEGER,
+        last_attempt_at INTEGER
+      )
+    `);
+    // Migration: last_attempt_at, for the once-per-24h retry of rows past
+    // the attempt cap (I2). NULL on old rows: retried on the next fire.
+    try {
+      sql.exec("SELECT last_attempt_at FROM ct_backlog LIMIT 0");
+    } catch {
+      sql.exec("ALTER TABLE ct_backlog ADD COLUMN last_attempt_at INTEGER");
+    }
+    // Migration: abandoned_at, set when a gaveUp row passes CT_ABANDON_AFTER_S
+    // (notme-1b46a8 cost review). NULL on old rows: still being retried.
+    try {
+      sql.exec("SELECT abandoned_at FROM ct_backlog LIMIT 0");
+    } catch {
+      sql.exec("ALTER TABLE ct_backlog ADD COLUMN abandoned_at INTEGER");
+    }
+    sql.exec(
+      "CREATE INDEX IF NOT EXISTS ct_backlog_drain ON ct_backlog (logged_at, attempts, created_at)",
+    );
+  }
+
+  #ctSchemaReady = false;
+  #ensureCtSchema(): void {
+    if (this.#ctSchemaReady) return;
+    // Same DDL as init: health can be read on an object that has not minted.
+    this.#ensureCtBacklogSchema();
+    const sql = this.ctx.storage.sql;
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS ct_health (
+        id               TEXT PRIMARY KEY DEFAULT 'ct',
+        unloggable_count INTEGER NOT NULL DEFAULT 0,
+        unloggable_last_at INTEGER NOT NULL DEFAULT 0,
+        unloggable_reason TEXT NOT NULL DEFAULT '',
+        embed_failed_count INTEGER NOT NULL DEFAULT 0,
+        embed_failed_last_at INTEGER NOT NULL DEFAULT 0,
+        last_error       TEXT    NOT NULL DEFAULT '',
+        last_error_at    INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    for (const [col, ddl] of [
+      ["unloggable_reason", "TEXT NOT NULL DEFAULT ''"],
+      ["embed_failed_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["embed_failed_last_at", "INTEGER NOT NULL DEFAULT 0"],
+      ["abandoned_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["abandoned_last_at", "INTEGER NOT NULL DEFAULT 0"],
+    ] as const) {
+      try {
+        sql.exec(`SELECT ${col} FROM ct_health LIMIT 0`);
+      } catch {
+        sql.exec(`ALTER TABLE ct_health ADD COLUMN ${col} ${ddl}`);
+      }
+    }
+    sql.exec("INSERT OR IGNORE INTO ct_health (id) VALUES ('ct')");
+    this.#ctSchemaReady = true;
+  }
+
+  // ── Signed, never delivered (notme-b35676) ────────────────────────────────
+  //
+  // A CT monitor reconciles what the log holds against what the authority
+  // issued. Three paths sign a certificate (or the precertificate the log
+  // records under its serial) that nobody ever receives:
+  //   - mint_state_moved: the key/epoch re-check after the log wait refuses;
+  //     the review-L2 retry then mints under NEW serials, so the first
+  //     precerts' certificates never exist (#mintLogged);
+  //   - mint_failed: the same window, ending in any other error;
+  //   - claim_taken_over: a tier collect whose claim was reclaimed while it
+  //     minted (TIER_COLLECT_RECLAIM_S) discards its certificate, which with
+  //     CT bound was logged or backlogged (collectTierEnrolment).
+  // Each serial is kept here, durably, and published read-only at
+  // /.well-known/ct-not-delivered.json, for CT_NOT_DELIVERED_RETENTION_S.
+  // Growth is bounded by what causes a row — an operator rotate/revokeEpoch
+  // inside a log wait, or a mint outlasting the 60 s reclaim window — not by
+  // request volume.
+
+  /**
+   * How long a not-delivered serial is kept and served (notme-a3804c, review
+   * L3): 400 days. The rows used to be kept forever and served capped at
+   * 1000, so once the table passed 1000 the oldest silently vanished from
+   * the route anyway. 400 days is over a year past the longest-lived
+   * certificate this authority logs (bridge pairs default to 5 minutes,
+   * tiers are capped at 24 h), and longer than a whole CT shard interval (a
+   * year, ct/config.notme.json) plus a month: past it the certificate is
+   * long expired and its shard closed, so no monitor still needs the
+   * explanation. Chosen over paginating the route, whose cursor would make
+   * every distinct query an uncached SigningAuthority call on a public
+   * route (the miss notme-ed6114 closed). ct/README.md documents it.
+   */
+  static readonly CT_NOT_DELIVERED_RETENTION_S = 400 * 24 * 60 * 60;
+  /** Most rows listNotDeliveredCerts returns; more logs ct.not_delivered_truncated. */
+  static readonly CT_NOT_DELIVERED_MAX = 1000;
+
+  #notDeliveredReady = false;
+  #ensureNotDeliveredSchema(): void {
+    if (this.#notDeliveredReady) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS ct_not_delivered (
+        serial       TEXT PRIMARY KEY,
+        reason       TEXT NOT NULL,
+        discarded_at INTEGER NOT NULL
+      )
+    `);
+    // The listing sorts and the prune filters by time (review L3: the sort
+    // had no index).
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS ct_not_delivered_by_time ON ct_not_delivered (discarded_at, serial)",
+    );
+    this.#notDeliveredReady = true;
+  }
+
+  /** Record serials that were signed and will never be delivered. Never throws. */
+  #recordNotDelivered(
+    serials: string[],
+    reason: "mint_state_moved" | "mint_failed" | "claim_taken_over",
+  ): void {
+    if (serials.length === 0) return;
+    try {
+      this.#ensureNotDeliveredSchema();
+      const now = Math.floor(Date.now() / 1000);
+      for (const serial of serials) {
+        // OR IGNORE: a serial is unique to one certificate, so the first
+        // reason recorded for it stands.
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO ct_not_delivered (serial, reason, discarded_at) VALUES (?, ?, ?)",
+          serial,
+          reason,
+          now,
+        );
+      }
+      console.warn({ event: "ct.not_delivered", reason, serials });
+      // Pruned here, at the only point the table grows, so no alarm work is
+      // needed to keep it bounded; the listing filters by the same cutoff,
+      // so what is served is exact either way. Its own try: a failed prune
+      // is not a lost row.
+      try {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM ct_not_delivered WHERE discarded_at <= ?",
+          now - SigningAuthority.CT_NOT_DELIVERED_RETENTION_S,
+        );
+      } catch (err) {
+        console.error({ event: "ct.not_delivered_prune_failed", error: String(err) });
+      }
+    } catch (err) {
+      // The mint's outcome is already decided; losing this row loses only
+      // the explanation, and the console line above is the fallback record.
+      console.error({ event: "ct.not_delivered_write_failed", reason, serials, error: String(err) });
+    }
+  }
+
+  /**
+   * Every serial signed and never delivered within the last
+   * CT_NOT_DELIVERED_RETENTION_S, newest first, at most `limit` (default and
+   * cap CT_NOT_DELIVERED_MAX). Read-only; published unauthenticated at
+   * /.well-known/ct-not-delivered.json, because what it names is already in
+   * the public log — it only explains it (notme-b35676). A retained list
+   * longer than the cap is logged (`ct.not_delivered_truncated`), so rows
+   * never drop off the route silently (notme-a3804c).
+   */
+  async listNotDeliveredCerts(
+    limit = SigningAuthority.CT_NOT_DELIVERED_MAX,
+  ): Promise<Array<{ serial: string; reason: string; discardedAt: number }>> {
+    this.#ensureNotDeliveredSchema();
+    const cap = SigningAuthority.CT_NOT_DELIVERED_MAX;
+    const n = Math.max(1, Math.min(cap, Math.floor(Number(limit) || cap)));
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT serial, reason, discarded_at FROM ct_not_delivered WHERE discarded_at > ? ORDER BY discarded_at DESC, serial LIMIT ?",
+        Math.floor(Date.now() / 1000) - SigningAuthority.CT_NOT_DELIVERED_RETENTION_S,
+        cap + 1,
+      )
+      .toArray() as Array<{ serial: string; reason: string; discarded_at: number }>;
+    if (rows.length > cap) {
+      console.error({ event: "ct.not_delivered_truncated", served: cap, retentionS: SigningAuthority.CT_NOT_DELIVERED_RETENTION_S });
+    }
+    return rows.slice(0, n).map((r) => ({ serial: r.serial, reason: r.reason, discardedAt: r.discarded_at }));
+  }
+
+  /** Record a CT observation for health. Never throws. */
+  #ctRecord(kind: "unloggable" | "embedFailed" | "error", msg: string): void {
+    try {
+      this.#ensureCtSchema();
+      const now = Math.floor(Date.now() / 1000);
+      const m = msg.slice(0, 200);
+      if (kind === "unloggable") {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_health SET unloggable_count = unloggable_count + 1, unloggable_last_at = ?, unloggable_reason = ?, last_error = ?, last_error_at = ? WHERE id = 'ct'",
+          now,
+          m,
+          m,
+          now,
+        );
+      } else if (kind === "embedFailed") {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_health SET embed_failed_count = embed_failed_count + 1, embed_failed_last_at = ?, last_error = ?, last_error_at = ? WHERE id = 'ct'",
+          now,
+          m,
+          now,
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_health SET last_error = ?, last_error_at = ? WHERE id = 'ct'",
+          m,
+          now,
+        );
+      }
+    } catch (err) {
+      console.error({ event: "ct.health_write_failed", error: String(err) });
+    }
+  }
+
+  /**
+   * Submit up to CT_DRAIN_BATCH backlog rows to the log via add-chain,
+   * CT_DRAIN_CONCURRENCY at a time. A row is due once its own backoff has
+   * passed (CT_RETRY_BASE_S doubling to CT_RETRY_MAX_S, one hour): one
+   * continuous curve, so an outage of any length, a root rotation or a
+   * shard roll is drained within about an hour of being fixed (notme-a3804c).
+   * Rows under CT_MAX_ATTEMPTS come first; rows past it ("gaveUp") fill what
+   * is left of the batch, least recently tried first.
+   *
+   * A row is marked logged only when the answer is an SCT from the pinned log
+   * whose signature verifies over the x509_entry for that row's certificate.
+   * Anything else increments attempts and records lastError with the reason.
+   * A row that cannot even be parsed counts as a failed attempt, so it ages
+   * out instead of poisoning the batch. With CT_LOG_ID / CT_LOG_KEY invalid
+   * nothing is submitted, no row is touched and lastError is left alone
+   * (configError reports it). Callers wrap this in
+   * try/catch: a drain error is never an alarm failure.
+   */
+  async #drainCtBacklog(): Promise<void> {
+    const log = this.env.CT_LOG;
+    if (!log) return;
+    this.#ensureCtSchema();
+    // Before the pin check: bounding the table must not wait on the config.
+    this.#ctBacklogHygiene();
+    const shardSet = await this.#ctShards();
+    if ("error" in shardSet) {
+      // health.configError already reports this on every read. Writing it to
+      // lastError on every fire would overwrite the last real submission
+      // error with the same config message (notme-c0c9a2).
+      console.warn({ event: "ct.drain_skipped", error: shardSet.error });
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const max = SigningAuthority.CT_MAX_ATTEMPTS;
+    // Due: never tried, or its backoff (CT_RETRY_BASE_S * 2^(attempts-1),
+    // capped at CT_RETRY_MAX_S) has passed. The shift is clamped so a row
+    // with hundreds of attempts cannot overflow it. Order: rows under
+    // CT_MAX_ATTEMPTS first, then within each class the least recently
+    // tried — a round robin, so no due row starves behind a large backlog.
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT id, chain_json FROM ct_backlog
+           WHERE logged_at IS NULL AND abandoned_at IS NULL
+             AND (last_attempt_at IS NULL
+                  OR last_attempt_at <= ? - MIN(? * (1 << MIN(MAX(attempts - 1, 0), 20)), ?))
+           ORDER BY (attempts >= ?), COALESCE(last_attempt_at, 0), created_at, id
+           LIMIT ?`,
+        now,
+        SigningAuthority.CT_RETRY_BASE_S,
+        SigningAuthority.CT_RETRY_MAX_S,
+        max,
+        SigningAuthority.CT_DRAIN_BATCH,
+      )
+      .toArray() as Array<{ id: number; chain_json: string }>;
+
+    const one = async (row: { id: number; chain_json: string }): Promise<void> => {
+      let ok = false;
+      try {
+        const chain = JSON.parse(row.chain_json) as string[];
+        const certDer = b64ToBytes(chain[0]!);
+        // The shard is chosen again, by the certificate's own notAfter
+        // (notme-afa9d8), so the row goes wherever the CURRENT shard set
+        // says — including a shard added after it was backlogged.
+        const notAfter = notAfterOf(certDer);
+        const shard = selectShard(shardSet.shards, notAfter);
+        let why: string;
+        if (!shard) {
+          why = `no shard covers notAfter ${new Date(notAfter).toISOString()}`;
+        } else {
+          const r = await postChain(log, chain, DEFAULT_TIMEOUT_MS, shard.path);
+          why = r.ok ? await verifySct(r.sct, { kind: "x509", certDer }, shard.pin) : r.reason;
+        }
+        ok = why === "ok";
+        if (!ok) this.#ctRecord("error", `add-chain failed for backlog row ${row.id}: ${why}`);
+      } catch (err) {
+        this.#ctRecord("error", `backlog row ${row.id}: ${String(err)}`);
+      }
+      const at = Math.floor(Date.now() / 1000);
+      if (ok) {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_backlog SET logged_at = ?, last_attempt_at = ? WHERE id = ?",
+          at,
+          at,
+          row.id,
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          "UPDATE ct_backlog SET attempts = attempts + 1, last_attempt_at = ? WHERE id = ?",
+          at,
+          row.id,
+        );
+      }
     };
+
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < rows.length) {
+        const row = rows[next++]!;
+        try {
+          await one(row);
+        } catch (err) {
+          console.error({ event: "ct.drain_row_failed", id: row.id, error: String(err) });
+        }
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(SigningAuthority.CT_DRAIN_CONCURRENCY, rows.length) },
+        worker,
+      ),
+    );
+  }
+
+  /**
+   * Keep ct_backlog bounded (notme-1b46a8 cost review). Two statements, both
+   * synchronous storage writes:
+   *   1. abandon gaveUp rows minted over CT_ABANDON_AFTER_S ago, counting
+   *      them in ct_health (health `abandoned`);
+   *   2. delete rows logged, or abandoned, over CT_RETENTION_S ago.
+   * A row that is neither logged nor abandoned is never deleted.
+   */
+  #ctBacklogHygiene(): void {
+    const sql = this.ctx.storage.sql;
+    const now = Math.floor(Date.now() / 1000);
+    const abandoned = sql
+      .exec(
+        `UPDATE ct_backlog SET abandoned_at = ?
+           WHERE logged_at IS NULL AND abandoned_at IS NULL
+             AND attempts >= ? AND created_at <= ?
+           RETURNING id`,
+        now,
+        SigningAuthority.CT_MAX_ATTEMPTS,
+        now - SigningAuthority.CT_ABANDON_AFTER_S,
+      )
+      .toArray().length;
+    if (abandoned > 0) {
+      console.error({ event: "ct.backlog_abandoned", rows: abandoned });
+      sql.exec(
+        "UPDATE ct_health SET abandoned_count = abandoned_count + ?, abandoned_last_at = ? WHERE id = 'ct'",
+        abandoned,
+        now,
+      );
+    }
+    const cutoff = now - SigningAuthority.CT_RETENTION_S;
+    sql.exec(
+      `DELETE FROM ct_backlog
+         WHERE (logged_at IS NOT NULL AND logged_at <= ?)
+            OR (abandoned_at IS NOT NULL AND abandoned_at <= ?)`,
+      cutoff,
+      cutoff,
+    );
+  }
+
+  /** What getAlarmHealth reports under `rekor` (notme-d8cf4e). */
+  #readRekorHealth(): RekorHealth {
+    this.#ensureEpochHistorySchema();
+    const sql = this.ctx.storage.sql;
+    const p = sql
+      .exec("SELECT COUNT(*) AS n, MIN(revoked_at) AS oldest FROM epoch_revocations WHERE rekor_log_index IS NULL")
+      .toArray()[0] as { n: number; oldest: number | null };
+    const last = sql
+      .exec(
+        "SELECT rekor_last_error, rekor_last_attempt_at FROM epoch_revocations WHERE rekor_log_index IS NULL AND rekor_last_attempt_at IS NOT NULL ORDER BY rekor_last_attempt_at DESC LIMIT 1",
+      )
+      .toArray()[0] as { rekor_last_error: string | null; rekor_last_attempt_at: number } | undefined;
+    return {
+      pending: p.n,
+      oldestPendingAgeS: p.oldest === null ? null : Math.max(0, Math.floor(Date.now() / 1000) - p.oldest),
+      lastError: last?.rekor_last_error ?? "",
+      lastAttemptAt: last?.rekor_last_attempt_at ?? 0,
+      submitEnabled: this.env.REKOR_SUBMIT !== "off",
+    };
+  }
+
+  async #readCtHealth(): Promise<CtHealth> {
+    this.#ensureCtSchema();
+    const pin = this.env.CT_LOG ? await this.#ctShards() : null;
+    const sql = this.ctx.storage.sql;
+    const max = SigningAuthority.CT_MAX_ATTEMPTS;
+    const b = sql
+      .exec(
+        "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM ct_backlog WHERE logged_at IS NULL AND abandoned_at IS NULL AND attempts < ?",
+        max,
+      )
+      .toArray()[0] as { n: number; oldest: number | null };
+    const g = sql
+      .exec(
+        "SELECT COUNT(*) AS n FROM ct_backlog WHERE logged_at IS NULL AND abandoned_at IS NULL AND attempts >= ?",
+        max,
+      )
+      .toArray()[0] as { n: number };
+    const h = sql
+      .exec(
+        "SELECT unloggable_count, unloggable_last_at, unloggable_reason, embed_failed_count, embed_failed_last_at, abandoned_count, abandoned_last_at, last_error, last_error_at FROM ct_health WHERE id = 'ct'",
+      )
+      .toArray()[0] as {
+      unloggable_count: number;
+      unloggable_last_at: number;
+      unloggable_reason: string;
+      embed_failed_count: number;
+      embed_failed_last_at: number;
+      abandoned_count: number;
+      abandoned_last_at: number;
+      last_error: string;
+      last_error_at: number;
+    };
+    return {
+      backlog: b.n,
+      oldestUnloggedAgeS:
+        b.oldest === null ? null : Math.max(0, Math.floor(Date.now() / 1000) - b.oldest),
+      gaveUp: g.n,
+      lastError: h.last_error,
+      lastErrorAt: h.last_error_at,
+      unloggable: {
+        count: h.unloggable_count,
+        lastAt: h.unloggable_last_at,
+        reason: h.unloggable_reason,
+      },
+      embedFailed: { count: h.embed_failed_count, lastAt: h.embed_failed_last_at },
+      abandoned: { count: h.abandoned_count, lastAt: h.abandoned_last_at },
+      configError: pin && "error" in pin ? pin.error : null,
+      ...(pin && "shards" in pin
+        ? shardEndHealth(pin.shards, Date.now())
+        : { shardEndsAt: null, shardEndsInDays: null, shardClosingSoon: false }),
+    };
+  }
+
+  /**
+   * Mint the Issuing CA tier (ADR-019 D4): CA=true, pathlen=0, keyCertSign.
+   * Same shape as mintBridgeCertPair — the DO supplies the key and the
+   * epoch, never the policy: WHO may request this and WHAT scopes it may
+   * carry are decided at the route, which is the only caller.
+   */
+  async mintIssuingCa(params: {
+    subject: string;
+    identity: string;
+    publicKeyPem: string;
+    scopes: string[];
+    authMethod: string;
+    ttlMs?: number;
+    /** The criteria the approver granted (notme-bdc850); absent for a legacy enrollment. */
+    criteria?: import("./criteria").Criteria[];
+  }): Promise<
+    import("./cert-authority").IssuingCaCertResult & {
+      authority: { epoch: number; key_id: string };
+    }
+  > {
+    // A leaked stub is already full-CA capability, but an Issuing CA cert is
+    // POST-LEAK PERSISTENCE: it keeps signing task certs after stub access is
+    // lost, for its whole lifetime. Refuse rather than clamp — no legitimate
+    // caller sends a long TTL (the route sends none), so a long TTL is
+    // evidence of misuse, and clamping would hide it.
+    const MAX_ISSUING_TTL_MS = 24 * 60 * 60 * 1000;
+    if (params.ttlMs !== undefined && params.ttlMs > MAX_ISSUING_TTL_MS) {
+      throw new Error(
+        `issuing tier ttl capped at 24h, got ${params.ttlMs}ms`,
+      );
+    }
+    // One synchronous capture, re-checked before every signature and
+    // retried once on a refusal — see mintBridgeCertPair (notme-b54368).
+    return this.#withMintRetry(async (cap) => {
+      // Root read right after the key that signs the tier — see
+      // mintBridgeCertPair: its subject names the issuer, its PEM the chain.
+      const root = await this.#rootForMint();
+      const issuerPem = root.ctPem;
+      const { mintIssuingCaCert } = await import("./cert-authority");
+      const ttlMs = params.ttlMs ?? 60 * 60 * 1000;
+      const notBefore = new Date();
+      const result = await this.#mintLogged({
+        pin: {
+          serial: randomSerialHex(),
+          notBefore,
+          notAfter: new Date(notBefore.getTime() + ttlMs),
+        },
+        mint: (pin, ct) =>
+          mintIssuingCaCert(
+            params.subject,
+            params.identity,
+            params.publicKeyPem,
+            cap.signingKey,
+            {
+              scopes: params.scopes,
+              epoch: cap.epoch,
+              authMethod: params.authMethod,
+              ttlMs: params.ttlMs,
+              issuerName: root.subject,
+              pin,
+              extraExtensions: ct(0),
+              ...(params.criteria ? { criteria: params.criteria } : {}),
+            },
+          ),
+        pems: (r) => [r.certificate],
+        issuerPem,
+        captured: cap,
+      });
+      return {
+        ...result,
+        authority: { epoch: cap.epoch, key_id: cap.keyId },
+      };
+    });
+  }
+
+  // ── Session-bound PoP nonces (notme-486e8a) ────────────────────────────
+  //
+  // The session term in a cert-pair binding. Issued to a principal, single
+  // use, short-lived. Replaces SHA-256 of the HttpOnly session cookie, which
+  // no browser could compute.
+
+  #ensurePopNonceSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS pop_nonces (
+        nonce_hash   TEXT PRIMARY KEY,
+        principal_id TEXT NOT NULL,
+        expires_at   INTEGER NOT NULL
+      )
+    `);
+  }
+
+  async issuePopNonce(principalId: string): Promise<{ nonce: string; expiresIn: number }> {
+    this.#ensurePopNonceSchema();
+    const now = Math.floor(Date.now() / 1000);
+    this.ctx.storage.sql.exec("DELETE FROM pop_nonces WHERE expires_at <= ?", now);
+    const nonce = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce))));
+    this.ctx.storage.sql.exec(
+      "INSERT INTO pop_nonces (nonce_hash, principal_id, expires_at) VALUES (?, ?, ?)",
+      hash,
+      principalId,
+      now + POP_NONCE_TTL_S,
+    );
+    return { nonce, expiresIn: POP_NONCE_TTL_S };
+  }
+
+  /**
+   * Spend a nonce for this principal. Atomic: the DELETE is the check, so of
+   * two concurrent spends exactly one sees changes() = 1. A nonce issued to a
+   * DIFFERENT principal does not match — which is what defeats replay under
+   * another session.
+   */
+  async consumePopNonce(nonce: string, principalId: string): Promise<boolean> {
+    this.#ensurePopNonceSchema();
+    if (typeof nonce !== "string" || !nonce) return false;
+    const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce))));
+    this.ctx.storage.sql.exec(
+      "DELETE FROM pop_nonces WHERE nonce_hash = ? AND principal_id = ? AND expires_at > ?",
+      hash,
+      principalId,
+      Math.floor(Date.now() / 1000),
+    );
+    const [c] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+    return c.n === 1;
+  }
+
+  // ── Tier enrolment by device authorization (notme-486e8a) ──────────────
+  //
+  // /cert/issuing-ca bound its proof to SHA-256 of the HttpOnly session
+  // cookie, which no client can read, so a tier was never enrollable. This is
+  // the RFC 8628 shape instead: the MACHINE holds the tier key and the device
+  // code; the HUMAN approves a short user code in a passkey session, after
+  // comparing the key fingerprint; the machine collects with a proof over the
+  // device code, which never appears in a browser.
+  //
+  // State lives here, not in KV, so approval and collection are atomic and
+  // collection is single-use — the same reason mintDPoPTokenOnce consumes in
+  // SQLite.
+
+  #ensureTierEnrolmentSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tier_enrolments (
+        device_code_hash TEXT PRIMARY KEY,
+        user_code        TEXT NOT NULL UNIQUE,
+        public_key_pem   TEXT NOT NULL,
+        key_fingerprint  TEXT NOT NULL,
+        requested_scopes TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        principal_id     TEXT,
+        identity         TEXT,
+        auth_method      TEXT,
+        granted_scopes   TEXT,
+        expires_at       INTEGER NOT NULL
+      )
+    `);
+    // Renewal (notme-337d82): the enrollment is KEPT after collection and is
+    // what a machine renews against. expires_at stays the device-code expiry;
+    // these carry the approval's lifetime.
+    for (const col of [
+      "renew_until INTEGER",
+      "revoked_at INTEGER",
+      "approved_epoch INTEGER",
+      // Generations (notme-747cc7): the counter a v2 renewal must sign, why
+      // the enrollment was revoked, and which renewal binding it speaks.
+      "generation INTEGER NOT NULL DEFAULT 0",
+      "revoke_reason TEXT",
+      "binding_version INTEGER",
+      // The approver's clone policy (notme-747cc7): recorded and shown only;
+      // phase 1 has no branch endpoint, so every line acts as a singleton.
+      "clone_policy TEXT NOT NULL DEFAULT 'singleton'",
+      // The criteria the approver granted (notme-bdc850), as a JSON list of
+      // { name, version }. NULL is a pre-phase-2 enrollment: its tiers carry
+      // no .1.10, at collect and at every renewal, so its tasks stay legacy.
+      "criteria TEXT",
+      // The in-flight collect (notme-d06b7b): who holds the claim and since
+      // when. Set while status is 'collecting', between the proof check and
+      // the activation that follows a successful mint.
+      "collect_claim TEXT",
+      "collect_started_at INTEGER",
+      // The network that started the enrolment (notme-a36d10): what the
+      // per-source cap and fair-share eviction count by. NULL on rows from
+      // before it, which count as one source of their own.
+      "source TEXT",
+    ]) {
+      try {
+        this.ctx.storage.sql.exec(`ALTER TABLE tier_enrolments ADD COLUMN ${col}`);
+      } catch {
+        /* already present */
+      }
+    }
+    // Every ACCEPTED v2 renewal, by generation: what tells an honest retry
+    // (or a harmless replay) of an accepted request from a fork, which is a
+    // stale-generation request nobody accepted.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tier_renewal_digests (
+        key_fingerprint TEXT NOT NULL,
+        generation      INTEGER NOT NULL,
+        digest          TEXT NOT NULL,
+        iat             INTEGER NOT NULL,
+        PRIMARY KEY (key_fingerprint, generation)
+      )
+    `);
+  }
+
+  /**
+   * Record a machine's request for a tier. Unauthenticated BY NATURE — the
+   * machine has no credential yet — so it grants nothing: it stores a public
+   * key and waits for a human. Bounded, because an open endpoint that writes
+   * rows is a storage-exhaustion vector: expired rows are pruned on every
+   * start and the pending set is capped.
+   *
+   * The cap is also an availability target (notme-a36d10, review H1): one
+   * global cap let 0.83 rps from anywhere keep every honest machine "busy".
+   * So the in-flight set is bounded per `source` (the caller's network, from
+   * clientNetworkBucket) at TIER_ENROLMENT_PER_SOURCE_CAP, and when the
+   * global cap is full anyway a source holding FEWER rows than the busiest
+   * source evicts that source's oldest still-PENDING row (max-min fairness).
+   * A new source therefore always gets in; a flood can only displace an
+   * honest row by spreading over more networks than the cap has rows, each
+   * holding no more than the honest one. Approved and collecting rows — a
+   * human vetted them — are never evicted.
+   */
+  async startTierEnrolment(params: {
+    publicKeyPem: string;
+    requestedScopes: string[];
+    /** The caller's network bucket. Absent (internal callers) is "none". */
+    source?: string;
+  }): Promise<
+    | { ok: true; deviceCode: string; userCode: string; keyFingerprint: string; expiresIn: number }
+    | { ok: false; reason: "invalid_key" | "busy" | "source_busy" }
+  > {
+    this.#ensureTierEnrolmentSchema();
+    const { importPublicKey } = await import("./cert-authority");
+    let key: CryptoKey;
+    try {
+      key = await importPublicKey(params.publicKeyPem);
+    } catch {
+      return { ok: false, reason: "invalid_key" };
+    }
+    if (key.algorithm.name !== "Ed25519") return { ok: false, reason: "invalid_key" };
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
+    const keyFingerprint = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", spki)));
+
+    const now = Math.floor(Date.now() / 1000);
+    const sql = this.ctx.storage.sql;
+    // Prune and cap only enrollments still in FLIGHT. An active enrollment is
+    // the record a machine renews against; its device code expiring is
+    // irrelevant to it, and pruning it would silently end renewal ten minutes
+    // after collection.
+    sql.exec(
+      "DELETE FROM tier_enrolments WHERE expires_at <= ? AND status IN ('pending', 'approved', 'collecting')",
+      now,
+    );
+    const source = typeof params.source === "string" && params.source ? params.source.slice(0, 128) : "none";
+    const IN_FLIGHT = "status IN ('pending', 'approved', 'collecting')";
+    const [{ mine }] = [
+      ...sql.exec<{ mine: number }>(
+        `SELECT COUNT(*) AS mine FROM tier_enrolments WHERE ${IN_FLIGHT} AND source IS ?`,
+        source,
+      ),
+    ];
+    if (mine >= TIER_ENROLMENT_PER_SOURCE_CAP) return { ok: false, reason: "source_busy" };
+    const [{ n }] = [
+      ...sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM tier_enrolments WHERE ${IN_FLIGHT}`),
+    ];
+    if (n >= TIER_ENROLMENT_CAP) {
+      // Full. The busiest source by PENDING rows (ties: the one whose oldest
+      // pending row is oldest) gives up its oldest pending row, if it holds
+      // more than this caller does. Otherwise nobody is fairly evictable.
+      const busiest = [
+        ...sql.exec<{ source: string | null; c: number }>(
+          `SELECT source, COUNT(*) AS c, MIN(expires_at) AS oldest FROM tier_enrolments
+             WHERE status = 'pending' GROUP BY source ORDER BY c DESC, oldest ASC LIMIT 1`,
+        ),
+      ][0];
+      if (!busiest || busiest.c <= mine) return { ok: false, reason: "busy" };
+      sql.exec(
+        `DELETE FROM tier_enrolments WHERE device_code_hash = (
+           SELECT device_code_hash FROM tier_enrolments
+             WHERE status = 'pending' AND source IS ? ORDER BY expires_at ASC LIMIT 1)`,
+        busiest.source,
+      );
+      console.warn(
+        JSON.stringify({ event: "tier_enrolment.evicted", reason: "global_cap_full", from: busiest.source, held: busiest.c, for: source }),
+      );
+    }
+
+    const deviceCode = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const deviceCodeHash = hex(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(deviceCode))),
+    );
+    // RFC 8628 §6.1: a short code from an alphabet with no vowels (no
+    // accidental words) and no look-alikes, so a human can read it across.
+    const userCode = randomUserCode();
+    sql.exec(
+      `INSERT INTO tier_enrolments
+         (device_code_hash, user_code, public_key_pem, key_fingerprint,
+          requested_scopes, status, expires_at, source)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      deviceCodeHash,
+      userCode,
+      params.publicKeyPem,
+      keyFingerprint,
+      JSON.stringify(params.requestedScopes),
+      now + TIER_ENROLMENT_TTL_S,
+      source,
+    );
+    return { ok: true, deviceCode, userCode, keyFingerprint, expiresIn: TIER_ENROLMENT_TTL_S };
+  }
+
+  /** What the approval page shows. No device code, no identity. */
+  async getTierEnrolment(userCode: string): Promise<
+    | { keyFingerprint: string; requestedScopes: string[]; status: string; expiresAt: number }
+    | null
+  > {
+    this.#ensureTierEnrolmentSchema();
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT key_fingerprint, requested_scopes, status, expires_at FROM tier_enrolments WHERE user_code = ?",
+        userCode,
+      )
+      .toArray()[0] as
+      | { key_fingerprint: string; requested_scopes: string; status: string; expires_at: number }
+      | undefined;
+    if (!row) return null;
+    return {
+      keyFingerprint: row.key_fingerprint,
+      requestedScopes: JSON.parse(row.requested_scopes),
+      status: row.status,
+      expiresAt: row.expires_at,
+    };
+  }
+
+  /**
+   * Bind a pending enrolment to the approving human. The ROUTE decides who
+   * may approve and what scopes survive; this records it. A leaked stub could
+   * approve for any principal — and could already call mintIssuingCa for any
+   * subject directly, so the capability class is unchanged.
+   */
+  async approveTierEnrolment(params: {
+    userCode: string;
+    principalId: string;
+    identity: string;
+    authMethod: import("./auth/session").AuthMethod; // parsed, never raw (notme-32003c)
+    scopes: string[];
+    /** How long the machine may renew without a human (notme-337d82). */
+    renewDays: number;
+    /** The ROUTE validates and authorizes; this records it. */
+    clonePolicy: "singleton" | "replicas:2" | "replicas:4" | "replicas:8";
+    /** The criteria granted (notme-bdc850). The ROUTE checks each is grantable. */
+    criteria: import("./criteria").Criteria[];
+  }): Promise<{ ok: true } | { ok: false; reason: "not_found" | "expired" | "not_pending" }> {
+    this.#ensureTierEnrolmentSchema();
+    const now = Math.floor(Date.now() / 1000);
+    const row = this.ctx.storage.sql
+      .exec("SELECT status, expires_at FROM tier_enrolments WHERE user_code = ?", params.userCode)
+      .toArray()[0] as { status: string; expires_at: number } | undefined;
+    if (!row) return { ok: false, reason: "not_found" };
+    if (row.expires_at <= now) return { ok: false, reason: "expired" };
+    if (row.status !== "pending") return { ok: false, reason: "not_pending" };
+    const epoch = (await this.getAuthorityState()).epoch;
+    // The checks above ran before that await, and a revoke, a second approval
+    // or the expiry deadline can land in it (notme-052431). The UPDATE repeats
+    // both guards, and its changed-row count, not the earlier read, decides
+    // the answer: an approve that matched nothing must not report success.
+    const writeAt = Math.floor(Date.now() / 1000);
+    const written = this.ctx.storage.sql.exec(
+      `UPDATE tier_enrolments
+          SET status = 'approved', principal_id = ?, identity = ?, auth_method = ?, granted_scopes = ?,
+              renew_until = ?, approved_epoch = ?, clone_policy = ?, criteria = ?
+        WHERE user_code = ? AND status = 'pending' AND expires_at > ?`,
+      params.principalId,
+      params.identity,
+      params.authMethod,
+      JSON.stringify(params.scopes),
+      now + params.renewDays * 86400,
+      epoch,
+      params.clonePolicy,
+      JSON.stringify(params.criteria.map(({ name, version }) => ({ name, version }))),
+      params.userCode,
+      writeAt,
+    ).rowsWritten;
+    if (written === 0) {
+      // Say why, from the row as it is now.
+      const after = this.ctx.storage.sql
+        .exec("SELECT status, expires_at FROM tier_enrolments WHERE user_code = ?", params.userCode)
+        .toArray()[0] as { status: string; expires_at: number } | undefined;
+      if (!after) return { ok: false, reason: "not_found" };
+      if (after.status === "pending" && after.expires_at <= writeAt) {
+        return { ok: false, reason: "expired" };
+      }
+      return { ok: false, reason: "not_pending" };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * The machine collects its tier. The proof is verified HERE, against the
+   * key recorded at start, over `"notme/tier-enrol/v1\0" || SPKI ||
+   * SHA-256(device_code)`. A bad proof does not consume the enrolment — a
+   * thief holding the device code but not the key must not be able to burn
+   * the real holder's approval.
+   *
+   * A good proof CLAIMS the enrolment ('collecting') before minting and
+   * activates it only after the mint returns (notme-d06b7b). It used to be
+   * marked 'active' first, so a mint that threw stranded it: every retry got
+   * invalid_grant and the machine had to go back to a human. Now a failed
+   * mint hands the claim back ('approved') and the retry mints; a collect
+   * arriving while a mint is in flight is told authorization_pending; and a
+   * claim abandoned by an evicted isolate is reclaimable after
+   * TIER_COLLECT_RECLAIM_S. Exactly one collect ever DELIVERS a tier: the
+   * activation is a compare-and-swap on the claim id, so a minter whose
+   * claim was taken over discards its certificate and gets invalid_grant.
+   */
+  async collectTierEnrolment(params: { deviceCode: string; proof: string }): Promise<
+    | ({
+        ok: true;
+        principalId: string;
+        authMethod: string;
+        renewUntil: number;
+        generation: number;
+        /** The enrollment's id, hex: what a v3 renewal signs (notme-c9fc8c). Only with RENEWAL_BINDING_V3 "on". */
+        enrollmentId?: string;
+        clone_policy: string;
+        /** Criteria ids ("agent-session/1"); null for a pre-phase-2 enrollment. */
+        criteria: string[] | null;
+      } &
+        import("./cert-authority").IssuingCaCertResult & {
+          authority: { epoch: number; key_id: string };
+        })
+    | {
+        ok: false;
+        reason: "authorization_pending" | "expired_token" | "invalid_grant" | "invalid_proof";
+      }
+  > {
+    this.#ensureTierEnrolmentSchema();
+    if (typeof params.deviceCode !== "string" || params.deviceCode.length === 0) {
+      return { ok: false, reason: "invalid_grant" };
+    }
+    const deviceCodeHash = hex(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(params.deviceCode)),
+      ),
+    );
+    const row = this.ctx.storage.sql
+      .exec("SELECT * FROM tier_enrolments WHERE device_code_hash = ?", deviceCodeHash)
+      .toArray()[0] as
+      | {
+          public_key_pem: string;
+          status: string;
+          principal_id: string;
+          identity: string;
+          auth_method: string;
+          granted_scopes: string;
+          expires_at: number;
+          renew_until: number | null;
+          key_fingerprint: string;
+          clone_policy: string;
+          criteria: string | null;
+          collect_started_at: number | null;
+        }
+      | undefined;
+    if (!row) return { ok: false, reason: "invalid_grant" };
+    if (row.expires_at <= Math.floor(Date.now() / 1000)) {
+      return { ok: false, reason: "expired_token" };
+    }
+    if (row.status === "pending") return { ok: false, reason: "authorization_pending" };
+    const staleBefore = Math.floor(Date.now() / 1000) - TIER_COLLECT_RECLAIM_S;
+    const claimable =
+      row.status === "approved" ||
+      (row.status === "collecting" && (row.collect_started_at ?? 0) <= staleBefore);
+    // Another collect is minting this enrolment right now. Poll again: it
+    // either delivers (and this device code is then spent) or hands back.
+    if (row.status === "collecting" && !claimable) {
+      return { ok: false, reason: "authorization_pending" };
+    }
+    if (!claimable) return { ok: false, reason: "invalid_grant" };
+
+    const { importPublicKey } = await import("./cert-authority");
+    const key = await importPublicKey(row.public_key_pem);
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
+    const { verifyEd25519PopProof } = await import("./auth/pop");
+    const { tierEnrolmentBinding } = await import("./auth/tier-enrolment-binding");
+    const codeHashBytes = Uint8Array.from(deviceCodeHash.match(/../g)!.map((h) => parseInt(h, 16)));
+    if (!(await verifyEd25519PopProof(tierEnrolmentBinding(spki, codeHashBytes), key, params.proof))) {
+      return { ok: false, reason: "invalid_proof" };
+    }
+
+    const { tierEnrolmentId } = await import("./auth/tier-enrolment-binding");
+    const enrollmentId = hex(await tierEnrolmentId(codeHashBytes));
+    const v3On = this.env.RENEWAL_BINDING_V3 === "on";
+
+    const criteria = storedCriteria(row.criteria);
+    const { criteriaId } = await import("./criteria");
+
+    // CLAIM, atomically: of two concurrent collects with a valid proof,
+    // exactly one sees changes() = 1. The claim id is what the activation
+    // compares against, so a claim that was taken over is never the one
+    // that delivers (notme-d06b7b).
+    const claim = b64url(crypto.getRandomValues(new Uint8Array(16)));
+    this.ctx.storage.sql.exec(
+      `UPDATE tier_enrolments SET status = 'collecting', collect_claim = ?, collect_started_at = ?
+        WHERE device_code_hash = ?
+          AND (status = 'approved' OR (status = 'collecting' AND COALESCE(collect_started_at, 0) <= ?))`,
+      claim,
+      Math.floor(Date.now() / 1000),
+      deviceCodeHash,
+      staleBefore,
+    );
+    const [claimed] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+    if (claimed.n !== 1) {
+      // Lost the race to a concurrent collect: poll while it mints.
+      const now = this.ctx.storage.sql
+        .exec("SELECT status FROM tier_enrolments WHERE device_code_hash = ?", deviceCodeHash)
+        .toArray()[0] as { status: string } | undefined;
+      return now?.status === "collecting"
+        ? { ok: false, reason: "authorization_pending" }
+        : { ok: false, reason: "invalid_grant" };
+    }
+
+    let result: Awaited<ReturnType<SigningAuthority["mintIssuingCa"]>>;
+    try {
+      result = await this.mintIssuingCa({
+        subject: row.principal_id,
+        identity: row.identity,
+        publicKeyPem: row.public_key_pem,
+        scopes: JSON.parse(row.granted_scopes),
+        authMethod: row.auth_method,
+        ...(criteria ? { criteria } : {}),
+      });
+    } catch (err) {
+      // Hand the claim back: nothing was delivered and the human's approval
+      // still holds, so the machine's retry mints rather than re-enrolling.
+      // Only OUR claim — one taken over in the meantime is not ours to undo.
+      this.ctx.storage.sql.exec(
+        "UPDATE tier_enrolments SET status = 'approved', collect_claim = NULL, collect_started_at = NULL WHERE device_code_hash = ? AND status = 'collecting' AND collect_claim = ?",
+        deviceCodeHash,
+        claim,
+      );
+      throw err;
+    }
+
+    // ACTIVATE, in one transaction straight after the mint returns.
+    //
+    // Binding version (notme-c9fc8c). A key collected for the first time
+    // speaks v2 or v3: the v2 binding does not name the enrollment, but no
+    // other enrollment of this key ever existed, so no request signed for one
+    // can be replayed here — and a v2-only client mid-flight keeps working.
+    // A RE-enrolled key (an earlier enrollment of it was ever collected)
+    // speaks v3 only: a v2 request signed for the earlier enrollment could
+    // otherwise claim, or fork, this one. Same synchronous block as the
+    // activation, so no collect interleaves between the check and the write.
+    const activated = this.ctx.storage.transactionSync(() => {
+      const reEnrolled =
+        this.ctx.storage.sql
+          .exec(
+            "SELECT 1 FROM tier_enrolments WHERE key_fingerprint = ? AND device_code_hash != ? AND status IN ('active', 'superseded') LIMIT 1",
+            row.key_fingerprint,
+            deviceCodeHash,
+          )
+          .toArray().length > 0;
+      this.ctx.storage.sql.exec(
+        // 'active', not 'consumed': the enrollment lives on as the record a
+        // machine renews against (notme-337d82). Single use still holds — a
+        // later collect finds status 'active' and is refused.
+        // A collected enrollment starts at generation 0 (notme-747cc7).
+        `UPDATE tier_enrolments
+            SET status = 'active', generation = 0, binding_version = ?,
+                collect_claim = NULL, collect_started_at = NULL
+          WHERE device_code_hash = ? AND status = 'collecting' AND collect_claim = ?`,
+        // While v3 is off no client can learn an id, so a v3-only row would
+        // strand it: re-enrolled keys collect at v2 too (M4 stays open for
+        // them until v3 is turned on).
+        reEnrolled && v3On ? 3 : 2,
+        deviceCodeHash,
+        claim,
+      );
+      const [change] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+      // Our claim was reclaimed while we minted (we looked abandoned), and
+      // the reclaimer delivers. This certificate is discarded undelivered.
+      if (change.n !== 1) return false;
+      // At most one ACTIVE enrollment per key (notme-747cc7). Re-enrolling a
+      // key retires its earlier enrollments, revoked or not — kept as
+      // 'superseded' for the record. Otherwise renewal (which looks up by key)
+      // could keep counting the old enrollment's generation and read the new
+      // one's generation 0 as a fork; and a revoked old enrollment would hide
+      // the new one, though re-enrolling is how a machine recovers from a fork.
+      // Same transaction as the activation: no request sees two.
+      this.ctx.storage.sql.exec(
+        "UPDATE tier_enrolments SET status = 'superseded' WHERE key_fingerprint = ? AND status = 'active' AND device_code_hash != ?",
+        row.key_fingerprint,
+        deviceCodeHash,
+      );
+      // A re-enrolled key starts its generations over: digests recorded under
+      // an earlier enrollment of the same key must not read as this one's.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM tier_renewal_digests WHERE key_fingerprint = ?",
+        row.key_fingerprint,
+      );
+      return true;
+    });
+    if (!activated) {
+      // Signed, and with CT bound logged or backlogged, but never handed out:
+      // say so for a CT monitor (notme-b35676).
+      let serial: string[] = [];
+      try {
+        serial = [serialOf(b64ToBytes(pemToB64(result.certificate)))];
+      } catch (err) {
+        console.error({ event: "ct.not_delivered_unparseable", error: String(err) });
+      }
+      this.#recordNotDelivered(serial, "claim_taken_over");
+      return { ok: false, reason: "invalid_grant" };
+    }
+
+    return {
+      ok: true,
+      principalId: row.principal_id,
+      authMethod: row.auth_method,
+      renewUntil: row.renew_until ?? 0,
+      generation: 0,
+      ...(v3On ? { enrollmentId } : {}),
+      clone_policy: row.clone_policy,
+      criteria: criteria?.map(criteriaId) ?? null,
+      ...result,
+    };
+  }
+
+  // ── Tier renewal (notme-337d82) ─────────────────────────────────────────
+  //
+  // A machine renews its tier by proof of possession, without a human, for as
+  // long as the human's approval holds. This is the pause/resume case: a VM
+  // suspended past its tier's lifetime resumes, renews, and carries on, where
+  // before it needed a human to re-enroll — an approved action blocked on a
+  // person.
+  //
+  // Looked up by KEY, so renewal never needs the old (expired) tier cert.
+  // Refused — each for a reason a machine can act on — when the approval no
+  // longer holds: revoked, past the horizon, the epoch moved (so mass
+  // revocation still reaches machines), or the approver no longer holds
+  // certMint. The scopes renewed are the granted scopes still LIVE on the
+  // approver, so narrowing a grant narrows every machine at its next renewal.
+
+  //
+  // Generations (notme-747cc7). A v2 renewal signs the enrollment's current
+  // GENERATION; each accepted one moves it on by one. Whoever holds a copy of
+  // the key can renew too, but two holders cannot both keep up: the second to
+  // renew at g presents a generation the authority has moved past. Told
+  // apart, for a VALID proof at g < current:
+  //   - the exact request accepted at current-1, within the retry window:
+  //     the honest machine lost the response — mint again, counter unchanged;
+  //   - any other request that was accepted: a replay — stale, NOT revoked;
+  //   - a fresh request nobody accepted: a FORK — the enrollment is revoked,
+  //     because nobody can tell which holder is the honest one;
+  //   - an old request nobody accepted: stale, not revoked.
+  // A generation ahead of the authority is malformed: stale, never revoked.
+  // At g == current a valid proof is accepted with iat up to the retry
+  // window old (and no more than the skew ahead): the honest resend of a
+  // request that never arrived.
+  // Nothing is written before the proof verifies, so a stranger posting a
+  // stale generation for someone's public key cannot shut it off.
+  //
+  // The proof is verified BEFORE the enrollment row is read (notme-c9fc8c
+  // M3). Every binding is computed from the request alone, so a caller
+  // without the key learns only invalid_proof: not whether the key is
+  // enrolled (unknown_key), nor which binding its enrollment speaks
+  // (binding_v2_required / binding_v3_required).
+  //
+  // Binding v3 (notme-c9fc8c M4) adds the enrollment id, so a request signed
+  // for one enrollment of a key never counts for a re-enrollment of the same
+  // key. A row that has accepted v3 (or was collected as a re-enrollment)
+  // refuses v1 and v2; a row at v2 still accepts v2, so a client that
+  // predates v3 keeps renewing.
+
+  async renewTier(params: {
+    publicKeyPem: string;
+    iat: number;
+    proof: string;
+    generation?: number;
+    /** Hex enrollment id: selects binding v3 (with `generation`). */
+    enrollmentId?: string;
+  }): Promise<
+    | ({ ok: true; renewUntil: number; generation: number; enrollmentId?: string; criteria: string[] | null } & import("./cert-authority").IssuingCaCertResult & {
+        authority: { epoch: number; key_id: string };
+      })
+    | {
+        ok: false;
+        reason:
+          | "invalid_key"
+          | "unknown_key"
+          | "stale_proof"
+          | "invalid_proof"
+          | "revoked"
+          | "horizon_passed"
+          | "epoch_changed"
+          | "approval_withdrawn"
+          | "fork_detected"
+          | "binding_v2_required"
+          | "binding_v3_required";
+      }
+  > {
+    this.#ensureTierEnrolmentSchema();
+    const { importPublicKey } = await import("./cert-authority");
+    let key: CryptoKey;
+    try {
+      key = await importPublicKey(params.publicKeyPem);
+    } catch {
+      return { ok: false, reason: "invalid_key" };
+    }
+    if (key.algorithm.name !== "Ed25519") return { ok: false, reason: "invalid_key" };
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
+    const fingerprint = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", spki)));
+
+    const now = Math.floor(Date.now() / 1000);
+    const {
+      RENEWAL_SKEW_S,
+      RENEWAL_RETRY_WINDOW_S,
+      ENROLMENT_ID_HEX,
+      tierEnrolmentId,
+      tierRenewalBinding,
+      tierRenewalBindingV2,
+      tierRenewalBindingV3,
+      renewalRequestDigest,
+    } = await import("./auth/tier-enrolment-binding");
+    const { verifyEd25519PopProof } = await import("./auth/pop");
+    // The binding the request claims: v3 names the enrollment, v2 a
+    // generation, v1 neither.
+    const version: 1 | 2 | 3 =
+      params.enrollmentId !== undefined ? 3 : params.generation !== undefined ? 2 : 1;
+    const v2 = version >= 2; // generations: v2 and v3 alike
+    const fresh = Number.isSafeInteger(params.iat) && Math.abs(now - params.iat) <= RENEWAL_SKEW_S;
+    // At the CURRENT generation a valid proof may be up to the retry window
+    // old: a request that never reached the authority (offline on resume, a
+    // 5xx, a 429) is resent byte for byte, with its original iat. Accepting
+    // it is safe — a key holder can sign any iat, and a captured request
+    // nobody accepted only advances the counter, PROVIDED the honest client
+    // still holds that request: its resend of the same bytes then lands on
+    // the retry path. The client guarantees this by clearing a refused first
+    // attempt ONLY for a reason this authority could never reverse for the
+    // same bytes (invalid_key, invalid_proof for a v1/v2 request — a v3
+    // request refused invalid_proof is KEPT, since a rolled-back authority
+    // may not know v3 — binding_v2_required,
+    // binding_v3_required, revoked, fork_detected, horizon_passed,
+    // epoch_changed, unknown_key, a malformed body). stale_proof (judged
+    // against a clock that moves) and approval_withdrawn (judged against LIVE
+    // scopes, so a restored grant reverses it) are kept; were the client to
+    // clear either and re-sign at this generation, a replay of the cleared
+    // request would make that new request a fork.
+    const inRetryWindow =
+      Number.isSafeInteger(params.iat) &&
+      params.iat >= now - RENEWAL_RETRY_WINDOW_S &&
+      params.iat <= now + RENEWAL_SKEW_S;
+    let digest = "";
+    if (v2) {
+      // v2/v3: verify FIRST — a retry carries its original (older) iat, so
+      // freshness is decided per branch below, never before the proof.
+      const g = params.generation;
+      if (!Number.isSafeInteger(params.iat) || params.iat < 0) return { ok: false, reason: "stale_proof" };
+      if (g === undefined || !Number.isSafeInteger(g) || g < 0) return { ok: false, reason: "invalid_proof" };
+      let binding: Uint8Array;
+      if (version === 3) {
+        const id = params.enrollmentId as string;
+        if (!ENROLMENT_ID_HEX.test(id)) return { ok: false, reason: "invalid_proof" };
+        binding = tierRenewalBindingV3(spki, params.iat, g, unhex(id));
+      } else {
+        binding = tierRenewalBindingV2(spki, params.iat, g);
+      }
+      if (!(await verifyEd25519PopProof(binding, key, params.proof))) {
+        return { ok: false, reason: "invalid_proof" };
+      }
+      digest = await renewalRequestDigest(binding);
+    } else {
+      if (!Number.isSafeInteger(params.iat) || params.iat < 0) return { ok: false, reason: "stale_proof" };
+      if (!(await verifyEd25519PopProof(tierRenewalBinding(spki, params.iat), key, params.proof))) {
+        return { ok: false, reason: "invalid_proof" };
+      }
+    }
+
+    // ── Only a holder of the key gets past this line. ──
+    type Row = {
+      device_code_hash: string;
+      principal_id: string;
+      identity: string;
+      auth_method: string;
+      granted_scopes: string;
+      renew_until: number | null;
+      revoked_at: number | null;
+      revoke_reason: string | null;
+      approved_epoch: number | null;
+      public_key_pem: string;
+      generation: number;
+      binding_version: number | null;
+      criteria: string | null;
+    };
+    const readRow = () =>
+      this.ctx.storage.sql
+        .exec(
+          "SELECT * FROM tier_enrolments WHERE key_fingerprint = ? AND status = 'active' ORDER BY renew_until DESC LIMIT 1",
+          fingerprint,
+        )
+        .toArray()[0] as Row | undefined;
+    const row = readRow();
+    if (!row) return { ok: false, reason: "unknown_key" };
+    const enrollmentId = hex(await tierEnrolmentId(unhex(row.device_code_hash)));
+    // A v3 request signed for ANOTHER enrollment of this key (one since
+    // superseded) is not a request for this one: answered as if the key had
+    // no enrollment, and nothing about this one changes.
+    if (version === 3 && params.enrollmentId !== enrollmentId) return { ok: false, reason: "unknown_key" };
+    // A request below the row's binding is refused by name, so the machine
+    // says "update task-cert", not "approval ended". v1 neither checks nor
+    // advances the generation, so a copied key could renew around the fork
+    // check with it; v2 does not name the enrollment. NULL (a legacy row)
+    // accepts all three; the first v2 or v3 renewal raises it.
+    if (row.binding_version === 3 && version < 3) {
+      // A VALID proof from this key that the current client would not sign
+      // (it speaks v3): a copied key without tier.json, or a downgraded
+      // binary. Not revoked, since the two look the same, but made visible
+      // (review L1).
+      this.#recordBelowBinding({ fingerprint, version, rowVersion: 3, generation: params.generation, current: row.generation });
+      return { ok: false, reason: "binding_v3_required" };
+    }
+    if (row.binding_version === 2 && version < 2) return { ok: false, reason: "binding_v2_required" };
+    if (!v2 && !inRetryWindow) return { ok: false, reason: "stale_proof" };
+
+    const revokedReason = (r: Row) =>
+      (r.revoke_reason === "fork_detected" ? "fork_detected" : "revoked") as "fork_detected" | "revoked";
+    if (row.revoked_at !== null) return { ok: false, reason: revokedReason(row) };
+    if (row.renew_until === null || row.renew_until <= now) return { ok: false, reason: "horizon_passed" };
+    const state = await this.getAuthorityState();
+    if (row.approved_epoch === null || row.approved_epoch !== state.epoch) {
+      return { ok: false, reason: "epoch_changed" };
+    }
+    const live = new Set(await this.getPrincipalScopes(row.principal_id));
+    if (!live.has("certMint")) return { ok: false, reason: "approval_withdrawn" };
+    const scopes = (JSON.parse(row.granted_scopes) as string[]).filter((s) => live.has(s));
+    if (scopes.length === 0) return { ok: false, reason: "approval_withdrawn" };
+
+    let generation = row.generation;
+    if (v2) {
+      const decided = this.#decideRenewalGeneration({
+        row,
+        readRow,
+        fingerprint,
+        generation: params.generation as number,
+        version: version as 2 | 3,
+        iat: params.iat,
+        digest,
+        fresh,
+        inRetryWindow,
+        now,
+        retryWindowS: RENEWAL_RETRY_WINDOW_S,
+      });
+      if (!decided.ok) return { ok: false, reason: decided.reason };
+      generation = decided.generation;
+    }
+
+    // Never past the horizon the human set.
+    const ttlMs = Math.min(60 * 60 * 1000, (row.renew_until - now) * 1000);
+    // The same criteria as at collect, never re-judged: they were checked
+    // grantable at approval. A legacy (NULL) row stays without .1.10.
+    const criteria = storedCriteria(row.criteria);
+    const { criteriaId } = await import("./criteria");
+    const result = await this.mintIssuingCa({
+      subject: row.principal_id,
+      identity: row.identity,
+      publicKeyPem: row.public_key_pem,
+      scopes,
+      authMethod: row.auth_method,
+      ttlMs,
+      ...(criteria ? { criteria } : {}),
+    });
+    // With RENEWAL_BINDING_V3 "on" (review M1),
+    // enrollmentId on every renewal, v1 and v2 included: a machine collected
+    // before v3 learns it here, and its next renewal signs v3.
+    return {
+      ok: true,
+      renewUntil: row.renew_until,
+      generation,
+      ...(this.env.RENEWAL_BINDING_V3 === "on" ? { enrollmentId } : {}),
+      criteria: criteria?.map(criteriaId) ?? null,
+      ...result,
+    };
+  }
+
+  /** Renewal health (review L1): verified proofs below the binding their enrollment speaks. */
+  #ensureRenewalHealth(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tier_renewal_health (
+        id                    TEXT PRIMARY KEY DEFAULT 'renewal',
+        below_binding_count   INTEGER NOT NULL DEFAULT 0,
+        below_binding_last_at INTEGER NOT NULL DEFAULT 0,
+        below_binding_last    TEXT    NOT NULL DEFAULT ''
+      )
+    `);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO tier_renewal_health (id) VALUES ('renewal')");
+  }
+
+  /** Log and count a verified renewal below its row's binding. Never throws. */
+  #recordBelowBinding(e: {
+    fingerprint: string;
+    version: number;
+    rowVersion: number;
+    generation: number | undefined;
+    current: number;
+  }): void {
+    console.warn({
+      event: "tier.renew_below_binding",
+      fingerprint: e.fingerprint,
+      version: e.version,
+      row_version: e.rowVersion,
+      generation: e.generation ?? null,
+      current: e.current,
+    });
+    try {
+      this.#ensureRenewalHealth();
+      const g = e.generation === undefined ? "none" : String(e.generation);
+      this.ctx.storage.sql.exec(
+        "UPDATE tier_renewal_health SET below_binding_count = below_binding_count + 1, below_binding_last_at = ?, below_binding_last = ? WHERE id = 'renewal'",
+        Math.floor(Date.now() / 1000),
+        `key ${e.fingerprint.slice(0, 16)}: v${e.version} against binding ${e.rowVersion} (generation ${g}, current ${e.current})`,
+      );
+    } catch (err) {
+      console.error({ event: "tier.renewal_health_write_failed", error: String(err) });
+    }
+  }
+
+  /** /join health (ADR-023 D5): joins that used the plain shared audience. */
+  #ensureJoinHealth(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS join_health (
+        id                   TEXT PRIMARY KEY DEFAULT 'join',
+        plain_count          INTEGER NOT NULL DEFAULT 0,
+        plain_last_at        INTEGER NOT NULL DEFAULT 0,
+        plain_last_issuer    TEXT    NOT NULL DEFAULT ''
+      )
+    `);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO join_health (id) VALUES ('join')");
+  }
+
+  /** Log (issuer only, never the subject) and count a plain-audience join. Never throws. */
+  #recordPlainAudienceJoin(issuer: string): void {
+    console.warn({ event: "join.plain_audience", issuer });
+    try {
+      this.#ensureJoinHealth();
+      this.ctx.storage.sql.exec(
+        "UPDATE join_health SET plain_count = plain_count + 1, plain_last_at = ?, plain_last_issuer = ? WHERE id = 'join'",
+        Math.floor(Date.now() / 1000),
+        issuer,
+      );
+    } catch (err) {
+      console.error({ event: "join.health_write_failed", error: String(err) });
+    }
+  }
+
+  #readJoinHealth(): JoinHealth {
+    this.#ensureJoinHealth();
+    const h = this.ctx.storage.sql
+      .exec("SELECT plain_count, plain_last_at, plain_last_issuer FROM join_health WHERE id = 'join'")
+      .toArray()[0] as { plain_count: number; plain_last_at: number; plain_last_issuer: string };
+    return { plainAudience: { count: h.plain_count, lastAt: h.plain_last_at, lastIssuer: h.plain_last_issuer } };
+  }
+
+  #readRenewalHealth(): RenewalHealth {
+    this.#ensureRenewalHealth();
+    const h = this.ctx.storage.sql
+      .exec("SELECT below_binding_count, below_binding_last_at, below_binding_last FROM tier_renewal_health WHERE id = 'renewal'")
+      .toArray()[0] as { below_binding_count: number; below_binding_last_at: number; below_binding_last: string };
+    return {
+      belowBinding: { count: h.below_binding_count, lastAt: h.below_binding_last_at, last: h.below_binding_last },
+    };
+  }
+
+  /**
+   * The generation decision for a VERIFIED v2 renewal. Synchronous on
+   * purpose: no await between reading the counter, claiming it and recording
+   * the digest, so no other request interleaves inside it. Returns the
+   * generation the machine must sign next, or why not.
+   */
+  #decideRenewalGeneration(p: {
+    row: { device_code_hash: string; generation: number };
+    readRow: () => { generation: number; revoked_at: number | null; revoke_reason: string | null } | undefined;
+    fingerprint: string;
+    generation: number;
+    /** The request's binding, 2 or 3: what the claim raises binding_version to. */
+    version: 2 | 3;
+    iat: number;
+    digest: string;
+    fresh: boolean;
+    /** iat ∈ [now − retry window, now + skew]: what the CURRENT generation accepts. */
+    inRetryWindow: boolean;
+    now: number;
+    retryWindowS: number;
+  }): { ok: true; generation: number } | { ok: false; reason: "stale_proof" | "fork_detected" | "revoked" } {
+    const sql = this.ctx.storage.sql;
+    const g = p.generation;
+    if (g > p.row.generation) return { ok: false, reason: "stale_proof" };
+    if (g === p.row.generation) {
+      if (!p.inRetryWindow) return { ok: false, reason: "stale_proof" };
+      // The row was read before this request's awaits, so another renewal
+      // may have claimed g since: the generation guard is what makes exactly
+      // one of two concurrent claims win.
+      // The binding guard does the same for the version: a v2 claim never
+      // lands on a row a concurrent v3 renewal raised to 3 meanwhile.
+      sql.exec(
+        `UPDATE tier_enrolments SET generation = generation + 1, binding_version = ?
+          WHERE device_code_hash = ? AND key_fingerprint = ? AND status = 'active'
+            AND revoked_at IS NULL AND generation = ?
+            AND (binding_version IS NULL OR binding_version <= ?)`,
+        p.version,
+        p.row.device_code_hash,
+        p.fingerprint,
+        g,
+        p.version,
+      );
+      const [c] = [...sql.exec<{ n: number }>("SELECT changes() AS n")];
+      if (c.n === 1) {
+        sql.exec(
+          "INSERT OR REPLACE INTO tier_renewal_digests (key_fingerprint, generation, digest, iat) VALUES (?, ?, ?, ?)",
+          p.fingerprint,
+          g,
+          p.digest,
+          p.iat,
+        );
+        return { ok: true, generation: g + 1 };
+      }
+      // The other side won the claim: decide as a stale generation.
+    }
+    // Re-read: another renewal may have advanced, or revoked, the row since.
+    const current = p.readRow();
+    if (!current) return { ok: false, reason: "revoked" };
+    if (current.revoked_at !== null) {
+      return { ok: false, reason: current.revoke_reason === "fork_detected" ? "fork_detected" : "revoked" };
+    }
+    return this.#staleGeneration({ ...p, current: current.generation });
+  }
+
+  /** A verified v2 renewal at g < current: retry, replay, or fork. */
+  #staleGeneration(p: {
+    row: { device_code_hash: string };
+    fingerprint: string;
+    generation: number;
+    iat: number;
+    digest: string;
+    fresh: boolean;
+    now: number;
+    retryWindowS: number;
+    current: number;
+  }): { ok: true; generation: number } | { ok: false; reason: "stale_proof" | "fork_detected" } {
+    const sql = this.ctx.storage.sql;
+    const g = p.generation;
+    if (g >= p.current) return { ok: false, reason: "stale_proof" };
+    const recorded = sql
+      .exec<{ digest: string }>(
+        "SELECT digest FROM tier_renewal_digests WHERE key_fingerprint = ? AND generation = ?",
+        p.fingerprint,
+        g,
+      )
+      .toArray()[0];
+    if (recorded && recorded.digest === p.digest) {
+      // The exact request already accepted. A retry only for the latest
+      // generation and within the window; otherwise a harmless replay.
+      if (g === p.current - 1 && p.now - p.iat <= p.retryWindowS) {
+        return { ok: true, generation: p.current };
+      }
+      return { ok: false, reason: "stale_proof" };
+    }
+    if (!p.fresh) return { ok: false, reason: "stale_proof" };
+    // A fresh, valid request at a generation already spent by a DIFFERENT
+    // request: two holders of one key. Shut the enrollment off.
+    sql.exec(
+      `UPDATE tier_enrolments SET revoked_at = ?, revoke_reason = 'fork_detected'
+        WHERE device_code_hash = ? AND status = 'active' AND revoked_at IS NULL`,
+      p.now,
+      p.row.device_code_hash,
+    );
+    return { ok: false, reason: "fork_detected" };
+  }
+
+  /** A principal's enrolled machines — what the human approved, and its state. */
+  async listTierEnrolments(principalId: string): Promise<
+    Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; revoke_reason: string | null; scopes: string[]; clone_policy: string; generation: number; criteria: string[] | null }>
+  > {
+    this.#ensureTierEnrolmentSchema();
+    // revoke_reason (null unless revoked, e.g. fork_detected) so the human sees WHY a machine stopped.
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT key_fingerprint, status, renew_until, revoked_at, revoke_reason, granted_scopes, clone_policy, generation, criteria FROM tier_enrolments WHERE principal_id = ? AND status = 'active'",
+        principalId,
+      )
+      .toArray() as Array<{ key_fingerprint: string; status: string; renew_until: number | null; revoked_at: number | null; revoke_reason: string | null; granted_scopes: string; clone_policy: string; generation: number; criteria: string | null }>;
+    const { criteriaId } = await import("./criteria");
+    return rows.map(({ granted_scopes, criteria, ...r }) => ({
+      ...r,
+      revoke_reason: r.revoked_at === null ? null : (r.revoke_reason ?? null),
+      scopes: JSON.parse(granted_scopes),
+      criteria: storedCriteria(criteria)?.map(criteriaId) ?? null,
+    }));
+  }
+
+  /**
+   * Stop a machine renewing. The ROUTE decides who may: the approver, or an
+   * administrator (`anyPrincipal`). Its current tier lives out its (≤1 h)
+   * lifetime; renewal is what this ends.
+   */
+  async revokeTierEnrolment(params: {
+    keyFingerprint: string;
+    byPrincipal: string;
+    anyPrincipal: boolean;
+  }): Promise<{ ok: boolean }> {
+    this.#ensureTierEnrolmentSchema();
+    this.ctx.storage.sql.exec(
+      `UPDATE tier_enrolments SET revoked_at = ?
+        WHERE key_fingerprint = ? AND status = 'active' AND revoked_at IS NULL
+          AND (? = 1 OR principal_id = ?)`,
+      Math.floor(Date.now() / 1000),
+      params.keyFingerprint,
+      params.anyPrincipal ? 1 : 0,
+      params.byPrincipal,
+    );
+    const [c] = [...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n")];
+    return { ok: c.n > 0 };
   }
 
   // Current epoch and keyId for embedding in issued certs.
@@ -1286,7 +4415,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     keyId: string;
   }> {
     this.#ensureSchema();
-    const { keyId } = await this.getOrCreateSigningKey();
+    const { keyId } = await this.#getOrCreateSigningKey();
     const rows = this.ctx.storage.sql
       .exec("SELECT epoch, seqno FROM state WHERE id = 'authority'")
       .toArray() as Array<{ epoch: number; seqno: number }>;
@@ -1297,8 +4426,30 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // Generate a signed CABundle for the revocation verifier.
   // Caller writes this to CA_BUNDLE_CACHE KV.
   async generateBundle(): Promise<CABundle> {
-    const { signingKey, keyId } = await this.getOrCreateSigningKey();
-    const pubKeyB64 = await this.getPublicKeyRawB64();
+    // Restart once if a rotate() committed during the export (review L4),
+    // as cold start and #withMintRetry retry a moved state; a second move
+    // in a row is refused rather than looped on.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const bundle = await this.#generateBundleOnce();
+      if (bundle) return bundle;
+    }
+    throw new Error(
+      "bundle refused: the authority key changed twice while the bundle was built; retry",
+    );
+  }
+
+  /** One attempt; null when the key moved under the export await. */
+  async #generateBundleOnce(): Promise<CABundle | null> {
+    const { signingKey, verifyKey, keyId } = await this.#getOrCreateSigningKey();
+    // The public half of the SAME key that signs below — not a second
+    // #getOrCreateSigningKey() read, which could name a key a rotate()
+    // committed in between.
+    const pubKeyB64 = await rawPublicKeyB64(verifyKey);
+    // Past that await, before the synchronous seqno and prev-key reads: a
+    // rotate() that committed meanwhile would otherwise get a bundle naming
+    // the retired key as current, with its own prev record dropped
+    // (prevKeyId === keyId) and a seqno above the rotation's (review L4).
+    if (this.#getKeyId() !== keyId) return null;
 
     this.#ensureSchema();
 
@@ -1318,10 +4469,10 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // `keys` and `prevKeyId`, so consumers can resolve the prev key AND the
     // revocation check (token.keyId === bundle.prevKeyId) sees it.
     const keys: Record<string, string> = { [keyId]: pubKeyB64 };
-    const prevKeyId =
-      (await this.ctx.storage.get<string>("prevKeyId")) ?? undefined;
-    const prevPubKey =
-      (await this.ctx.storage.get<string>("prevPubKey")) ?? undefined;
+    // Synchronous KV (same `__cf_kv` store the async API wrote before
+    // notme-b54368), so rotate() can write both inside its transaction.
+    const prevKeyId = this.ctx.storage.kv.get<string>("prevKeyId") ?? undefined;
+    const prevPubKey = this.ctx.storage.kv.get<string>("prevPubKey") ?? undefined;
     const hasPrev = !!prevKeyId && prevKeyId !== keyId && !!prevPubKey;
     if (hasPrev) keys[prevKeyId] = prevPubKey;
 
@@ -1347,63 +4498,397 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return { ...bundle, signature: sigB64 } as CABundle;
   }
 
-  // Rotate the CA key. Increments epoch, generates new keypair.
-  // Previous keyId is preserved in the bundle as prevKeyId for graceful transition.
+  /**
+   * Replace the CA key. Does NOT move the epoch (notme-77a024).
+   *
+   * Epoch and key identity are independent axes, and conflating them cost
+   * notme both levers at once:
+   *
+   *   - A ROUTINE ROTATION became a mass revocation nobody asked for.
+   *     `checkRevocation` tests epoch (step 5) before keyId (step 6), so
+   *     every token minted before the rotation died on `epoch_mismatch` and
+   *     the republished `prevKeyId` grace window built for notme-54f84b
+   *     guarded a branch no token could enter.
+   *   - A MASS REVOCATION required destroying the signing key, the one
+   *     irreversible action available — which past the archive's retention
+   *     made the actor's own receipts unverifiable. A lever that costs an
+   *     audit trail does not get pulled.
+   *
+   * So: rotation is about which key signs, `revokeEpoch()` is about which
+   * credentials are still good, and the grace window now works because a
+   * pre-rotation token carries the SAME epoch and a `prevKeyId` match.
+   *
+   * seqno still advances: the published bundle genuinely changed, and the
+   * rollback-protection DO must refuse the pre-rotation bundle afterwards.
+   */
   async rotate(): Promise<{ newKeyId: string; epoch: number }> {
     this.#ensureSchema();
-    const oldKeyId = this.#getKeyId();
-    // Capture the old PUBLIC key BEFORE deleting it. The grace window needs it
-    // published (generateBundle above) so tokens the old key signed still verify
-    // until they expire; storing only the id (prevKeyId) left the pubkey gone
-    // and the grace window broken (notme-54f84b).
-    const oldPubKeyB64 = await this.getPublicKeyRawB64();
+    // ATOMIC (notme-b54368). This used to archive the old key, DELETE it,
+    // generate the new one across several awaits and then write prevKeyId
+    // and prevPubKey with two separately awaited puts. A throw or eviction
+    // anywhere after the DELETE left the authority with NO key row — the next
+    // call silently generated an unrelated key — and with no grace record.
+    // Cloudflare's SQLite storage API: transactionSync "rolls back" if its
+    // callback throws, and "only synchronous storage operations can be part
+    // of the transaction". So every await happens first, then every write
+    // commits together in one transactionSync, and the in-memory key switches
+    // in the same synchronous run — nothing can interleave between storage
+    // naming the new key and this isolate signing with it.
 
-    // Archive the outgoing PUBLIC key by epoch BEFORE the delete (ADR-014).
-    //
-    // Ordering is the whole point: after the DELETE below there is nothing
-    // left to archive, and the prevPubKey slot written further down holds
-    // exactly one generation. Receipts must stay verifiable for arbitrary
-    // later audit (RECEIPTS.md §2.3), so the key that signed epoch N has to
-    // survive epochs N+2, N+3, … — otherwise the actor voids its own evidence
-    // by rotating twice.
-    //
-    // INSERT OR IGNORE, not REPLACE: an epoch's public key is immutable once
-    // recorded. Overwriting one would rewrite history, which is precisely the
-    // capability an audit trail exists to deny.
-    const oldEpochRows = this.ctx.storage.sql
-      .exec("SELECT epoch FROM state WHERE id = 'authority'")
-      .toArray() as Array<{ epoch: number }>;
-    this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO retired_keys (epoch, key_id, public_raw, retired_at) VALUES (?, ?, ?, ?)",
-      oldEpochRows[0]!.epoch,
-      oldKeyId,
-      oldPubKeyB64,
-      Math.floor(Date.now() / 1000),
+    // ── Async half: the outgoing key (loaded, or created on a fresh
+    // authority), its public bytes, and the new key. No storage writes. ──
+    const old = await this.#getOrCreateSigningKey();
+    // The grace window needs the old PUBLIC key published (generateBundle)
+    // so tokens it signed still verify until they expire; storing only the
+    // id left the pubkey gone and the grace window broken (notme-54f84b).
+    const oldPubKeyB64 = await rawPublicKeyB64(old.verifyKey);
+    const fresh = await this.#generateKeyMaterial();
+
+    // ── Synchronous half: one transaction. ──
+    const epoch = this.ctx.storage.transactionSync(() => {
+      // The key captured above must still be the live one. A concurrent
+      // rotate() that committed during the awaits would otherwise have its
+      // key deleted unarchived — and that key may already have signed.
+      const cur = this.#readKeyRow();
+      if (!cur || cur.key_id !== old.keyId || this.#signingKey !== old.signingKey) {
+        throw new Error(
+          "rotate refused: the authority key changed while this rotation was prepared " +
+            "(a concurrent rotate?); nothing was written — retry",
+        );
+      }
+      const [{ epoch: untilEpoch }] = this.ctx.storage.sql
+        .exec("SELECT epoch FROM state WHERE id = 'authority'")
+        .toArray() as Array<{ epoch: number }>;
+
+      // Archive the outgoing PUBLIC key BEFORE the delete (ADR-014).
+      //
+      // Receipts must stay verifiable for arbitrary later audit (RECEIPTS.md
+      // §2.3), so the key that signed epoch N has to survive epochs N+2,
+      // N+3, … — otherwise the actor voids its own evidence by rotating
+      // twice. The prevPubKey slot below holds exactly one generation.
+      //
+      // INSERT OR IGNORE, not REPLACE: a key's public record is immutable
+      // once written. Overwriting one would rewrite history, which is
+      // precisely the capability an audit trail exists to deny.
+      //
+      // The span, not one epoch: this key may have signed across a
+      // `revokeEpoch()`, so `from_epoch` is where it started and
+      // `until_epoch` is the generation current as it retires.
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO retired_keys (key_id, public_raw, from_epoch, until_epoch, retired_at) VALUES (?, ?, ?, ?, ?)",
+        old.keyId,
+        oldPubKeyB64,
+        cur.from_epoch,
+        untilEpoch,
+        Math.floor(Date.now() / 1000),
+      );
+      this.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");
+      // The new key INHERITS the current epoch (notme-77a024).
+      this.ctx.storage.sql.exec(
+        "INSERT INTO keys (id, private_jwk, public_spki, key_id, from_epoch) VALUES ('authority', ?, ?, ?, ?)",
+        fresh.storedPrivate,
+        fresh.publicSpkiB64,
+        fresh.keyId,
+        untilEpoch,
+      );
+      // seqno only. The epoch belongs to revokeEpoch().
+      this.ctx.storage.sql.exec(
+        "UPDATE state SET seqno = seqno + 1 WHERE id = 'authority'",
+      );
+      // The grace record — both halves, written together (generateBundle
+      // republishes the previous key from them). The synchronous KV API is
+      // the same `__cf_kv` store the async put() used, so existing
+      // deployments' records read back unchanged, and unlike put() it can
+      // be part of this transaction.
+      this.ctx.storage.kv.put("prevKeyId", old.keyId);
+      this.ctx.storage.kv.put("prevPubKey", oldPubKeyB64);
+      return untilEpoch;
+    });
+    this.#signingKey = fresh.signingKey;
+    this.#verifyKey = fresh.verifyKey;
+
+    // Publish straight away, as revokeEpoch() does (notme-ed6114, re-review
+    // NEW-1). The KV bundle is what verifiers and the trust-anchor gates
+    // read the CURRENT key from; left alone it named the old key until the
+    // next alarm or its staleness window, while the edge also still served
+    // the old root — so the two agreed and a release could sign it. After
+    // the commit, so the bundle carries the grace-window key too.
+    await this.#publishBundle();
+
+    return { newKeyId: fresh.keyId, epoch };
+  }
+
+  /**
+   * Advance the revocation generation: void every credential issued so far,
+   * keep the signing key (notme-77a024).
+   *
+   * This is the unit between "wait for expiry" and "there is no lever". Every
+   * tier of the chain already carries `OID_EPOCH` and every verifier checks
+   * it, so a bump invalidates outstanding certificates and tokens at their
+   * next verification without the authority enumerating them.
+   *
+   * WHAT IT IS NOT. Class-level, never targeted: it cannot revoke one task,
+   * one tier, or one principal.
+   *
+   * CORRECTION to the first version of this comment, which claimed the
+   * targeted job was already covered by "the chain — revoke a tier and every
+   * task cert beneath it fails path validation by issuer, intrinsic X.509, no
+   * index required". The X.509 mechanics are right and the LEVER DOES NOT
+   * EXIST: there is no CRL, no OCSP, and no per-certificate status anywhere
+   * in this repo, and the published bundle carries only epoch, seqno, keys,
+   * keyId, prevKeyId and issuedAt — no revoked-serial list. Nothing can mark
+   * one tier revoked, so nothing beneath one falls. That claim also
+   * contradicted the paragraph directly above it in ADR-019, which had
+   * always said the honest version: TTL-only for anything finer than an
+   * epoch.
+   *
+   * So the levers that EXIST are this one and the grant (`liveScopes` at the
+   * authorization gate, which governs what a session may do — not the
+   * validity of a certificate already in someone's hands). Killing one task
+   * or one machine is the open hole, and the shape ADR-019 D7 commits to is
+   * a renewal predicate rather than a revocation list.
+   *
+   * THE KEY SURVIVES, deliberately. Receipts naming earlier epochs stay
+   * verifiable, which is the difference between revoking credentials and
+   * destroying evidence. Interlace RECEIPTS.md §2.3 makes historical
+   * resolution a MUST precisely so an actor cannot defeat an audit by
+   * rotating; a revocation lever that forced a rotation handed that back.
+   *
+   * CALLERS SEE `EPOCH_MISMATCH` and retry once against fresh
+   * `getReceiptFacts()` — the one retryable code, already specified for this
+   * shape (ADR-014). Its one HTTP door is the admin-gated
+   * `POST /admin/revoke-epoch` (ADR-019 D7); `rotate()` has none. Any door
+   * onto mass revocation is a denial-of-service surface with an
+   * authentication bug away from being free, so that route stays behind the
+   * authorityManage admin check.
+   */
+  async revokeEpoch(reason?: string): Promise<{ epoch: number; seqno: number }> {
+    this.#ensureSchema();
+    // The reason is published verbatim in /.well-known/epochs.json, so it is
+    // checked here too, not only at the route: this is an RPC method.
+    const why = normalizeRevocationReason(reason);
+    if (why === null) {
+      throw new Error(
+        "revokeEpoch refused: reason must be 1-200 characters with no control characters; nothing was written",
+      );
+    }
+    this.#ensureEpochHistorySchema();
+    // ONE transaction (notme-6a4f23): the epoch moves and the record of what
+    // ended it commits together, or neither does. A bump without its row
+    // would read as "ended, time unknown" to every verifier.
+    const ended = this.ctx.storage.transactionSync(() => {
+      const [{ epoch: current }] = this.ctx.storage.sql
+        .exec("SELECT epoch FROM state WHERE id = 'authority'")
+        .toArray() as Array<{ epoch: number }>;
+      this.ctx.storage.sql.exec(
+        "UPDATE state SET epoch = epoch + 1 WHERE id = 'authority'",
+      );
+      // The epochs.json seqno reserved WITH the revocation (notme-8befcc):
+      // every document signed after this commit has a larger one and reads
+      // this row, so the statement can say "any history past this seqno
+      // carries me" and a verifier can hold the authority to it.
+      const historySeqno = this.#reserveHistorySeqno();
+      this.ctx.storage.sql.exec(
+        "INSERT INTO epoch_revocations (epoch, revoked_at, reason, history_seqno) VALUES (?, ?, ?, ?)",
+        current,
+        Math.floor(Date.now() / 1000),
+        why,
+        historySeqno,
+      );
+      return current;
+    });
+    // AFTER the commit, and never able to undo it (notme-8befcc): sign the
+    // revocation's statement now, while the key that signs epochs.json is
+    // the one that was live when it happened. A failure here leaves the row
+    // without a statement, and the alarm signs it later.
+    try {
+      await this.#signRevocationStatement(ended);
+    } catch (err) {
+      console.error({ event: "rekor.statement_sign_failed", epoch: ended, error: String(err) });
+    }
+    // Publish straight away: the bundle is how a verifier learns the epoch
+    // moved, so leaving it stale makes the lever a no-op until the next
+    // alarm fires — and an alarm is exactly what cannot be relied on here
+    // (production once measured totalFires: 0 for 130 days, notme-4896d8).
+    // The returned numbers come FROM the published bundle, because
+    // generateBundle() advances seqno itself and the operator needs the
+    // generation a verifier will actually read.
+    const bundle = await this.#publishBundle();
+    const { epoch, seqno } = bundle;
+    console.warn({ event: "authority.epoch_revoked", epoch, seqno, revokedEpoch: ended, reason: why });
+    // One immediate submission to Rekor, after the commit AND the publish,
+    // so nothing about the log can delay or undo either. Bounded
+    // (REKOR_TIMEOUT_MS) and never throws: an outage leaves the row pending
+    // and the alarm retries it (#drainRekor).
+    try {
+      await this.#drainRekor({ only: ended });
+    } catch (err) {
+      console.error({ event: "rekor.submit_failed", epoch: ended, error: String(err) });
+    }
+    return { epoch, seqno };
+  }
+
+  // ── Revocation transparency: Rekor (notme-8befcc) ──
+  //
+  // Each revocation's root-signed DSSE statement (rekor-revocation.ts) is
+  // logged once in Rekor, AFTER revokeEpoch() commits. Pending rows are
+  // retried from alarm() with bounded exponential backoff and never
+  // abandoned: a revocation is rare and its log entry is permanent evidence,
+  // so a long outage costs about one request an hour per pending
+  // revocation, not the record.
+
+  /** Requests are bounded per attempt; revokeEpoch's response waits at most this (x2 on a 409). */
+  static readonly REKOR_TIMEOUT_MS = 5_000;
+  /** Backoff after the n-th failure: REKOR_RETRY_BASE_S * 2^(n-1), capped at REKOR_RETRY_MAX_S. */
+  static readonly REKOR_RETRY_BASE_S = 4 * 60;
+  // 1 h, not 6 h (notme-a3804c, review L2): at 6 h the first try after a
+  // long Rekor outage could come 6 h after it ended. Revocations are rare,
+  // so an hourly retry of each pending one costs nothing.
+  static readonly REKOR_RETRY_MAX_S = 60 * 60;
+  /** Rows attempted per alarm fire. */
+  static readonly REKOR_DRAIN_BATCH = 5;
+
+  /** Epochs with a submission in flight in this instance, so the alarm and revokeEpoch never send one twice. */
+  #rekorInFlight = new Set<number>();
+
+  /** Sign `epoch`'s revocation statement with the live root key, once. Idempotent. */
+  async #signRevocationStatement(epoch: number): Promise<void> {
+    this.#ensureEpochHistorySchema();
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT revoked_at, reason, history_seqno, statement FROM epoch_revocations WHERE epoch = ?",
+        epoch,
+      )
+      .toArray()[0] as
+      | { revoked_at: number; reason: string; history_seqno: number; statement: string | null }
+      | undefined;
+    if (!row || row.statement !== null) return;
+    // The root signs through the existing path: the non-extractable
+    // CryptoKey stays in this object, and rekor-revocation.ts only ever sees
+    // a signer callback.
+    const { signingKey, verifyKey, keyId } = await this.#getOrCreateSigningKey();
+    const rootPub = await rawPublicKeyB64(verifyKey);
+    if (this.#getKeyId() !== keyId) return; // rotated mid-sign: the next attempt signs with the new key
+    const envelope = await signRevocationStatement(
+      {
+        epoch,
+        revokedAt: row.revoked_at,
+        reason: row.reason,
+        historySeqno: row.history_seqno,
+        rootKeyId: keyId,
+      },
+      rootPub,
+      (message) => crypto.subtle.sign(ED25519, signingKey, message),
     );
-
-    // Delete old key
-    this.ctx.storage.sql.exec("DELETE FROM keys WHERE id = 'authority'");
-    this.#signingKey = null;
-    this.#verifyKey = null;
-
-    // Increment epoch
+    // `statement IS NULL`: the first signature stands, so a statement already
+    // sent to the log is never replaced by a different one.
     this.ctx.storage.sql.exec(
-      "UPDATE state SET epoch = epoch + 1, seqno = seqno + 1 WHERE id = 'authority'",
+      "UPDATE epoch_revocations SET statement = ?, statement_key = ? WHERE epoch = ? AND statement IS NULL",
+      JSON.stringify(envelope),
+      rootPub,
+      epoch,
     );
+  }
 
-    // Generate new key (getOrCreateSigningKey will create since we deleted)
-    const { keyId: newKeyId } = await this.getOrCreateSigningKey();
+  /**
+   * Sign any unsigned statements, then submit pending ones to Rekor.
+   * `only`: just that epoch, ignoring backoff (revokeEpoch's immediate try).
+   * Otherwise (the alarm): up to REKOR_DRAIN_BATCH pending rows whose backoff
+   * has passed. With REKOR_SUBMIT=off it signs and sends nothing. Never
+   * throws per row; failures are recorded on the row.
+   */
+  async #drainRekor(opts: { only?: number } = {}): Promise<void> {
+    this.#ensureEpochHistorySchema();
+    const sql = this.ctx.storage.sql;
+    const rows = (
+      opts.only === undefined
+        ? sql.exec(
+            "SELECT epoch, statement, rekor_attempts, rekor_last_attempt_at FROM epoch_revocations WHERE rekor_log_index IS NULL ORDER BY epoch ASC",
+          )
+        : sql.exec(
+            "SELECT epoch, statement, rekor_attempts, rekor_last_attempt_at FROM epoch_revocations WHERE rekor_log_index IS NULL AND epoch = ?",
+            opts.only,
+          )
+    ).toArray() as Array<{
+      epoch: number;
+      statement: string | null;
+      rekor_attempts: number;
+      rekor_last_attempt_at: number | null;
+    }>;
 
-    // Store prevKeyId + prevPubKey for the transition window (both needed so
-    // generateBundle can republish the previous key for grace-window verify).
-    await this.ctx.storage.put("prevKeyId", oldKeyId);
-    await this.ctx.storage.put("prevPubKey", oldPubKeyB64);
+    for (const row of rows) {
+      if (row.statement === null) {
+        try {
+          await this.#signRevocationStatement(row.epoch);
+        } catch (err) {
+          console.error({ event: "rekor.statement_sign_failed", epoch: row.epoch, error: String(err) });
+        }
+      }
+    }
+    if (this.env.REKOR_SUBMIT === "off") return;
 
-    const rows = this.ctx.storage.sql
-      .exec("SELECT epoch FROM state WHERE id = 'authority'")
-      .toArray() as Array<{ epoch: number }>;
+    const now = Math.floor(Date.now() / 1000);
+    const due = rows.filter((r) => {
+      if (opts.only !== undefined || r.rekor_last_attempt_at === null) return true;
+      const wait = Math.min(
+        SigningAuthority.REKOR_RETRY_BASE_S * 2 ** Math.max(0, r.rekor_attempts - 1),
+        SigningAuthority.REKOR_RETRY_MAX_S,
+      );
+      return now >= r.rekor_last_attempt_at + wait;
+    });
 
-    return { newKeyId, epoch: rows[0]!.epoch };
+    for (const r of due.slice(0, SigningAuthority.REKOR_DRAIN_BATCH)) {
+      if (this.#rekorInFlight.has(r.epoch)) continue;
+      // Re-read: the statement may have been signed just above.
+      const cur = sql
+        .exec(
+          "SELECT statement, statement_key, rekor_log_index FROM epoch_revocations WHERE epoch = ?",
+          r.epoch,
+        )
+        .toArray()[0] as { statement: string | null; statement_key: string | null; rekor_log_index: number | null };
+      if (!cur || cur.rekor_log_index !== null || cur.statement === null || cur.statement_key === null) continue;
+      this.#rekorInFlight.add(r.epoch);
+      try {
+        const result = await submitToRekor({
+          baseUrl: this.env.REKOR_URL || DEFAULT_REKOR_URL,
+          // The public-Rekor guard (notme-a3804c): a non-production
+          // authority's statement never reaches the public log.
+          authorityUrl: this.env.SIGNET_AUTHORITY_URL,
+          envelope: JSON.parse(cur.statement) as DsseEnvelope,
+          rootPublicRawB64: cur.statement_key,
+          timeoutMs: SigningAuthority.REKOR_TIMEOUT_MS,
+        });
+        const at = Math.floor(Date.now() / 1000);
+        if (result.ok) {
+          sql.exec(
+            "UPDATE epoch_revocations SET rekor_log_index = ?, rekor_uuid = ?, rekor_integrated_time = ?, rekor_last_attempt_at = ?, rekor_last_error = NULL WHERE epoch = ? AND rekor_log_index IS NULL",
+            result.logIndex,
+            result.uuid,
+            result.integratedTime,
+            at,
+            r.epoch,
+          );
+          console.warn({ event: "rekor.logged", epoch: r.epoch, logIndex: result.logIndex, uuid: result.uuid });
+        } else {
+          sql.exec(
+            "UPDATE epoch_revocations SET rekor_attempts = rekor_attempts + 1, rekor_last_attempt_at = ?, rekor_last_error = ? WHERE epoch = ?",
+            at,
+            result.reason.slice(0, 200),
+            r.epoch,
+          );
+          // A refusal is its own event: nothing was sent, and only a config
+          // fix (REKOR_URL, or the authority host) clears it. The row stays
+          // pending either way, with the reason in alarm-health lastError.
+          console.error({
+            event: result.refused ? "rekor.submit_refused" : "rekor.submit_failed",
+            epoch: r.epoch,
+            reason: result.reason,
+          });
+        }
+      } finally {
+        this.#rekorInFlight.delete(r.epoch);
+      }
+    }
   }
 
   // ── Passkey operations (delegates to passkey module, uses DO's SQLite) ──
@@ -1423,16 +4908,172 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     response: any,
     rpId: string,
     origin: string,
-  ): Promise<{ verified: boolean; isAdmin: boolean }> {
+    /** The reservation secret from the browser's HttpOnly cookie (review M1). */
+    reservationSecret?: string,
+  ): Promise<{ verified: boolean; isAdmin: boolean; refused?: true }> {
     const { verifyRegistration } = await import("./auth/passkey");
-    return verifyRegistration(
+    // Hashed BEFORE the ceremony, so the admit block below stays synchronous.
+    const secretHash = reservationSecret ? await sha256Hex(reservationSecret) : "";
+    try {
+      return await verifyRegistration(
+        userId,
+        displayName,
+        response,
+        rpId,
+        origin,
+        this.ctx.storage.sql,
+        () => this.#admitRegistration(userId, secretHash),
+        // ONE transaction around admit AND the credential stores (review
+        // L1): the redeem, the principal, its grants, the passkey user and
+        // the credential commit together or not at all.
+        (fn) => this.ctx.storage.transactionSync(fn),
+      );
+    } catch (e: any) {
+      // A failed ceremony is an answer, not an exception to ship across RPC
+      // (review M1): verifier messages can name the expected challenge, and
+      // a thrown message is what the route used to hand back to the caller.
+      console.error("[passkey] registration verify failed:", e?.message);
+      // Burn the challenge here too: a store that threw rolled back with the
+      // transaction, challenge deletion included.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM passkey_challenges WHERE user_id = ? AND type = 'registration'",
+        userId,
+      );
+      return { verified: false, isAdmin: false };
+    }
+  }
+
+  /**
+   * Is this verified registration authorized? Runs synchronously inside
+   * verifyRegistration, after the attestation checks out and before the
+   * credential is stored (notme-3dfe15).
+   *
+   * Exactly three registrations are admitted, mirroring the gates on
+   * /auth/passkey/register/options:
+   *   - a FIRST-USER registration, marked by beginFirstUserRegistration once
+   *     options consumed the bootstrap code (review L2). The mark, not
+   *     "passkey_users is empty", is what makes the registrant the admin:
+   *     the count is empty on any authority whose admin has no passkey, and
+   *     trusting it handed the admin scopes to whatever reached verify;
+   *   - a claim registration, marked at options and finalized by the route;
+   *   - one holding a live invite reservation, which is CONSUMED here — the
+   *     invite is redeemed and the principal created with the invite's
+   *     scopes in the same block that stores the credential.
+   * Anything else — a reservation superseded by a registration that verified
+   * first, one past its window, none at all — stores nothing. Before this the
+   * gate lived only at options, so the bridgeCert fallback in
+   * ensurePasskeyPrincipal admitted any verified registration that slipped it.
+   */
+  #admitRegistration(userId: string, secretHash: string): false | { isAdmin: boolean } {
+    const sql = this.ctx.storage.sql;
+    const now = Math.floor(Date.now() / 1000);
+    // Every mark is bound to the browser that earned it (review M1 for the
+    // invite, notme-a2e75d for these two): the userId comes back in the same
+    // body as the challenge, so knowing it must not be enough. A wrong or
+    // missing secret matches nothing — and deletes nothing, so a caller who
+    // merely knows the userId can neither use a mark nor cancel it. A mark
+    // with no hash ('' — a pre-column row) can never be admitted.
+    if (!secretHash) return false;
+    this.#ensureFirstUserSchema();
+    sql.exec(
+      "DELETE FROM first_user_registrations WHERE user_id = ? AND expires_at > ? AND secret_hash = ?",
       userId,
-      displayName,
-      response,
-      rpId,
-      origin,
-      this.ctx.storage.sql,
+      now,
+      secretHash,
     );
+    const [first] = [...sql.exec<{ n: number }>("SELECT changes() AS n")];
+    if (first!.n === 1) return { isAdmin: true };
+    this.#ensureClaimSchema();
+    const [{ n }] = [
+      ...sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM bootstrap_claim_registrations WHERE user_id = ? AND expires_at > ? AND secret_hash = ?",
+        userId,
+        now,
+        secretHash,
+      ),
+    ];
+    if (n > 0) return { isAdmin: false };
+    const invite = consumeInviteReservation(sql, userId, secretHash);
+    if (!invite) return false;
+    createPrincipal(sql, userId, undefined, invite.createdBy);
+    for (const scope of invite.scopes) {
+      grantCapability(sql, userId, scope, invite.createdBy);
+    }
+    return { isAdmin: false };
+  }
+
+  // ── First-user registration (review L2) ──────────────────────────────
+
+  #ensureFirstUserSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS first_user_registrations (
+        user_id     TEXT PRIMARY KEY,
+        expires_at  INTEGER NOT NULL,
+        secret_hash TEXT NOT NULL DEFAULT ''
+      )
+    `);
+    // secret_hash binds the mark to the reserving browser (notme-a2e75d).
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE first_user_registrations ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* column exists */
+    }
+  }
+
+  /**
+   * Is a new registration a FIRST-USER (deployer) registration? True when no
+   * passkey user exists AND no administrator can sign in another way — a
+   * live authorityManage grant on a principal with a linked identity.
+   *
+   * Not "passkey_users is empty" alone (review L2): on an authority whose
+   * admin authenticates by OIDC, that sent every invitee to the bootstrap
+   * gate. Not "no administrator" alone either: a bare principal holding
+   * authorityManage (POST /cert bootstrap) or an admin whose passkeys a reset
+   * wiped cannot sign in, and the bootstrap gate is exactly how that
+   * authority is recovered (notme-976385, notme-4838ae).
+   */
+  #isFirstUserRegistration(ensurePasskeySchema: (sql: any) => void): boolean {
+    const sql = this.ctx.storage.sql;
+    ensurePasskeySchema(sql);
+    const [{ users }] = [...sql.exec<{ users: number }>("SELECT COUNT(*) AS users FROM passkey_users")];
+    if (users > 0) return false;
+    ensurePrincipalSchema(sql);
+    const [{ admins }] = [
+      ...sql.exec<{ admins: number }>(
+        "SELECT COUNT(*) AS admins FROM capability_grants g JOIN federated_identities f ON f.principal_id = g.principal_id WHERE g.scope = 'authorityManage' AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > datetime('now'))",
+      ),
+    ];
+    return admins === 0;
+  }
+
+  /** Would a registration starting now be a first-user registration? A read. */
+  async registrationIsFirstUser(): Promise<boolean> {
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    return this.#isFirstUserRegistration(ensurePasskeySchema);
+  }
+
+  /**
+   * Start a first-user registration for `userId`: still first-user, and the
+   * bootstrap code is valid (consumed). Marks the registration so verify
+   * admits it as the admin — and nothing else does. Returns the mark's
+   * secret for the reserving browser's HttpOnly cookie (notme-a2e75d), or
+   * null when refused; only its hash is stored.
+   */
+  async beginFirstUserRegistration(code: string, userId: string): Promise<{ secret: string } | null> {
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    if (!this.#isFirstUserRegistration(ensurePasskeySchema)) return null;
+    if (typeof code !== "string" || !(await this.consumeBootstrapCode(code))) return null;
+    this.#ensureFirstUserSchema();
+    const { secret, hash } = await newMarkSecret();
+    const now = Math.floor(Date.now() / 1000);
+    this.ctx.storage.sql.exec("DELETE FROM first_user_registrations WHERE expires_at <= ?", now);
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO first_user_registrations (user_id, expires_at, secret_hash) VALUES (?, ?, ?)",
+      userId,
+      now + FIRST_USER_REGISTRATION_TTL_S,
+      hash,
+    );
+    return { secret };
   }
 
   async passkeyAuthenticationOptions(rpId: string): Promise<any> {
@@ -1491,12 +5132,175 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     return { token: invite.token, expiresAt: invite.expiresAt };
   }
 
-  async redeemInviteToken(
+  /**
+   * Reserve an invite for the passkey registration `userId` is starting
+   * (notme-3dfe15). Spends nothing: the invite is consumed only when that
+   * registration's credential verifies (#admitRegistration). Returns the
+   * scopes the invite will grant, or null when it is not live.
+   */
+  async reserveInviteToken(
     token: string,
-    redeemedBy: string,
-  ): Promise<{ scopes: string[] } | null> {
-    const { redeemInvite } = await import("./auth/principals");
-    return redeemInvite(this.ctx.storage.sql, token, redeemedBy);
+    userId: string,
+  ): Promise<{ scopes: string[]; secret: string } | null> {
+    // The secret goes to the reserving browser in an HttpOnly cookie and is
+    // required at verify (review M1); only its hash is stored here.
+    const { secret, hash } = await newMarkSecret();
+    const invite = reserveInvite(this.ctx.storage.sql, token, userId, hash);
+    return invite ? { scopes: invite.scopes, secret } : null;
+  }
+
+  /**
+   * Join by invite with an OIDC identity the caller has ALREADY VERIFIED
+   * (notme-3dfe15). One synchronous block: the invite is redeemed, the
+   * principal created with its scopes, and the identity linked — or nothing
+   * happens. Refuses an identity already linked to a principal: the link
+   * table's INSERT OR REPLACE would otherwise move someone's existing
+   * identity onto the new principal.
+   *
+   * The INVITE is checked first (review L4): answering "already linked" for
+   * a garbage invite told any holder of an id_token whether that identity
+   * had joined. Synchronous throughout, so the two reads and the writes
+   * cannot interleave with another join.
+   */
+  async joinInviteWithFederated(
+    token: string,
+    provider: string,
+    providerSub: string,
+    proof: {
+      jti: string;
+      exp: number;
+      spentElsewhere: boolean;
+      /** The token carried the shared `notme.bot` audience, not a challenge (ADR-023 D5). */
+      plainAudience?: boolean;
+    },
+  ): Promise<
+    | { ok: true; principalId: string; scopes: string[] }
+    | { ok: false; reason: "invalid_invite" | "already_linked" | "proof_reused" }
+  > {
+    const result = this.#joinInviteWithFederated(token, provider, providerSub, proof);
+    // Counted on success only: the counter answers "does anything still join
+    // with plain notme.bot?", which decides when JOIN_REQUIRE_NONCE flips.
+    if (result.ok && proof.plainAudience) this.#recordPlainAudienceJoin(provider);
+    return result;
+  }
+
+  #joinInviteWithFederated(
+    token: string,
+    provider: string,
+    providerSub: string,
+    proof: { jti: string; exp: number; spentElsewhere: boolean },
+  ):
+    | { ok: true; principalId: string; scopes: string[] }
+    | { ok: false; reason: "invalid_invite" | "already_linked" | "proof_reused" } {
+    const sql = this.ctx.storage.sql;
+    this.#ensureSchema();
+    ensurePrincipalSchema(sql);
+    if (!liveInvite(sql, token)) return { ok: false, reason: "invalid_invite" };
+    // The proof is single-use (notme-3dfe15 part 1, option A). Checked AFTER
+    // the invite, like the link (review L4): a garbage invite answers the
+    // same whatever the token's history. `spentElsewhere` is the worker's
+    // read of the shared `jti:<jti>` keyspace /cert/gha, /cert and /token
+    // spend — the same aud-`notme.bot` tokens /join accepts.
+    if (proof.spentElsewhere) return { ok: false, reason: "proof_reused" };
+    if (findPrincipalByFederated(sql, provider, providerSub)) {
+      return { ok: false, reason: "already_linked" };
+    }
+    const principalId = crypto.randomUUID();
+    const jtiKey = SigningAuthority.#oidcJtiKey(provider, proof.jti);
+    return this.ctx.storage.transactionSync(() => {
+      // Consumed in the same synchronous block as the invite and the link:
+      // a replay cannot interleave with the first use, and a refused join
+      // rolls the consume back with everything else (no burn on refusal).
+      if (!this.#consumeJti(jtiKey, proof.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS)) {
+        return { ok: false as const, reason: "proof_reused" as const };
+      }
+      const invite = redeemInvite(sql, token, principalId);
+      if (!invite) {
+        // Throw-free rollback: undo the consume so a refused join spends
+        // nothing. (transactionSync commits on return.)
+        sql.exec("DELETE FROM dpop_jtis WHERE jti = ?", jtiKey);
+        return { ok: false as const, reason: "invalid_invite" as const };
+      }
+      createPrincipal(sql, principalId, undefined, invite.createdBy);
+      for (const scope of invite.scopes) {
+        grantCapability(sql, principalId, scope, invite.createdBy);
+      }
+      linkFederatedIdentity(sql, principalId, provider, providerSub);
+      return { ok: true as const, principalId, scopes: invite.scopes };
+    });
+  }
+
+  /**
+   * The ONE `dpop_jtis` key for an OIDC proof spent in this DO, whichever
+   * route spends it: /join (joinInviteWithFederated), /auth/oidc/login
+   * (loginWithFederated) and the AUTH binding's mintBridgeCert gha-oidc
+   * proof (notme-f850f2). One key, not one per route (re-review N1): with
+   * per-route keys the only guard between the two legs was KV `jti:<jti>`,
+   * written after the DO commit and eventually consistent, so a token just
+   * spent at /join could still become a session. Namespaced so it cannot
+   * collide with a DPoP proof jti, and by issuer because a jti is unique
+   * only within its issuer. A DPoP client could choose a jti of this shape,
+   * but only to pre-spend an OIDC token whose jti it already knows — one it
+   * has already seen, whose replay is refused anyway.
+   */
+  static #oidcJtiKey(issuer: string, jti: string): string {
+    return `oidc:${issuer}#${jti}`;
+  }
+
+  /**
+   * Spend a VERIFIED OIDC token's jti in the shared `oidc:<issuer>#<jti>`
+   * key: true the first time, false on every later call (notme-b0d10f).
+   * For the routes with no other DO block to put the consume in —
+   * /cert/gha, /cert with an `oidc` proof, the /token exchange and
+   * /bootstrap/claim. They used to spend in KV `jti:<jti>` alone, which is
+   * eventually consistent, so the same token could win at two of them, or
+   * at one of them and a DO leg, inside KV's propagation window. Same key
+   * and same `exp + 300s` retention as /join, /auth/oidc/login and
+   * mintBridgeCert. The caller verifies the token and makes every refusal
+   * IT can decide before calling; a refusal only something after the spend
+   * can make (a mint that throws, /token's DPoP-jti consume, the DO's
+   * claim-code lookup) leaves the token spent — THREAT_MODEL lists them.
+   * Fails closed: an empty issuer or jti, or an exp that is not a positive
+   * finite number, cannot be retained, so it is reported as spent.
+   */
+  async spendOidcJti(issuer: string, jti: string, exp: number): Promise<boolean> {
+    if (!issuer || !jti || !Number.isFinite(exp) || exp <= 0) return false;
+    this.#ensureSchema();
+    return this.#consumeJti(SigningAuthority.#oidcJtiKey(issuer, jti), exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS);
+  }
+
+  /**
+   * Sign in with an OIDC identity the caller has ALREADY VERIFIED, spending
+   * the proof (review F1 of notme-3dfe15 part 1). The 24h session the route
+   * mints used to cost nothing but an unexpired token: any token for a
+   * linked identity — spent at /cert/gha, /cert, /token or /join, or read
+   * from a log — logged in, as often as it was presented.
+   *
+   * One synchronous block, as joinInviteWithFederated: the principal lookup,
+   * the jti consume (the shared `oidc:<issuer>#<jti>`, kept past exp per F2) and
+   * the scope read cannot interleave with a concurrent login. A refusal
+   * spends nothing: an unknown identity returns before the consume, so the
+   * same token still works once its holder joins. `spentElsewhere` is the
+   * worker's read of the shared `jti:<jti>` KV keyspace.
+   */
+  async loginWithFederated(
+    provider: string,
+    providerSub: string,
+    proof: { jti: string; exp: number; spentElsewhere: boolean },
+  ): Promise<
+    | { ok: true; principalId: string; scopes: string[] }
+    | { ok: false; reason: "unknown_identity" | "proof_reused" }
+  > {
+    const sql = this.ctx.storage.sql;
+    this.#ensureSchema();
+    ensurePrincipalSchema(sql);
+    if (proof.spentElsewhere) return { ok: false, reason: "proof_reused" };
+    const principalId = findPrincipalByFederated(sql, provider, providerSub);
+    if (!principalId) return { ok: false, reason: "unknown_identity" };
+    if (!this.#consumeJti(SigningAuthority.#oidcJtiKey(provider, proof.jti), proof.exp + OIDC_JTI_RETAIN_PAST_EXP_SECONDS)) {
+      return { ok: false, reason: "proof_reused" };
+    }
+    return { ok: true, principalId, scopes: getCapabilities(sql, principalId) };
   }
 
   // ── Principal management ──
@@ -1516,6 +5320,106 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   async getPrincipalScopes(principalId: string): Promise<string[]> {
     const { getCapabilities } = await import("./auth/principals");
+    return getCapabilities(this.ctx.storage.sql, principalId);
+  }
+
+  /** Revoke one grant — the revocation unit (notme-77a024). */
+  async revokeCapability(
+    principalId: string,
+    scope: string,
+    revokedBy?: string,
+  ): Promise<{ revoked: boolean }> {
+    const { revokeCapability } = await import("./auth/principals");
+    return revokeCapability(this.ctx.storage.sql, principalId, scope, revokedBy);
+  }
+
+  async listGrants(
+    principalId: string,
+  ): Promise<import("./auth/principals").Grant[]> {
+    const { listGrants } = await import("./auth/principals");
+    return listGrants(this.ctx.storage.sql, principalId);
+  }
+
+  /**
+   * Make a passkey user a principal with GRANTS, so its authority has one
+   * source and one revoke path. Idempotent: an existing principal keeps its
+   * grants exactly (a returning admin whose authorityManage was revoked must
+   * NOT get it back by logging in again — that is what the bead's finding (b)
+   * was). Only a principal with no row at all is created, and only then does
+   * `isFirstUser` decide whether the admin scopes are granted.
+   */
+  /**
+   * Give existing deployers the signing scopes the admin set now includes
+   * (notme-486e8a). Runs once per DO start and is safe to call again.
+   *
+   * WHO: only a principal holding the WHOLE prior deployer set
+   * (bridgeCert + authorityManage + certMint, all live). A partial admin was
+   * never a deployer and is left alone.
+   *
+   * WHAT: sign:git and sign:attestation — but only a scope the principal has
+   * NO row for, live or revoked. A deliberate revocation must stick; a
+   * migration that re-granted on every cold start would make revoking your
+   * own signing scope impossible.
+   *
+   * A leaked stub calling this gains nothing a deployer could not already do:
+   * it only ever grants signing purposes to principals that already hold
+   * authorityManage and certMint. Recorded as granted_by
+   * "migration:notme-486e8a", so listGrants shows where it came from.
+   */
+  async migrateAdminSigningScopes(): Promise<{ granted: number }> {
+    return { granted: this.#migrateAdminSigningScopes() };
+  }
+
+  #migrateAdminSigningScopes(): number {
+    const sql = this.ctx.storage.sql;
+    ensurePrincipalSchema(sql);
+    const live = (scope: string) =>
+      new Set(
+        (sql
+          .exec(
+            "SELECT principal_id FROM capability_grants WHERE scope = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))",
+            scope,
+          )
+          .toArray() as Array<{ principal_id: string }>).map((r) => r.principal_id),
+      );
+    const holders = PRIOR_ADMIN_SCOPES.map(live);
+    const deployers = [...holders[0]!].filter((pid) => holders.every((h) => h.has(pid)));
+    let granted = 0;
+    for (const pid of deployers) {
+      for (const scope of SIGNING_SCOPES) {
+        const [{ n }] = [
+          ...sql.exec<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM capability_grants WHERE principal_id = ? AND scope = ?",
+            pid,
+            scope,
+          ),
+        ];
+        if (n === 0) {
+          grantCapability(sql, pid, scope, "migration:notme-486e8a");
+          granted++;
+        }
+      }
+    }
+    if (granted > 0) {
+      console.warn({ event: "admin.signing_scopes_migrated", granted, deployers: deployers.length });
+    }
+    return granted;
+  }
+
+  async ensurePasskeyPrincipal(
+    principalId: string,
+    isFirstUser: boolean,
+  ): Promise<string[]> {
+    const { getPrincipal, getCapabilities } = await import("./auth/principals");
+    if (!getPrincipal(this.ctx.storage.sql, principalId)) {
+      await this.createPrincipalWithCapabilities(
+        principalId,
+        isFirstUser
+          ? [...ADMIN_SCOPES]
+          : ["bridgeCert"],
+        "passkey-registration",
+      );
+    }
     return getCapabilities(this.ctx.storage.sql, principalId);
   }
 
@@ -1577,12 +5481,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
   // deletes from passkey_credentials, federated_identities, principals, or
   // invites. Two invariants currently rest on that being true:
   //
-  //   1. The known gap in #hasAuthenticator — that it does not count
-  //      outstanding invites — is UNREACHABLE, because reaching "no
+  //   1. #hasAuthenticator does not count outstanding invites. That is safe
+  //      because this method now REVOKES them (notme-2131e8): "reset" is
+  //      total, so it cannot leave a live authorityManage invite behind. It
+  //      was already unreachable before that, and still is: reaching "no
   //      authenticator but a live authorityManage invite" requires losing a
   //      credential, which requires this method, which requires consuming a
   //      bootstrap code, which requires already having no authenticator. The
-  //      transition is circular (notme-2131e8). That last step is now
+  //      transition is circular. The revocation is what keeps that from
+  //      mattering when the circularity breaks. That last step is now
   //      ENFORCED rather than emergent: consumeBootstrapCode refuses once
   //      anyone can authenticate. The circularity used to hold only because
   //      a consumed code stayed consumed, which is a weaker reason.
@@ -1612,6 +5519,26 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     this.ctx.storage.sql.exec("DELETE FROM passkey_credentials");
     this.ctx.storage.sql.exec("DELETE FROM passkey_users");
     this.ctx.storage.sql.exec("DELETE FROM passkey_challenges");
+
+    // Revoke every outstanding invite (notme-2131e8). An invite is a way in
+    // that #hasAuthenticator does not count, so a reset that left one live
+    // left a way in the predicate cannot see — an authorityManage invite
+    // outliving the wipe it was supposed to be inside. Redeemed rows stay:
+    // they are the audit trail of who joined by whom, not a way in.
+    ensurePrincipalSchema(this.ctx.storage.sql);
+    this.ctx.storage.sql.exec("DELETE FROM invites WHERE redeemed_at IS NULL");
+    this.ctx.storage.sql.exec("DELETE FROM invite_reservations");
+    // And every in-flight first-user / claim mark, plus claim codes pending
+    // approval (security review F4 of notme-a2e75d). #admitRegistration
+    // trusts a first-user mark without re-checking first-user standing, so a
+    // pre-reset mark let the browser holding its cookie become the admin of
+    // the post-reset authority — the reset did not revoke the very browser
+    // it may have been done to shut out.
+    this.#ensureFirstUserSchema();
+    this.#ensureClaimSchema();
+    this.ctx.storage.sql.exec("DELETE FROM first_user_registrations");
+    this.ctx.storage.sql.exec("DELETE FROM bootstrap_claim_registrations");
+    this.ctx.storage.sql.exec("DELETE FROM bootstrap_claims");
 
     // Rotate the session secret, invalidating every cookie issued before
     // this reset. Without it a reset revoked NOTHING: the secret was minted
@@ -1750,14 +5677,189 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * `BOOTSTRAP_CODE`, which requires control of the deployment rather than
    * merely the ability to send an HTTP request.
    */
+  // ── Bootstrap by attested claim (notme-486e8a) ─────────────────────────
+  //
+  // REPLACES bootstrapFromAttestation, which made the attested WORKFLOW the
+  // administrator as a side effect of /cert/gha. Its comment said the human
+  // would then "attach a passkey by taking an invite from it" — but /invites
+  // accepts only a browser session and a workflow never has one, so the
+  // authority ended up governed by an identity no human could act as, and
+  // closed to everyone else. The fix inverts the roles: the HUMAN registers a
+  // passkey and holds nothing; the named workflow APPROVES that passkey's
+  // claim code with its GitHub OIDC token. The human holds the credential,
+  // GitHub attests the deployer, and nothing secret crosses a log.
+  //
+  // Gated on "no administrator exists" — a live authorityManage grant — and
+  // NOT on "no credential exists". Under the old gate a stranger who
+  // registered first and was never approved would close the door on the
+  // deployer for good. Anyone may open a claim; only an approved one counts.
+
+  #ensureClaimSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap_claim_registrations (
+        user_id     TEXT PRIMARY KEY,
+        expires_at  INTEGER NOT NULL,
+        secret_hash TEXT NOT NULL DEFAULT ''
+      )
+    `);
+    // secret_hash binds the mark to the reserving browser (notme-a2e75d).
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE bootstrap_claim_registrations ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* column exists */
+    }
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS bootstrap_claims (
+        code         TEXT PRIMARY KEY,
+        principal_id TEXT NOT NULL,
+        expires_at   INTEGER NOT NULL
+      )
+    `);
+  }
+
+  #hasAdministrator(): boolean {
+    const sql = this.ctx.storage.sql;
+    ensurePrincipalSchema(sql);
+    const [{ n }] = [
+      ...sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM capability_grants WHERE scope = 'authorityManage' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))",
+      ),
+    ];
+    return n > 0;
+  }
+
+  /** Does any principal hold a live authorityManage grant? */
+  async hasAdministrator(): Promise<boolean> {
+    return this.#hasAdministrator();
+  }
+
+  /** May an unauthenticated passkey registration open a claim right now? */
+  async claimAvailable(): Promise<boolean> {
+    return bootstrapAttestedSubject(this.env) !== null && !this.#hasAdministrator();
+  }
+
+  /**
+   * Mark a registration (by its WebAuthn user id) as a claim, so verify knows
+   * not to grant it anything. Bounded: an open endpoint that writes rows is a
+   * storage-exhaustion vector. Returns the mark's secret for the reserving
+   * browser's HttpOnly cookie (notme-a2e75d); only its hash is stored.
+   */
+  async markClaimRegistration(
+    userId: string,
+  ): Promise<{ ok: true; secret: string } | { ok: false; reason: "unavailable" | "busy" }> {
+    if (!(await this.claimAvailable())) return { ok: false, reason: "unavailable" };
+    // Hashed BEFORE the cap check, so check-and-insert stays one synchronous block.
+    const { secret, hash } = await newMarkSecret();
+    this.#ensureClaimSchema();
+    const now = Math.floor(Date.now() / 1000);
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM bootstrap_claim_registrations WHERE expires_at <= ?", now);
+    sql.exec("DELETE FROM bootstrap_claims WHERE expires_at <= ?", now);
+    const [{ n }] = [...sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM bootstrap_claim_registrations")];
+    if (n >= CLAIM_CAP) return { ok: false, reason: "busy" };
+    sql.exec(
+      "INSERT OR REPLACE INTO bootstrap_claim_registrations (user_id, expires_at, secret_hash) VALUES (?, ?, ?)",
+      userId,
+      now + CLAIM_REGISTRATION_TTL_S,
+      hash,
+    );
+    return { ok: true, secret };
+  }
+
+  /**
+   * After a claim registration's WebAuthn ceremony verifies: create the
+   * principal with NO grants, clear the first-credential admin flag
+   * passkey verification set, and issue the claim code. null when the
+   * registration was not a claim.
+   */
+  async finalizeClaimRegistration(userId: string): Promise<{ code: string; expiresIn: number } | null> {
+    this.#ensureClaimSchema();
+    const sql = this.ctx.storage.sql;
+    const now = Math.floor(Date.now() / 1000);
+    sql.exec(
+      "DELETE FROM bootstrap_claim_registrations WHERE user_id = ? AND expires_at > ?",
+      userId,
+      now,
+    );
+    const [c] = [...sql.exec<{ n: number }>("SELECT changes() AS n")];
+    if (c.n !== 1) return null;
+    const { ensurePasskeySchema } = await import("./auth/passkey");
+    ensurePasskeySchema(sql);
+    // verifyRegistration marks the FIRST credential is_admin=1. A claim is
+    // not an admin until approved, whatever order it registered in.
+    sql.exec("UPDATE passkey_users SET is_admin = 0 WHERE user_id = ?", userId);
+    const { createPrincipal } = await import("./auth/principals");
+    createPrincipal(sql, userId, undefined, "bootstrap-claim");
+    const code = randomUserCode();
+    sql.exec(
+      "INSERT INTO bootstrap_claims (code, principal_id, expires_at) VALUES (?, ?, ?)",
+      code,
+      userId,
+      now + CLAIM_CODE_TTL_S,
+    );
+    return { code, expiresIn: CLAIM_CODE_TTL_S };
+  }
+
+  /**
+   * The named workflow approves a claim. The caller is trusted to have
+   * VERIFIED the GitHub token (signature, audience, jti) — this takes an
+   * attested subject, never a raw one.
+   */
+  async approveBootstrapClaim(
+    code: string,
+    attestedSubject: string,
+  ): Promise<
+    | { ok: true; principalId: string }
+    | { ok: false; reason: "not_configured" | "subject_mismatch" | "governed" | "no_such_claim" }
+  > {
+    const expected = bootstrapAttestedSubject(this.env);
+    if (expected === null) return { ok: false, reason: "not_configured" };
+    const { timingSafeEqual } = await import("./auth/timing-safe");
+    const subjectsMatch = await timingSafeEqual(attestedSubject, expected);
+    if (!subjectsMatch) return { ok: false, reason: "subject_mismatch" };
+    if (
+      !mayBootstrapFromAttestation({
+        configuredSubject: expected,
+        subjectsMatch,
+        authorityIsGovernable: this.#hasAdministrator(),
+      })
+    ) {
+      return { ok: false, reason: "governed" };
+    }
+    this.#ensureClaimSchema();
+    const sql = this.ctx.storage.sql;
+    const row = sql
+      .exec(
+        "SELECT principal_id FROM bootstrap_claims WHERE code = ? AND expires_at > ?",
+        String(code).toUpperCase(),
+        Math.floor(Date.now() / 1000),
+      )
+      .toArray()[0] as { principal_id: string } | undefined;
+    if (!row) return { ok: false, reason: "no_such_claim" };
+    for (const scope of ADMIN_SCOPES) {
+      grantCapability(sql, row.principal_id, scope, `gha-oidc:${attestedSubject}`);
+    }
+    // The door closes: every other pending claim is void. Their principals
+    // keep zero grants.
+    sql.exec("DELETE FROM bootstrap_claims");
+    sql.exec("DELETE FROM bootstrap_claim_registrations");
+    console.warn({ event: "bootstrap.claimed", principalId: row.principal_id, attestedSubject });
+    return { ok: true, principalId: row.principal_id };
+  }
+
   async getBootstrapState(): Promise<BootstrapReadState> {
     const { ensurePasskeySchema } = await import("./auth/passkey");
     const { ensurePrincipalSchema } = await import("./auth/principals");
     if (this.#hasAuthenticator(ensurePasskeySchema, ensurePrincipalSchema)) {
       return { status: "closed" };
     }
-    // `armed` reports only that a secret EXISTS, never its value or length.
-    return bootstrapSecret(this.env) ? { status: "armed" } : { status: "unconfigured" };
+    // `armed` reports only that a mechanism EXISTS, never a value or length.
+    const methods: BootstrapMethod[] = [];
+    if (bootstrapSecret(this.env)) methods.push("secret");
+    if (bootstrapAttestedSubject(this.env)) methods.push("gha-oidc");
+    return methods.length > 0
+      ? { status: "armed", methods }
+      : { status: "unconfigured" };
   }
 
   async getOrCreateBootstrapCode(): Promise<BootstrapState> {
@@ -1859,8 +5961,13 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // Mint-side gating cannot cover this: the code was legitimately issued at
     // a moment when it was valid. Only the consumer knows the authority has
     // since gained a way in.
+    // Imports hoisted to the top (notme-b51777): `await import(...)` is a
+    // yield point, so none may sit between the stored-code SELECT and its
+    // UPDATE below. timingSafeEqual itself still awaits crypto.subtle inside
+    // that window, which is why the UPDATE is a compare-and-swap.
     const { ensurePasskeySchema } = await import("./auth/passkey");
     const { ensurePrincipalSchema } = await import("./auth/principals");
+    const { timingSafeEqual } = await import("./auth/timing-safe");
     // ── OPERATOR SECRET OUTRANKS THE AUTHENTICATOR GATE (notme-4838ae) ──
     //
     // Checked BEFORE #hasAuthenticator, deliberately, and this is a security
@@ -1887,7 +5994,6 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // LOUD, because silent admin acquisition is the thing the gate guarded.
     const operatorSecret = bootstrapSecret(this.env);
     if (operatorSecret) {
-      const { timingSafeEqual } = await import("./auth/timing-safe");
       if (await timingSafeEqual(code, operatorSecret)) {
         console.warn(
           "[bootstrap] ADMIN RECOVERY: operator secret accepted while authenticators exist (notme-4838ae)",
@@ -1910,7 +6016,6 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // leaked position would let a caller recover it byte by byte.
     const secret = bootstrapSecret(this.env);
     if (secret) {
-      const { timingSafeEqual } = await import("./auth/timing-safe");
       if (await timingSafeEqual(code, secret)) return true;
       // Fall through rather than returning false. An authority can hold BOTH
       // an operator secret and a legacy stored code (armed deliberately via
@@ -1932,9 +6037,12 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       )
       .toArray() as Array<{ code: string; created_at: string }>;
 
-    const { timingSafeEqual } = await import("./auth/timing-safe");
     if (rows.length === 0 || !(await timingSafeEqual(rows[0]!.code, code)))
       return false;
+    // ↑ That await is a non-storage I/O point: a concurrent consume of the
+    // same code can run to completion while this one is suspended. Nothing
+    // read above may be trusted past it; the UPDATE below re-checks `used`
+    // itself.
 
     // Enforce 15-minute TTL here too (not just in getOrCreateBootstrapCode)
     const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
@@ -1944,10 +6052,22 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       return false;
     }
 
+    // COMPARE-AND-SWAP (notme-b51777). Cloudflare's rules of Durable Objects:
+    // input gates protect only storage operations, and around other awaits
+    // "use optimistic locking (check-and-set) patterns". Pre-fix this was an
+    // unconditional `SET used = 1`, so two consumers that both passed the
+    // SELECT above both returned true: two administrators from one
+    // single-use code. Now the write itself carries the `used = 0` predicate,
+    // and the UPDATE plus its changes() read run with no await between them,
+    // so exactly one concurrent consumer sees changes() = 1. Same pattern as
+    // consumePopNonce and collectTierEnrolment.
     this.ctx.storage.sql.exec(
-      "UPDATE bootstrap SET used = 1 WHERE id = 'code'",
+      "UPDATE bootstrap SET used = 1 WHERE id = 'code' AND used = 0",
     );
-    return true;
+    const [c] = [
+      ...this.ctx.storage.sql.exec<{ n: number }>("SELECT changes() AS n"),
+    ];
+    return c?.n === 1;
   }
 
   // Passkey stats — no PII, just counts for diagnostics
@@ -1976,14 +6096,18 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
 
   // ── Alarm: periodic bundle publish ──────────────────────────────────
   // Ensures CA bundle in KV stays fresh (< BUNDLE_MAX_AGE_MS).
-  // Scheduled on first getOrCreateSigningKey() and re-arms after each fire.
+  // Scheduled on first #getOrCreateSigningKey() and re-arms after each fire.
   //
   // Hardening (notme-5c2511 EPIC, post 2026-05-10 cautionary-tale review):
   //   - alarm_health table tracks failure_count, total_fires, last_fire_at,
   //     last_outcome, first_fire_at.
   //   - Circuit breaker: after MAX_CONSECUTIVE_ALARM_FAILURES consecutive
-  //     failures, alarm() stops re-arming. Manual recovery via
-  //     resetAlarmHealth() RPC.
+  //     failures it opens, and the only alarm pending is the half-open probe
+  //     a cool-off out (notme-a36d10): the tripping fire replaces any
+  //     successor its bundle work armed, and scheduleNextRefresh() never arms
+  //     earlier than the probe. The probe's success closes it; its failure
+  //     re-opens it with the cool-off doubled, capped. resetAlarmHealth()
+  //     RPC recovers at once.
   //   - Defense-in-depth: re-arm goes through getAlarm() check first
   //     (mirrors scheduleNextRefresh's pattern).
 
@@ -2001,10 +6125,33 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
         first_fire_at   INTEGER NOT NULL DEFAULT 0
       )
     `);
+    // The half-open breaker's state (notme-a36d10), in ms like last_fire_at.
+    // next_probe_at 0 with the breaker open is a row tripped under the old
+    // latch: its probe is due now (see scheduleNextRefresh).
+    for (const col of [
+      "tripped_at INTEGER NOT NULL DEFAULT 0",
+      "next_probe_at INTEGER NOT NULL DEFAULT 0",
+      "consecutive_trips INTEGER NOT NULL DEFAULT 0",
+    ]) {
+      try {
+        this.ctx.storage.sql.exec(`ALTER TABLE alarm_health ADD COLUMN ${col}`);
+      } catch {
+        /* already present */
+      }
+    }
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO alarm_health (id) VALUES ('authority')",
     );
     this.#alarmHealthInitialized = true;
+  }
+
+  /** The half-open breaker's columns (notme-a36d10). */
+  #readBreakerRow(): { tripped_at: number; next_probe_at: number; consecutive_trips: number } {
+    this.#ensureAlarmHealthSchema();
+    const row = this.ctx.storage.sql
+      .exec("SELECT tripped_at, next_probe_at, consecutive_trips FROM alarm_health WHERE id = 'authority'")
+      .toArray()[0] as { tripped_at: number; next_probe_at: number; consecutive_trips: number } | undefined;
+    return row ?? { tripped_at: 0, next_probe_at: 0, consecutive_trips: 0 };
   }
 
   #readAlarmHealthRow(): {
@@ -2037,11 +6184,67 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     );
   }
 
+  /** True once MAX_CONSECUTIVE_ALARM_FAILURES consecutive fires have failed. */
+  #alarmBreakerOpen(): boolean {
+    return (
+      this.#readAlarmHealthRow().failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES
+    );
+  }
+
   async scheduleNextRefresh(): Promise<void> {
+    // An open breaker means NO alarm, from any caller (notme-5c2511). The warm
+    // path of #getOrCreateSigningKey reaches here on every request that
+    // touches the signing key, and generateBundle reaches it inside alarm()
+    // itself; without this check either one re-armed the loop the breaker had
+    // just stopped.
+    //
+    // Half-open (notme-a36d10): behind an open breaker the one alarm allowed
+    // is the probe at next_probe_at, which the tripping fire arms itself. So
+    // this arms nothing while an alarm is pending, and never earlier than the
+    // probe. With none pending (a row tripped under the old latch, whose
+    // next_probe_at is 0, or a lost probe) it arms the probe, no sooner than
+    // one cadence out — never in the past, so a probe fire that reaches the
+    // warm path cannot schedule an immediate re-fire.
+    if (this.#alarmBreakerOpen()) {
+      if (!(await this.ctx.storage.getAlarm())) {
+        const { next_probe_at } = this.#readBreakerRow();
+        await this.ctx.storage.setAlarm(Math.max(next_probe_at, Date.now() + BUNDLE_REFRESH_MS));
+      }
+      return;
+    }
     const current = await this.ctx.storage.getAlarm();
     if (!current) {
       await this.ctx.storage.setAlarm(Date.now() + BUNDLE_REFRESH_MS);
     }
+  }
+
+  /**
+   * Sign the current bundle and publish it to the KV the edge reads.
+   *
+   * ECMAScript #private: a `private` method stays live on the DO's RPC
+   * surface (ADR-016), and nothing outside this object should be able to
+   * force a republish. Shared by `alarm()`, `revokeEpoch()` and `rotate()` so they
+   * cannot drift — a revocation that published a differently-shaped bundle
+   * than the refresh path would be a very bad day to debug.
+   *
+   * No CA_BUNDLE_CACHE binding is a real configuration, not a failure: the
+   * bundle is still signed and the state still advances.
+   */
+  async #publishBundle(): Promise<CABundle> {
+    const bundle = await this.generateBundle();
+    if (this.env.CA_BUNDLE_CACHE) {
+      // No expirationTtl, deliberately (notme-05324c, DO audit L2). The bound
+      // on a bundle's life is checkRevocation's read-time check, issuedAt +
+      // BUNDLE_MAX_AGE_MS, which fails CLOSED (bundle_stale). A KV TTL would
+      // turn a stale bundle into an absent one, and an absent bundle fails
+      // OPEN (the bootstrap case): if the alarm stopped, verifiers would go
+      // from refusing to accepting the moment the key expired.
+      await this.env.CA_BUNDLE_CACHE.put(
+        "bundle:current",
+        JSON.stringify(bundle),
+      );
+    }
+    return bundle;
   }
 
   override async alarm(): Promise<void> {
@@ -2068,24 +6271,35 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       first_fire_at: 0,
     };
 
-    // Circuit breaker — stop re-arming if too many consecutive failures.
-    // Operator must call resetAlarmHealth() to recover.
+    // Circuit breaker, half-open (notme-a36d10). Open and still inside the
+    // cool-off: do no work, and leave exactly the probe armed — never an
+    // earlier alarm, so a stray fire cannot start a storm. Open and past
+    // next_probe_at: this fire IS the probe, and runs the full work below.
     //
-    // Even though we early-return without doing the bundle work, we DO
-    // record the fire in alarm_health (atomic increment). Otherwise total_fires
-    // would undercount the actual alarm fires that occurred — important for
-    // post-mortem ("how many fires did we eat after the breaker tripped").
-    if (pre.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES) {
+    // Even though the cool-off path returns without doing the bundle work, we
+    // DO record the fire in alarm_health (atomic increment). Otherwise
+    // total_fires would undercount the actual alarm fires that occurred —
+    // important for post-mortem ("how many fires did we eat after the
+    // breaker tripped").
+    const breaker = this.#readBreakerRow();
+    const probing = pre.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES;
+    if (probing && now < breaker.next_probe_at) {
       console.error(
         `[signing-authority] CIRCUIT BREAKER OPEN: ${pre.failure_count} consecutive ` +
           `alarm failures. Last outcome: "${pre.last_outcome}". ` +
-          `Not re-arming. Manual recovery via resetAlarmHealth() RPC.`,
+          `Next probe at ${new Date(breaker.next_probe_at).toISOString()}.`,
       );
       this.ctx.storage.sql.exec(
         "UPDATE alarm_health SET total_fires = total_fires + 1, last_fire_at = ?, last_outcome = 'skipped: circuit breaker open' WHERE id = 'authority'",
         now,
       );
-      return; // do NOT re-arm
+      await this.ctx.storage.setAlarm(breaker.next_probe_at);
+      return;
+    }
+    if (probing) {
+      console.warn(
+        JSON.stringify({ event: "alarm.breaker_probe", failureCount: pre.failure_count, trips: breaker.consecutive_trips }),
+      );
     }
 
     // Set first_fire_at on the very first fire (idempotent: only updates
@@ -2100,13 +6314,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     let success = false;
     let outcome: string;
     try {
-      const bundle = await this.generateBundle();
-      if (this.env.CA_BUNDLE_CACHE) {
-        await this.env.CA_BUNDLE_CACHE.put(
-          "bundle:current",
-          JSON.stringify(bundle),
-        );
-      }
+      await this.#publishBundle();
       success = true;
       outcome = "success";
     } catch (e) {
@@ -2115,15 +6323,40 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       outcome = `error: ${msg.slice(0, 200)}`;
     }
 
+    // Drain the CT backlog. Deliberately OUTSIDE the refresh try and
+    // swallowed: a log problem is not a bundle-refresh failure, so it must
+    // never feed failure_count / the circuit breaker, and nothing here may
+    // throw out of alarm().
+    if (this.env.CT_LOG) {
+      try {
+        await this.#drainCtBacklog();
+      } catch (err) {
+        console.error({ event: "ct.drain_failed", error: String(err) });
+        this.#ctRecord("error", `drain: ${String(err)}`);
+      }
+    }
+
+    // Retry pending revocation statements to Rekor (notme-8befcc). Outside
+    // the refresh try and swallowed, as the CT drain: a log outage is not a
+    // bundle failure and must never feed the circuit breaker.
+    try {
+      await this.#drainRekor();
+    } catch (err) {
+      console.error({ event: "rekor.drain_failed", error: String(err) });
+    }
+
     // Atomic update — `total_fires = total_fires + 1` and (on failure)
     // `failure_count = failure_count + 1` happen in SQL, so concurrent fires
     // can't drop increments. failure_count resets to 0 on success.
     if (success) {
       this.ctx.storage.sql.exec(
-        "UPDATE alarm_health SET failure_count = 0, total_fires = total_fires + 1, last_fire_at = ?, last_outcome = ? WHERE id = 'authority'",
+        "UPDATE alarm_health SET failure_count = 0, consecutive_trips = 0, next_probe_at = 0, total_fires = total_fires + 1, last_fire_at = ?, last_outcome = ? WHERE id = 'authority'",
         now,
         outcome,
       );
+      if (probing) {
+        console.warn(JSON.stringify({ event: "alarm.breaker_closed", afterTrips: breaker.consecutive_trips }));
+      }
     } else {
       this.ctx.storage.sql.exec(
         "UPDATE alarm_health SET failure_count = failure_count + 1, total_fires = total_fires + 1, last_fire_at = ?, last_outcome = ? WHERE id = 'authority'",
@@ -2142,12 +6375,32 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       .toArray() as Array<{ failure_count: number }>;
     const postFailureCount = postRows[0]?.failure_count ?? 0;
     if (postFailureCount >= MAX_CONSECUTIVE_ALARM_FAILURES) {
-      console.error(
-        `[signing-authority] CIRCUIT BREAKER TRIPPED on this fire: ` +
-          `${postFailureCount} consecutive failures. ` +
-          `Not re-arming. Manual recovery via resetAlarmHealth() RPC.`,
+      // Tripped on this fire, or a failed probe re-opening it (notme-a36d10).
+      // Either way: the cool-off doubles per consecutive trip, capped, and
+      // the ONE alarm left is the next probe.
+      const trips = breaker.consecutive_trips + 1;
+      const cooloff = Math.min(
+        ALARM_BREAKER_COOLOFF_BASE_MS * 2 ** (trips - 1),
+        ALARM_BREAKER_COOLOFF_MAX_MS,
       );
-      return; // do NOT re-arm — breaker tripped on this fire
+      const nextProbeAt = now + cooloff;
+      this.ctx.storage.sql.exec(
+        "UPDATE alarm_health SET tripped_at = ?, next_probe_at = ?, consecutive_trips = ? WHERE id = 'authority'",
+        now,
+        nextProbeAt,
+        trips,
+      );
+      console.error(
+        `[signing-authority] CIRCUIT BREAKER ${probing ? "RE-OPENED by a failed probe" : "TRIPPED on this fire"}: ` +
+          `${postFailureCount} consecutive failures. ` +
+          `Next probe in ${cooloff / 60_000} min (trip ${trips}).`,
+      );
+      // This fire's own bundle work ran #getOrCreateSigningKey's warm path,
+      // which may already have armed a cadence successor. setAlarm REPLACES
+      // it: the only alarm pending is the probe (notme-5c2511's "no alarm
+      // storm", kept).
+      await this.ctx.storage.setAlarm(nextProbeAt);
+      return;
     }
 
     // Re-arm with defense-in-depth getAlarm() check.
@@ -2177,7 +6430,7 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     // last administrative action." If a "last reset at" timestamp is wanted
     // later, add it as a separate column.
     this.ctx.storage.sql.exec(
-      "UPDATE alarm_health SET failure_count = 0, last_outcome = 'manually_reset' WHERE id = 'authority'",
+      "UPDATE alarm_health SET failure_count = 0, consecutive_trips = 0, next_probe_at = 0, last_outcome = 'manually_reset' WHERE id = 'authority'",
     );
     let rearmed = false;
     if (!(await this.ctx.storage.getAlarm())) {
@@ -2210,7 +6463,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
    * MUST gate runaway alerts on `warmupComplete === true` before treating
    * `driftRatio > 1` as an anomaly. After warmup, sustained driftRatio
    * above ~1.2 indicates the alarm is firing faster than the
-   * BUNDLE_REFRESH_MS cadence prescribes.
+   * BUNDLE_REFRESH_MS cadence prescribes; a driftRatio far BELOW 1, or
+   * totalFires 0 with warmupComplete false long after deploy, means the alarm
+   * is slow or dead (the 130-day failure, notme-4896d8).
+   *
+   * Who reads it (notme-e992ad): the only consumer is an operator, through
+   * `GET /admin/alarm-health` (authorityManage-gated, worker.ts). Nothing
+   * alerts on it automatically, deliberately: the unauthenticated, outcome-
+   * level probe is the bundle's own age (`/internal/ca-bundle` issuedAt,
+   * checked by scripts/check-authority.sh), which catches a dead alarm
+   * whatever its cause. The derived fields are pinned by
+   * alarm-health.do.test.ts so what the operator reads is correct.
    */
   async getAlarmHealth(): Promise<{
     totalFires: number;
@@ -2223,8 +6486,15 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
     driftRatio: number;
     warmupComplete: boolean;
     circuitBreakerOpen: boolean;
+    breaker: AlarmBreakerHealth;
+    rekor: RekorHealth;
+    ct: CtHealth;
+    renewal: RenewalHealth;
+    join: JoinHealth;
   }> {
     const health = this.#readAlarmHealthRow();
+    const b = this.#readBreakerRow();
+    const open = health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES;
     const now = Date.now();
     const elapsedHours =
       health.first_fire_at > 0
@@ -2246,8 +6516,17 @@ export class SigningAuthority extends DurableObject<SigningAuthorityEnv> {
       driftRatio,
       warmupComplete:
         health.total_fires >= SigningAuthority.DRIFT_RATIO_WARMUP_FIRES,
-      circuitBreakerOpen:
-        health.failure_count >= MAX_CONSECUTIVE_ALARM_FAILURES,
+      circuitBreakerOpen: open,
+      breaker: {
+        state: !open ? "closed" : now >= b.next_probe_at ? "half_open" : "open",
+        lastTrippedAt: b.tripped_at,
+        nextProbeAt: open ? b.next_probe_at : 0,
+        consecutiveTrips: b.consecutive_trips,
+      },
+      rekor: this.#readRekorHealth(),
+      ct: await this.#readCtHealth(),
+      renewal: this.#readRenewalHealth(),
+      join: this.#readJoinHealth(),
     };
   }
 }

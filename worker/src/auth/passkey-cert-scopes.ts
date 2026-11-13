@@ -46,6 +46,15 @@ import { escalatedScopes, verifyScopeChain } from "./scope-chain";
  */
 export const CERT_ELIGIBLE_SCOPES: ReadonlySet<string> = new Set([
   "bridgeCert",
+  // YES to the signing PURPOSES (notme-486e8a). A certificate is the signing
+  // credential: sign:git says "this cert may sign git commits", which is a
+  // narrowing of what bridgeCert already permits, not a new power. They were
+  // advertised in scopes_supported and required by AuthService.sign() for
+  // git-commit and dsse, but could never appear in a cert — so those formats
+  // were unreachable. Unlike certMint and authorityManage below, carrying
+  // them delegates nothing and administers nothing.
+  "sign:git",
+  "sign:attestation",
 ]);
 
 /**

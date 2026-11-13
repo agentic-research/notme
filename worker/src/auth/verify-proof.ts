@@ -2,8 +2,12 @@
 // No provider-specific code. If it has a JWKS, we can verify it.
 
 import { TRUSTED_ISSUERS as CONTRACT_TRUSTED_ISSUERS } from "@notme/contract";
+/** The contract's trusted issuers (ADR-023 narrows their pin to a challenge audience at /join). */
+export { CONTRACT_TRUSTED_ISSUERS };
 import { base64urlDecode } from "@agentic-research/dpop";
 import { OID_EPOCH } from "../cert-authority";
+import { assertGhaEventAllowed, GHA_ISSUER as GHA_OIDC_ISSUER } from "../gha-oidc";
+import { JWKS_FETCH_TIMEOUT_MS, JWKS_POLICY, JwksCache } from "./jwks-cache";
 
 export interface VerifiedIdentity {
   type: "oidc" | "x509";
@@ -20,6 +24,12 @@ export interface OIDCProof {
 export interface X509Proof {
   type: "x509";
   cert: string; // PEM
+  /**
+   * Intermediate tier certificates, leaf-side first — present when the cert
+   * was signed by an Issuing CA tier rather than the root (ADR-019 D4).
+   * Absent or empty means root-signed, verified single-hop by verifyX509.
+   */
+  chain?: string[];
 }
 
 export type Proof = OIDCProof | X509Proof;
@@ -61,72 +71,121 @@ export function selectVerifyingKey<K extends { kid: string }>(
   );
 }
 
-// Trusted OIDC issuers — prevents SSRF via attacker-controlled iss claim.
-// Source of truth lives in @notme/contract so notme.bot's server-side
-// allowlist and this consumer's enforcement set can't drift.
+// ── Per-issuer audience map (notme-0a1ee8) ──
 //
-// The audience pin on /connections /auth/oidc/login /join is "notme.bot",
-// which works for:
-//   - https://auth.notme.bot — self-issued, always carries aud=notme.bot
-//   - https://token.actions.githubusercontent.com — GHA workflows can
-//     request any audience via core.getIDToken(audience) so they can mint
-//     tokens with aud=notme.bot
+// Which OIDC issuers are trusted, and the audience each one's tokens must
+// carry. PRESENCE IN THE MAP IS TRUST: an issuer with no entry is refused
+// before any JWKS fetch, which is what stops an attacker-controlled `iss`
+// from steering a fetch (SSRF).
 //
-// Google ID tokens carry aud=<google-client-id>.apps.googleusercontent.com
-// so they CANNOT match audience="notme.bot". Including Google here would
-// be misleading: the issuer would pass the trust check but every legitimate
-// token would fail the audience check. notme-ae65a0 / M1 from session
-// review tracks the proper fix (per-issuer audience map keyed by env config
-// for the Google client ID); until then, Google is intentionally absent so
-// callers who try it get a clear "untrusted issuer" failure rather than a
-// confusing "wrong audience" failure on every request.
-const TRUSTED_ISSUERS = new Set<string>(CONTRACT_TRUSTED_ISSUERS);
+// One audience for every issuer was the old shape, and it is why Google
+// could not be supported: its ID tokens carry
+// aud=<client-id>.apps.googleusercontent.com, which can never match
+// "notme.bot". A pin per issuer lets each carry the audience it actually
+// issues (notme-ae65a0, M1).
+//
+//   - https://auth.notme.bot: self-issued, always aud=notme.bot.
+//   - https://token.actions.githubusercontent.com: a workflow requests
+//     aud=notme.bot via core.getIDToken(audience).
+//   - https://accounts.google.com: ONLY when GOOGLE_CLIENT_ID is set, and
+//     pinned to exactly that client id.
+export type IssuerAudienceMap = Readonly<Record<string, string | readonly string[]>>;
 
-// Simple JWKS cache — per-issuer, 1 hour TTL
-const jwksCache = new Map<string, { keys: JWK[]; at: number }>();
+/** The audience the baseline issuers (@notme/contract TRUSTED_ISSUERS) must carry. */
+export const NOTME_AUDIENCE = "notme.bot";
 
-async function fetchJWKS(issuer: string): Promise<JWK[]> {
-  if (!TRUSTED_ISSUERS.has(issuer)) {
-    throw new Error(`untrusted issuer: ${issuer}`);
-  }
-  const now = Date.now();
-  const cached = jwksCache.get(issuer);
-  if (cached && now - cached.at < 3600_000) return cached.keys;
+export const GOOGLE_ISSUER = "https://accounts.google.com";
 
+/**
+ * The deployment's audience map, from its env. The contract's baseline
+ * issuers always pin "notme.bot", exactly as the single pin did. Google is
+ * added only when the operator sets GOOGLE_CLIENT_ID. Unset or blank means
+ * Google stays untrusted rather than trusted with no audience.
+ */
+export function issuerAudiences(env: { GOOGLE_CLIENT_ID?: unknown }): IssuerAudienceMap {
+  const map: Record<string, string> = {};
+  for (const iss of CONTRACT_TRUSTED_ISSUERS) map[iss] = NOTME_AUDIENCE;
+  const google = typeof env.GOOGLE_CLIENT_ID === "string" ? env.GOOGLE_CLIENT_ID.trim() : "";
+  if (google) map[GOOGLE_ISSUER] = google;
+  return Object.freeze(map);
+}
+
+/**
+ * The audiences `iss` must carry, or null if it is not trusted. Own
+ * properties only: `iss` is attacker-chosen, so "constructor" or
+ * "__proto__" must not resolve through Object.prototype. An entry with no
+ * usable audience counts as untrusted, never as "any audience".
+ */
+function expectedAudiencesFor(map: IssuerAudienceMap, iss: string): string[] | null {
+  if (!Object.prototype.hasOwnProperty.call(map, iss)) return null;
+  const v = map[iss];
+  const arr = (Array.isArray(v) ? v : [v]).filter((a): a is string => typeof a === "string" && a.length > 0);
+  return arr.length > 0 ? arr : null;
+}
+
+// Per-issuer JWKS cache (notme-a36d10, review M2): 1 h TTL, one rate-limited
+// refetch on an unknown kid, stale keys served up to 24 h when the issuer is
+// down. The rules are in jwks-cache.ts. The fetcher runs only for an issuer
+// fetchJWKS has already checked against the trust map.
+const jwksCache = new JwksCache<JWK>(async (issuer, { bypassCache }) => {
+  // Each request bounded, so the up-to-three-step discovery cannot hold a
+  // route on a hung issuer; an unknown-kid refetch skips any HTTP cache.
+  const get = (url: string) =>
+    fetch(url, {
+      ...(bypassCache ? { cache: "no-store" as const } : {}),
+      signal: AbortSignal.timeout(JWKS_FETCH_TIMEOUT_MS),
+    });
   // Try .well-known/jwks first, then .well-known/openid-configuration
-  let jwksUrl = `${issuer}/.well-known/jwks`;
-  let res = await fetch(jwksUrl);
+  let res = await get(`${issuer}/.well-known/jwks`);
   if (!res.ok) {
-    const configRes = await fetch(
-      `${issuer}/.well-known/openid-configuration`,
-    );
+    const configRes = await get(`${issuer}/.well-known/openid-configuration`);
     if (configRes.ok) {
       const config = (await configRes.json()) as { jwks_uri?: string };
       if (config.jwks_uri) {
-        res = await fetch(config.jwks_uri);
+        res = await get(config.jwks_uri);
       }
     }
   }
   if (!res.ok) throw new Error(`JWKS fetch failed for ${issuer}: ${res.status}`);
+  const body = (await res.json()) as { keys?: unknown };
+  if (!Array.isArray(body.keys)) throw new Error(`JWKS fetch failed for ${issuer}: no keys array`);
+  return body.keys as JWK[];
+}, JWKS_POLICY);
 
-  const body = (await res.json()) as { keys: JWK[] };
-  jwksCache.set(issuer, { keys: body.keys, at: now });
-  return body.keys;
+async function fetchJWKS(
+  issuer: string,
+  audiences: IssuerAudienceMap,
+  kid: string | undefined,
+): Promise<JWK[]> {
+  // Re-checked here, where the fetch is, so that no path can reach the
+  // network with an issuer the map does not name.
+  if (!expectedAudiencesFor(audiences, issuer)) {
+    throw new Error(`untrusted issuer: ${issuer}`);
+  }
+  return jwksCache.get(issuer, (keys) => {
+    try {
+      return selectVerifyingKey(keys, kid) !== undefined;
+    } catch {
+      return true; // kid omitted with several keys: refetching cannot help; the caller refuses
+    }
+  });
 }
 
 /**
- * Verify an OIDC token with mandatory audience validation.
+ * Verify an OIDC token with mandatory, per-issuer audience validation.
  *
- * `expectedAudience` is REQUIRED. It prevents confused deputy attacks: a
- * token issued for evil-app.com (same Google issuer, same user sub) must
- * be rejected because its aud doesn't match notme's client ID. Earlier
- * the parameter was optional and `/connections` forgot to pass it (see
+ * `audiences` is REQUIRED. It prevents confused deputy attacks: a token
+ * issued for evil-app.com (same Google issuer, same user sub) must be
+ * rejected because its aud doesn't match notme's client ID. Earlier the
+ * audience was optional and `/connections` forgot to pass it (see
  * notme-567f07); making it required at the type level kills the bug
- * class — TS rejects callers that try to skip the check.
+ * class — TS rejects callers that try to skip the check. It is a MAP since
+ * notme-0a1ee8: the token's own `iss` selects its audience, and an `iss`
+ * absent from the map is untrusted.
  */
 export async function verifyOIDC(
   token: string,
-  expectedAudience: string | string[],
+  audiences: IssuerAudienceMap,
 ): Promise<VerifiedIdentity> {
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("malformed JWT");
@@ -147,9 +206,13 @@ export async function verifyOIDC(
   if (typeof exp !== "number") throw new Error("missing exp claim");
   if (exp < Math.floor(Date.now() / 1000)) throw new Error("token expired");
 
+  // Trust, then audience. The token's own `iss` picks its audience pin, so
+  // an issuer with no pin has nothing to check against and is refused here.
+  const expectedArr = expectedAudiencesFor(audiences, iss);
+  if (!expectedArr) throw new Error(`untrusted issuer: ${iss}`);
+
   // Audience validation — always runs. Confused-deputy defense.
   const tokenAud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-  const expectedArr = Array.isArray(expectedAudience) ? expectedAudience : [expectedAudience];
   const audienceOk = tokenAud.some((a: unknown) =>
     typeof a === "string" && expectedArr.includes(a),
   );
@@ -160,7 +223,7 @@ export async function verifyOIDC(
   }
 
   // Fetch JWKS and select the verifying key by kid (see selectVerifyingKey).
-  const keys = await fetchJWKS(iss);
+  const keys = await fetchJWKS(iss, audiences, header.kid);
   const jwk = selectVerifyingKey(keys, header.kid);
   if (!jwk) throw new Error(`unknown key id: ${header.kid ?? "<omitted>"}`);
 
@@ -198,6 +261,12 @@ export async function verifyOIDC(
     signingInput,
   );
   if (!valid) throw new Error("invalid signature");
+
+  // GitHub Actions tokens from fork-PR events buy nothing (notme-fbb00e):
+  // the same rule validateGHAToken enforces, here for the routes that take a
+  // GitHub token through this verifier (/cert oidc, /join, /auth/oidc/login).
+  // After the signature, so the claim is GitHub-signed.
+  if (iss === GHA_OIDC_ISSUER) assertGhaEventAllowed(payload.event_name);
 
   return {
     type: "oidc",
@@ -306,23 +375,31 @@ export async function verifyX509(
 export async function verifyProof(
   proof: Proof,
   caPublicKeyPem: string | undefined,
-  expectedAudience: string | string[],
+  audiences: IssuerAudienceMap,
   /** Authority's current epoch — required for the x509 path. See verifyX509. */
   currentEpoch?: number,
 ): Promise<VerifiedIdentity> {
   if (proof.type === "oidc") {
-    return verifyOIDC(proof.token, expectedAudience);
+    return verifyOIDC(proof.token, audiences);
   }
   if (proof.type === "x509") {
     if (!caPublicKeyPem) throw new Error("CA public key required for x509 verification");
-    // expectedAudience is unused here — certs don't carry an aud claim. We
+    // `audiences` is unused here — certs don't carry an aud claim. We
     // still take it as a required argument so callers can't accidentally
     // route a token-issuing flow through this function without one.
-    void expectedAudience; // intent in IR, not just prose
+    void audiences; // intent in IR, not just prose
     // Fail closed: a caller that did not supply the epoch cannot have its
     // certificate checked against rotation, and must not be given a pass.
     if (currentEpoch === undefined) {
       throw new Error("current epoch required for x509 verification");
+    }
+    if (proof.chain && proof.chain.length > 0) {
+      // A tier-signed cert. The chain walker carries the three bounds a
+      // single-hop check cannot: pathlen, scopes ⊆ parent, and the D5
+      // namespace confinement. verifyX509 stays single-hop on purpose —
+      // delegation-depth.do.test.ts pins that split.
+      const { verifyCertChain } = await import("./verify-chain");
+      return verifyCertChain(proof.cert, proof.chain, caPublicKeyPem, currentEpoch);
     }
     return verifyX509(proof.cert, caPublicKeyPem, currentEpoch);
   }

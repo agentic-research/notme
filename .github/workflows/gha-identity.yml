@@ -86,7 +86,14 @@ on:
         description: 'Ed25519 bridge cert PEM — commit signing and APAS attestations. Public data.'
         value: ${{ jobs.exchange.outputs.notme_signing_cert }}
       notme_identity:
-        description: 'WIMSE identity URI (wimse://notme.bot/gha/{owner}/{repo})'
+        # SHAPE CORRECTED 2026-10-27. This said wimse://notme.bot/gha/{owner}/{repo},
+        # which notme stopped emitting when ADR-019 D2 took the attestation
+        # mechanism out of the identity slot (notme-77438b). /cert/gha returns
+        # principalIdentity(trustDomain, claims.sub) — see worker.ts:825.
+        # A stale identity shape in the automated path is not cosmetic: it is
+        # the same defect as signet-751af3, where verification inputs pinned
+        # the old shape and release verification could not pass.
+        description: 'WIMSE identity URI: wimse://notme.bot/principal/<urlencoded OIDC sub>, e.g. wimse://notme.bot/principal/repo%3Aowner%2Frepo%3Aref%3Arefs%2Fheads%2Fmain'
         value: ${{ jobs.exchange.outputs.notme_identity }}
       expires_at:
         description: 'Cert expiry, Unix timestamp'

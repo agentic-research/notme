@@ -19,6 +19,7 @@
 
 import { SubjectAlternativeNameExtension, X509Certificate } from "@peculiar/x509";
 import { importPublicKey, OID_SCOPES, OID_SUBJECT } from "../cert-authority";
+import { certEpoch } from "./verify-proof";
 
 export interface DerivedCredentials {
   /**
@@ -26,7 +27,7 @@ export interface DerivedCredentials {
    *
    * NOT from OID_SUBJECT — that extension carries the internal PRINCIPAL name
    * (e.g. `principal-test`), while the WIMSE URI callers audit and authorize
-   * against (`wimse://notme.bot/gha/org/repo`) is minted into the SAN. Reading
+   * against (`wimse://notme.bot/principal/<oidc-sub>`) is minted into the SAN. Reading
    * the wrong one yields a plausible non-empty string, which is the failure
    * mode that would survive review.
    */
@@ -37,6 +38,12 @@ export interface DerivedCredentials {
   scopes: string[];
   /** Unix seconds, from the signing cert's notAfter. */
   expiresAt: number;
+  /**
+   * CA epoch both certs were issued under (OID_EPOCH). proxy() compares it
+   * with the authority's current epoch before attaching the certs, so a
+   * revokeEpoch() or rotate() stops them (notme-baea8c).
+   */
+  epoch: number;
 }
 
 /**
@@ -145,7 +152,16 @@ async function verifyAgainstCA(
   caPublicKey: CryptoKey,
   what: string,
 ): Promise<X509Certificate> {
-  const cert = new X509Certificate(certPem);
+  // A caller's bytes, so a parse failure is the caller's fault and says so by
+  // name. @peculiar/x509 3.x refuses DER with trailing bytes (1.14.3 accepted
+  // it and kept them in rawData); its message names ASN.1 internals, which
+  // are the library's business, not the caller's (notme-3ee3b0).
+  let cert: X509Certificate;
+  try {
+    cert = new X509Certificate(certPem);
+  } catch {
+    throw new Error(`${what} cert is not a well-formed DER certificate`);
+  }
 
   // `signatureOnly` matters. peculiar's verify() checks the validity window
   // as well by default, so an EXPIRED cert comes back as `false` — reported as
@@ -199,7 +215,19 @@ export async function deriveCredentialsFromCerts(
     );
   }
 
+  // One epoch for the pair, and it must be readable: a held cert with no
+  // epoch could not be checked against revocation, so it is not held.
+  const epoch = certEpoch(signingCert);
+  const mtlsEpoch = certEpoch(mtlsCert);
+  if (epoch === null || mtlsEpoch === null) {
+    throw new Error("cert carries no epoch — cannot be checked against rotation");
+  }
+  if (epoch !== mtlsEpoch) {
+    throw new Error(`cert epoch mismatch — signing cert epoch ${epoch}, mTLS cert epoch ${mtlsEpoch}`);
+  }
+
   return {
+    epoch,
     identity,
     principal: extensionString(signingCert, OID_SUBJECT, "subject identity"),
     scopes: extensionScopes(signingCert),

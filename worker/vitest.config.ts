@@ -17,5 +17,11 @@ export default defineConfig({
       // owned + tested in cloister.)
       "../packages/dpop/__tests__/**/*.test.ts",
     ],
+    // Hermetic: a fetch to any non-loopback host is refused and fails the
+    // test that made it (notme-3fc74b). Two OIDC tests used to reach live
+    // auth.notme.bot and pass on whatever the network did.
+    // reflect-metadata FIRST: @peculiar/x509 3.x needs the polyfill loaded
+    // before it (notme-3ee3b0, setup/reflect-metadata.ts).
+    setupFiles: ["./src/__tests__/setup/reflect-metadata.ts", "./src/__tests__/setup/no-network.ts"],
   },
 });

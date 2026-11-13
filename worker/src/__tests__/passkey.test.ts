@@ -8,7 +8,7 @@
  *   session.hmac.integrity
  *   session.expiry
  *
- * Runs in Workerd runtime via @cloudflare/vitest-pool-workers.
+ * Runs in Workerd runtime via @cloudflare/vitest-plugin.
  */
 
 import { describe, expect, it } from "vitest";
@@ -288,7 +288,7 @@ describe("passkey.challenge.session-binding", () => {
     };
   }
 
-  it("rejects assertions whose challenge was never issued", async () => {
+  it("passkey.challenge.unknown-rejected — rejects assertions whose challenge was never issued", async () => {
     const sql = createMockSql();
     // No challenges stored. Submitted challenge has no DB match.
     const result = await verifyAuthentication(

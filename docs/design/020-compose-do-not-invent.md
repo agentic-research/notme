@@ -112,7 +112,9 @@ Recorded because each was proposed at some point in the design conversation:
 - A notme-specific task store or bead mirror. rosary owns task state.
 - A "promise token" or bespoke completion credential. Acceptance is a grant
   (ADR-019), expressed with the credentials that already exist.
-- A notme hash-chain or transparency format of its own invention.
+- A notme hash-chain or transparency format of its own invention. (Applied
+  2026-08-28: issuance transparency is a Static CT API log composed from
+  Cloudflare's `azul`, not a notme log format — `notme-907299`.)
   `notme-907299` targets the **Static CT API** — tiled, existing tooling — not
   RFC 6962, whose logs shut down 2026-02-28, and not something new.
 - A parallel attestation format alongside in-toto. The gap in-toto leaves is
@@ -163,3 +165,13 @@ answer — it is the cost being moved from notme onto every consumer.
 3. **Does this ADR bind signet and cloister**, or only notme? It is written as
    notme's constraint; the layer table asserts ownership that those repos
    should confirm rather than inherit.
+4. **Where does the predicate-type registry live?** Lifted from `notme-e7e1cf`
+   (CAS-release ADR, deferred): a predicate type minted under `notme.bot` puts
+   vocabulary in notme's namespace when APAS — signet's document — is where
+   predicate types already live. The acceptance-predicate work (`notme-8eb592`)
+   will hit the same question independently; two predicate types designed
+   without a registry convention will collide or diverge. Candidates:
+   `signet/docs/apas` (where the existing predicate lives), `notme/docs`, or a
+   dedicated registry doc. This ADR's own test applies: in-toto's
+   `predicateType` URI convention is the standard — the open part is only
+   *whose namespace* the URIs live under.

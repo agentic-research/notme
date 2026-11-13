@@ -23,4 +23,6 @@ overrides:
   ws@<8.20.1: "^8.20.1"
   # undici reaches us only via action>@actions/http-client — no direct dep to
   # bump, hence the override.
-  undici@<6.28.0: "^6.28.0"
+  # Raised to 6.29.1 (notme-0fff62): GHSA for the TLS certificate validation
+  # bypass and the second DoS require >=6.29.1.
+  undici@<6.29.1: "^6.29.1"

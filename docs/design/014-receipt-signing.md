@@ -120,15 +120,91 @@ rather than signing what it was told. The wire shape is unchanged — a correct
 caller sends correct values and nothing happens — but a lying one is refused
 instead of served.
 
+### `timestamp_ms` is bounded to notme's clock
+
+`timestamp_ms` is caller-chosen, but notme has a clock, so it is checked:
+anything outside **±300s** of the authority's `Date.now()` is refused with
+`TIMESTAMP_OUT_OF_RANGE` (notme-ad2a7a). The window is RECEIPTS.md §2.2.1
+step 12's, the one a conformant peer already applies against its own clock.
+A tighter window would reject receipts every conformant verifier accepts.
+
+Without the bound, a compromised binding holder could date a fabricated
+receipt anywhere from 1970 to year 287396 and get a valid master-key
+signature on it. With it, a fabrication can only be dated to the window in
+which the attacker actually held the binding.
+
+**Residual, structurally unboundable.** Even with the clamp, a compromised
+binding holder still chooses `nonce`, `request_hash`, `body_hash` and
+`headers_hash` freely. They describe a request notme never sees, so notme has
+nothing to check them against. Within the time window, then, a compromised
+binding holder can mint a validly signed receipt for a request that never
+happened, and an offline auditor can't tell it from a genuine one. Bounding
+that takes the binding itself: who holds it, and notme's own record of when
+it was used.
+
+### The optional ninth key, `delegation`: validator only, not reachable
+
+`receipts/commitment.ts` admits one key beyond the eight: `delegation`, the
+UTF-8 correlation key `<principal>/<bridge>/<task>` (notme-9f84e6). Like
+`actor_fp`, it is caller-sent and authority-checked: it is signed only if it
+equals the delegation the authority derived itself from the presented
+credential (`CommitmentFacts.delegation`), and refused with
+`DELEGATION_MISMATCH` otherwise, including when the authority derived none.
+
+**No production path derives one** (notme-c0db9b). `signReceipt` receives
+only the commitment bytes, and `signReceiptCommitment` builds its facts from
+`actorFp`, `epoch` and the clock. With no credential, there is nothing to
+derive a delegation from. So today notme **refuses every nine-key
+commitment**. The field is not "inert until cloister adopts it": if cloister
+sent one tomorrow, it would be refused.
+
+The outstanding work is notme's, and it needs a wire decision first:
+`signReceipt` has to receive the credential the request was made under (a
+task cert and its tier), verify it with `verifyCertChain`, and pass
+`taskCorrelationKey()` of the verified chain as `facts.delegation`. That
+changes the `ReceiptSigner` signature, so it is agreed with the caller under
+`cloister-c10ff2`, not chosen unilaterally here.
+
+Tests: `receipt-delegation.test.ts` covers the validator alone.
+`receipt-signer.do.test.ts` pins the refusal through the real entry point,
+and carries an `it.fails` that flips when a producer lands.
+
 ## What is deliberately not built
 
 - **No `/internal/sign-jwt`** (notme-d87ef2). Identical hazard class and it
   should get the same treatment, but it is a separate contract with a
   separate consumer; bundling them would hide one behind the other.
-- **No key material export, ever.** `signReceipt` returns a signature and an
-  epoch. `CryptoKey` is not Structured Cloneable and cannot cross the RPC
-  boundary regardless — that is a property of the platform, not a check we
-  perform, and it is worth not undermining by adding an export path later.
+- **`signReceipt` itself returns no key material** — a signature and an
+  epoch, and that is a property of the method.
+
+  This ADR previously generalised that into "`CryptoKey` is not Structured
+  Cloneable and cannot cross the RPC boundary regardless — that is a property
+  of the platform, not a check we perform." Both halves needed correcting
+  (notme-bcbd74), and the corrected version is *less* comfortable than the
+  original, which is why it is written out here rather than quietly reworded:
+
+  - **The platform claim is false.** W3C WebCrypto declares `[Serializable]
+    interface CryptoKey`, and Node clones a non-extractable Ed25519 private
+    key successfully. What is true is narrower and runtime-specific:
+    *workerd's* serializer refuses `CryptoKey` with a `DataCloneError`.
+    Measured, not assumed — `rpc.cryptokey.isolation`.
+  - **"Regardless" was doing real work, and it is load-bearing.**
+    `SigningAuthority.getOrCreateSigningKey()` is in the RPC allow-list and
+    its return type is `{ signingKey: CryptoKey; verifyKey: CryptoKey; keyId }`
+    — so a caller holding a stub *does* invoke a method that hands back the
+    authority's private key, and the ONLY thing stopping delivery is that
+    serializer. Measured: the call throws `DataCloneError` on the return path.
+  - **Non-extractability is a different control and does not cover the gap.**
+    The held key IS non-extractable in every storage mode — generated
+    extractable just long enough to serialize one JWK, then re-imported
+    non-extractable. That stops byte export. It does not stop USE: a
+    non-extractable private key still signs, so a caller who received one
+    would hold the authority's full signing capability.
+
+  So the mitigation for RPC key extraction is a single runtime behaviour that
+  no standard requires. Do not port this reasoning to another runtime, and do
+  not add a second method returning `CryptoKey` on the assumption that the
+  first one is safe. Narrowing that surface is tracked separately.
 - **`/internal/sign-receipt` as an HTTP path is explicitly refused**, not
   merely absent, so a caller following the bead's original wire shape gets a
   clear 404 with a pointer instead of falling through to the asset handler.
@@ -161,6 +237,17 @@ leaving `NOTME` exactly as it is.
 Yes. Both `receiptFacts()` and `signReceipt()` are methods on `ReceiptSigner`,
 so **one** dedicated binding covers both.
 
+So is `epochPublicKey(epoch)` (notme-a0cff4). It returns every public key
+that served that epoch, current or retired: the same bytes
+`/.well-known/epochs.json` serves. It exists so an archive built by polling
+`/internal/ca-bundle` can backfill an epoch it never observed, such as one that
+two rotations between polls skipped. It returns a result union
+(`EpochPublicKeyResult`). `EPOCH_UNKNOWN` means notme has no key for that
+epoch, and `EPOCH_INVALID` means the argument was not a non-negative integer.
+Neither code is retryable, and a transport failure rejects the call instead.
+The result is a set because several keys can sign under one epoch: pick the
+signer by `actor_fp` = SHA-256(raw public key).
+
 ### 2. The full error-code set
 
 Exported as `CommitmentErrorCode` from `worker/src/receipts/commitment.ts`, so
@@ -171,7 +258,7 @@ a `switch` gets exhaustiveness from the compiler rather than from a guess:
 | `EMPTY_INPUT` | zero-length input | no |
 | `NOT_CBOR` | undecodable — where DER certs and JWT signing inputs land | no |
 | `NOT_A_MAP` | decoded to something other than a CBOR map | no |
-| `WRONG_KEY_COUNT` | not exactly 8 keys | no |
+| `WRONG_KEY_COUNT` | not 8 keys, or 9 whose ninth is not `delegation` | no |
 | `MISSING_KEY` | a required key absent | no |
 | `FIELD_NOT_BYTES` | byte-string field wasn't one | no |
 | `FIELD_NOT_UINT` | uint field wasn't a non-negative integer | no |
@@ -181,6 +268,7 @@ a `switch` gets exhaustiveness from the compiler rather than from a guess:
 | `TIMESTAMP_OUT_OF_RANGE` | outside ±300s of the authority clock | no* |
 | `ACTOR_FP_MISMATCH` | `actor_fp` isn't this authority's | no |
 | `EPOCH_MISMATCH` | `epoch` isn't current | **YES — once** |
+| `DELEGATION_MISMATCH` | `delegation` isn't the one the authority derived. Today it derives none, so every nine-key commitment gets this (see above) | no |
 | `NOT_CANONICAL` | bytes aren't the canonical encoding of the structure | no |
 
 \* not retryable *unchanged*; a caller whose clock has drifted must correct it,
@@ -218,12 +306,28 @@ Only two things invalidate it:
 
 1. **`EPOCH_MISMATCH` from `signReceipt`.** This is the signal. Re-read, retry
    once.
-2. **An explicit `rotate()`**, which is an operator action over admin RPC.
+2. **An explicit operator action over admin RPC.** There are two, and since
+   `notme-77a024` decoupled them they invalidate *different halves* of
+   `receiptFacts()` and surface as different codes:
+
+   | action | changes | code a stale caller sees | retryable |
+   |---|---|---|---|
+   | `revokeEpoch()` | `epoch` | `EPOCH_MISMATCH` | **yes — once** |
+   | `rotate()` | `actor_fp` | `ACTOR_FP_MISMATCH` | no |
+
+   The asymmetry is deliberate and worth stating because it is easy to read
+   the table as a bug. `actor_fp` is checked first (`commitment.ts`), so a
+   rotation has *always* surfaced as the non-retryable code — this is not a
+   regression introduced by the decoupling. A revocation is a generation a
+   caller can simply re-read and retry into; a key rotation means the
+   commitment was built against an authority identity that no longer signs,
+   and retrying the same bytes cannot fix that.
 
 No TTL is needed and polling is the wrong shape: `alarm()` calls
-`generateBundle()`, never `rotate()`, so the epoch does not move on a timer.
-(An earlier version of this ADR and a code comment both said rotation was
-"alarm-driven" — that was drift; corrected.)
+`generateBundle()`, never `rotate()` or `revokeEpoch()`, so the epoch does not
+move on a timer. (An earlier version of this ADR and a code comment both said
+rotation was "alarm-driven" — that was drift; corrected. Rotation no longer
+moves the epoch at all.)
 
 ### Bound the retry — one attempt
 

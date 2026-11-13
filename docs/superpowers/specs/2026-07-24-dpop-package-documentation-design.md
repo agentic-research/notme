@@ -1,5 +1,7 @@
 # DPoP Package Documentation Design
 
+**Status (2026-11-03):** implemented (notme-1c93bc, closed).
+
 Date: 2026-07-24
 Bead: `notme-1c93bc`
 

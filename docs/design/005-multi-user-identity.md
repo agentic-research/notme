@@ -8,6 +8,7 @@
 **Status:** Accepted
 **Date:** 2026-03-28
 **Status updated:** 2026-05-09 — principal model + capability_grants shipped (`worker/src/auth/principals.ts`, `worker/src/auth/connections.ts`)
+**Status amended:** 2026-11-02 (`notme-c006aa`) — as of 2026-08-28 (`notme-77a024`) the passkey path also enrols a principal with grants, and every authority gate reads grants live. Phase 2 item 5 and all of Phase 3 were not executed: `passkey_users.is_admin` and the `connections` table are still live, and `/auth/federated/link` does not exist. See the notes under "What disappears", "Session Payload" and "Migration Path".
 **Bead:** notme-7c7f83
 **Relates to:** ADR-004 (bridge certs), ADR-0002 (identity & secrets architecture)
 
@@ -167,6 +168,25 @@ CREATE TABLE challenges (
 - `connections` table -- replaced by `federated_identities`
 - The `isAdmin` field in session cookies -- replaced by a list of active scopes
 
+> **CORRECTION (2026-11-02, `notme-c006aa`).** Only the grant model shipped;
+> none of the four removals did.
+>
+> - `passkey_users` and its `is_admin` column still exist
+>   (`worker/src/auth/passkey.ts`). Since 2026-08-28 they no longer decide a
+>   passkey user's authority on each login: `ensurePasskeyPrincipal`
+>   (`worker/src/signing-authority.ts`) creates a `principals` row with grants
+>   the first time a passkey user registers or signs in, and `is_admin` only
+>   chooses the initial grant set then (all three scopes vs `bridgeCert`).
+>   After that the grant store is the source. Before 2026-08-28 the passkey
+>   path created no principal and derived scopes from `is_admin` on every
+>   login.
+> - `connections` was not replaced. `POST /connections` still writes the
+>   legacy table, keyed by `session.userId`. `federated_identities` exists
+>   and is written by `/join` and the OIDC path, but the two tables coexist.
+> - The session cookie still carries an `isAdmin` field, now derived from
+>   `scopes.includes("authorityManage")` (`worker/src/auth/session.ts`) for
+>   older readers; it is not consulted by authority gates.
+
 ### Session Payload
 
 ```typescript
@@ -187,13 +207,40 @@ For operations that require real-time authorization checks (e.g., `authorityMana
 scope), the route handler re-validates against `capability_grants` at request time
 rather than trusting the session alone.
 
+> **Note (2026-11-02, `notme-c006aa`).** This was not true when written and
+> became true on 2026-08-28 (`notme-77a024`). Until then every gate read only
+> the signed cookie, so a revoked grant stayed usable until the session expired
+> (`SESSION_TTL_SECONDS` = 24h). Now `liveScopes()`
+> (`worker/src/auth/session.ts`) intersects the cookie's scopes with
+> `getPrincipalScopes()` on each request, and the authority gates in
+> `worker/worker.ts` call it — not only for `authorityManage`. The previous
+> paragraph's "existing sessions remain valid until expiry" therefore no
+> longer describes authority checks: the cookie stays valid, but a revoked
+> scope stops working on the next request.
+
 ### Bridge Cert Subject
 
 The bridge cert subject identifies the holder. The correct content:
 
+> **CORRECTION (2026-08-30).** The allocation below **never shipped** and must
+> not be used to pick a number. The code uses `.1.4` for the epoch and `.1.5`
+> for the auth method, not `.1.7` and `.1.8`. Worse, `.1.7` was independently
+> claimed by ley-line-open for `confinementDigest` (LLO v0.7.6,
+> `ley-line-open-c79ea8`), which cloister's verifier parses out of
+> notme-minted certificates — so this table's `.1.7` has a third meaning
+> again. A task-scope extension was briefly allocated there before the
+> collision was found; nothing was issued carrying it.
+>
+> **`worker/src/cert-authority.ts` is the registry.** It carries the live
+> allocation and a note on which numbers belong to which repo. Three
+> projects — notme, signet and ley-line-open — allocate under the same
+> squatted `1.3.6.1.4.1.99999` arc with no registry between them, which is
+> the underlying problem and why `notme-229dc3` (obtain a real IANA PEN)
+> is not cosmetic.
+
 ```
 Subject CN: <principal_id>
-Extensions:
+Extensions:                                      # HISTORICAL — never shipped
   1.3.6.1.4.1.99999.1.1: OIDCSubject (if authenticated via OIDC)
   1.3.6.1.4.1.99999.1.7: Epoch
   1.3.6.1.4.1.99999.1.8: AuthMethod ("passkey" | "oidc:<issuer>")
@@ -231,20 +278,35 @@ The deployer's principal gets all three capability grants:
 ```
 1. Existing user (with authorityManage scope) creates an invite:
    POST /invites { scopes: ["bridgeCert"], ttl: 3600 }
-   -> returns { token: "a1b2c3d4...", url: "https://auth.example.com/join?t=a1b2c3d4" }
+   -> returns { token: "a1b2c3d4...", url: "https://auth.example.com/join#t=a1b2c3d4" }
+      (token in the fragment, never the query: a fragment is not sent to the
+      server, so it stays out of request logs -- notme-3dfe15)
 
 2. Inviter shares the URL (text message, email, QR code -- out of band)
 
 3. New user opens the URL
 4. System validates invite token (not expired, not redeemed)
-5. System creates a new principal with the scopes specified in the invite
-6. User is presented with authentication options:
+5. User is presented with authentication options:
    a. Register a passkey (preferred)
    b. Sign in with OIDC (if any provider tokens are available)
-7. Chosen credential is linked to the new principal
-8. Invite marked as redeemed
-9. Session cookie issued
+6. Chosen credential is verified
+7. Only then: invite marked as redeemed, principal created with the invite's
+   scopes, credential linked to it -- one atomic step in the DO
+8. Session cookie issued
 ```
+
+> **As built (notme-3dfe15).** The first version redeemed the invite and
+> created the principal at step 4, before any credential existed: a failed
+> passkey ceremony burned the invite, a successful one enrolled the principal
+> with `bridgeCert` whatever the invite said, and `POST /join` with no proof
+> issued a session to a principal with no authenticator. Now `POST /join`
+> without a proof (or `register/options` with `inviteToken`) only *reserves*
+> the invite for one WebAuthn user id and returns registration options;
+> `register/verify` consumes the reservation. `POST /join` with an OIDC proof
+> verifies the proof first (bad proof: 403, invite untouched) and refuses an
+> identity already linked to a principal (409). Each OIDC token is accepted
+> once at `/join` (and at `/auth/oidc/login`): its jti is spent in the
+> SigningAuthority DO and kept until 300 s past the token's exp (8aed7ef).
 
 The invite token is the authorization to create an account. It replaces the
 "admin must be present" requirement. The invite is time-limited (default 1 hour),
@@ -252,7 +314,8 @@ single-use, and scoped (the inviter chooses what capabilities the invitee gets).
 
 **Security properties:**
 - The invite URL is a bearer token -- anyone who has it can use it
-- Time-limited (configurable, default 1 hour)
+- Time-limited (configurable, default 1 hour, clamped to a 7-day ceiling —
+  `INVITE_MAX_TTL_SECONDS`, notme-2131e8)
 - Single-use (redeemed_at is set on first use)
 - Scoped (invitee cannot escalate beyond what the invite grants)
 - Auditable (created_by, redeemed_by tracked)
@@ -332,6 +395,11 @@ POST /auth/passkey/register/verify   (links new credential to session.principalI
 POST /auth/federated/link { proof: { type: "oidc", token: "<jwt>" } }
 (requires active session, links identity to session.principalId)
 ```
+
+> **Not built (2026-11-02, `notme-c006aa`).** `/auth/federated/link` does not
+> exist. Linking an identity to a signed-in user is `POST /connections`, which
+> writes the legacy `connections` table keyed by `session.userId` — the shape
+> Issue 1 above describes.
 
 ### Flow 6: Self-Hoster Without Passkeys
 
@@ -428,6 +496,14 @@ But delegation is always bounded by the grantor's own capabilities.
 3. Drop `is_admin` references
 4. Update identity.capnp to add `OIDCProof` to the Proof union (generic, not GHA-specific)
 
+> **Execution status (2026-11-02, `notme-c006aa`).** Phase 2 items 1, 2, 4 and
+> 6 shipped; item 3 shipped as create only (`POST /invites` plus the `GET`
+> form — there is no invite list or revoke route). Item 5 (`/connections` -> `/auth/federated/link`) did not. Phase 3 was not
+> executed: `passkey_users`, `connections` and `is_admin` are all still
+> present. Phase 1 was done in effect rather than as a one-shot migration —
+> passkey users are enrolled as principals lazily, on their next
+> registration or sign-in.
+
 ## Open Questions
 
 1. **Open registration:** Should a new OIDC identity automatically create a principal,
@@ -461,11 +537,12 @@ But delegation is always bounded by the grantor's own capabilities.
 
 An invite URL is a bearer token. If leaked, anyone can create an account with the
 granted scopes. Mitigations:
-- Short TTL (default 1 hour, configurable)
+- Short TTL (default 1 hour, configurable up to a 7-day ceiling)
 - Single-use
 - Scoped (invitee gets only what the invite specifies)
 - Auditable (created_by is recorded)
-- Revocable (delete the invite before it is redeemed)
+- Revoked wholesale by `/auth/passkey/reset`, which deletes every unredeemed
+  invite (notme-2131e8). There is no per-invite revoke route.
 
 ### Threat: OIDC issuer compromise
 
@@ -490,6 +567,8 @@ A principal's `authorityManage` grant is revoked, but their session still carrie
 the scope. Mitigations:
 - Session TTL is 24 hours maximum
 - `authorityManage` operations re-check grants at request time (not session-only)
+  — true since 2026-08-28 via `liveScopes()`, for every authority gate; see the
+  note under "Session Payload"
 - For higher assurance: reduce session TTL or implement a session revocation list
 
 ## Consequences

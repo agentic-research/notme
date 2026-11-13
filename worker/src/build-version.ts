@@ -59,3 +59,52 @@ export function buildInfo(env: { BUILD_SHA?: string }): BuildInfo {
   if (!raw || !COMMIT_SHA_RE.test(raw)) return UNSTAMPED;
   return { commit: raw, stamped: true };
 }
+
+/** A Cloudflare Worker version id (a UUID). */
+const VERSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * The Cloudflare VERSION serving this request, from the version-metadata
+ * binding (`[version_metadata] binding = "CF_VERSION_METADATA"`), or
+ * `"unknown"` when the binding is absent or malformed (notme-325916, review M5).
+ *
+ * WHY BOTH THIS AND THE COMMIT. Two versions can share a commit — a config- or
+ * secret-only re-upload, the same commit uploaded twice — so a pinned probe that
+ * Cloudflare silently routed to the OLD version could still report the
+ * expected commit. The version id cannot collide that way: Cloudflare mints a
+ * new one per upload. `worker-verify.sh` compares it whenever it is known.
+ *
+ * Same fail-honest rule as `buildInfo`: never a guess, never an omitted field.
+ */
+export function versionId(env: { CF_VERSION_METADATA?: { id?: unknown } }): string {
+  const id = env.CF_VERSION_METADATA?.id;
+  return typeof id === "string" && VERSION_ID_RE.test(id.toLowerCase()) ? id.toLowerCase() : "unknown";
+}
+
+/**
+ * The version id to PUBLISH on this request, or undefined to omit it
+ * (notme-325916, re-review N2).
+ *
+ * Cloudflare honours `Cloudflare-Workers-Version-Overrides` for any client.
+ * Version ids are random UUIDs, so before this endpoint served one an outsider
+ * could not pin; serving it unconditionally would let anyone collect both ids
+ * during a canary and pin themselves to either — including staying on the OLD
+ * build through the canary of a security fix. So the id is served only when
+ * the request's own override header already names it: the caller proves it
+ * knows the id, and learns only that its pin landed. worker-verify.sh always
+ * sends the pin, so verification is unaffected.
+ *
+ * This is the one deliberate exception to "never omit a field": an omitted
+ * version_id means "not disclosed to you", which the verifier treats as
+ * "not proven" rather than as a match.
+ */
+export function disclosedVersionId(
+  env: { CF_VERSION_METADATA?: { id?: unknown } },
+  overrideHeader: string | null,
+): string | undefined {
+  const id = versionId(env);
+  if (id === "unknown" || !overrideHeader) return undefined;
+  // Dictionary values are quoted strings; compare exact values, not substrings.
+  const named = [...overrideHeader.matchAll(/=\s*"([^"]*)"/g)].map((m) => m[1].toLowerCase());
+  return named.includes(id) ? id : undefined;
+}

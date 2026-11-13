@@ -104,6 +104,24 @@ describe("session.expiry", () => {
     const value = expiredCookie.split("notme_session=")[1].split(";")[0];
     expect(await verifySessionCookie(value, secret)).toBeNull();
   });
+
+  it("rejects a signed cookie with no usable exp (it would never expire)", async () => {
+    const { createSessionCookieWithExp, verifySessionCookie } = await import(
+      "../auth/session"
+    );
+    const secret = "test-secret-32-chars-minimum-ok!";
+    // undefined is dropped by JSON.stringify, so the signed payload has no exp;
+    // a string exp compares false against the clock in the same way.
+    for (const exp of [undefined, "9999999999"] as unknown as number[]) {
+      const cookie = await createSessionCookieWithExp(
+        { principalId: "p-1", scopes: ["bridgeCert"], authMethod: "passkey" },
+        secret,
+        exp,
+      );
+      const value = cookie.split("notme_session=")[1].split(";")[0];
+      expect(await verifySessionCookie(value, secret)).toBeNull();
+    }
+  });
 });
 
 describe("session.scopes", () => {
@@ -138,5 +156,73 @@ describe("session.scopes", () => {
     const userValue = userCookie.split("notme_session=")[1].split(";")[0];
     const userSession = await verifySessionCookie(userValue, secret);
     expect(userSession!.isAdmin).toBe(false);
+  });
+});
+
+// ── authMethod is parsed at the boundary (notme-32003c) ──────────────────────
+//
+// verifySessionCookie used to JSON.parse the payload with no shape check, so
+// each mint route carried its own guard against a missing authMethod. The
+// check now lives here, once: a validly signed payload whose authMethod does
+// not parse is not a session.
+
+/** Sign arbitrary payload bytes exactly as createSessionCookie does. */
+async function signedRaw(raw: string, secret: string): Promise<string> {
+  const { encodeBase64url } = await import("@oslojs/encoding");
+  const bytes = new TextEncoder().encode(raw);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, bytes));
+  return `${encodeBase64url(bytes)}.${encodeBase64url(sig)}`;
+}
+const signedValue = (payload: Record<string, unknown>, secret: string) =>
+  signedRaw(JSON.stringify(payload), secret);
+
+describe("session.auth-method.parsed", () => {
+  const secret = "test-secret-32-chars-minimum-ok!";
+  const exp = Math.floor(Date.now() / 1000) + 3600;
+
+  it("rejects a signed payload with no authMethod", async () => {
+    const { verifySessionCookie } = await import("../auth/session");
+    const value = await signedValue({ principalId: "p-1", scopes: ["bridgeCert"], exp }, secret);
+    expect(await verifySessionCookie(value, secret)).toBeNull();
+  });
+
+  it("rejects an empty or non-string authMethod", async () => {
+    const { verifySessionCookie } = await import("../auth/session");
+    for (const authMethod of ["", 42, null, ["passkey"], { m: "passkey" }]) {
+      const value = await signedValue({ principalId: "p-1", scopes: [], authMethod, exp }, secret);
+      expect(await verifySessionCookie(value, secret), JSON.stringify(authMethod)).toBeNull();
+    }
+  });
+
+  it("rejects a signed payload that is not an object", async () => {
+    const { verifySessionCookie } = await import("../auth/session");
+    for (const raw of ["null", "42", '"passkey"']) {
+      expect(await verifySessionCookie(await signedRaw(raw, secret), secret), raw).toBeNull();
+    }
+  });
+
+  it("still migrates a v1 session, whose method was always passkey", async () => {
+    const { verifySessionCookie } = await import("../auth/session");
+    const value = await signedValue({ userId: "u-1", isAdmin: false, exp }, secret);
+    const session = await verifySessionCookie(value, secret);
+    expect(session).not.toBeNull();
+    expect(session!.principalId).toBe("u-1");
+    expect(session!.authMethod).toBe("passkey");
+  });
+
+  it("parseAuthMethod accepts any non-empty string and nothing else", async () => {
+    const { parseAuthMethod } = await import("../auth/session");
+    expect(parseAuthMethod("passkey")).toBe("passkey");
+    expect(parseAuthMethod("oidc:https://accounts.example")).toBe("oidc:https://accounts.example");
+    for (const bad of ["", undefined, null, 1, {}, []]) {
+      expect(parseAuthMethod(bad), JSON.stringify(bad)).toBeNull();
+    }
   });
 });

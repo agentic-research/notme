@@ -102,8 +102,13 @@ async function run(): Promise<void> {
   const mtlsPem = exportSpkiPem(mtlsSpki);
   const signingPem = exportSpkiPem(signingSpki);
 
-  // ── Compute binding payload + PoP proofs ──
-  // binding = SHA-256(mtls_spki || signing_spki || SHA-256(oidc_jwt))
+  // ── Compute binding input + PoP proofs ──
+  // binding_input = mtls_spki || signing_spki || SHA-256(oidc_jwt)
+  //
+  // NO outer SHA-256. This comment used to carry one, directly above code
+  // that correctly does not — the same wrong formula ADR-008 specified
+  // (notme-bd68f2). A reader checking the code against its own comment would
+  // have "fixed" the code.
   const oidcHash = await wc.subtle.digest("SHA-256", Buffer.from(oidcToken));
   const bindingInput = Buffer.concat([
     Buffer.from(mtlsSpki),

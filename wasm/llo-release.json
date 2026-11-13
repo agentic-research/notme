@@ -1,0 +1,21 @@
+{
+  "repo": "agentic-research/ley-line-open",
+  "tag": "v0.25.0",
+  "tagCommit": "575cb7f7c3551004fc30936b51adcfcd63ebf1ef",
+  "sha256sums": {
+    "file": "SHA256SUMS",
+    "sha256": "2dab014e1db0f3a06bb555fde0cd56ac12a3f8e340fba89bfa5c120794447dbd"
+  },
+  "assets": [
+    {
+      "file": "leyline_sign.wasm",
+      "sha256": "4785107841bbd4dd911718bd8718289542d5f82ecc8e6c6717648292224a2eba",
+      "size": 320421
+    }
+  ],
+  "signature": {
+    "status": "none-published",
+    "checked": "2026-11-09: v0.25.0 has no SHA256SUMS.{sigstore.json,bundle,sig,asc,intoto.jsonl}; `gh attestation verify` finds no attestation for leyline_sign.wasm or SHA256SUMS (HTTP 404); LLO release.yml attests only the OCI image. The tag object is unsigned; its commit carries GitHub's web-flow signature (verified), which covers source, not these bytes."
+  },
+  "verifiedAgainstSource": "2026-11-09: rebuilt from the tag (cargo build --locked --release -p leyline-sign --features root-signer --target wasm32-unknown-unknown, rust 1.97.1, cargo and std source paths remapped to the runner's). NOT byte-identical, so recorded as a near-reproduction, not proof: every section has the released length, and the type, table, memory, global, export, data, producers and target_features sections are byte-identical; the function, element, code and name sections differ. The name section shows different Rust crate hashes in the symbols; that a resulting function reordering explains the rest is a hypothesis, not checked."
+}

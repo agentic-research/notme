@@ -22,6 +22,16 @@ npm install @agentic-research/dpop
 pnpm add @agentic-research/dpop
 ```
 
+### Verify where it was built
+
+From **0.4.0** onward, each version is published by this repository's `publish-dpop.yml` workflow through npm trusted publishing, and carries a provenance attestation binding the tarball to that workflow and commit:
+
+```bash
+npm audit signatures   # in a project that depends on it
+```
+
+**0.2.0 and 0.3.0 carry no attestation** (the registry's attestations endpoint returns 404 for both). 0.3.0 was also not built by the workflow at all. Use 0.4.0 or later.
+
 ## Verify a DPoP-bound token
 
 ```ts

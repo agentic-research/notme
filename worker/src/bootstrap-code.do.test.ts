@@ -70,8 +70,8 @@ async function bootstrapStatus(stub: {
   return (await stub.getOrCreateBootstrapCode()).status as string;
 }
 
-describe("bootstrap code single-use invariant (real DO)", () => {
-  it("consumes exactly once — the same code never consumes twice", async () => {
+describe("passkey.admin.bootstrap-code — bootstrap code single-use invariant (real DO)", () => {
+  it("passkey.reset.single-use — consumes exactly once, so a leaked code cannot re-wipe", async () => {
     const stub = authority("bs-single-use");
     const code = await issuedCode(stub);
     expect(code).toBeTruthy();
@@ -285,11 +285,24 @@ describe("epoch key index — third-party historical verification (notme-a0cff4)
   //
   // This is the notme half of third-party attestability: publish the epoch →
   // key mapping so an auditor can verify history, not just the present.
-  it("serves every epoch's signing key, current and retired", async () => {
+  // KEYED BY KEY, NOT BY EPOCH (notme-77a024). This test used to index the
+  // response by `epoch` and expect one key per epoch. That held only while
+  // `rotate()` bumped the epoch in the same statement that replaced the key;
+  // now the epoch is the revocation generation and moves only on
+  // `revokeEpoch()`, so several keys can have signed under one epoch and one
+  // key can span several. Indexing by epoch would silently drop keys — which
+  // is the very repudiation risk this test exists to deny, so the index moved
+  // to `keyId` and the epoch became the span each key covers.
+  it("serves every key that ever signed, current and retired", async () => {
     const stub = authority("default");
-    // Establish a key, then rotate twice so there is real history to resolve.
+    // Establish a key, rotate twice, and move the epoch once — so there is
+    // both key history AND epoch history, and the two are interleaved rather
+    // than moving in lockstep.
     const first = await stub.getPublicKeyRawB64();
+    const firstBundle = await stub.generateBundle();
+    const startEpoch = firstBundle.epoch;
     const r1 = await stub.rotate();
+    await stub.revokeEpoch();
     const r2 = await stub.rotate();
 
     const res = await worker.fetch(
@@ -300,22 +313,38 @@ describe("epoch key index — third-party historical verification (notme-a0cff4)
     const body = (await res.json()) as {
       epochs: Array<{
         epoch: number;
+        untilEpoch: number | null;
         keyId: string;
         publicRawB64: string;
         retiredAt: number | null;
       }>;
     };
 
-    // Every epoch that ever existed is resolvable, including the two retired
-    // by the rotations above — the case cloister could previously miss.
-    const byEpoch = new Map(body.epochs.map((e) => [e.epoch, e]));
-    expect(byEpoch.size).toBeGreaterThanOrEqual(3);
-    expect(byEpoch.get(r2.epoch)?.retiredAt).toBeNull(); // current
-    expect(byEpoch.get(r1.epoch)?.retiredAt).toBeTypeOf("number"); // retired
+    // Every key that ever signed is resolvable, including the two retired by
+    // the rotations above — the case cloister could previously miss.
+    const byKeyId = new Map(body.epochs.map((e) => [e.keyId, e]));
+    expect(byKeyId.size).toBeGreaterThanOrEqual(3);
+    expect(byKeyId.get(r2.newKeyId)?.retiredAt).toBeNull(); // current
+    expect(byKeyId.get(r2.newKeyId)?.untilEpoch).toBeNull(); // still serving
+    expect(byKeyId.get(r1.newKeyId)?.retiredAt).toBeTypeOf("number"); // retired
+
+    // The middle key signed ACROSS the revocation, so its span is two epochs
+    // wide. One epoch number could not have recorded that.
+    expect(byKeyId.get(r1.newKeyId)?.epoch).toBe(startEpoch);
+    expect(byKeyId.get(r1.newKeyId)?.untilEpoch).toBe(startEpoch + 1);
+
     // The original key is still resolvable two rotations later — the exact
-    // repudiation risk notme-acd503 described.
-    const oldest = [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch)[0]!;
-    expect(oldest.publicRawB64).toBe(first);
+    // repudiation risk notme-acd503 described. Identified by keyId, because
+    // EPOCH NO LONGER ORDERS KEYS: this key and r1's both began at
+    // startEpoch, so "sort by epoch and take the first" picks between them
+    // arbitrarily. That tie is the decoupling showing through, and an earlier
+    // draft of this test failed on it — worth asserting rather than sorting
+    // around, since any consumer treating epoch as a key's identity hits the
+    // same ambiguity.
+    expect(byKeyId.get(firstBundle.keyId)?.publicRawB64).toBe(first);
+    expect(byKeyId.get(firstBundle.keyId)?.epoch).toBe(startEpoch);
+    expect(byKeyId.get(r1.newKeyId)?.epoch).toBe(startEpoch);
+    expect(firstBundle.keyId).not.toBe(r1.newKeyId);
   });
 
   it("is cacheable and needs no authentication — an auditor is not a principal", async () => {
@@ -433,5 +462,100 @@ describe("a bootstrap code is valid ONLY while nobody can authenticate (notme-ad
     const stub = authority("bs-consume-no-admin");
     const code = await issuedCode(stub);
     expect(await stub.consumeBootstrapCode(code)).toBe(true);
+  });
+});
+
+describe("invites are inside the reset, and inside a ceiling (notme-2131e8)", () => {
+  // An invite is a way in: redeeming one creates a principal with whatever
+  // scopes it names, authorityManage included. #hasAuthenticator does not
+  // count invites, so "reset left nobody able to authenticate" was only true
+  // if no invite survived the reset. Redemption checked redeemed_at
+  // and expires_at and nothing else — so one did.
+  it("invite.reset.revokes — an invite minted before resetPasskeyData cannot be redeemed after it", async () => {
+    const stub = authority("bs-reset-revokes-invites");
+    // A real granter, so the invite is live on its own terms before the reset
+    // (an invite whose inviter cannot grant it is dead anyway — review M2 —
+    // which would make this test pass for the wrong reason).
+    await stub.createPrincipalWithCapabilities("pre-reset-admin", ["bridgeCert", "authorityManage"]);
+    const invite = await stub.createInviteToken(
+      "pre-reset-admin",
+      ["bridgeCert", "authorityManage"],
+      3600,
+    );
+    expect(await stub.reserveInviteToken(invite.token, "pre-reset-probe")).not.toBeNull();
+    await stub.resetPasskeyData();
+    expect(await stub.reserveInviteToken(invite.token, "post-reset-stranger")).toBeNull();
+  });
+
+  // The TTL was caller-supplied and unclamped: `body.ttl ?? 3600` went
+  // straight into expires_at, so an authorityManage invite could be minted
+  // to live for a decade. The ceiling is the one the invite form already
+  // states (max="168" hours) — the API simply did not enforce it.
+  it("invite.ttl.ceiling — clamps an invite's lifetime to INVITE_MAX_TTL_SECONDS (7 days)", async () => {
+    const stub = authority("bs-invite-ttl-ceiling");
+    const tenYears = 10 * 365 * 24 * 3600;
+    const before = Date.now();
+    const invite = await stub.createInviteToken("admin", ["authorityManage"], tenYears);
+    const lifetimeS = (Date.parse(invite.expiresAt) - before) / 1000;
+    expect(lifetimeS).toBeLessThanOrEqual(7 * 24 * 3600 + 5);
+    expect(lifetimeS).toBeGreaterThan(7 * 24 * 3600 - 60);
+  });
+
+  it("invite.ttl.finite — refuses a non-finite TTL rather than minting an invite with no usable expiry", async () => {
+    // Inside the DO rather than over RPC: a rejected RPC promise surfaces as
+    // an unhandled rejection in this pool even when the test awaits it.
+    const { createInvite } = await import("./auth/principals");
+    await runInDurableObject(authority("bs-invite-ttl-nonfinite"), async (_auth, state) => {
+      for (const ttl of [Number.POSITIVE_INFINITY, Number.NaN]) {
+        expect(() => createInvite(state.storage.sql, "admin", ["bridgeCert"], ttl)).toThrow(
+          /finite/,
+        );
+      }
+    });
+  });
+});
+
+// ── notme-b51777: the consume is a compare-and-swap ──────────────────────────
+//
+// consumeBootstrapCode reads `used = 0`, then awaits timingSafeEqual (an HMAC
+// over crypto.subtle, a non-storage await), then marks the row used. Per
+// Cloudflare's rules of Durable Objects, input gates protect only storage
+// operations; any other await lets a second request interleave. Pre-fix the
+// write was an unconditional `UPDATE … SET used = 1`, so two concurrent
+// consumers that both passed the SELECT both returned true: two
+// administrators out of one single-use code.
+describe("passkey.admin.bootstrap-code — concurrent consume (notme-b51777)", () => {
+  it("passkey.admin.bootstrap-code.cas — two concurrent consumes of one code: exactly one succeeds", async () => {
+    const stub = authority("bs-concurrent-consume");
+    const code = await issuedCode(stub);
+    const results = await Promise.all([
+      stub.consumeBootstrapCode(code),
+      stub.consumeBootstrapCode(code),
+    ]);
+    expect(results.filter((r) => r === true)).toHaveLength(1);
+    // And the code stays spent.
+    expect(await stub.consumeBootstrapCode(code)).toBe(false);
+  });
+
+  // The test above went red over real RPC on the pre-fix code, but whether
+  // two RPC calls actually interleave at those awaits is up to workerd's
+  // scheduling and is not deterministic run to run, so on its own it cannot
+  // prove the CAS is what holds the line. The docs promise nothing about
+  // which awaits admit other events, so this one forces the interleave: two consumes
+  // started together inside ONE event, suspended at the same awaits, both
+  // past the SELECT before either UPDATE runs. Only the `AND used = 0`
+  // predicate keeps the second from returning true.
+  it("passkey.admin.bootstrap-code.cas-interleaved — consumes interleaved at the HMAC await: exactly one succeeds", async () => {
+    const stub = authority("bs-concurrent-consume-interleaved");
+    const code = await issuedCode(stub);
+    await runInDurableObject(stub, async (instance) => {
+      const auth = instance as SigningAuthority;
+      const results = await Promise.all([
+        auth.consumeBootstrapCode(code),
+        auth.consumeBootstrapCode(code),
+      ]);
+      expect(results.filter((r) => r === true)).toHaveLength(1);
+    });
+    expect(await stub.consumeBootstrapCode(code)).toBe(false);
   });
 });

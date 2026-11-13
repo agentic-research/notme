@@ -117,6 +117,7 @@ export function dpopNonceRequired(env: {
 async function deriveNonceKey(
   secret: string,
   usage: "sign" | "verify",
+  domain: string = NONCE_DOMAIN,
 ): Promise<CryptoKey> {
   const material = await crypto.subtle.importKey(
     "raw",
@@ -130,7 +131,7 @@ async function deriveNonceKey(
       name: "HKDF",
       hash: "SHA-256",
       salt: new Uint8Array(0),
-      info: new TextEncoder().encode(NONCE_DOMAIN),
+      info: new TextEncoder().encode(domain),
     },
     material,
     { name: "HMAC", hash: "SHA-256" },
@@ -139,9 +140,35 @@ async function deriveNonceKey(
   );
 }
 
-/** The bytes the MAC covers: the domain separator and the timestamp. */
-function nonceMessage(issuedAt: number): Uint8Array {
-  return new TextEncoder().encode(`${NONCE_DOMAIN}:${issuedAt}`);
+/**
+ * The bytes the MAC covers: the domain separator, the timestamp and, for a
+ * bound nonce, what it is bound to. An unbound message is exactly the DPoP
+ * format it always was, so outstanding DPoP nonces keep verifying.
+ */
+function nonceMessage(domain: string, issuedAt: number, binding?: string): Uint8Array {
+  return new TextEncoder().encode(
+    binding === undefined ? `${domain}:${issuedAt}` : `${domain}:${issuedAt}:${binding}`,
+  );
+}
+
+/**
+ * The shared construction behind every stateless server nonce: HMAC under an
+ * HKDF key whose info is `domain`, over `domain:issuedAt[:binding]`. Exported
+ * for other nonce kinds (join-nonce.ts, ADR-023); each must use its own
+ * domain, which is what keeps one kind from passing as another.
+ */
+export async function issueMacNonce(
+  domain: string,
+  secret: string,
+  now: number,
+  binding?: string,
+): Promise<string> {
+  const issuedAt = Math.floor(now);
+  const key = await deriveNonceKey(secret, "sign", domain);
+  const mac = new Uint8Array(
+    await crypto.subtle.sign("HMAC", key, nonceMessage(domain, issuedAt, binding)),
+  );
+  return `${issuedAt}.${encodeBase64url(mac)}`;
 }
 
 /**
@@ -158,12 +185,7 @@ export async function issueDpopNonce(
   secret: string,
   now: number = Math.floor(Date.now() / 1000),
 ): Promise<string> {
-  const issuedAt = Math.floor(now);
-  const key = await deriveNonceKey(secret, "sign");
-  const mac = new Uint8Array(
-    await crypto.subtle.sign("HMAC", key, nonceMessage(issuedAt)),
-  );
-  return `${issuedAt}.${encodeBase64url(mac)}`;
+  return issueMacNonce(NONCE_DOMAIN, secret, now);
 }
 
 /**
@@ -184,6 +206,21 @@ export async function verifyDpopNonce(
   secret: string,
   now: number = Math.floor(Date.now() / 1000),
 ): Promise<boolean> {
+  return verifyMacNonce(NONCE_DOMAIN, nonce, secret, now, NONCE_TTL_SECONDS);
+}
+
+/**
+ * Verify a nonce from `issueMacNonce` in `domain`. Every rejection is
+ * `false`; see verifyDpopNonce for why the reasons are not distinguished.
+ */
+export async function verifyMacNonce(
+  domain: string,
+  nonce: unknown,
+  secret: string,
+  now: number,
+  ttlSeconds: number,
+  binding?: string,
+): Promise<boolean> {
   if (typeof nonce !== "string") return false;
 
   const separator = nonce.indexOf(".");
@@ -203,7 +240,7 @@ export async function verifyDpopNonce(
   if (!Number.isSafeInteger(issuedAt)) return false;
 
   const age = now - issuedAt;
-  if (age > NONCE_TTL_SECONDS) return false;
+  if (age > ttlSeconds) return false;
   if (age < -NONCE_FUTURE_SKEW_SECONDS) return false;
 
   let mac: Uint8Array;
@@ -213,8 +250,8 @@ export async function verifyDpopNonce(
     return false;
   }
 
-  const key = await deriveNonceKey(secret, "verify");
+  const key = await deriveNonceKey(secret, "verify", domain);
   // crypto.subtle.verify, not a byte comparison — the platform's HMAC
   // verification does not short-circuit on the first differing byte.
-  return crypto.subtle.verify("HMAC", key, mac, nonceMessage(issuedAt));
+  return crypto.subtle.verify("HMAC", key, mac, nonceMessage(domain, issuedAt, binding));
 }

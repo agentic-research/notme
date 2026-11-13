@@ -10,7 +10,7 @@
 //
 //	func handler(w http.ResponseWriter, r *http.Request) {
 //	    id := verify.IdentityFromContext(r.Context())
-//	    fmt.Println(id.URI)    // wimse://notme.bot/gha/agentic-research/notme
+//	    fmt.Println(id.URI)    // wimse://notme.bot/principal/repo%3Aowner%2Fname%3A...
 //	    fmt.Println(id.Scopes) // [bridgeCert sign:git]
 //	}
 package verify
@@ -25,20 +25,45 @@ import (
 
 // Identity represents a verified notme bridge cert identity.
 type Identity struct {
-	// URI is the WIMSE identity from the cert SAN (e.g. wimse://notme.bot/gha/owner/repo).
+	// URI is the WIMSE identity from the cert SAN:
+	// wimse://<trust-domain>/principal/<stable-id>, where <stable-id> is
+	// percent-encoded and equals Subject.
 	//
 	// DISPLAY AND ROUTING ONLY — never authorize on it.
 	//
-	// Its second segment is NOT reliably AuthMethod. For a GHA cert the
-	// path is /gha/<owner>/<repo> while AuthMethod is "gha-oidc"; for a
-	// session-minted cert the segment IS the auth method, percent-encoded
-	// so an issuer-qualified value stays a single segment
-	// (wimse://notme.bot/oidc%3Ahttps%3A%2F%2Fissuer/<subject>). The
-	// segment count differs too — three for GHA, two for session certs.
+	// The shape is now uniform across every issuing route, and the id is
+	// the same value as Subject, so splitting it yields nothing Subject
+	// does not already give you — correctly, and without an encoding step.
+	// Use Subject.
 	//
-	// So the obvious cross-check, strings.Split(uri.Path, "/")[1] ==
-	// id.AuthMethod, reads as a tamper signal while being wrong in two
-	// different ways at once. Compare AuthMethod. Never split this string.
+	// HISTORY, because certificates issued before 2026-08-29 are still
+	// verifiable and do not look like this. The second segment used to be
+	// the auth ceremony for session certs (percent-encoded, so an
+	// issuer-qualified method stayed one segment) and the attestation
+	// mechanism for CI certs, whose path was /gha/<owner>/<repo> — three
+	// segments against two, with the subject at a different index. The
+	// obvious cross-check, strings.Split(uri.Path, "/")[1] == AuthMethod,
+	// therefore read as a tamper signal while being wrong in two ways at
+	// once. That is why this field says never to split it, and the advice
+	// stands: an old cert and a new one answer differently.
+	//
+	// Compare AuthMethod for the ceremony, PrincipalKind for what the
+	// subject is (notme-77438b, ADR-019 D2).
+	//
+	// AND IF YOU MUST TOUCH IT: use the string, never url.URL.Path.
+	// Measured 2026-09-02 on a real minted certificate whose subject is a
+	// GHA `sub`:
+	//
+	//	String()  wimse://notme.bot/principal/repo%3Aowner%2Fname%3Aref%3A...
+	//	RawPath   /principal/repo%3Aowner%2Fname%3Aref%3A...
+	//	Path      /principal/repo:owner/name:ref:refs/heads/main   <- DECODED
+	//
+	// Path silently turns encoded separators into real ones, so splitting it
+	// yields more segments than the issuer wrote — the subject moves, and a
+	// consumer routing on position reads the wrong field rather than
+	// failing. String() and RawPath round-trip exactly, which is why
+	// signet's exact-equality identity check still accepts these certs
+	// (verified against its enroll.go check, not just read).
 	URI string
 
 	// Scopes are the granted capabilities from the cert extensions.
@@ -108,10 +133,24 @@ func ParseIdentity(cert *x509.Certificate) (*Identity, error) {
 				id.Scopes = scopes
 			}
 		case ext.Id.Equal(oidEpoch):
+			// An UNPARSEABLE epoch is not epoch zero. Swallowing this error
+			// is how a real defect stayed invisible: notme emitted the epoch
+			// as a fixed-width `02 04 00 00 00 01`, which is valid BER and
+			// invalid DER (X.690 §8.3.2 forbids the leading zero octets), so
+			// encoding/asn1 returned "integer not minimally encoded" and
+			// every certificate silently reported Epoch 0 — disabling the
+			// revocation lever for every Go consumer.
+			//
+			// Epoch is load-bearing: a caller comparing it against the
+			// authority's current epoch is making a revocation decision. A
+			// zero it cannot distinguish from a real value makes that
+			// decision wrong in whichever direction the caller's comparison
+			// happens to fall. Refuse the certificate instead.
 			epoch, err := parseInteger(ext.Value)
-			if err == nil {
-				id.Epoch = epoch
+			if err != nil {
+				return nil, fmt.Errorf("malformed epoch extension: %w", err)
 			}
+			id.Epoch = epoch
 		case ext.Id.Equal(oidAuthMethod):
 			s, err := parseUTF8String(ext.Value)
 			if err == nil {

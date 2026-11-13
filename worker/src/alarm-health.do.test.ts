@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 /**
  * alarm-health.do.test.ts — the bundle-refresh alarm, its circuit breaker, and
  * the recovery procedure (notme-77a024).
@@ -18,8 +18,14 @@
  * alarm scheduling via `runDurableObjectAlarm`, not a mock.
  */
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { withPinnedClock } from "./__tests__/helpers/pinned-clock";
 import type { SigningAuthority } from "./signing-authority";
+import {
+  ALARM_BREAKER_COOLOFF_BASE_MS,
+  ALARM_BREAKER_COOLOFF_MAX_MS,
+  BUNDLE_REFRESH_MS,
+} from "./signing-authority";
 
 /** Just the storage surface these tests reach for. */
 interface AlarmCtx {
@@ -27,15 +33,54 @@ interface AlarmCtx {
     storage: {
       setAlarm(t: number): Promise<void>;
       getAlarm(): Promise<number | null>;
+      deleteAlarm(): Promise<void>;
     };
   };
 }
 
-const authority = (name: string) =>
-  env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+/**
+ * Where a test arms its alarm: far enough out that the platform's own timer
+ * can never fire it while the test runs (notme-070a8f).
+ *
+ * `runDurableObjectAlarm` "immediately runs and removes the Durable Object
+ * pointed to by stub's alarm if one is scheduled", whatever time it is set
+ * for (https://developers.cloudflare.com/workers/testing/vitest-integration/test-apis/;
+ * the DO testing guide arms `Date.now() + 60_000` and runs it at once:
+ * https://developers.cloudflare.com/durable-objects/examples/testing-with-durable-objects/).
+ * So the scheduled time only decides whether the REAL timer races the
+ * manual run. This file used `Date.now() + 50`: the real fire won often
+ * enough (3 runs in 10, with no load added) that `runDurableObjectAlarm`
+ * found no alarm, returned false, and the KV write landed at an arbitrary
+ * moment.
+ */
+const FAR_FUTURE_MS = 60 * 60 * 1000;
 
-/** Force the breaker open by writing the failure count the DO reads. */
-async function tripBreaker(stub: ReturnType<typeof authority>, failures: number) {
+/** Every authority this file has touched, so afterEach can disarm it. */
+const touched = new Set<string>();
+
+const authority = (name: string) => {
+  touched.add(name);
+  return env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+};
+
+// No alarm outlives the test that armed it. A fire re-arms itself (that is
+// the property under test) and so does resetAlarmHealth, so without this
+// each test leaves a real 4-minute alarm behind it (DO audit L11).
+afterEach(async () => {
+  for (const name of touched) {
+    const stub = env.SIGNING_AUTHORITY.get(env.SIGNING_AUTHORITY.idFromName(name));
+    await runInDurableObject(stub, (auth) =>
+      (auth as unknown as AlarmCtx).ctx.storage.deleteAlarm(),
+    );
+  }
+  touched.clear();
+});
+
+/** Write the alarm_health row the DO reads, creating the table as the DO does. */
+async function seedHealth(
+  stub: ReturnType<typeof authority>,
+  row: { totalFires: number; failureCount: number; firstFireAt?: number },
+) {
   await runInDurableObject(stub, (auth) => {
     const sql = (auth as unknown as { ctx: { storage: { sql: any } } }).ctx
       .storage.sql;
@@ -48,15 +93,61 @@ async function tripBreaker(stub: ReturnType<typeof authority>, failures: number)
       first_fire_at INTEGER NOT NULL DEFAULT 0
     )`);
     sql.exec(
-      "INSERT OR REPLACE INTO alarm_health (id, total_fires, failure_count, last_fire_at, last_outcome, first_fire_at) VALUES ('authority', ?, ?, 0, 'error', 0)",
-      failures,
-      failures,
+      "INSERT OR REPLACE INTO alarm_health (id, total_fires, failure_count, last_fire_at, last_outcome, first_fire_at) VALUES ('authority', ?, ?, 0, 'error', ?)",
+      row.totalFires,
+      row.failureCount,
+      row.firstFireAt ?? 0,
     );
   });
 }
 
+/** Force the breaker open by writing the failure count the DO reads. */
+const tripBreaker = (stub: ReturnType<typeof authority>, failures: number) =>
+  seedHealth(stub, { totalFires: failures, failureCount: failures });
+
+/** The alarm timestamp, or null when none is pending. */
+const alarmOf = (stub: ReturnType<typeof authority>) =>
+  runInDurableObject(stub, (auth) =>
+    (auth as unknown as AlarmCtx).ctx.storage.getAlarm(),
+  );
+
+const armAlarmAt = (stub: ReturnType<typeof authority>, at: number) =>
+  runInDurableObject(stub, (auth) =>
+    (auth as unknown as AlarmCtx).ctx.storage.setAlarm(at),
+  );
+
+/**
+ * Make every KV publish from this authority fail (or succeed again), and count
+ * the attempts. The bundle refresh is the alarm's one real unit of work, and a
+ * KV put that throws is the "KV unavailable" failure THREAT_MODEL §3 names.
+ * Patched on the DO's own env, so no other test's KV binding is touched.
+ */
+async function controlKv(stub: ReturnType<typeof authority>) {
+  const state = { failing: true, puts: 0 };
+  let restore: () => void = () => {};
+  await runInDurableObject(stub, (auth) => {
+    const e = (auth as unknown as { env: Record<string, unknown> }).env;
+    const original = e.CA_BUNDLE_CACHE;
+    Object.defineProperty(e, "CA_BUNDLE_CACHE", {
+      configurable: true,
+      value: {
+        put: async () => {
+          state.puts++;
+          if (state.failing) throw new Error("kv unavailable (test)");
+        },
+      },
+    });
+    restore = () =>
+      Object.defineProperty(e, "CA_BUNDLE_CACHE", {
+        configurable: true,
+        value: original,
+      });
+  });
+  return { state, restore: () => restore() };
+}
+
 describe("bundle refresh alarm (notme-77a024)", () => {
-  it("reports health without having to be running", async () => {
+  it("signing.alarm.health-counter — reports health without having to be running", async () => {
     // The accessor an operator needs first. It must answer on a DO that has
     // never fired, rather than throwing on a missing table — an operator
     // diagnosing a dead alarm is the least convenient time to hit a crash.
@@ -65,6 +156,59 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     );
     expect(health.failureCount).toBe(0);
     expect(health.totalFires).toBe(0);
+    // Nothing has fired, so there is no rate to compare: zero, not NaN or Infinity.
+    expect(health.firesPerHour).toBe(0);
+    expect(health.driftRatio).toBe(0);
+    expect(health.warmupComplete).toBe(false);
+    expect(health.circuitBreakerOpen).toBe(false);
+  });
+
+  it("signing.alarm.health-counter — expectedFiresPerHour is the cadence the alarm is armed with", async () => {
+    // 4-minute BUNDLE_REFRESH_MS = 15 fires an hour. driftRatio's denominator;
+    // if the cadence constant moves and this does not follow, the ratio lies.
+    const health = await runInDurableObject(authority("alarm-expected"), (auth) =>
+      (auth as SigningAuthority).getAlarmHealth(),
+    );
+    expect(health.expectedFiresPerHour).toBe(15);
+  });
+
+  it("signing.alarm.health-counter — warmupComplete flips at exactly 3 fires", async () => {
+    // driftRatio over fewer fires is noise; consumers gate on this flag.
+    const flag = async (name: string, totalFires: number) => {
+      const stub = authority(name);
+      await seedHealth(stub, { totalFires, failureCount: 0, firstFireAt: Date.now() - 60_000 });
+      return (await runInDurableObject(stub, (auth) =>
+        (auth as SigningAuthority).getAlarmHealth(),
+      )).warmupComplete;
+    };
+    expect(await flag("alarm-warm-2", 2)).toBe(false);
+    expect(await flag("alarm-warm-3", 3)).toBe(true);
+  });
+
+  it("signing.alarm.health-counter — driftRatio is ~1 on cadence and large when the alarm runs away", async () => {
+    // 6 fires over 0.4 h is 15/h, exactly the cadence: ratio 1. The same 0.4 h
+    // with 60 fires is 150/h, ten times the cadence: the runaway the row
+    // exists to detect. Date is pinned so the elapsed time is exact.
+    await withPinnedClock(async () => {
+      const onCadence = authority("alarm-drift-ok");
+      await seedHealth(onCadence, { totalFires: 6, failureCount: 0, firstFireAt: Date.now() - 1_440_000 });
+      const ok = await runInDurableObject(onCadence, (auth) =>
+        (auth as SigningAuthority).getAlarmHealth(),
+      );
+      expect(ok.firesPerHour).toBeCloseTo(15, 9);
+      expect(ok.driftRatio).toBeCloseTo(1, 9);
+
+      const runaway = authority("alarm-drift-runaway");
+      await seedHealth(runaway, { totalFires: 60, failureCount: 0, firstFireAt: Date.now() - 1_440_000 });
+      const bad = await runInDurableObject(runaway, (auth) =>
+        (auth as SigningAuthority).getAlarmHealth(),
+      );
+      expect(bad.driftRatio).toBeCloseTo(10, 9);
+      expect(bad.warmupComplete).toBe(true);
+      // The documented alert threshold (~1.2) separates the two.
+      expect(ok.driftRatio).toBeLessThan(1.2);
+      expect(bad.driftRatio).toBeGreaterThan(1.2);
+    });
   });
 
   it("publishes a bundle to KV when the alarm fires", async () => {
@@ -77,7 +221,7 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     // Arm it, then run it.
     await runInDurableObject(stub, (auth) =>
       (auth as unknown as AlarmCtx).ctx.storage.setAlarm(
-        Date.now() + 50,
+        Date.now() + FAR_FUTURE_MS,
       ),
     );
     const ran = await runDurableObjectAlarm(stub);
@@ -90,17 +234,17 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     expect(Math.abs(Date.now() / 1000 - bundle.issuedAt)).toBeLessThan(300);
   });
 
-  it("re-arms itself, so one fire is not the last fire", async () => {
+  it("signing.alarm.idempotent-reschedule — re-arms itself, so one fire is not the last fire", async () => {
     // The failure mode behind a 130-day-old bundle is not "the alarm errored",
     // it is "the alarm stopped coming back". A fire that does not schedule the
     // next one looks perfectly healthy exactly once.
     const stub = authority("alarm-rearms");
     await runInDurableObject(stub, (auth) =>
       (auth as unknown as AlarmCtx).ctx.storage.setAlarm(
-        Date.now() + 50,
+        Date.now() + FAR_FUTURE_MS,
       ),
     );
-    await runDurableObjectAlarm(stub);
+    expect(await runDurableObjectAlarm(stub), "alarm did not run").toBe(true);
 
     const next = await runInDurableObject(stub, (auth) =>
       (auth as unknown as AlarmCtx).ctx.storage.getAlarm(),
@@ -108,15 +252,186 @@ describe("bundle refresh alarm (notme-77a024)", () => {
     expect(next, "alarm fired without scheduling its successor").not.toBeNull();
   });
 
-  it("stops re-arming once the breaker is open", async () => {
-    // The breaker is deliberate: an alarm failing every 4 minutes forever is
-    // its own incident. This pins that it actually stops.
-    const stub = authority("alarm-breaker");
-    await tripBreaker(stub, 5); // MAX_CONSECUTIVE_ALARM_FAILURES
-    const health = await runInDurableObject(stub, (auth) =>
-      (auth as SigningAuthority).getAlarmHealth(),
+  it("signing.alarm.idempotent-reschedule — scheduleNextRefresh leaves a pending alarm alone", async () => {
+    // THE getAlarm-before-setAlarm guard, observed. The pending alarm is an
+    // hour out; a call that re-armed would move it to now + 4 min. Same
+    // timestamp afterwards is the only way it can look if setAlarm never ran.
+    const stub = authority("alarm-noop");
+    const pending = Date.now() + FAR_FUTURE_MS;
+    await armAlarmAt(stub, pending);
+
+    for (let i = 0; i < 3; i++) {
+      await runInDurableObject(stub, (auth) =>
+        (auth as SigningAuthority).scheduleNextRefresh(),
+      );
+    }
+    expect(await alarmOf(stub), "a pending alarm was rescheduled").toBe(pending);
+  });
+
+  it("signing.alarm.idempotent-reschedule — with no alarm pending, scheduleNextRefresh arms exactly one, one cadence out", async () => {
+    const stub = authority("alarm-arms-once");
+    expect(await alarmOf(stub)).toBeNull();
+    await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).scheduleNextRefresh(),
     );
-    expect(health.failureCount).toBeGreaterThanOrEqual(5);
+    const first = await alarmOf(stub);
+    expect(first).not.toBeNull();
+    const fromNow = first! - Date.now();
+    expect(fromNow).toBeGreaterThan(3 * 60_000);
+    expect(fromNow).toBeLessThanOrEqual(4 * 60_000);
+
+    // A second call must not move it.
+    await runInDurableObject(stub, (auth) =>
+      (auth as SigningAuthority).scheduleNextRefresh(),
+    );
+    expect(await alarmOf(stub)).toBe(first);
+  });
+
+  it("signing.alarm.idempotent-reschedule — every warm request leaves the pending alarm untouched", async () => {
+    // The warm path calls scheduleNextRefresh on EVERY request that reaches
+    // the signing key (notme-4896d8). N requests must not become N alarms or
+    // push the one alarm back. Pending is an hour out, as above.
+    const stub = authority("alarm-warm-noop");
+    await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getPublicKeyPem());
+    const pending = Date.now() + FAR_FUTURE_MS;
+    await armAlarmAt(stub, pending);
+    for (let i = 0; i < 3; i++) {
+      await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getPublicKeyPem());
+    }
+    expect(await alarmOf(stub)).toBe(pending);
+  });
+
+  it("signing.alarm.circuit-breaker — counts real failures to 5 and opens on the 5th", async () => {
+    // Real failures, not a seeded count: KV rejects every publish and the
+    // platform runs the alarm (consuming it). Fires 1-4 leave the breaker
+    // closed and a successor armed; the 5th opens it ON THAT FIRE.
+    const stub = authority("alarm-breaker-real");
+    const kv = await controlKv(stub);
+    try {
+      await armAlarmAt(stub, Date.now() + FAR_FUTURE_MS);
+      for (let fire = 1; fire <= 5; fire++) {
+        expect(await runDurableObjectAlarm(stub), `fire ${fire} did not run`).toBe(true);
+        const h = await runInDurableObject(stub, (auth) =>
+          (auth as SigningAuthority).getAlarmHealth(),
+        );
+        expect(h.failureCount, `after fire ${fire}`).toBe(fire);
+        expect(h.totalFires).toBe(fire);
+        expect(h.lastOutcome).toMatch(/^error: kv unavailable/);
+        if (fire < 5) {
+          expect(h.circuitBreakerOpen, `breaker opened early, at fire ${fire}`).toBe(false);
+          expect(await alarmOf(stub), `fire ${fire} did not re-arm`).not.toBeNull();
+        } else {
+          // That the 5th fire leaves no alarm behind is its own test below
+          // (notme-5c2511).
+          expect(h.circuitBreakerOpen).toBe(true);
+        }
+      }
+      expect(kv.state.puts, "each of the 5 fires should have tried to publish").toBe(5);
+    } finally {
+      kv.restore();
+    }
+  });
+
+  it("signing.alarm.circuit-breaker — alarm() against an open breaker declines to work and re-arms nothing before the probe", async () => {
+    // Open the breaker for real (5 failing fires), then deliver a 6th alarm
+    // anyway, inside the cool-off, as a stray timer or a manual run would. It
+    // must not publish, must arm nothing but the one probe already due at
+    // nextProbeAt (no earlier, so no storm; notme-a36d10 replaced "never"
+    // with the half-open probe), and must still be counted (post-mortem: how
+    // many fires arrived after the trip).
+    const stub = authority("alarm-breaker-open");
+    const kv = await controlKv(stub);
+    try {
+      await armAlarmAt(stub, Date.now() + FAR_FUTURE_MS);
+      for (let fire = 1; fire <= 5; fire++) await runDurableObjectAlarm(stub);
+      const putsAtTrip = kv.state.puts;
+      kv.state.failing = false; // even a healthy KV must not be touched now
+
+      await armAlarmAt(stub, Date.now() + FAR_FUTURE_MS);
+      expect(await runDurableObjectAlarm(stub), "6th alarm did not run").toBe(true);
+
+      const h = await runInDurableObject(stub, (auth) =>
+        (auth as SigningAuthority).getAlarmHealth(),
+      );
+      expect(h.lastOutcome).toBe("skipped: circuit breaker open");
+      expect(h.totalFires, "the skipped fire was not counted").toBe(6);
+      expect(h.failureCount, "an open breaker must stay open").toBe(5);
+      expect(kv.state.puts, "an open breaker still did bundle work").toBe(putsAtTrip);
+      expect(h.breaker.state).toBe("open");
+      expect(await alarmOf(stub), "an open breaker armed something other than its probe").toBe(h.breaker.nextProbeAt);
+    } finally {
+      kv.restore();
+    }
+  });
+
+  it("signing.alarm.circuit-breaker — a success resets the consecutive-failure count", async () => {
+    // "Consecutive" is the contract: 4 failures then a success must not leave
+    // the breaker one strike from open.
+    const stub = authority("alarm-breaker-consecutive");
+    const kv = await controlKv(stub);
+    try {
+      await armAlarmAt(stub, Date.now() + FAR_FUTURE_MS);
+      for (let fire = 1; fire <= 4; fire++) await runDurableObjectAlarm(stub);
+      kv.state.failing = false;
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      const h = await runInDurableObject(stub, (auth) =>
+        (auth as SigningAuthority).getAlarmHealth(),
+      );
+      expect(h.failureCount).toBe(0);
+      expect(h.lastOutcome).toBe("success");
+      expect(await alarmOf(stub), "a success must re-arm").not.toBeNull();
+    } finally {
+      kv.restore();
+    }
+  });
+
+  // notme-5c2511 (found by the strengthened tests above). The breaker used to
+  // leave the alarm armed in two ways, both because the warm path of
+  // #getOrCreateSigningKey calls scheduleNextRefresh():
+  //   1. the tripping fire: #publishBundle -> generateBundle -> warm path armed
+  //      a successor while failure_count was still one short, so alarm()
+  //      "returned without re-arming" with an alarm pending anyway;
+  //   2. any later request that reached the signing key re-armed it again.
+  // Both were pinned as `it.fails` until the fix: scheduleNextRefresh() now
+  // declines behind an open breaker, and the tripping fire deletes whatever
+  // its own bundle work armed. Only resetAlarmHealth() re-arms.
+  //
+  // notme-a36d10 (review H2) then replaced the latch: "no alarm pending"
+  // meant the Rekor retry and the CT drain stopped for good after ~20 min of
+  // KV errors, with nobody told. The tripping fire now leaves exactly ONE
+  // alarm, the half-open probe a full cool-off out, and both pins below still
+  // hold the 5c2511 property: nothing behind an open breaker arms anything
+  // earlier than that probe.
+  it("signing.alarm.circuit-breaker — the tripping fire leaves exactly one alarm: the probe, a full cool-off out (notme-5c2511, notme-a36d10)", async () => {
+    const stub = authority("alarm-breaker-trip-rearm");
+    const kv = await controlKv(stub);
+    try {
+      await armAlarmAt(stub, Date.now() + FAR_FUTURE_MS);
+      for (let fire = 1; fire <= 4; fire++) await runDurableObjectAlarm(stub);
+      const before5th = Date.now();
+      await runDurableObjectAlarm(stub);
+      const h = await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getAlarmHealth());
+      expect(h.breaker.state).toBe("open");
+      expect(h.breaker.nextProbeAt).toBeGreaterThanOrEqual(before5th + ALARM_BREAKER_COOLOFF_BASE_MS);
+      expect(await alarmOf(stub), "the 5th failure left an alarm other than the probe").toBe(h.breaker.nextProbeAt);
+    } finally {
+      kv.restore();
+    }
+  });
+
+  it("signing.alarm.circuit-breaker — a request behind an open breaker does not move the probe earlier (notme-5c2511)", async () => {
+    const stub = authority("alarm-breaker-warm");
+    const kv = await controlKv(stub);
+    try {
+      await armAlarmAt(stub, Date.now() + FAR_FUTURE_MS);
+      for (let fire = 1; fire <= 5; fire++) await runDurableObjectAlarm(stub);
+      const probe = await alarmOf(stub);
+      expect(probe).not.toBeNull();
+      await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getPublicKeyPem());
+      expect(await alarmOf(stub), "a request re-armed the alarm behind an open breaker").toBe(probe);
+    } finally {
+      kv.restore();
+    }
   });
 
   it("resetAlarmHealth clears the breaker AND re-arms", async () => {
@@ -144,5 +459,144 @@ describe("bundle refresh alarm (notme-77a024)", () => {
       (auth as unknown as AlarmCtx).ctx.storage.getAlarm(),
     );
     expect(scheduled, "no alarm scheduled after recovery").not.toBeNull();
+  });
+});
+
+/**
+ * The half-open breaker (notme-a36d10, overnight review H2). After a trip the
+ * alarm waits a cool-off, then ONE probe fire does the full work: success
+ * closes the breaker and the loop resumes at cadence; failure re-opens it
+ * with the cool-off doubled, capped. Each window holds at most one fire, so
+ * an outage costs one fire per cool-off, not one per BUNDLE_REFRESH_MS.
+ */
+describe("the breaker recovers on its own (notme-a36d10)", () => {
+  /** Trip the breaker with five real KV failures; return the health after. */
+  async function trip(stub: ReturnType<typeof authority>) {
+    await armAlarmAt(stub, Date.now() + FAR_FUTURE_MS);
+    for (let fire = 1; fire <= 5; fire++) await runDurableObjectAlarm(stub);
+    return runInDurableObject(stub, (auth) => (auth as SigningAuthority).getAlarmHealth());
+  }
+  /** Run the pending alarm with the clock at `at` (only Date is faked). */
+  async function fireAt(stub: ReturnType<typeof authority>, at: number) {
+    vi.useFakeTimers({ toFake: ["Date"], now: at });
+    try {
+      expect(await runDurableObjectAlarm(stub), "no alarm was pending").toBe(true);
+      return await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getAlarmHealth());
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("signing.alarm.breaker-half-open — reports the trip: state, trip time, next probe", async () => {
+    const stub = authority("alarm-halfopen-report");
+    const kv = await controlKv(stub);
+    try {
+      const t0 = Date.now();
+      const h = await trip(stub);
+      expect(h.breaker.state).toBe("open");
+      expect(h.breaker.lastTrippedAt).toBeGreaterThanOrEqual(t0);
+      expect(h.breaker.nextProbeAt).toBe(h.breaker.lastTrippedAt + ALARM_BREAKER_COOLOFF_BASE_MS);
+      expect(h.breaker.consecutiveTrips).toBe(1);
+    } finally {
+      kv.restore();
+    }
+  });
+
+  it("signing.alarm.breaker-half-open — after the cool-off, one probe on a healthy KV closes it and the loop resumes", async () => {
+    const stub = authority("alarm-halfopen-recover");
+    const kv = await controlKv(stub);
+    try {
+      const tripped = await trip(stub);
+      kv.state.failing = false;
+      const putsBefore = kv.state.puts;
+      const probeAt = tripped.breaker.nextProbeAt;
+      const h = await fireAt(stub, probeAt);
+      expect(kv.state.puts, "the probe did not do the bundle work").toBe(putsBefore + 1);
+      expect(h.breaker.state).toBe("closed");
+      expect(h.circuitBreakerOpen).toBe(false);
+      expect(h.failureCount).toBe(0);
+      expect(h.lastOutcome).toBe("success");
+      expect(h.breaker.consecutiveTrips).toBe(0);
+      expect(h.breaker.nextProbeAt).toBe(0);
+      // The loop is live again: one alarm, one cadence after the probe.
+      expect(await alarmOf(stub)).toBe(probeAt + BUNDLE_REFRESH_MS);
+    } finally {
+      kv.restore();
+    }
+  });
+
+  it("signing.alarm.breaker-half-open — a probe on a still-failing KV re-opens it with the cool-off doubled, and arms only the next probe", async () => {
+    const stub = authority("alarm-halfopen-reopen");
+    const kv = await controlKv(stub);
+    try {
+      const tripped = await trip(stub);
+      const putsBefore = kv.state.puts;
+      const probe1 = tripped.breaker.nextProbeAt;
+      const h = await fireAt(stub, probe1);
+      expect(kv.state.puts, "exactly one probe").toBe(putsBefore + 1);
+      expect(h.breaker.state).toBe("open");
+      expect(h.failureCount).toBe(6);
+      expect(h.breaker.consecutiveTrips).toBe(2);
+      expect(h.breaker.lastTrippedAt).toBe(probe1);
+      expect(h.breaker.nextProbeAt).toBe(probe1 + 2 * ALARM_BREAKER_COOLOFF_BASE_MS);
+      expect(await alarmOf(stub)).toBe(h.breaker.nextProbeAt);
+
+      // A stray fire inside the new cool-off does nothing and moves nothing.
+      const stray = await fireAt(stub, probe1 + 1000);
+      expect(kv.state.puts).toBe(putsBefore + 1);
+      expect(stray.lastOutcome).toBe("skipped: circuit breaker open");
+      expect(await alarmOf(stub)).toBe(h.breaker.nextProbeAt);
+    } finally {
+      kv.restore();
+    }
+  });
+
+  it("signing.alarm.breaker-half-open — the cool-off backs off exponentially and is capped", async () => {
+    const stub = authority("alarm-halfopen-cap");
+    const kv = await controlKv(stub);
+    try {
+      let h = await trip(stub);
+      const seen: number[] = [h.breaker.nextProbeAt - h.breaker.lastTrippedAt];
+      for (let i = 0; i < 8; i++) {
+        h = await fireAt(stub, h.breaker.nextProbeAt);
+        seen.push(h.breaker.nextProbeAt - h.breaker.lastTrippedAt);
+      }
+      expect(seen.slice(0, 3)).toEqual([1, 2, 4].map((k) => k * ALARM_BREAKER_COOLOFF_BASE_MS));
+      expect(Math.max(...seen)).toBe(ALARM_BREAKER_COOLOFF_MAX_MS);
+      expect(seen.at(-1)).toBe(ALARM_BREAKER_COOLOFF_MAX_MS);
+    } finally {
+      kv.restore();
+    }
+  });
+
+  it("signing.alarm.breaker-half-open — a breaker latched before this change (no probe time) is probed on the next request", async () => {
+    // Production DOs that tripped under the old latch carry failure_count >= 5
+    // and no next_probe_at. They must not stay dead until someone notices.
+    const stub = authority("alarm-halfopen-legacy");
+    await tripBreaker(stub, 5);
+    const before = await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getAlarmHealth());
+    expect(before.breaker.state).toBe("half_open");
+    const t = Date.now();
+    await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getPublicKeyPem());
+    const at = await alarmOf(stub);
+    expect(at, "a latched legacy breaker was never probed").not.toBeNull();
+    expect(at!).toBeGreaterThanOrEqual(t + BUNDLE_REFRESH_MS);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const after = await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getAlarmHealth());
+    expect(after.breaker.state).toBe("closed");
+    expect(after.lastOutcome).toBe("success");
+  });
+
+  it("resetAlarmHealth also clears the probe schedule", async () => {
+    const stub = authority("alarm-halfopen-reset");
+    const kv = await controlKv(stub);
+    try {
+      await trip(stub);
+      await runInDurableObject(stub, (auth) => (auth as SigningAuthority).resetAlarmHealth());
+      const h = await runInDurableObject(stub, (auth) => (auth as SigningAuthority).getAlarmHealth());
+      expect(h.breaker).toMatchObject({ state: "closed", nextProbeAt: 0, consecutiveTrips: 0 });
+    } finally {
+      kv.restore();
+    }
   });
 });

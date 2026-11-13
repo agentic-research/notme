@@ -39,7 +39,7 @@
 !tasks/**
 
 # Root pnpm workspace (for repo-level scripts: scripts/check-sha-pins.ts,
-# scripts/doc-check.ts, schema/codegen/capnp-to-ts.ts). The workspace also
+# scripts/doc-check.ts, scripts/llo-schema-bridge.ts). The workspace also
 # wires action/, worker/, and packages/* together so workspace deps like
 # @notme/contract resolve through pnpm's symlink graph instead of relative
 # imports.
@@ -61,6 +61,8 @@
 !schema/fixtures/*.json
 !schema/fixtures/*.expected.hex
 !schema/fixtures/*.bin
+# Digest manifest pinning every fixture file (notme-1629fe).
+!schema/fixtures/SHA256SUMS
 
 # Committed root trust anchor — the out-of-band copy of the signet root CA a
 # third party pins against, instead of re-establishing trust on every fetch of
@@ -123,6 +125,13 @@ proxy/target/
 # Design docs
 !docs/
 !docs/**
+
+# notme-ct — the issuance transparency log's OWN identity: its roots, its
+# temporal interval, its EKU policy (notme-1b46a8). azul is the engine and is
+# deliberately not vendored; only the material that says "this is notme's log"
+# lives here. roots.notme.pem is the published CA, not a secret.
+!ct/
+!ct/**
 
 # GitHub Actions workflows
 !.github/

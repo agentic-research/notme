@@ -97,7 +97,7 @@ binding payload includes `SHA-256(jwt)` so the PoP signatures are inseparable fr
 | `notme_url` | authority URL for subsequent API calls |
 | `notme_cert` | P-256 bridge cert PEM — mTLS transport auth (public data) |
 | `notme_signing_cert` | Ed25519 bridge cert PEM — git commit signing + APAS attestations (public data) |
-| `notme_identity` | WIMSE identity URI: `wimse://notme.bot/gha/{owner}/{repo}` |
+| `notme_identity` | WIMSE identity URI: `wimse://notme.bot/principal/{oidc-sub}` (the sub is percent-encoded; owner and repo read from it, or from the cert's `principal_kind`/claims — changed 2026-08-29, `notme-77438b`) |
 | `expires_at` | cert expiry (Unix timestamp). worker default TTL is 5 minutes |
 
 private keys are **never** an output. they exist only in the step's process memory and are garbage-collected when the step exits. for cross-step usage, run the action again — each invocation gets its own keypair.
@@ -144,7 +144,7 @@ tags are mutable. an attacker who pushes to the action repo can move `v1` to a m
 
 | file | role |
 |---|---|
-| `action.yml` | manifest GitHub reads — declares 5 inputs, 6 outputs, `runs: node20`, `main: dist/index.js` |
+| `action.yml` | manifest GitHub reads — declares 5 inputs, 6 outputs, `runs: node24`, `main: dist/index.js` |
 | `src/index.ts` | source — keypair generation, PoP construction, exchange, output wiring |
 | `dist/index.js` | committed bundle — what GitHub actually executes |
 
@@ -153,7 +153,7 @@ tags are mutable. an attacker who pushes to the action repo can move `v1` to a m
 ```bash
 cd action
 npm install
-npm run build      # esbuild src/index.ts → dist/index.js (bundled, node20)
+npm run build      # esbuild src/index.ts → dist/index.js (bundled, node24)
 git add dist/      # consumers run dist/, not src/
 ```
 

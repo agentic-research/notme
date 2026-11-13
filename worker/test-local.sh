@@ -11,6 +11,9 @@ FAIL=0
 
 cleanup() {
   if [ -n "${WPID:-}" ]; then
+    # The npm `workerd` bin is a node launcher that spawns the native binary;
+    # killing only the launcher orphans workerd still holding the port.
+    pkill -P "$WPID" 2>/dev/null || true
     kill "$WPID" 2>/dev/null || true
     wait "$WPID" 2>/dev/null || true
   fi
@@ -28,7 +31,13 @@ sed "s|path = \"/data/do\"|path = \"$STORAGE_DIR\"|" config.capnp > "$CONFIG_LOC
 
 # ── Start workerd ──
 echo "▸ Starting workerd on :$PORT..."
-./node_modules/workerd/bin/workerd serve "$CONFIG_LOCAL" --experimental &
+# workerd is not a direct dependency of worker/ (pnpm installs it under
+# wrangler → miniflare), so ./node_modules/workerd does not exist. Resolve the
+# binary wrangler itself runs: the same build the gate tests against.
+WORKERD="${WORKERD:-$(node -e 'const w = require.resolve("wrangler/package.json");
+  const m = require.resolve("miniflare", { paths: [w] });
+  console.log(require.resolve("workerd/bin/workerd", { paths: [m] }))')}"
+"$WORKERD" serve "$CONFIG_LOCAL" --experimental &
 WPID=$!
 sleep 3
 
