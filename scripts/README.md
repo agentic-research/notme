@@ -11,6 +11,7 @@ standalone tooling — small utilities run via `npx tsx` or by Taskfile targets,
 | `check-image-versions.ts` | validate `server.json` against its declared schema, and verify its OCI artifacts + the notme melange recipes agree with the tag the publish job will push | `task server:check` (PR gate) · `task version:check VERSION=0.1.0` (release gate) | `0` agree · `1` any violation (including a `server.json` with no declared version) · `2` missing/invalid VERSION argument, or an unreadable/unparseable file |
 | `config-drift.ts` | refuse a deploy while the live, gitignored `worker/wrangler.toml` lags `worker/wrangler.toml.example`: compat date, `version_metadata`, ratelimit bindings, staging `REKOR_URL`, refused Node compat flags, staging vars. Names keys only, never a live value | `task worker:config-drift` (a dependency of every deploy/traffic task except `worker:rollback`) | `0` in line, or live file absent · `1` drift, unparseable file, or live absent with `STRICT=1` |
 | `fetch-llo-wasm.ts` | vendor ley-line-open's released `leyline_sign.wasm` into `wasm/`, verified against the release's `SHA256SUMS` and the pins in `wasm/llo-release.json`; `--check` re-verifies the vendored copy offline; `--pin vX.Y.Z` re-pins (TOFU: LLO publishes no signature) | `task llo:wasm` · `--check` runs in `task docs:check` | `0` verified · `1` any mismatch, or a signature appeared that the script does not yet verify · `2` usage |
+| `llo-schema-bridge.ts` | resolve ley-line-open's released `capnpc-schema-bridge-zod` for this host, pinned in `schema/codegen/llo-release.json`: `--path` prints a cached binary only after re-hashing it against the pin and the release's `SHA256SUMS` (downloading on a miss); `--check` verifies the pins offline; `--pin vX.Y.Z` re-pins (TOFU: LLO publishes no signature) | `task schema:zod` (`--path`) · `--check` runs in `task docs:check` · `task llo:schema-bridge -- --pin vX.Y.Z` | `0` verified · `1` any mismatch, or a signature appeared that the script does not yet verify · `2` usage, or a host LLO ships no binary for |
 | `verify-ct-log.ts` | check the deployed CT log's key and log_id against `trust/notme-ct-log.json`; `--write --metadata <url>` records the pin once | `task ct:verify` | `0` match, or pin is `not-provisioned` · `1` mismatch/unreadable/malformed · `2` `--write` refused (a different pin is recorded) |
 
 ## how check-image-versions works
@@ -58,7 +59,7 @@ it walks `worker/public/`, `docs/`, and the top-level `README.md` looking for bl
 
 then for each declared claim:
 
-- **`@types`** — must appear as a `struct` or `enum` in `schema/identity.capnp`, **or** as an exported `interface | enum | const | type | function` in `gen/ts/identity.ts`.
+- **`@types`** — must appear as a `struct` or `enum` in `schema/identity.capnp`, **or** as an exported `interface | enum | const | type | function` in `gen/ts/identity.zod.ts`.
 - **`@endpoints`** (`METHOD /path`) — must match a `pathname === "/path" && request.method === "METHOD"` site in `worker/worker.ts`. routes without an explicit method guard match any method.
 - **`@links`** — fetched via HEAD (5s timeout, follow redirects); `--skip-external` skips anything not on `notme.bot`.
 
@@ -67,7 +68,7 @@ sequenceDiagram
     participant Task as task docs:check
     participant DC as doc-check.ts
     participant Schema as schema/identity.capnp
-    participant Gen as gen/ts/identity.ts
+    participant Gen as gen/ts/identity.zod.ts
     participant Worker as worker/worker.ts
     participant Docs as worker/public/ + docs/ + README.md
     participant Net as external host
@@ -136,5 +137,5 @@ it's also part of `task ship` and `task ship-prod`, so doc drift blocks deploys.
 - [`../README.md`](../README.md) — the file being doc-checked. the `@doc-check` block at the top declares `@types` and `@endpoints`.
 - [`../Taskfile.yml`](../Taskfile.yml) — `docs:check` task definition.
 - [`../schema/identity.capnp`](../schema/identity.capnp) — source of truth for `@types` (structs + enums).
-- [`../gen/ts/identity.ts`](../gen/ts/identity.ts) — generated TS, also a source for `@types`.
+- [`../gen/ts/identity.zod.ts`](../gen/ts/identity.zod.ts) — generated TS, also a source for `@types`.
 - [`../worker/worker.ts`](../worker/worker.ts) — source of truth for `@endpoints`.

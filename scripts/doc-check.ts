@@ -17,7 +17,7 @@ function extractTypes(): Set<string> {
   const types = new Set<string>();
   const capnp = readFileSync(join(ROOT, "schema/identity.capnp"), "utf-8");
   for (const m of capnp.matchAll(/^(?:struct|enum)\s+(\w+)/gm)) types.add(m[1]);
-  const ts = readFileSync(join(ROOT, "gen/ts/identity.ts"), "utf-8");
+  const ts = readFileSync(join(ROOT, "gen/ts/identity.zod.ts"), "utf-8");
   for (const m of ts.matchAll(/^export\s+(?:interface|enum|const|type|function)\s+(\w+)/gm)) types.add(m[1]);
   return types;
 }
