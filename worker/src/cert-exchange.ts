@@ -7,17 +7,16 @@
 //   4. Check the principal has the requested capability
 //   5. Mint a bridge cert with principal_id as CN + scopes in extensions
 //
-// Schema-driven: input/output types from gen/ts/identity.ts (generated from identity.capnp).
+// The wire types below are this endpoint's JSON (snake_case, `proof.type`).
+// identity.capnp's CertPairRequest / BridgeCertPair describe the same exchange
+// as capnp structs, but gen/ts/identity.zod.ts does not accept this JSON, so
+// nothing here parses with it (worker/src/__tests__/identity-zod.test.ts).
 
 import { verifyPopProofs } from "./auth/pop";
 import { opaqueError } from "./error-body";
 import { AUTH_METHOD, oidcAuthMethod, type AuthMethod } from "./auth/session";
 import { authorityStub } from "./authority-stub";
 import { markJtiSpentInKv } from "./jti-kv";
-
-// Types from the schema (would import from gen/ts/identity.ts, but
-// we keep it simple and define the wire format inline to avoid
-// build-time dependency on the generated code for now)
 
 export interface CertExchangeRequest {
   proof: {

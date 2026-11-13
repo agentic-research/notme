@@ -80,7 +80,7 @@ describe("the secrets block did not over-reach", () => {
     "worker/src/signing-authority.ts",
     "docs/design/015-delegated-jwt-signing.md",
     "packages/melange.rsa.pub", // .pub, not .key — signing verification, public
-    "gen/ts/identity.ts",
+    "gen/ts/identity.zod.ts",
     "worker/wrangler.toml.example",
   ];
 

@@ -39,7 +39,7 @@
 !tasks/**
 
 # Root pnpm workspace (for repo-level scripts: scripts/check-sha-pins.ts,
-# scripts/doc-check.ts, schema/codegen/capnp-to-ts.ts). The workspace also
+# scripts/doc-check.ts, scripts/llo-schema-bridge.ts). The workspace also
 # wires action/, worker/, and packages/* together so workspace deps like
 # @notme/contract resolve through pnpm's symlink graph instead of relative
 # imports.

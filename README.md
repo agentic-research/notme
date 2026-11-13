@@ -188,7 +188,7 @@ proxy/              Rust mTLS forward proxy — bridge cert lives in process mem
                     workerd Workers fetch() through it. TCP or UDS listen.
 action/             GHA action — OIDC → bridge cert pair (zero secrets, zero files)
 scripts/task-cert/  machine-side CLI — enroll, renew, mint tasks and subtasks, verify
-gen/ts/             TypeScript types generated from schema/ (task schema:ts; drift-checked in CI)
+gen/ts/             zod schemas generated from schema/ by LLO's pinned schema-bridge (task schema:zod; drift-checked in CI)
 schema/             cap'n proto type definitions (CABundle, GHAClaims, etc.)
 packages/           container image pipeline (melange + apko) + workspace libs (contract, dpop)
 docs/design/        ADRs 005–024

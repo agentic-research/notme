@@ -152,6 +152,9 @@ jobs:
   # build. This installs exactly the pinned pair (Taskfile top-level vars for
   # capnp, gen/go/go.mod for capnpc-go), refuses anything else, and fails if
   # the committed gen/go is not what they generate from schema/.
+  # The same pinned capnp then runs ley-line-open's released zod plugin
+  # (pinned in schema/codegen/llo-release.json, sha256-checked before use) and
+  # fails if the committed gen/ts/identity.zod.ts is stale (notme-3e9c73).
   schema:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -163,6 +166,13 @@ jobs:
         with:
           go-version-file: gen/go/go.mod
           cache: false
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
       - uses: ./.github/actions/setup-task
       - run: task schema:toolchain:install
       - run: task schema:go:check
+      - run: task schema:zod:check

@@ -353,7 +353,7 @@ comment/doc contract only, nothing enforces it.
 | CF RPC `JwtSigner` / `ReceiptSigner` entrypoints | cloister `wrangler.toml` | class name only — **no build-time check** | blocking (runtime) |
 | `schema/identity.capnp` | cloister vendored copy | no drift today; sync gate is manual | blocking (build) when it drifts |
 | `bundleCanonical` CBOR bytes + canonical `kid` derivation | signet `canonical.go`/`sigid`, cloister, LLO `kid.rs` | hand-copied fixture / comment-only | **advisory but should be blocking** — divergence silently breaks cross-implementation signature verification (notme-e9d2b8) |
-| `gen/go`, `wasm/`, `packages/schema-bridge`, reusable `gha-identity.yml` workflow | **none** (verified: no `go.mod` requires gen/go; signet copied the workflow locally instead; LLO forked schema-bridge; cloister builds its own wasm) | — | zero-consumer — can move freely |
+| `gen/go`, `wasm/`, `packages/schema-bridge` (retired 2026-11-13 for LLO's released plugin, notme-3e9c73), reusable `gha-identity.yml` workflow | **none** (verified: no `go.mod` requires gen/go; signet copied the workflow locally instead; LLO forked schema-bridge; cloister builds its own wasm) | — | zero-consumer — can move freely |
 
 Release implication: the surfaces that can actually break a consumer on the
 next promotion are the two RPC entrypoint class names + signatures

@@ -1,0 +1,36 @@
+{
+  "repo": "agentic-research/ley-line-open",
+  "tag": "v0.30.0",
+  "tagCommit": "de638aeaf77133e6c14125a0f59f5f6b0acade00",
+  "sha256sums": {
+    "file": "SHA256SUMS",
+    "sha256": "aab471cee2d5885afe4b253027c6efebf2125990b9f4ab2b393846cab2dc1351"
+  },
+  "plugin": "capnpc-schema-bridge-zod",
+  "assets": [
+    {
+      "file": "capnpc-schema-bridge-zod-darwin-amd64",
+      "sha256": "845753aa720d19165cc2333e95b58d919b2bf3299b6ddc56903be4a105563945",
+      "size": 682240
+    },
+    {
+      "file": "capnpc-schema-bridge-zod-darwin-arm64",
+      "sha256": "2a3e1e59202bd36520dfc9ee36e3dd3017bd90945c6974562afde2e0950f4e3c",
+      "size": 666368
+    },
+    {
+      "file": "capnpc-schema-bridge-zod-linux-amd64",
+      "sha256": "f9c88389ccbdb7d4540277cdc4c678c7cdb2d080263f8bbb8e9a4cfa4464d252",
+      "size": 730200
+    },
+    {
+      "file": "capnpc-schema-bridge-zod-linux-arm64",
+      "sha256": "b28f7cb00e2a4ce2534f25951a3281b1fdddc31c31ef15bc483d7e1954fc6472",
+      "size": 723048
+    }
+  ],
+  "signature": {
+    "status": "none-published",
+    "checked": "2026-11-13: v0.30.0 has no SHA256SUMS.{sigstore.json,bundle,sig,asc,intoto.jsonl}; `gh attestation verify` finds no attestation for capnpc-schema-bridge-zod-linux-amd64 or SHA256SUMS (HTTP 404). The tag object is unsigned."
+  }
+}

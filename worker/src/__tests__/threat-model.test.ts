@@ -59,7 +59,7 @@ import {
   bundleCanonical,
   verifyBundleSignature,
 } from "../revocation";
-import { CertScope } from "../../../gen/ts/identity";
+import { CertScopeSchema } from "../../../gen/ts/identity.zod";
 
 // Constructor under cloudflare:workers' real types expects 0 args; our mock
 // supplies (ctx, env). Cast through the mock-friendly shape so the TS checker
@@ -487,7 +487,7 @@ describe("contract.scopes.vocabulary", () => {
     // Adding a scope here means: also document it in THREAT_MODEL.md, also
     // update any consumer that allowlists scopes locally. This test pins
     // the vocabulary so additions are intentional.
-    expect(Object.values(CertScope).sort()).toEqual(
+    expect([...CertScopeSchema.options].sort()).toEqual(
       ["authorityManage", "bridgeCert", "certMint"].sort(),
     );
   });
@@ -496,11 +496,11 @@ describe("contract.scopes.vocabulary", () => {
     // The worker.ts proxy() handler checks `heldCerts.scopes.includes("bridgeCert")`
     // with a bare literal. Pin the literal to the enum so a future enum
     // rename without a worker.ts update fails here, not at runtime.
-    expect(CertScope.bridgeCert).toBe("bridgeCert");
+    expect(CertScopeSchema.parse("bridgeCert")).toBe("bridgeCert");
   });
 
   it("admin gating uses the authorityManage scope literal", () => {
-    expect(CertScope.authorityManage).toBe("authorityManage");
+    expect(CertScopeSchema.parse("authorityManage")).toBe("authorityManage");
   });
 });
 
